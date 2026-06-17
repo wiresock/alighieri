@@ -26,9 +26,10 @@ use crate::socks5::{self, TargetAddr};
 const TCP_BUF: usize = 32 * 1024;
 /// Maximum UDP datagram we will buffer (covers a full IPv4 payload).
 const UDP_BUF: usize = 65535;
-/// Best-effort per-socket UDP buffer target. The kernel clamps this to
-/// `net.core.{r,w}mem_max`, so operators expecting sustained high throughput
-/// should raise those sysctls to actually get the larger buffers.
+/// Best-effort per-socket UDP buffer target. On Linux the kernel clamps this to
+/// `net.core.{r,w}mem_max` (and stores roughly double the request), so operators
+/// expecting sustained high throughput should raise those sysctls to actually
+/// get the larger buffers.
 const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 /// Consecutive *unexpected* `recv_from` failures tolerated on a relay socket
 /// before the association is torn down. ICMP-driven errors (a prior send hit a
@@ -38,7 +39,8 @@ const MAX_CONSECUTIVE_UDP_RECV_ERRORS: u32 = 16;
 
 /// Best-effort enlarge a UDP relay socket's send and receive buffers so a burst
 /// of sustained high-rate traffic is absorbed rather than dropped by the kernel.
-/// Failures (e.g. the kernel clamping the request) are ignored.
+/// A setsockopt error is ignored, and the OS may silently clamp or adjust the
+/// requested size (Linux caps it at `net.core.{r,w}mem_max`).
 pub(crate) fn tune_udp_buffers(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
