@@ -447,21 +447,22 @@ impl Connection {
         let recorder = self.byte_recorder.clone()?;
         let metrics = self.metrics.clone();
         let peer_ip = self.peer.ip();
-        // Warn the first time this association starts dropping for the byte-rate
-        // cap. Exceeding `ratelimit.byterate` otherwise silently drops every
-        // datagram until the fixed window resets, which is indistinguishable
-        // from a server hang (notably for sustained UDP like a tunnel). Logged
-        // once per association — the closure runs per datagram on the hot path,
-        // so the guard is a cheap relaxed atomic.
-        let warned = Arc::new(AtomicBool::new(false));
+        // Warn the first time this connection is cut off by the byte-rate cap.
+        // Exceeding `ratelimit.byterate` otherwise silently drops UDP datagrams
+        // (until the window resets) or tears down a TCP relay, which is
+        // indistinguishable from a server hang. The closure is shared by both
+        // relay directions and runs per datagram/chunk on the hot path, so it
+        // owns a single AtomicBool (no Arc/indirection) and short-circuits on a
+        // relaxed load — only the first over-limit call does the read-modify-write.
+        let warned = AtomicBool::new(false);
         Some(Arc::new(move |bytes| {
             let allowed = recorder.record_bytes(bytes).is_ok();
             if !allowed {
                 metrics.rate_limited();
-                if !warned.swap(true, Ordering::Relaxed) {
+                if !warned.load(Ordering::Relaxed) && !warned.swap(true, Ordering::Relaxed) {
                     warn!(
                         peer = %peer_ip,
-                        "byte rate limit (ratelimit.byterate) exceeded; dropping datagrams until the rate window resets — raise or remove the cap if this is legitimate traffic"
+                        "byte rate limit (ratelimit.byterate) exceeded; halting relay traffic until the rate window resets — raise or remove the cap if this is legitimate traffic"
                     );
                 }
             }

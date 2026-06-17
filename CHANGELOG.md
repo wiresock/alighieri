@@ -8,9 +8,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
-- Log a warning the first time a client trips `ratelimit.byterate` and starts
-  dropping datagrams, so an exhausted byte cap is no longer a silent stall
-  (previously only a metric moved).
+- Log a warning the first time a client trips `ratelimit.byterate` (UDP
+  datagrams dropped / TCP relay torn down), so an exhausted byte cap is no
+  longer a silent stall (previously only a metric moved).
 
 ### Changed
 
