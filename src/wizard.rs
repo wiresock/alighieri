@@ -732,15 +732,22 @@ fn render_config(form: &WizardForm) -> String {
             .unwrap();
             writeln!(
                 text,
-                "# working directory and may point to an unwritable or unexpected location."
+                "# working directory. If that location is not writable, logging fails to"
+            )
+            .unwrap();
+            writeln!(
+                text,
+                "# initialise and the proxy exits at startup. Use an absolute path instead."
             )
             .unwrap();
             #[cfg(target_os = "linux")]
             writeln!(
                 text,
-                "# (under a hardened systemd unit WorkingDirectory is / and the logs are dropped.)"
+                "# (a hardened systemd unit runs with WorkingDirectory=/, so a relative path"
             )
             .unwrap();
+            #[cfg(target_os = "linux")]
+            writeln!(text, "#  resolves under / and is not writable.)").unwrap();
         }
         writeln!(
             text,
@@ -1762,6 +1769,8 @@ mod tests {
         let rel_form = wizard_form_from_fields(&rel, Path::new("alighieri.conf")).unwrap();
         let rel_config = render_config(&rel_form);
         assert!(rel_config.contains("# WARNING: this logfile path is relative"));
+        // The footgun is a hard startup failure (logging init aborts), not silent loss.
+        assert!(rel_config.contains("exits at startup"));
         assert!(rel_config.contains("# logfile should be an absolute path"));
         Config::parse(&rel_config).unwrap();
         // The systemd specifics are scoped to Linux; other platforms must not see them.
