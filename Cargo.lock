@@ -21,6 +21,7 @@ dependencies = [
  "password-hash",
  "rpassword",
  "rustls-pki-types",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

@@ -11,6 +11,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Log a warning the first time a client trips `ratelimit.byterate` (UDP
   datagrams dropped / TCP relay torn down), so an exhausted byte cap is no
   longer a silent stall (previously only a metric moved).
+- Relay robustness for sustained high-rate UDP: the relay sockets request
+  larger kernel send/receive buffers (raise `net.core.{r,w}mem_max` to benefit),
+  and a transient `recv_from` error no longer tears down the whole UDP
+  association — only a sustained run of failures does.
 
 ### Changed
 
