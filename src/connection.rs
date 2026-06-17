@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -445,10 +446,27 @@ impl Connection {
     fn byte_limiter(&self) -> Option<relay::ByteLimiter> {
         let recorder = self.byte_recorder.clone()?;
         let metrics = self.metrics.clone();
+        let peer_ip = self.peer.ip();
+        // Warn the first time this connection is cut off by the byte-rate cap.
+        // Exceeding `ratelimit.byterate` otherwise silently drops UDP datagrams
+        // (until the window resets) or tears down a TCP relay, which is
+        // indistinguishable from a server hang. The closure is shared by both
+        // relay directions and runs per datagram/chunk on the hot path, so it
+        // owns a single AtomicBool (no Arc/indirection) and short-circuits on a
+        // relaxed load: sustained over-limit calls avoid the read-modify-write.
+        // The two relay directions can both observe the initial `false` and swap
+        // once each (a few RMWs at most), but only one wins and logs.
+        let warned = AtomicBool::new(false);
         Some(Arc::new(move |bytes| {
             let allowed = recorder.record_bytes(bytes).is_ok();
             if !allowed {
                 metrics.rate_limited();
+                if !warned.load(Ordering::Relaxed) && !warned.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        peer = %peer_ip,
+                        "byte rate limit (ratelimit.byterate) exceeded; UDP datagrams are dropped until the window resets and TCP relays are torn down — raise or remove the cap if this is legitimate traffic"
+                    );
+                }
             }
             allowed
         }))
