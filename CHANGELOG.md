@@ -38,7 +38,8 @@ commercial license available for proprietary use (see
   uninstall, and status, with a self-bootstrapping standalone mode and an
   `install-linux.sh` compatibility shim.
 - A short-lived, loopback-only configuration wizard that can generate a new
-  config or import and edit an existing one.
+  config or import and edit an existing one; it logs to stdout by default, with
+  file logging opt-in.
 - Userlist management commands: `user add`, `user delete`, `user list`, and
   `user verify`.
 - Configuration validation (`--check`, `--check --json`), machine-readable
