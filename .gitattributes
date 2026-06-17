@@ -1,0 +1,3 @@
+# Shell scripts must use LF endings so they run on Linux regardless of the
+# platform they were committed from (this repo is developed on Windows too).
+*.sh text eol=lf

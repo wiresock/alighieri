@@ -1,0 +1,56 @@
+[package]
+name = "alighieri"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server with Dante-inspired configuration"
+repository = "https://github.com/wiresock/alighieri"
+homepage = "https://github.com/wiresock/alighieri"
+# Open-source license. Alighieri is dual-licensed: a commercial license is also
+# available for proprietary use — see LICENSING.md.
+license = "AGPL-3.0-or-later"
+keywords = ["socks5", "proxy", "network", "dante", "async"]
+categories = ["network-programming", "command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "alighieri"
+path = "src/main.rs"
+
+[lib]
+name = "alighieri"
+path = "src/lib.rs"
+
+[dependencies]
+argon2 = { version = "0.5", features = ["std"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "2"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rpassword = "7"
+# PEM parsing for the TLS listener. The std feature provides the reader/file
+# PEM helpers; this replaces the now-unmaintained rustls-pemfile crate.
+rustls-pki-types = { version = "1", features = ["std"] }
+# Pinned to the ring provider: aws-lc-rs (the rustls default) needs CMake and
+# NASM to build on Windows, which this project's contributors cannot assume.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_System_IO", "Win32_System_Registry"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

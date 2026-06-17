@@ -1,0 +1,8 @@
+/target
+/target-*
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+.DS_Store
+# Local editor / assistant state
+/.claude/

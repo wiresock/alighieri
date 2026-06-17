@@ -1,0 +1,1045 @@
+//! End-to-end integration tests for the Alighieri SOCKS5 proxy.
+//!
+//! These tests spin up real TCP listeners and exercise the full proxy path:
+//! handshake → method selection → (optional auth) → request → relay.
+
+use std::io::Write;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+use alighieri::auth::UserDb;
+use alighieri::config::Config;
+use alighieri::server::Server;
+use alighieri::socks5::{self, TargetAddr};
+
+/// A minimal permissive configuration. The listen address uses port 0 so the
+/// kernel assigns an ephemeral port; the real address is obtained from
+/// `Server::local_addr()` after binding.
+fn permissive_config() -> Config {
+    Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap()
+}
+
+/// Starts the proxy, queries the actual bound address, then spawns the run loop.
+async fn start_proxy() -> (tokio::task::JoinHandle<Option<()>>, SocketAddr) {
+    let server = Server::bind(permissive_config()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = tokio::spawn(async move { server.run().await.ok() });
+    // Give the server time to enter its accept loop.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (handle, addr)
+}
+
+async fn start_proxy_with_config(cfg: Config) -> (tokio::task::JoinHandle<Option<()>>, SocketAddr) {
+    let server = Server::bind(cfg).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let handle = tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (handle, addr)
+}
+
+/// Performs a SOCKS5 handshake with `Method::None` (0x00) on `stream`.
+async fn handshake_noauth(stream: &mut TcpStream) {
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+}
+
+async fn handshake_username(stream: &mut TcpStream, username: &str, password: &str) -> bool {
+    stream.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+    let mut selection = [0u8; 2];
+    stream.read_exact(&mut selection).await.unwrap();
+    assert_eq!(selection, [0x05, 0x02]);
+
+    let mut auth = vec![0x01, username.len() as u8];
+    auth.extend_from_slice(username.as_bytes());
+    auth.push(password.len() as u8);
+    auth.extend_from_slice(password.as_bytes());
+    stream.write_all(&auth).await.unwrap();
+
+    let mut status = [0u8; 2];
+    stream.read_exact(&mut status).await.unwrap();
+    assert_eq!(status[0], 0x01);
+    status[1] == 0x00
+}
+
+async fn expect_connection_closed(mut stream: TcpStream) {
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    let res = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+    match res {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("expected closed connection, read {n} bytes"),
+        Err(_) => panic!("connection stayed open instead of being rate limited"),
+    }
+}
+
+/// Sends a CONNECT request for `dest` and returns the bound address from the
+/// reply. Panics on failure.
+async fn request_connect(stream: &mut TcpStream, dest: SocketAddr) -> SocketAddr {
+    let mut req = vec![0x05, 0x01, 0x00];
+    match dest {
+        SocketAddr::V4(v4) => {
+            req.push(0x01);
+            req.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            req.push(0x04);
+            req.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    req.extend_from_slice(&dest.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x00,
+        "CONNECT failed with reply 0x{:02x}",
+        reply[1]
+    );
+    assert_eq!(reply[2], 0x00); // RSV
+
+    let atyp = reply[3];
+    let bound = match atyp {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+        }
+        other => panic!("unexpected ATYP {other}"),
+    };
+    bound
+}
+
+async fn request_udp_associate(stream: &mut TcpStream) -> SocketAddr {
+    let mut req = vec![0x05, 0x03, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x00,
+        "UDP ASSOCIATE failed with reply 0x{:02x}",
+        reply[1]
+    );
+    assert_eq!(reply[2], 0x00);
+
+    match reply[3] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+        }
+        other => panic!("unexpected ATYP {other}"),
+    }
+}
+
+/// Starts a TCP echo server and returns its local address.
+async fn start_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    addr
+}
+
+async fn start_udp_echo_server() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        loop {
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&buf[..n], peer).await.unwrap();
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn full_connect_relay_ipv4() {
+    let (_handle, proxy_addr) = start_proxy().await;
+    let echo = start_echo_server().await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+    let _bound = request_connect(&mut client, echo).await;
+
+    let payload = b"Hello through SOCKS5!";
+    client.write_all(payload).await.unwrap();
+    client.shutdown().await.ok();
+
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, payload);
+}
+
+#[tokio::test]
+async fn connection_rate_limit_rejects_excess_client_connections() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+ratelimit.connectionrate: 1/60
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut first = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut first).await;
+
+    let second = TcpStream::connect(proxy_addr).await.unwrap();
+    expect_connection_closed(second).await;
+}
+
+#[tokio::test]
+async fn auth_failure_rate_limit_blocks_later_connections() {
+    let mut users = tempfile::NamedTempFile::new().unwrap();
+    writeln!(users, "alice:s3cr3t").unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: username
+userlist: {}
+ratelimit.authfailurerate: 1/60
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }}
+"#,
+        users.path().display()
+    ))
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut first = TcpStream::connect(proxy_addr).await.unwrap();
+    assert!(!handshake_username(&mut first, "alice", "wrong").await);
+
+    let second = TcpStream::connect(proxy_addr).await.unwrap();
+    expect_connection_closed(second).await;
+}
+
+#[tokio::test]
+async fn username_password_auth_success_allows_connect() {
+    let mut users = tempfile::NamedTempFile::new().unwrap();
+    writeln!(users, "alice:s3cr3t").unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: username
+userlist: {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }}
+"#,
+        users.path().display()
+    ))
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let echo = start_echo_server().await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    assert!(handshake_username(&mut client, "alice", "s3cr3t").await);
+    let _bound = request_connect(&mut client, echo).await;
+
+    client.write_all(b"auth ok").await.unwrap();
+    let mut received = [0u8; 7];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"auth ok");
+}
+
+#[tokio::test]
+async fn argon2_username_password_auth_success_allows_connect() {
+    let mut users = tempfile::NamedTempFile::new().unwrap();
+    let line = UserDb::hash_user_line("alice", "s3cr3t").unwrap();
+    writeln!(users, "{line}").unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: username
+userlist: {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }}
+"#,
+        users.path().display()
+    ))
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let echo = start_echo_server().await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    assert!(handshake_username(&mut client, "alice", "s3cr3t").await);
+    let _bound = request_connect(&mut client, echo).await;
+
+    client.write_all(b"argon ok").await.unwrap();
+    let mut received = [0u8; 8];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"argon ok");
+}
+
+#[tokio::test]
+async fn username_password_auth_failure_closes_connection() {
+    let mut users = tempfile::NamedTempFile::new().unwrap();
+    writeln!(users, "alice:s3cr3t").unwrap();
+    let cfg = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: username
+userlist: {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }}
+"#,
+        users.path().display()
+    ))
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    assert!(!handshake_username(&mut client, "alice", "wrong").await);
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "expected EOF after failed authentication");
+}
+
+#[tokio::test]
+async fn connect_denied_by_socks_rule() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks block { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let echo = start_echo_server().await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(
+        &echo
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()
+            .unwrap()
+            .octets(),
+    );
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x02); // ConnectionNotAllowed
+}
+
+#[tokio::test]
+async fn udp_associate_handshake() {
+    let (_handle, proxy_addr) = start_proxy().await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+
+    // UDP ASSOCIATE request (dest is usually ignored; 0.0.0.0:0 is conventional).
+    let mut req = vec![0x05, 0x03, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(
+        reply[1], 0x00,
+        "UDP ASSOCIATE failed with reply 0x{:02x}",
+        reply[1]
+    );
+    assert_eq!(reply[3], 0x01); // ATYP IPv4
+
+    let mut bound_octets = [0u8; 4];
+    client.read_exact(&mut bound_octets).await.unwrap();
+    let _bound_port = client.read_u16().await.unwrap();
+
+    client.shutdown().await.ok();
+}
+
+#[tokio::test]
+async fn udp_associate_relays_datagrams() {
+    let (_handle, proxy_addr) = start_proxy().await;
+    let echo = start_udp_echo_server().await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"udp ping");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(header.dest, TargetAddr::Ip(echo));
+    assert_eq!(&buf[header.payload_offset..n], b"udp ping");
+}
+
+#[tokio::test]
+async fn udp_associate_rejects_second_client_port_from_same_ip() {
+    let (_handle, proxy_addr) = start_proxy().await;
+    let echo = start_udp_echo_server().await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let mut first_datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    first_datagram.extend_from_slice(b"first");
+    first.send_to(&first_datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), first.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"first");
+
+    let mut second_datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    second_datagram.extend_from_slice(b"second");
+    second.send_to(&second_datagram, relay_addr).await.unwrap();
+
+    let blocked =
+        tokio::time::timeout(Duration::from_millis(250), second.recv_from(&mut buf)).await;
+    assert!(
+        blocked.is_err(),
+        "second UDP port should not receive a relay response"
+    );
+}
+
+#[tokio::test]
+async fn slow_client_is_disconnected_during_handshake() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+handshaketimeout: 1
+maxconnections: 1
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0, "expected EOF after handshake timeout");
+}
+
+#[tokio::test]
+async fn client_rule_blocks_untrusted_source() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+client block { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    // The server immediately closes the connection because the client rule
+    // blocks everything.
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "expected immediate EOF because client rule blocks");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_connection_counters() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+metrics.listen: 127.0.0.1:0
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    let metrics_addr = server.metrics_addr().unwrap().unwrap();
+    let handle = tokio::spawn(async move { server.run().await.ok() });
+    let _ = wait_for_metrics(metrics_addr, |_| true).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+    drop(client);
+
+    let response = wait_for_metrics(metrics_addr, |response| {
+        response.contains("alighieri_connections_accepted_total 1\n")
+            && response.contains("alighieri_connections_active 0\n")
+    })
+    .await;
+    handle.abort();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("alighieri_connections_accepted_total 1\n"));
+    assert!(response.contains("alighieri_connections_active 0\n"));
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_named_rule_hits() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+metrics.listen: 127.0.0.1:0
+client pass "client-any" { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks block "block-all" { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    let metrics_addr = server.metrics_addr().unwrap().unwrap();
+    let handle = tokio::spawn(async move { server.run().await.ok() });
+    let _ = wait_for_metrics(metrics_addr, |_| true).await;
+
+    let echo = start_echo_server().await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    req.extend_from_slice(
+        &echo
+            .ip()
+            .to_string()
+            .parse::<std::net::Ipv4Addr>()
+            .unwrap()
+            .octets(),
+    );
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[1], 0x02);
+    drop(client);
+
+    let response = wait_for_metrics(metrics_addr, |response| {
+        response.contains(
+            "alighieri_rule_hits_total{scope=\"client\",verdict=\"pass\",line=\"5\"} 1\n",
+        ) && response.contains(
+            "alighieri_rule_hits_total{scope=\"socks\",verdict=\"block\",line=\"6\"} 1\n",
+        ) && response.contains(
+            "alighieri_rule_named_hits_total{scope=\"client\",verdict=\"pass\",line=\"5\",name=\"client-any\"} 1\n",
+        ) && response.contains(
+            "alighieri_rule_named_hits_total{scope=\"socks\",verdict=\"block\",line=\"6\",name=\"block-all\"} 1\n",
+        )
+    })
+    .await;
+    handle.abort();
+
+    assert!(response.contains("name=\"client-any\""));
+    assert!(response.contains("name=\"block-all\""));
+}
+
+async fn fetch_metrics(metrics_addr: SocketAddr) -> std::io::Result<String> {
+    let mut metrics = TcpStream::connect(metrics_addr).await?;
+    metrics
+        .write_all(b"GET /metrics HTTP/1.1\r\nhost: localhost\r\n\r\n")
+        .await?;
+    let mut response = String::new();
+    metrics.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
+async fn wait_for_metrics(metrics_addr: SocketAddr, ready: impl Fn(&str) -> bool) -> String {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(response) = fetch_metrics(metrics_addr).await {
+                if response.starts_with("HTTP/1.1 200 OK") && ready(&response) {
+                    return response;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("metrics endpoint did not become ready")
+}
+
+// ---------------------------------------------------------------------------
+// TLS listener
+// ---------------------------------------------------------------------------
+
+/// Leaf certificate for `localhost` (SAN: DNS:localhost, CA:FALSE, EKU
+/// serverAuth), signed by `TLS_TEST_CA`. The server presents this leaf
+/// followed by the CA — the chain is assembled at write time, so the CA PEM
+/// lives in exactly one place. Clients trust the CA; rustls' verifier rejects
+/// CA certificates presented as end entities, so a bare self-signed CA cert
+/// would not do. Both certs are backdated to 2020 and valid until 2126, so
+/// clock skew on a CI or developer machine cannot make the handshake flaky.
+const TLS_TEST_LEAF: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDTTCCAjWgAwIBAgIURQDuPY3MmGaKrbiFJlpV/RA+jIMwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRYWxpZ2hpZXJpLXRlc3QtY2EwIBcNMjAwMTAxMDAwMDAw
+WhgPMjEyNjAxMDEwMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAIhoiMB0/+yHm1AlM03aLlxK+a6eKVq+
+VllxkZAv+uAGllWtr78Dp/gcaBM1M1vlZjw2dS+hMrQ352fQ9NkTdyzZkZViuAeL
+0RIGbWIzDFpP5rf4k+JUAPysPmWFv/n6041U/B9ZMyhaRfJQ+76xZkgTxvUWnvCw
+KwnEyxaPX8DyN2A2azmiuJZVxM3vQROsCrX30JeF6js3gK4h6VdAGNYy+tBdbhWj
+haj/FusiB+1hEj1CP85yzlq6y2yj9LZKiqARPeeJvEJ6d76WTAytAz8eqh6iXG9K
+oTpTaGadkMKExr5bzDD4g2gPJc/AU933NN+hMwU9apTBVdhC3pAjNgcCAwEAAaOB
+jDCBiTAUBgNVHREEDTALgglsb2NhbGhvc3QwDAYDVR0TAQH/BAIwADAOBgNVHQ8B
+Af8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFJwS23CF10/s
+q0TAs0Gb3uQAdIjPMB8GA1UdIwQYMBaAFAd4EsDqm4dEcMlNHNV/I6CjgZbpMA0G
+CSqGSIb3DQEBCwUAA4IBAQC0zAoEpwghJ8SWOT6AcE0Irw+Fky9Uoiep3sLW/wTJ
+qjvBIyfQPnx+m4KJXHa3tqsOcxWpdnveYcm6xWP0eSR14LMPbOLNmVLmsWfrd9Oc
+pdraiaPRQk6jdcKkrJKib2pHmaDvlwbuKh9jhFaNQ0XDQvyiSXrw0BROlx33jTEf
+tlPuWnAzeAa9KoCcmhzjRAC0O4x1Jx18U91FN/lzzQIkfDYbjNmOHu/gwICiqr/7
+XXU0Z2cRAaCi4Cec/up6iScZjC3filyh7LUt6mhGHjT5xSosX8dMUkPj51hB2UdU
+/k2UNbZTJNoD3pFtaLomU8VLMrrP2N2IPXv79HYBr+Zd
+-----END CERTIFICATE-----
+"#;
+
+/// The issuing CA: the client-side trust root, and — appended after the leaf
+/// at write time — the second link in the chain the server presents. Single
+/// source of truth so the two uses cannot drift.
+const TLS_TEST_CA: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDKzCCAhOgAwIBAgIUTWWGs0iyjcAZCL0sKzpkYtnlsXUwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRYWxpZ2hpZXJpLXRlc3QtY2EwIBcNMjAwMTAxMDAwMDAw
+WhgPMjEyNjAxMDEwMDAwMDBaMBwxGjAYBgNVBAMMEWFsaWdoaWVyaS10ZXN0LWNh
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1DLhD2+I9gU5DGQE0SsD
+3IQKD4Y7fOyypTyRWzJLuBHmI8E2HuRUGWVcAXgfYuE2Fx8miFNIdGPFBXoSj/iP
+mVF6GhbJdtkP2FhaYSuj6mqlpaNYjXesU+LCJydtVCTYwsoBaL3zMFOYs/VkUF5S
+Z17Y4PhIT8dNl/d38DceiOntqeokJXHR7d3pu3reTLzITV+9ka5HJWXlwyMew00m
+ytUMk5K6Fo+ZOH4iIg+bry4tehgO3XbpGXs2o7PIQKPC9fy31NNzjxy1P3w8kWsb
+m/9lYcqPIDZ9t1ox6AE6uu5cDwSzMV+hJy1xqmbPSd1u0UGEqOoiP40cfTHtmkjF
+1wIDAQABo2MwYTAdBgNVHQ4EFgQUB3gSwOqbh0RwyU0c1X8joKOBlukwHwYDVR0j
+BBgwFoAUB3gSwOqbh0RwyU0c1X8joKOBlukwDwYDVR0TAQH/BAUwAwEB/zAOBgNV
+HQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQELBQADggEBAMYjv16fkPw4o7JDKCAehDMW
+0rz+ccBRludL/MmNSbceiWhtZ9X4zPho/IjQRUgq/ockPy6d1UV6dvE445k1/5ly
+jb3ObrbFaHGkwLuvnTJpPzKB48zl3JsT3t9AXYoTdRC5F6NyBZsnU3eokuhF40sK
+BS/Vm+pMwCZ3D9CGWssYCG1y1RjPHVqP+u+V7YZ4hBgHmNS3WZsA9cgikoXAgIXO
+A/EI4pnfvre8USf55/11bmVWL8A6E4b5llf8fW4TdBimFHs2++/19oB/QXRP3T0P
+g/mn7lfAslalLxDgp9UvP8qfAhoXNZ0rJRRXDnrTB7HZwoSArrYpiil53cai0Bo=
+-----END CERTIFICATE-----
+"#;
+
+const TLS_TEST_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCIaIjAdP/sh5tQ
+JTNN2i5cSvmunilavlZZcZGQL/rgBpZVra+/A6f4HGgTNTNb5WY8NnUvoTK0N+dn
+0PTZE3cs2ZGVYrgHi9ESBm1iMwxaT+a3+JPiVAD8rD5lhb/5+tONVPwfWTMoWkXy
+UPu+sWZIE8b1Fp7wsCsJxMsWj1/A8jdgNms5oriWVcTN70ETrAq199CXheo7N4Cu
+IelXQBjWMvrQXW4Vo4Wo/xbrIgftYRI9Qj/Ocs5austso/S2SoqgET3nibxCene+
+lkwMrQM/HqoeolxvSqE6U2hmnZDChMa+W8ww+INoDyXPwFPd9zTfoTMFPWqUwVXY
+Qt6QIzYHAgMBAAECggEAC2g2e2WtWzHR5qddvXZv5w7sB1K5oZmGLg+lvRmOELrs
+SnjuV/ptyv1RJL4Pr/Eklgd10EhaLaD5LIDYYOjUT/9XwdbSDet+zdOUxSAAufKx
+mBPlBgnBVV/wDdxb/AMiOtDvDo4OjaLS85sbGkzKgV+KBUfhfb41syjuVNIjj0Zy
+4ZQo/CV1Zhlmjj6Btvxf19RF+jCqRSNJbUJEsnpvHj7BpBVNQxbLvFw0IhbyBHNe
+s4a3TYn/0LkoSL78rqjPFpk4HJqo1Ad9gdIKNVbgMpouboXxI98dr9g1BwqMKRCQ
+3BqTTmyvf6zmGxQFz1jLY+FceGmG/YdIoGeGnAHHaQKBgQC+Vl1dg+OTg06M3AvS
+v0dmlXlPbc+owPkS7hkB1qijObRvtINuwQVay8l9ySXvZD5gkIIyaAkIqfZIBgrS
+vwPW2CrB8nVPeii1OzVo1cIT9xcIRik/xe7q2966WdnlY9VcO+whqQuhrqk+lZaZ
+42kPBmisfR+UDoY8T82csZWomQKBgQC3d24bCBnVDjnwhFMeejmU3cMP4+tAV6DY
+jYfv5hayI/ZW2Lr9C/q7zR7Htp2eIlpjz/NrTPz9LD/mdMMnEu32iQlGLYR27u8+
+li1vGLEU0JJowU9wJJfrkyChGWtmQW77Tk9GtZvvXs6F2+rbzbsqjuRKATcRBwAe
+qZeoy6/XnwKBgEQPyAUno1pdatpN2WB8C8EwFBgGEWqrzqUpRQH2S4lKmi4To6gY
+F50XIC79nbYT54ZKRnRV5V0Wwb2Rg49GxM2vsOJ3m+FWsnXT/U5Gmcbf5XmM9TUb
+x0puYx/J/3PaljIML2z98O3Y8iYyAY931VqNFSMQ/xjHdNLeSo0Mp5KJAoGBAIEH
+WoViViCUB8WSmo5lsVdz+zqStaGjvzhtmTvr2uxgBGChvig3I5iussYMNZ/AU0e9
+OVmuZIJ9e1dNqO4zDu6DA+W6H14xvkqK/dsTR373DPDle0PISJvh9mG2aeUZgb72
+HSUClm9rgt17hBof/1D3+6/cWOj9vmTSKxoIXlvLAoGAa8s9ugjAL5LnpPoIXmAn
+dj//P1QEVipld48dJDHXxFA94xpmWnUamZ1zZGSdzUvYZJ80e7N1PB/9WYa5K8zV
+VrxXuzx+kIDNIXMLXwcOfYWfSgzD/irxEPpg25GcQXti89IwkPXIF45YimDy3cr6
+1N896Ol4hWNORttOvx0kN/o=
+-----END PRIVATE KEY-----
+"#;
+
+/// Full TLS round trip through the proxy: handshake with the TLS-wrapped
+/// listener, SOCKS5 negotiation and CONNECT over the encrypted stream, then
+/// an echo relay — proving the upgraded rustls stack end to end.
+#[tokio::test]
+async fn tls_listener_relays_connect_traffic() {
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cert_file = dir.path().join("server.crt");
+    let key_file = dir.path().join("server.key");
+    // Server presents the leaf followed by the issuing CA.
+    std::fs::write(&cert_file, format!("{TLS_TEST_LEAF}{TLS_TEST_CA}")).unwrap();
+    std::fs::write(&key_file, TLS_TEST_KEY).unwrap();
+
+    let config = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+tls.certfile: {}
+tls.keyfile: {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
+"#,
+        cert_file.display(),
+        key_file.display()
+    ))
+    .unwrap();
+    let (_proxy, proxy_addr) = start_proxy_with_config(config).await;
+    let echo_addr = start_echo_server().await;
+
+    // Trust exactly the test CA.
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(TLS_TEST_CA.as_bytes()) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("TLS handshake with the proxy listener failed");
+
+    // SOCKS5 over TLS: greeting, CONNECT to the echo server, then relay.
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut selection = [0u8; 2];
+    stream.read_exact(&mut selection).await.unwrap();
+    assert_eq!(selection, [0x05, 0x00]);
+
+    let SocketAddr::V4(echo_v4) = echo_addr else {
+        panic!("echo server should bind IPv4");
+    };
+    let mut request = vec![0x05, 0x01, 0x00, 0x01];
+    request.extend_from_slice(&echo_v4.ip().octets());
+    request.extend_from_slice(&echo_v4.port().to_be_bytes());
+    stream.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 10];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x00,
+        "CONNECT failed with reply 0x{:02x}",
+        reply[1]
+    );
+
+    stream.write_all(b"over tls").await.unwrap();
+    let mut echoed = [0u8; 8];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"over tls");
+}
+
+// ---------------------------------------------------------------------------
+// IPv6, domain-name, negative-TLS, and hot-reload coverage
+// ---------------------------------------------------------------------------
+
+/// Starts a TCP echo server bound to `bind`, returning its address, or `None`
+/// when the bind fails — e.g. a host without IPv6 loopback.
+async fn try_start_echo_server(bind: &str) -> Option<SocketAddr> {
+    let listener = TcpListener::bind(bind).await.ok()?;
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+    Some(addr)
+}
+
+/// Sends a CONNECT request for a domain name (ATYP = 0x03) and returns the
+/// bound address from the reply. Panics on failure.
+async fn request_connect_domain(stream: &mut TcpStream, domain: &str, port: u16) -> SocketAddr {
+    // SOCKS5 domain names carry a single-byte length, so reject anything that
+    // would not fit rather than silently truncating with `as u8`.
+    let len = u8::try_from(domain.len()).expect("domain name exceeds 255 bytes");
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, len];
+    req.extend_from_slice(domain.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x00,
+        "CONNECT failed with reply 0x{:02x}",
+        reply[1]
+    );
+    assert_eq!(reply[2], 0x00);
+    match reply[3] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await.unwrap();
+            let port = stream.read_u16().await.unwrap();
+            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+        }
+        other => panic!("unexpected ATYP {other}"),
+    }
+}
+
+/// End-to-end CONNECT to an IPv6 destination (ATYP = 0x04). Skipped when the
+/// platform has no IPv6 loopback to bind the echo server to.
+#[tokio::test]
+async fn connect_relay_over_ipv6() {
+    let Some(echo_addr) = try_start_echo_server("[::1]:0").await else {
+        eprintln!("skipping connect_relay_over_ipv6: no IPv6 loopback");
+        return;
+    };
+    assert!(matches!(echo_addr, SocketAddr::V6(_)));
+
+    // The destination is IPv6, so the socks rule must allow `::/0`.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: ::/0 protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut stream).await;
+    request_connect(&mut stream, echo_addr).await;
+
+    stream.write_all(b"over ipv6").await.unwrap();
+    let mut echoed = [0u8; 9];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"over ipv6");
+}
+
+/// End-to-end CONNECT addressed by domain name, exercising proxy-side DNS
+/// resolution. `dns.prefer: ipv4` pins `localhost` to the 127.0.0.1 echo.
+#[tokio::test]
+async fn connect_relay_via_domain_name() {
+    let echo_addr = start_echo_server().await;
+    let SocketAddr::V4(echo_v4) = echo_addr else {
+        panic!("echo server should bind IPv4");
+    };
+
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+dns.prefer: ipv4
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut stream).await;
+    request_connect_domain(&mut stream, "localhost", echo_v4.port()).await;
+
+    stream.write_all(b"via dns").await.unwrap();
+    let mut echoed = [0u8; 7];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"via dns");
+}
+
+/// A TLS client that trusts no roots must fail the handshake with the TLS
+/// listener — the negative companion to `tls_listener_relays_connect_traffic`.
+#[tokio::test]
+async fn tls_listener_rejects_untrusted_client() {
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cert_file = dir.path().join("server.crt");
+    let key_file = dir.path().join("server.key");
+    std::fs::write(&cert_file, format!("{TLS_TEST_LEAF}{TLS_TEST_CA}")).unwrap();
+    std::fs::write(&key_file, TLS_TEST_KEY).unwrap();
+
+    let config = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+tls.certfile: {}
+tls.keyfile: {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
+"#,
+        cert_file.display(),
+        key_file.display()
+    ))
+    .unwrap();
+    let (_proxy, proxy_addr) = start_proxy_with_config(config).await;
+
+    // Empty trust store: the server's certificate is an unknown issuer.
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(RootCertStore::empty())
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let result = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await;
+    assert!(
+        result.is_err(),
+        "handshake must fail when the client trusts no CA"
+    );
+}
+
+/// Hot reload swaps the ACL set for newly accepted connections: a blocked
+/// destination becomes reachable after `Server::reload` without rebinding.
+#[tokio::test]
+async fn reload_swaps_acls_for_new_connections() {
+    let echo_addr = start_echo_server().await;
+    let SocketAddr::V4(echo_v4) = echo_addr else {
+        panic!("echo server should bind IPv4");
+    };
+
+    // Start with a config that blocks the echo destination outright.
+    let blocking = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks block {{ from: 0.0.0.0/0 to: {}/32 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
+"#,
+        echo_v4.ip()
+    ))
+    .unwrap();
+
+    let server = std::sync::Arc::new(Server::bind(blocking).await.unwrap());
+    let proxy_addr = server.local_addr().unwrap();
+    let run_server = server.clone();
+    let _handle = tokio::spawn(async move { run_server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Before reload: the block rule denies CONNECT to the echo server.
+    {
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut stream).await;
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&echo_v4.ip().octets());
+        req.extend_from_slice(&echo_v4.port().to_be_bytes());
+        stream.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            reply[1], 0x02,
+            "expected ConnectionNotAllowed before reload"
+        );
+        // Drain the rest of the reply (BND.ADDR + BND.PORT) before dropping the
+        // socket, so it closes cleanly instead of resetting with unread data.
+        let addr_len = match reply[3] {
+            0x01 => 4,
+            0x04 => 16,
+            other => panic!("unexpected ATYP {other}"),
+        };
+        let mut rest = vec![0u8; addr_len + 2];
+        stream.read_exact(&mut rest).await.unwrap();
+    }
+
+    // Reload with a permissive policy; the bound listener address is preserved.
+    server.reload(permissive_config()).await.unwrap();
+
+    // After reload: a new connection reaches the echo server and relays.
+    {
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut stream).await;
+        request_connect(&mut stream, echo_addr).await;
+        stream.write_all(b"after reload").await.unwrap();
+        let mut echoed = [0u8; 12];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"after reload");
+    }
+}
