@@ -724,9 +724,21 @@ fn render_config(form: &WizardForm) -> String {
     writeln!(text).unwrap();
     if let Some(log_file) = &form.log_file {
         writeln!(text, "logoutput: file").unwrap();
+        if log_file.is_relative() {
+            writeln!(
+                text,
+                "# WARNING: this logfile path is relative; under a hardened systemd unit"
+            )
+            .unwrap();
+            writeln!(
+                text,
+                "# (WorkingDirectory=/) it resolves to an unwritable location and logs are dropped."
+            )
+            .unwrap();
+        }
         writeln!(
             text,
-            "# logfile must be an absolute path writable by the running service"
+            "# logfile should be an absolute path writable by the running service"
         )
         .unwrap();
         writeln!(
@@ -1369,7 +1381,7 @@ fn render_wizard_form(
 <h2>Files</h2>
 <label>Config output <input name="output" value="{output}" required placeholder="alighieri.conf" autocomplete="off"></label>
 <label>Userlist path <input name="userlist" value="{userlist}" placeholder="users (required for the username template)" autocomplete="off"></label>
-<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path; empty = stdout / journald" autocomplete="off"></label>
+<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path recommended; empty = stdout / journald" autocomplete="off"></label>
 </section>
 <button type="submit">Generate config</button>
 </form>
@@ -1732,6 +1744,35 @@ mod tests {
         assert!(config.contains("logoutput: file"));
         assert!(config.contains("logfile: "));
         assert!(config.contains("alighieri.log"));
+    }
+
+    #[test]
+    fn relative_logfile_warns_in_config_but_absolute_does_not() {
+        // A relative path gets an explicit warning about the hardened-unit footgun.
+        let mut rel = HashMap::new();
+        rel.insert("template".into(), "local-no-auth".into());
+        rel.insert("logfile".into(), "logs/alighieri.log".into());
+        let rel_form = wizard_form_from_fields(&rel, Path::new("alighieri.conf")).unwrap();
+        let rel_config = render_config(&rel_form);
+        assert!(rel_config.contains("# WARNING: this logfile path is relative"));
+        assert!(rel_config.contains("# logfile should be an absolute path"));
+        Config::parse(&rel_config).unwrap();
+
+        // An absolute path gets the guidance comment but not the relative-path warning.
+        let mut abs = HashMap::new();
+        abs.insert("template".into(), "local-no-auth".into());
+        #[cfg(windows)]
+        abs.insert(
+            "logfile".into(),
+            r"C:\ProgramData\alighieri\alighieri.log".into(),
+        );
+        #[cfg(not(windows))]
+        abs.insert("logfile".into(), "/var/log/alighieri/alighieri.log".into());
+        let abs_form = wizard_form_from_fields(&abs, Path::new("alighieri.conf")).unwrap();
+        let abs_config = render_config(&abs_form);
+        assert!(!abs_config.contains("WARNING"));
+        assert!(abs_config.contains("# logfile should be an absolute path"));
+        Config::parse(&abs_config).unwrap();
     }
 
     #[test]
