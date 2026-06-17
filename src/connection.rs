@@ -453,7 +453,9 @@ impl Connection {
         // indistinguishable from a server hang. The closure is shared by both
         // relay directions and runs per datagram/chunk on the hot path, so it
         // owns a single AtomicBool (no Arc/indirection) and short-circuits on a
-        // relaxed load — only the first over-limit call does the read-modify-write.
+        // relaxed load: sustained over-limit calls avoid the read-modify-write.
+        // The two relay directions can both observe the initial `false` and swap
+        // once each (a few RMWs at most), but only one wins and logs.
         let warned = AtomicBool::new(false);
         Some(Arc::new(move |bytes| {
             let allowed = recorder.record_bytes(bytes).is_ok();
@@ -462,7 +464,7 @@ impl Connection {
                 if !warned.load(Ordering::Relaxed) && !warned.swap(true, Ordering::Relaxed) {
                     warn!(
                         peer = %peer_ip,
-                        "byte rate limit (ratelimit.byterate) exceeded; halting relay traffic until the rate window resets — raise or remove the cap if this is legitimate traffic"
+                        "byte rate limit (ratelimit.byterate) exceeded; UDP datagrams are dropped until the window resets and TCP relays are torn down — raise or remove the cap if this is legitimate traffic"
                     );
                 }
             }
