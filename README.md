@@ -248,7 +248,7 @@ socks pass "allow-default" {
 | `ratelimit.connectionrate` | —        | Per-client TCP accepts as `COUNT/WINDOW_SECONDS`     |
 | `ratelimit.authfailurerate` | —       | Per-client auth failures as `COUNT/WINDOW_SECONDS`   |
 | `ratelimit.concurrentconnections` | —  | Per-client concurrent accepted TCP connections       |
-| `ratelimit.byterate` | —             | Per-client relayed bytes as `BYTES/WINDOW_SECONDS`   |
+| `ratelimit.byterate` | —             | Per-client relayed-byte **drop cap** (both directions) as `BYTES/WINDOW_SECONDS` |
 
 When `logfile` is set, file logging is enabled even if `file` is omitted from
 `logoutput`. Size suffixes accept bytes or `K`, `KB`, `KiB`, `M`, `MB`, `MiB`,
@@ -301,12 +301,21 @@ Optional per-client rate limits use fixed windows and are keyed by source IP:
 ratelimit.connectionrate: 60/60       # 60 accepted TCP connections per minute
 ratelimit.authfailurerate: 5/300      # 5 failed auth attempts per 5 minutes
 ratelimit.concurrentconnections: 10   # 10 active accepted TCP connections
-ratelimit.byterate: 10MiB/60          # 10 MiB relayed per minute
+ratelimit.byterate: 10MiB/60          # HARD per-window drop cap — see the warning below
 ```
 
 Rate limit changes are applied on hot reload for new connections and later auth
 failure accounting. Existing relay connections continue with the byte-rate
 settings they accepted under.
+
+> **`ratelimit.byterate` is a hard cap, not a throttle.** It counts relayed
+> bytes (both directions) in a fixed window and **drops every datagram once the
+> budget is exhausted, until the window resets** — a sustained flow that exceeds
+> it *stalls* rather than slows down. Size it well above your expected sustained
+> throughput × window (a 250 Mbps tunnel moves ~1.8 GiB/min, so `10MiB/60` would
+> stall it within a second), or leave it unset and rely on the connection and
+> concurrency limits plus authentication. A client that trips the cap is logged
+> with a `byte rate limit … exceeded` warning.
 
 When both `tls.certfile` and `tls.keyfile` are set, Alighieri expects clients to
 complete a TLS handshake before sending the SOCKS5 greeting. SOCKS5 clients

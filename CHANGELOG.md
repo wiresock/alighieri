@@ -6,11 +6,19 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- Log a warning the first time a client trips `ratelimit.byterate` and starts
+  dropping datagrams, so an exhausted byte cap is no longer a silent stall
+  (previously only a metric moved).
+
 ### Changed
 
 - Dual licensing: Alighieri remains available under `AGPL-3.0-or-later`, and a
   commercial license is now offered for proprietary use. See
   [`LICENSING.md`](LICENSING.md).
+- Document `ratelimit.byterate` as a hard per-window drop cap (not a throttle),
+  with sizing guidance, in the README and the sample config.
 
 ## [0.1.0]
 

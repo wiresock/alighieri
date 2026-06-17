@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -445,10 +446,24 @@ impl Connection {
     fn byte_limiter(&self) -> Option<relay::ByteLimiter> {
         let recorder = self.byte_recorder.clone()?;
         let metrics = self.metrics.clone();
+        let peer_ip = self.peer.ip();
+        // Warn the first time this association starts dropping for the byte-rate
+        // cap. Exceeding `ratelimit.byterate` otherwise silently drops every
+        // datagram until the fixed window resets, which is indistinguishable
+        // from a server hang (notably for sustained UDP like a tunnel). Logged
+        // once per association — the closure runs per datagram on the hot path,
+        // so the guard is a cheap relaxed atomic.
+        let warned = Arc::new(AtomicBool::new(false));
         Some(Arc::new(move |bytes| {
             let allowed = recorder.record_bytes(bytes).is_ok();
             if !allowed {
                 metrics.rate_limited();
+                if !warned.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        peer = %peer_ip,
+                        "byte rate limit (ratelimit.byterate) exceeded; dropping datagrams until the rate window resets — raise or remove the cap if this is legitimate traffic"
+                    );
+                }
             }
             allowed
         }))
