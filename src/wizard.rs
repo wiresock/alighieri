@@ -505,7 +505,7 @@ fn wizard_form_from_fields(
     let default_log = default_log_path(&output_path);
     let userlist_path =
         path_field_with_changed_output(fields, "userlist", &initial_userlist, &default_userlist);
-    let log_file = log_field_with_changed_output(fields, template, &initial_log, &default_log);
+    let log_file = log_field_with_changed_output(fields, &initial_log, &default_log);
 
     let listen_ip = listen_host
         .parse::<IpAddr>()
@@ -636,14 +636,14 @@ fn path_field_with_changed_output(
 
 fn log_field_with_changed_output(
     fields: &HashMap<String, String>,
-    template: WizardTemplate,
     initial_default: &str,
     output_default: &str,
 ) -> Option<PathBuf> {
+    // Default to stdout (journald under systemd, console on Windows) for every
+    // template: a relative or non-service-writable log file is a common footgun
+    // under the hardened unit. File logging is opt-in — the operator supplies an
+    // absolute, service-writable path.
     match fields.get("logfile").map(String::as_str).map(str::trim) {
-        Some("") | None if template == WizardTemplate::LanUsername => {
-            Some(PathBuf::from(output_default))
-        }
         Some("") | None => None,
         Some(value) if path_value_matches(value, initial_default) => {
             Some(PathBuf::from(output_default))
@@ -724,6 +724,16 @@ fn render_config(form: &WizardForm) -> String {
     writeln!(text).unwrap();
     if let Some(log_file) = &form.log_file {
         writeln!(text, "logoutput: file").unwrap();
+        writeln!(
+            text,
+            "# logfile must be an absolute path writable by the running service"
+        )
+        .unwrap();
+        writeln!(
+            text,
+            "# (under the hardened systemd unit, only the service log dir is writable)"
+        )
+        .unwrap();
         writeln!(text, "logfile: {}", log_file.display()).unwrap();
         writeln!(text, "logrotate.size: 10MiB").unwrap();
         writeln!(text, "logrotate.keep: 5").unwrap();
@@ -1330,7 +1340,6 @@ fn render_wizard_form(
     let output = html_escape(&output_path.display().to_string());
     let userlist = html_escape(&userlist_value);
     let logfile = html_escape(&logfile_value);
-    let logfile_default = html_escape(&default_log_path(&output_path));
     let listen_host_attr = html_escape(&listen_host);
     let trusted_attr = html_escape(&trusted_client);
     let (local_checked, lan_checked) = match template {
@@ -1360,19 +1369,18 @@ fn render_wizard_form(
 <h2>Files</h2>
 <label>Config output <input name="output" value="{output}" required placeholder="alighieri.conf" autocomplete="off"></label>
 <label>Userlist path <input name="userlist" value="{userlist}" placeholder="users (required for the username template)" autocomplete="off"></label>
-<label>Log file <input name="logfile" value="{logfile}" data-default="{logfile_default}" autocomplete="off"></label>
+<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path; empty = stdout / journald" autocomplete="off"></label>
 </section>
 <button type="submit">Generate config</button>
 </form>
 <script>
 const presets = {{
   "local-no-auth": {{ listen: "127.0.0.1", trusted: "127.0.0.1", logfile: "" }},
-  "lan-username": {{ listen: "0.0.0.0", trusted: "192.168.0.0/16", logfile: null }}
+  "lan-username": {{ listen: "0.0.0.0", trusted: "192.168.0.0/16", logfile: "" }}
 }};
 const listen = document.querySelector("[name=listen_host]");
 const trusted = document.querySelector("[name=trusted_client]");
 const logfile = document.querySelector("[name=logfile]");
-presets["lan-username"].logfile = logfile.dataset.default || "";
 document.querySelectorAll("[name=template]").forEach((radio) => {{
   radio.addEventListener("change", () => {{
     const previous = radio.value === "lan-username" ? presets["local-no-auth"] : presets["lan-username"];
@@ -1727,30 +1735,43 @@ mod tests {
     }
 
     #[test]
-    fn rendered_form_uses_output_relative_file_defaults() {
+    fn rendered_form_uses_output_relative_userlist_default() {
         let output = Path::new("conf/alighieri.conf");
         let html = render_wizard_form("token", output, None);
         assert!(html.contains(&format!(
             r#"value="{}""#,
             html_escape(&default_userlist_path(output))
         )));
-        assert!(html.contains(&format!(
-            r#"data-default="{}""#,
-            html_escape(&default_log_path(output))
-        )));
+        // The log file no longer carries a pre-filled default (it defaults to stdout).
+        assert!(!html.contains("data-default"));
     }
 
     #[test]
-    fn rendered_form_reads_logfile_default_from_data_attribute() {
+    fn rendered_form_defaults_logfile_to_stdout() {
         let output = Path::new(r"C:\ProgramData\alighieri\alighieri.conf");
-        let logfile = html_escape(&default_log_path(output));
         let html = render_wizard_form("token", output, None);
+        // Both templates default the log file to empty -> stdout, with no
+        // pre-filled path and no JS auto-fill from a data attribute.
+        assert!(html.contains(
+            r#""lan-username": { listen: "0.0.0.0", trusted: "192.168.0.0/16", logfile: "" }"#
+        ));
+        assert!(!html.contains("dataset.default"));
+        assert!(!html.contains("data-default"));
+    }
 
-        assert!(html.contains(&format!(r#"data-default="{logfile}""#)));
-        assert!(!html.contains(&format!(r#"logfile: "{logfile}""#)));
-        assert!(
-            html.contains(r#"presets["lan-username"].logfile = logfile.dataset.default || "";"#)
-        );
+    #[test]
+    fn lan_template_defaults_to_stdout_logging() {
+        let mut fields = HashMap::new();
+        fields.insert("template".into(), "lan-username".into());
+        fields.insert("userlist".into(), "/etc/alighieri/users".into());
+        // No logfile field: must default to stdout, not a (possibly non-writable) file.
+        let form =
+            wizard_form_from_fields(&fields, Path::new("/etc/alighieri/alighieri.conf")).unwrap();
+        assert!(form.log_file.is_none());
+        let config = render_config(&form);
+        assert!(config.contains("logoutput: stdout"));
+        assert!(!config.contains("logoutput: file"));
+        Config::parse(&config).unwrap();
     }
 
     #[test]
