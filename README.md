@@ -492,11 +492,11 @@ generated unit).
 
 ### Tuning for sustained high-rate UDP
 
-For high-throughput UDP relaying (e.g. tunnelling a VPN), Alighieri enlarges its
-relay sockets' kernel buffers (it requests 4 MiB each), but the kernel clamps
-`SO_RCVBUF`/`SO_SNDBUF` to `net.core.rmem_max` / `net.core.wmem_max` — commonly
-only ~208 KiB by default. To actually get the larger buffers (fewer dropped
-datagrams under bursts), raise those limits:
+Alighieri enlarges its relay sockets' kernel buffers for high-throughput UDP
+relaying (e.g. tunnelling a VPN) — it requests 4 MiB each. **On Linux** the
+kernel clamps `SO_RCVBUF`/`SO_SNDBUF` to `net.core.rmem_max` /
+`net.core.wmem_max` (commonly only ~208 KiB by default), so to actually get the
+larger buffers (fewer dropped datagrams under bursts) raise those limits:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608

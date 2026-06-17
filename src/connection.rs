@@ -363,7 +363,8 @@ impl Connection {
         };
         // Enlarge the relay sockets' kernel buffers so sustained high-rate UDP
         // (e.g. a VPN tunnel) tolerates scheduling bursts without the kernel
-        // dropping datagrams. Best-effort and clamped to net.core.{r,w}mem_max.
+        // dropping datagrams. Best-effort; the OS may clamp the request (on
+        // Linux, to net.core.{r,w}mem_max).
         relay::tune_udp_buffers(&relay_socket);
         relay::tune_udp_buffers(&outbound);
 

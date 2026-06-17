@@ -30,24 +30,43 @@ const UDP_BUF: usize = 65535;
 /// `net.core.{r,w}mem_max`, so operators expecting sustained high throughput
 /// should raise those sysctls to actually get the larger buffers.
 const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
-/// Consecutive failed `recv_from`s tolerated on a relay socket before the
-/// association is torn down. A single transient error (e.g. a stray ICMP) must
-/// not kill a working relay; a sustained run means the socket is broken.
+/// Consecutive *unexpected* `recv_from` failures tolerated on a relay socket
+/// before the association is torn down. ICMP-driven errors (a prior send hit a
+/// dead port) are ignored entirely; only a sustained run of *other* failures —
+/// a genuinely broken socket — gives up.
 const MAX_CONSECUTIVE_UDP_RECV_ERRORS: u32 = 16;
 
 /// Best-effort enlarge a UDP relay socket's send and receive buffers so a burst
 /// of sustained high-rate traffic is absorbed rather than dropped by the kernel.
 /// Failures (e.g. the kernel clamping the request) are ignored.
-pub fn tune_udp_buffers(socket: &UdpSocket) {
+pub(crate) fn tune_udp_buffers(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
     let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
 }
 
-/// `recv_from` on a UDP relay socket, tolerating transient errors. Resets the
-/// shared error counter on success; surfaces the error (tearing the association
-/// down) only once a run of failures — a genuinely broken socket — exceeds
-/// [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`].
+/// True for recv errors that are normal while relaying UDP to many destinations:
+/// an ICMP unreachable/reset surfaced from a prior send to a dead port (notably
+/// `ConnectionReset` on Windows, `ConnectionRefused`/`*Unreachable` on Unix), or
+/// an interrupted syscall. These are reported on the receiving socket but say
+/// nothing about its health, so the relay ignores them without counting toward
+/// teardown.
+fn is_transient_recv_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::Interrupted
+    )
+}
+
+/// `recv_from` on a UDP relay socket, tolerating transient errors. Ignores
+/// ICMP-driven/interrupted errors without counting them, resets the counter on
+/// success, and surfaces the error (tearing the association down) only once a
+/// run of *other* failures exceeds [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`]. Yields
+/// on every error so a socket that errors immediately cannot spin the task.
 async fn recv_resilient(
     socket: &UdpSocket,
     buf: &mut [u8],
@@ -59,12 +78,17 @@ async fn recv_resilient(
                 *consecutive_errors = 0;
                 return Ok(v);
             }
+            Err(e) if is_transient_recv_error(&e) => {
+                debug!(error = %e, "udp relay recv: ignoring transient error");
+                tokio::task::yield_now().await;
+            }
             Err(e) => {
                 *consecutive_errors += 1;
                 if *consecutive_errors >= MAX_CONSECUTIVE_UDP_RECV_ERRORS {
                     return Err(e);
                 }
-                debug!(error = %e, "udp relay recv error; continuing");
+                debug!(error = %e, count = *consecutive_errors, "udp relay recv error; continuing");
+                tokio::task::yield_now().await;
             }
         }
     }
