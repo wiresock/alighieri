@@ -490,6 +490,23 @@ connections keep running under the configuration they were accepted with (see
 `CAP_NET_BIND_SERVICE` to the unit's capability directives (noted inline in the
 generated unit).
 
+### Tuning for sustained high-rate UDP
+
+Alighieri enlarges its relay sockets' kernel buffers for high-throughput UDP
+relaying (e.g. tunnelling a VPN) — it requests 4 MiB each. **On Linux** the
+kernel clamps `SO_RCVBUF`/`SO_SNDBUF` to `net.core.rmem_max` /
+`net.core.wmem_max` (commonly only ~208 KiB by default), so to actually get the
+larger buffers (fewer dropped datagrams under bursts) raise those limits. Linux
+also stores roughly double the requested value (kernel bookkeeping), so the
+4 MiB request needs a limit of ~8 MiB:
+
+```sh
+sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+# persist:
+echo 'net.core.rmem_max=8388608
+net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
+```
+
 ## Windows Service
 
 The same `alighieri.exe` supports interactive console mode and Windows Service

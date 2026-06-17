@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tracing::debug;
 
 use crate::client_stream::ClientStream;
 use crate::config::DnsPolicy;
@@ -25,6 +26,75 @@ use crate::socks5::{self, TargetAddr};
 const TCP_BUF: usize = 32 * 1024;
 /// Maximum UDP datagram we will buffer (covers a full IPv4 payload).
 const UDP_BUF: usize = 65535;
+/// Best-effort per-socket UDP buffer target. On Linux the kernel clamps this to
+/// `net.core.{r,w}mem_max` (and stores roughly double the request), so operators
+/// expecting sustained high throughput should raise those sysctls to actually
+/// get the larger buffers.
+const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+/// Consecutive *unexpected* `recv_from` failures tolerated on a relay socket
+/// before the association is torn down. ICMP-driven errors (a prior send hit a
+/// dead port) are ignored entirely; only a sustained run of *other* failures —
+/// a genuinely broken socket — gives up.
+const MAX_CONSECUTIVE_UDP_RECV_ERRORS: u32 = 16;
+
+/// Best-effort enlarge a UDP relay socket's send and receive buffers so a burst
+/// of sustained high-rate traffic is absorbed rather than dropped by the kernel.
+/// A setsockopt error is ignored, and the OS may silently clamp or adjust the
+/// requested size (Linux caps it at `net.core.{r,w}mem_max`).
+pub(crate) fn tune_udp_buffers(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
+}
+
+/// True for recv errors that are normal while relaying UDP to many destinations:
+/// an ICMP unreachable/reset surfaced from a prior send to a dead port (notably
+/// `ConnectionReset` on Windows, `ConnectionRefused`/`*Unreachable` on Unix), or
+/// an interrupted syscall. These are reported on the receiving socket but say
+/// nothing about its health, so the relay ignores them without counting toward
+/// teardown.
+fn is_transient_recv_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::Interrupted
+    )
+}
+
+/// `recv_from` on a UDP relay socket, tolerating transient errors. Ignores
+/// ICMP-driven/interrupted errors without counting them, resets the counter on
+/// success, and surfaces the error (tearing the association down) only once a
+/// run of *other* failures exceeds [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`]. Yields
+/// on every error so a socket that errors immediately cannot spin the task.
+async fn recv_resilient(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+    consecutive_errors: &mut u32,
+) -> io::Result<(usize, SocketAddr)> {
+    loop {
+        match socket.recv_from(buf).await {
+            Ok(v) => {
+                *consecutive_errors = 0;
+                return Ok(v);
+            }
+            Err(e) if is_transient_recv_error(&e) => {
+                debug!(error = %e, "udp relay recv: ignoring transient error");
+                tokio::task::yield_now().await;
+            }
+            Err(e) => {
+                *consecutive_errors += 1;
+                if *consecutive_errors >= MAX_CONSECUTIVE_UDP_RECV_ERRORS {
+                    return Err(e);
+                }
+                debug!(error = %e, count = *consecutive_errors, "udp relay recv error; continuing");
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
 
 pub type ByteLimiter = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
@@ -342,8 +412,9 @@ where
     F: Fn(IpAddr, u16) -> bool,
 {
     let mut buf = vec![0u8; UDP_BUF];
+    let mut recv_errors = 0u32;
     loop {
-        let (n, src) = relay_socket.recv_from(&mut buf).await?;
+        let (n, src) = recv_resilient(&relay_socket, &mut buf, &mut recv_errors).await?;
         activity.mark();
         if src.ip() != client_ip {
             continue; // reject spoofed / unrelated source
@@ -404,10 +475,14 @@ async fn relay_remote_to_client(
     // Headroom in front of the receive area lets the relay prepend the SOCKS
     // header in place instead of allocating per packet.
     let mut buf = vec![0u8; socks5::UDP_IP_HEADER_MAX + UDP_BUF];
+    let mut recv_errors = 0u32;
     loop {
-        let (n, remote_src) = outbound
-            .recv_from(&mut buf[socks5::UDP_IP_HEADER_MAX..])
-            .await?;
+        let (n, remote_src) = recv_resilient(
+            &outbound,
+            &mut buf[socks5::UDP_IP_HEADER_MAX..],
+            &mut recv_errors,
+        )
+        .await?;
         activity.mark();
         let Some(caddr) = client_endpoint.get().copied() else {
             continue;

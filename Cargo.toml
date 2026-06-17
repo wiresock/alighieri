@@ -24,6 +24,9 @@ path = "src/lib.rs"
 [dependencies]
 argon2 = { version = "0.5", features = ["std"] }
 tokio = { version = "1", features = ["full"] }
+# Borrowed access to the relay sockets to enlarge their kernel send/receive
+# buffers for sustained high-rate UDP. Already in the tree via tokio.
+socket2 = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
