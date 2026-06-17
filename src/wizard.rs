@@ -727,23 +727,30 @@ fn render_config(form: &WizardForm) -> String {
         if log_file.is_relative() {
             writeln!(
                 text,
-                "# WARNING: this logfile path is relative; under a hardened systemd unit"
+                "# WARNING: this logfile path is relative; it resolves against the service"
             )
             .unwrap();
             writeln!(
                 text,
-                "# (WorkingDirectory=/) it resolves to an unwritable location and logs are dropped."
+                "# working directory and may point to an unwritable or unexpected location."
+            )
+            .unwrap();
+            #[cfg(target_os = "linux")]
+            writeln!(
+                text,
+                "# (under a hardened systemd unit WorkingDirectory is / and the logs are dropped.)"
             )
             .unwrap();
         }
         writeln!(
             text,
-            "# logfile should be an absolute path writable by the running service"
+            "# logfile should be an absolute path writable by the running service."
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
         writeln!(
             text,
-            "# (under the hardened systemd unit, only the service log dir is writable)"
+            "# (under the hardened systemd unit, only the service log dir is writable.)"
         )
         .unwrap();
         writeln!(text, "logfile: {}", log_file.display()).unwrap();
@@ -1757,6 +1764,11 @@ mod tests {
         assert!(rel_config.contains("# WARNING: this logfile path is relative"));
         assert!(rel_config.contains("# logfile should be an absolute path"));
         Config::parse(&rel_config).unwrap();
+        // The systemd specifics are scoped to Linux; other platforms must not see them.
+        #[cfg(target_os = "linux")]
+        assert!(rel_config.contains("systemd"));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!rel_config.contains("systemd"));
 
         // An absolute path gets the guidance comment but not the relative-path warning.
         let mut abs = HashMap::new();
@@ -1773,6 +1785,10 @@ mod tests {
         assert!(!abs_config.contains("WARNING"));
         assert!(abs_config.contains("# logfile should be an absolute path"));
         Config::parse(&abs_config).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(abs_config.contains("systemd"));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!abs_config.contains("systemd"));
     }
 
     #[test]
