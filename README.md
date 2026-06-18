@@ -30,6 +30,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
 - [Benchmarks](#benchmarks)
+- [Comparison with Dante](#comparison-with-dante)
 - [Security considerations](#security-considerations)
 - [License](#license)
 
@@ -593,6 +594,98 @@ cargo run --release --example loadgen -- throughput --connections 8
 
 See [`doc/benchmarks.md`](doc/benchmarks.md) for scenario details,
 methodology, and recorded baselines.
+
+## Comparison with Dante
+
+[Dante](https://www.inet.no/dante/) (`sockd`, Inferno Nettverk) is the
+long-standing C reference SOCKS server: full SOCKS4/5 including the BIND command
+and GSSAPI, a client-side "socksify" preload library, and broad Unix
+portability, hardened since the late 1990s. Alighieri borrows Dante's
+configuration model but trades breadth (SOCKS4, BIND, GSSAPI, the client
+library, exotic Unixes) for memory safety, first-class **Windows** support,
+SOCKS-over-TLS, and built-in observability.
+
+Dante capabilities below are drawn from its documented feature set and vary by
+version; verify against the version you would deploy.
+
+**Platforms & architecture**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| Linux | first-class (CI + systemd manager) | yes |
+| Windows | native Service + Event Log | not supported |
+| macOS / *BSD / Solaris / AIX | likely compiles, console-only, untested | broadly supported |
+| Language | Rust (memory-safe) | C |
+| Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |
+
+**Protocol & commands**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| SOCKS5 (RFC 1928/1929) | yes | yes |
+| SOCKS4 / 4a | no | yes |
+| CONNECT | yes | yes |
+| UDP ASSOCIATE | yes — dual-stack, IPv4-mapped handling, configurable `udp.portrange` | yes |
+| BIND (reverse connect, e.g. active FTP) | no (replies "command not supported") | yes |
+| IPv4 / IPv6 | yes / yes (dual-stack listeners) | yes / yes |
+| Client socksify library (LD_PRELOAD) | no (server only) | yes (`socksify` / libsocks) |
+
+**Authentication**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| None | yes | yes |
+| Username/password (RFC 1929) | yes — Argon2id-hashed userlist + verified-credential cache | yes |
+| GSSAPI / Kerberos | no | yes |
+| PAM / system auth | no | yes |
+
+**Access control & configuration**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| Model | Dante-inspired `client` / `socks` rules, deny-by-default | the original `sockd.conf` |
+| Selectors | CIDR, port, command, protocol, auth-method | CIDR, port, command, protocol, user, hostname/domain |
+| Hostname / domain rules | no (IP/CIDR only) | yes |
+| libwrap / TCP wrappers | no | yes |
+| Named rules + `include` | yes | no (single config file) |
+| Destination redirect / rewrite | no | yes |
+| DNS policy (family preference, all-address fallback, deny categories, caching) | rich, built-in | basic |
+
+**Operations & observability**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| Log formats | text or JSON, size-rotation, non-blocking writer | syslog + file |
+| Prometheus metrics | built-in endpoint | no |
+| Hot reload | SIGHUP (Unix) + Windows SCM | SIGHUP |
+| Service tooling | systemd install/upgrade/uninstall script; Windows Service | distro init/systemd packaging |
+| Config wizard / validation | loopback wizard, `--check`, `--check --json` | startup config check |
+| Per-client abuse limits | connection-rate, auth-failure-rate, concurrency, byterate cap | session limits (+ bandwidth in some builds) |
+
+**Security & project**
+
+| | Alighieri | Dante |
+| --- | --- | --- |
+| Memory safety | Rust | C |
+| SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
+| Credential storage | Argon2id hashes | system / crypt / PAM |
+| License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
+| Maturity | new (first release 2026) | decades in production |
+
+**Which to choose**
+
+- **Dante** if you need SOCKS4, the BIND command (active FTP / callbacks),
+  GSSAPI/Kerberos or PAM auth, the client-side socksify library, hostname-based
+  rules, run on BSD/Solaris/AIX, or want a permissive license and a
+  decades-proven codebase.
+- **Alighieri** if you want SOCKS5 on Linux *and* Windows from one memory-safe
+  codebase, SOCKS-over-TLS, Prometheus/JSON observability, Argon2id-hashed
+  credentials, fixed UDP relay port ranges for firewalling, and a modern ops
+  story (wizard, systemd installer, hot reload on both OSes) — and do not need
+  SOCKS4/BIND/GSSAPI.
+
+Closing the remaining gaps (and going further) is tracked in
+[`doc/roadmap.md`](doc/roadmap.md).
 
 ## Security considerations
 

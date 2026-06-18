@@ -1,37 +1,73 @@
 # Alighieri Roadmap
 
-## Milestone 1: Core TCP Proxy
+A living, proposed plan for closing the remaining gaps with
+[Dante](https://www.inet.no/dante/) and pushing past it. See the
+[comparison in the README](../README.md#comparison-with-dante) for the current
+feature delta, and the [CHANGELOG](../CHANGELOG.md) for what has shipped.
 
-- Implement SOCKS5 greeting and request parsing.
-- Implement TCP CONNECT relay.
-- Add basic configuration loading.
-- Add deny-by-default client and SOCKS ACLs.
+Guiding principle: reach **parity where it matters** (the gaps real deployments
+hit), and **differentiate with modern strengths** — safety, cross-platform
+reach, observability, and a cloud-native operations story — rather than chasing
+every legacy Dante feature. SOCKS4 and GSSAPI are intentionally low priority.
 
-## Milestone 2: Authentication and ACLs
+Effort is a rough order of magnitude: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈
+multi-week. Value is the expected impact on real deployments.
 
-- Add username/password authentication.
-- Add CIDR, port, command, protocol, and method selectors.
-- Add configuration validation and useful operator errors.
+## Shipped (v0.1.0)
 
-## Milestone 3: UDP Proxy
+The initial release delivered the core proxy: SOCKS5 TCP `CONNECT` and UDP
+`ASSOCIATE` (dual-stack, IPv4-mapped clients, configurable `udp.portrange`),
+deny-by-default `client`/`socks` ACLs with username/password (Argon2id) auth, a
+DNS resolution policy, optional TLS listener and Prometheus metrics, text/JSON
+logging, per-client abuse controls, hot reload (SIGHUP / Windows SCM), Windows
+Service integration, a Linux systemd lifecycle manager, and a configuration
+wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 
-- Implement UDP ASSOCIATE.
-- Reuse SOCKS ACLs for UDP destinations.
-- Drop fragmented or malformed UDP datagrams.
-- Add UDP relay integration coverage.
+## Parity — close the Dante gaps
 
-## Milestone 4: Windows Service Support
+| Item | Value | Effort | Notes |
+| --- | --- | --- | --- |
+| **Hostname / domain ACL rules** | High | M | Match `client`/`socks` rules on the requested destination hostname (suffix/glob, e.g. `to: .example.com`) *before* resolution — what operators most often want, and the largest single parity gap. Builds on the existing domain targets and DNS resolver. |
+| **External auth hook** | High | M | Validate credentials via an external command or HTTP webhook, so LDAP / OIDC / corporate auth work without baking each in. Portable across Linux and Windows; covers most PAM use cases indirectly. |
+| **PAM / system auth (Unix)** | Med | M | Native PAM backend for Unix deployments that expect it. Follows the external-auth hook. |
+| **BIND command** | Med | L | RFC 1928 §6 two-stage reverse connect (active FTP, callbacks). Security-sensitive — gated off by default, restricted by `socks` rules. |
+| **SOCKS4 / 4a** | Low | S | Cheap, but legacy; modern clients use SOCKS5. Add only on demand. |
+| **GSSAPI / Kerberos** | Low | L | Complex and niche; SOCKS-over-TLS already covers channel security. Revisit only if asked. |
 
-- Add Windows Service lifecycle integration.
-- Add service install, uninstall, start, stop, and status commands.
-- Add Windows-specific configuration and logging paths.
-- Reuse graceful shutdown handling for Service Control Manager stop requests.
-- Document service installation and deployment.
+## Beyond Dante — differentiate
 
-## Milestone 5: Documentation and Hardening
+| Item | Value | Effort | Notes |
+| --- | --- | --- | --- |
+| **PROXY protocol (v1/v2) ingress** | High | S–M | Run behind a TCP load balancer (HAProxy, cloud NLB) while preserving the real client IP for `client` rules, metrics, and logs. Dante does not do this; high value for cloud deployments. |
+| **Token-bucket bandwidth throttle** | Med–High | M | Replace/augment the hard fixed-window `ratelimit.byterate` drop cap with a smooth per-client (and per-rule) throttle that *slows* rather than drops/tears down. Strictly better than both today's behaviour and Dante's. |
+| **Geo / ASN access rules** | Med | M | `from`/`to` by country or ASN (optional MaxMind dataset). Modern access control Dante lacks natively. |
+| **Audit log + OpenTelemetry** | Med | S–M | Per-rule metrics, a structured audit stream (who → where, rule hit, bytes), and optional OTel traces. Extends an existing strength. |
+| **Transparent / intercept mode (Linux)** | Med | L | TPROXY/redirect ingress so unmodified apps are proxied without SOCKS awareness — the modern answer to Dante's socksify preload library. |
+| **Happy Eyeballs (RFC 8305) for CONNECT** | Med | M | Concurrent dual-stack dialing for faster, more robust connects (builds on the existing all-address fallback). |
 
-- Add Windows deployment examples.
-- Write and maintain README coverage for common deployment modes.
-- Improve error messages.
-- Add limits and timeouts.
-- Run `cargo fmt`, `cargo clippy`, and `cargo test`.
+## Platform & packaging
+
+| Item | Value | Effort | Notes |
+| --- | --- | --- | --- |
+| **ARM64 builds** | Med | S | Add `aarch64` Linux and Windows ARM64 to the release matrix. |
+| **macOS / *BSD as first-class** | Med | M | CI coverage, a `launchd` plist, and docs — closes the portability gap that keeps Dante ahead on Unix. |
+| **Container image + Helm/compose** | Med | S–M | Official image and a cloud-native deployment story. |
+| **Native packages** | Med | M | `deb`/`rpm`, Homebrew, and `winget` for first-class install. |
+
+## Suggested first wave
+
+Ordered for value-to-effort while leaning into Alighieri's identity:
+
+1. **Hostname / domain ACL rules** — the biggest parity win.
+2. **PROXY protocol ingress** — cloud leapfrog, small effort.
+3. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
+4. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
+5. **ARM64 builds + container image** — reach and deployability.
+
+Then: BIND, geo/ASN rules, macOS/BSD first-class, audit/OTel. Deprioritized
+unless requested: SOCKS4, GSSAPI.
+
+---
+
+This is a proposal, not a commitment — priorities and scope are open to change.
+Items can be promoted to tracked GitHub issues/milestones as they are picked up.
