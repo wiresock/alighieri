@@ -232,9 +232,11 @@ impl CommandAuth {
     }
 
     /// Verifies `username`/`password` by running the command, bounded by
-    /// `timeout`. When `cache_ttl` is set, a success is cached so the command is
-    /// not re-run for the same credentials until the entry expires. Failures
-    /// always take the full path, so the cache cannot cheapen brute force.
+    /// `timeout`: a child that overruns is killed and reaped out of band, so the
+    /// call still returns within the deadline. When `cache_ttl` is set, a success
+    /// is cached so the command is not re-run for the same credentials until the
+    /// entry expires. Failures always take the full path, so the cache cannot
+    /// cheapen brute force.
     pub async fn verify_async(
         &self,
         username: &str,
@@ -303,32 +305,37 @@ impl CommandAuth {
             None => false,
         };
         if !delivered {
-            reap(child).await;
+            reap_in_background(child);
             return false;
         }
-        // Own the deadline here so the child is always killed *and* reaped:
-        // `kill_on_drop` only kills on drop and leaves reaping to tokio's orphan
-        // queue, whereas an explicit `wait` after the kill reaps synchronously,
-        // so repeated timeouts cannot accumulate unreaped processes.
+        // Bound the wait by `timeout`. On expiry the child is killed and reaped
+        // in a detached task — it is still explicitly waited on (not left to
+        // tokio's orphan queue), but reaping does not extend this call past its
+        // deadline, so repeated timeouts neither block the caller nor accumulate
+        // unreaped processes.
         let waited = tokio::time::timeout(timeout, child.wait()).await;
         match waited {
             Ok(Ok(status)) => status.success(),
             Ok(Err(_)) => false,
             Err(_) => {
                 tracing::warn!(program = %self.program, "auth.command timed out");
-                reap(child).await;
+                reap_in_background(child);
                 false
             }
         }
     }
 }
 
-/// Kills a verifier child and waits for it so it is reaped rather than left as a
-/// zombie. Bounded so a child wedged in an uninterruptible state cannot extend
-/// the caller; `kill_on_drop` then backstops reaping via tokio's orphan queue.
-async fn reap(mut child: tokio::process::Child) {
+/// Kills a verifier child and reaps it in a detached task, so it is explicitly
+/// waited on (not left to tokio's orphan queue) without extending the caller
+/// past its deadline. After the kill the child terminates promptly, so the task
+/// is short-lived; `kill_on_drop` backstops the kill if the task is itself
+/// dropped (e.g. at runtime shutdown).
+fn reap_in_background(mut child: tokio::process::Child) {
     let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
 }
 
 /// Remembers recently verified credentials so repeat handshakes skip the
@@ -850,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn command_auth_times_out() {
         // A verifier that never exits is bounded by CommandAuth's own deadline,
-        // which kills and reaps the child and reports failure.
+        // which kills the child (reaping it out of band) and reports failure.
         let auth = sh_auth("sleep 5");
         assert!(
             !auth

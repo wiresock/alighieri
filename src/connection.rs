@@ -141,8 +141,9 @@ impl Connection {
             // Verify against the external command hook when configured, otherwise
             // the userlist; both cache successful verifications. Each owns the
             // single deadline for its path: CommandAuth bounds itself by the
-            // handshake timeout (and kills/reaps the child), while the userlist
-            // path has no internal deadline and is bounded here.
+            // handshake timeout (killing and reaping any overrun child out of
+            // band, so the call still returns within the deadline), while the
+            // userlist path has no internal deadline and is bounded here.
             let ok = match &self.command_auth {
                 Some(cmd) => {
                     cmd.verify_async(
