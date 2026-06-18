@@ -223,7 +223,11 @@ impl HostPattern {
     /// authorisation path calls this per datagram, so the hot path must not
     /// allocate.
     pub fn matches(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.');
+        // Tolerate a single trailing dot (an FQDN like `example.com.`), matching
+        // what `parse` accepts. A host with extra trailing dots stays malformed
+        // and matches nothing, falling through to deny-by-default rather than
+        // being leniently normalised into a clean match.
+        let host = host.strip_suffix('.').unwrap_or(host);
         match self {
             HostPattern::Exact(h) => host.eq_ignore_ascii_case(h),
             HostPattern::Suffix(domain) => {
@@ -426,7 +430,8 @@ mod tests {
         assert_eq!(exact, HostPattern::Exact("example.com".into()));
         assert!(exact.matches("example.com"));
         assert!(exact.matches("EXAMPLE.COM"));
-        assert!(exact.matches("example.com.")); // trailing dot tolerated
+        assert!(exact.matches("example.com.")); // single trailing dot tolerated
+        assert!(!exact.matches("example.com..")); // but only one — not normalised
         assert!(!exact.matches("a.example.com"));
         assert!(!exact.matches("notexample.com"));
 
