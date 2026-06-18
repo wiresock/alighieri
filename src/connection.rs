@@ -139,7 +139,10 @@ impl Connection {
             )
             .await?;
             // Verify against the external command hook when configured,
-            // otherwise the userlist. Both cache successful verifications.
+            // otherwise the userlist. Both cache successful verifications and are
+            // bounded by the single handshake timeout below — the one deadline
+            // owner, like the other handshake steps. For the command hook, that
+            // timeout firing drops the future, killing/reaping the child.
             let verify = async {
                 match &self.command_auth {
                     Some(cmd) => {
@@ -147,7 +150,6 @@ impl Connection {
                             &creds.username,
                             &creds.password,
                             self.config.auth_cache_ttl,
-                            self.config.handshake_timeout,
                         )
                         .await
                     }

@@ -231,16 +231,17 @@ impl CommandAuth {
         })
     }
 
-    /// Verifies `username`/`password` by running the command, bounded by
-    /// `timeout`. When `cache_ttl` is set, a success is cached so the command is
-    /// not re-run for the same credentials until the entry expires. Failures
-    /// always take the full path, so the cache cannot cheapen brute force.
+    /// Verifies `username`/`password` by running the command. When `cache_ttl`
+    /// is set, a success is cached so the command is not re-run for the same
+    /// credentials until the entry expires. Failures always take the full path,
+    /// so the cache cannot cheapen brute force. The caller bounds the wall-clock
+    /// cost (the handshake timeout, like the other handshake steps); dropping
+    /// this future when that fires kills and reaps the child via `kill_on_drop`.
     pub async fn verify_async(
         &self,
         username: &str,
         password: &str,
         cache_ttl: Option<Duration>,
-        timeout: Duration,
     ) -> bool {
         let cached = cache_ttl.and_then(|ttl| Some((self.verified.tag(username, password)?, ttl)));
         if let Some((tag, _)) = &cached {
@@ -248,7 +249,7 @@ impl CommandAuth {
                 return true;
             }
         }
-        let ok = self.run(username, password, timeout).await;
+        let ok = self.run(username, password).await;
         if ok {
             if let Some((tag, ttl)) = cached {
                 let now = Instant::now();
@@ -260,7 +261,7 @@ impl CommandAuth {
         ok
     }
 
-    async fn run(&self, username: &str, password: &str, timeout: Duration) -> bool {
+    async fn run(&self, username: &str, password: &str) -> bool {
         // Credentials are passed as two newline-terminated lines on stdin. RFC
         // 1929 fields are arbitrary bytes, so reject any containing the delimiter
         // (newline) or a NUL to keep the framing unambiguous and free of
@@ -271,6 +272,9 @@ impl CommandAuth {
         {
             return false;
         }
+        // `kill_on_drop` means a cancelled verification (the caller's handshake
+        // timeout firing) kills and reaps the child, so this future owns no
+        // timeout of its own — the connection layer is the single deadline owner.
         let mut child = match tokio::process::Command::new(&self.program)
             .args(&self.args)
             .stdin(std::process::Stdio::piped())
@@ -288,7 +292,8 @@ impl CommandAuth {
         // Hand both credential lines to the child. If the stdin pipe is missing
         // or the write fails (the verifier exited or closed stdin before reading
         // them), the credentials were never delivered, so fail closed rather
-        // than trust a status the verifier produced without seeing them.
+        // than trust a status the verifier produced without seeing them. The
+        // child is killed and reaped when it drops on return.
         let delivered = match child.stdin.take() {
             Some(mut stdin) => {
                 use tokio::io::AsyncWriteExt;
@@ -299,29 +304,10 @@ impl CommandAuth {
             None => false,
         };
         if !delivered {
-            reap(&mut child).await;
             return false;
         }
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => status.success(),
-            Ok(Err(_)) => false,
-            Err(_) => {
-                // Timed out: kill and reap the child so it neither lingers nor
-                // is left as a zombie awaiting a `wait()`.
-                reap(&mut child).await;
-                false
-            }
-        }
+        matches!(child.wait().await, Ok(status) if status.success())
     }
-}
-
-/// Best-effort terminate and reap a child so it neither keeps running nor is
-/// left as a zombie. Bounded so a child wedged in an uninterruptible state
-/// cannot extend the caller; `kill_on_drop` still reaps it eventually in that
-/// case.
-async fn reap(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
 }
 
 /// Remembers recently verified credentials so repeat handshakes skip the
@@ -820,10 +806,9 @@ mod tests {
     async fn command_auth_allows_only_on_exit_zero() {
         // Reads the username then the password from stdin; allows alice/secret.
         let auth = sh_auth("read u; read p; [ \"$u\" = alice ] && [ \"$p\" = secret ]");
-        let t = Duration::from_secs(5);
-        assert!(auth.verify_async("alice", "secret", None, t).await);
-        assert!(!auth.verify_async("alice", "wrong", None, t).await);
-        assert!(!auth.verify_async("bob", "secret", None, t).await);
+        assert!(auth.verify_async("alice", "secret", None).await);
+        assert!(!auth.verify_async("alice", "wrong", None).await);
+        assert!(!auth.verify_async("bob", "secret", None).await);
     }
 
     #[cfg(unix)]
@@ -832,21 +817,24 @@ mod tests {
         // A command that always succeeds; the newline in the password must still
         // be rejected before it runs, to keep the stdin framing unambiguous.
         let auth = sh_auth("exit 0");
-        assert!(
-            !auth
-                .verify_async("alice", "sec\nret", None, Duration::from_secs(5))
-                .await
-        );
+        assert!(!auth.verify_async("alice", "sec\nret", None).await);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_auth_times_out() {
+    async fn command_auth_runs_until_cancelled() {
+        // Verification owns no timeout: a verifier that never exits must not
+        // resolve on its own. The connection layer bounds it, and that timeout
+        // firing drops this future (killing/reaping the child via kill_on_drop).
         let auth = sh_auth("sleep 5");
+        let bounded = tokio::time::timeout(
+            Duration::from_millis(100),
+            auth.verify_async("alice", "secret", None),
+        )
+        .await;
         assert!(
-            !auth
-                .verify_async("alice", "secret", None, Duration::from_millis(100))
-                .await
+            bounded.is_err(),
+            "verification must not complete on its own"
         );
     }
 
@@ -865,13 +853,9 @@ mod tests {
             m = marker.display()
         ));
         let ttl = Some(Duration::from_secs(60));
-        let t = Duration::from_secs(5);
+        assert!(auth.verify_async("alice", "secret", ttl).await, "first run");
         assert!(
-            auth.verify_async("alice", "secret", ttl, t).await,
-            "first run"
-        );
-        assert!(
-            auth.verify_async("alice", "secret", ttl, t).await,
+            auth.verify_async("alice", "secret", ttl).await,
             "second call should hit the cache"
         );
     }
