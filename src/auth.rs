@@ -35,6 +35,12 @@ use crate::errors::{Error, Result};
 const ARGON2_DIRECTIVE_PREFIX: &str = "# alighieri:user:argon2:";
 const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXJhbmRvbXNhbHQ$C7It2r7AayL9ud0k5lZByEYkYBm2MDc36XwDo7OZH34";
 const MAX_CONCURRENT_PASSWORD_VERIFICATIONS: usize = 4;
+/// Cap on concurrently running `auth.command` verifier processes, so a burst of
+/// username handshakes cannot fork an unbounded number of children. External
+/// verifiers are typically I/O-bound (LDAP/HTTP), so this is higher than the
+/// CPU-bound `MAX_CONCURRENT_PASSWORD_VERIFICATIONS`; excess handshakes wait for
+/// a slot and are denied if they cannot obtain one within the handshake timeout.
+const MAX_CONCURRENT_AUTH_COMMANDS: usize = 64;
 const RFC1929_FIELD_MAX: usize = u8::MAX as usize;
 const MAX_VERIFIED_CACHE_ENTRIES: usize = 1024;
 /// Cache tags use a deliberately cheap Argon2 instance (microseconds): the
@@ -216,6 +222,7 @@ pub struct CommandAuth {
     program: String,
     args: Vec<String>,
     verified: VerifiedCache,
+    limiter: Semaphore,
 }
 
 impl CommandAuth {
@@ -228,15 +235,17 @@ impl CommandAuth {
             program: program.clone(),
             args: args.to_vec(),
             verified: VerifiedCache::new(),
+            limiter: Semaphore::new(MAX_CONCURRENT_AUTH_COMMANDS),
         })
     }
 
-    /// Verifies `username`/`password` by running the command, bounded by
-    /// `timeout`: a child that overruns is killed and reaped out of band, so the
-    /// call still returns within the deadline. When `cache_ttl` is set, a success
-    /// is cached so the command is not re-run for the same credentials until the
-    /// entry expires. Failures always take the full path, so the cache cannot
-    /// cheapen brute force.
+    /// Verifies `username`/`password` by running the command, strictly bounded by
+    /// `timeout` over the whole operation — acquiring a concurrency slot, spawning
+    /// the verifier, delivering the credentials, and awaiting its verdict — so the
+    /// call always returns within the deadline (an overrun child is killed and
+    /// reaped out of band). When `cache_ttl` is set, a success is cached so the
+    /// command is not re-run for the same credentials until the entry expires.
+    /// Failures always take the full path, so the cache cannot cheapen brute force.
     pub async fn verify_async(
         &self,
         username: &str,
@@ -260,7 +269,16 @@ impl CommandAuth {
                 return true;
             }
         }
-        let ok = self.run(username, password, timeout).await;
+        // Bound the entire run — permit acquisition, spawn, credential delivery
+        // and the wait for a verdict — by `timeout`. On expiry the in-flight
+        // child is killed and reaped out of band by its guard.
+        let ok = match tokio::time::timeout(timeout, self.run(username, password)).await {
+            Ok(ok) => ok,
+            Err(_) => {
+                tracing::warn!(program = %self.program, "auth.command timed out");
+                false
+            }
+        };
         if ok {
             if let Some((tag, ttl)) = cached {
                 let now = Instant::now();
@@ -272,10 +290,17 @@ impl CommandAuth {
         ok
     }
 
-    async fn run(&self, username: &str, password: &str, timeout: Duration) -> bool {
+    async fn run(&self, username: &str, password: &str) -> bool {
+        // Cap concurrent verifier processes so a burst of handshakes cannot fork
+        // an unbounded number of children. When saturated this awaits a free slot
+        // until the surrounding `timeout` denies the attempt; the permit is held
+        // for the child's whole lifetime and released on return or cancellation.
+        let Ok(_permit) = self.limiter.acquire().await else {
+            return false; // The limiter is never closed; fail closed regardless.
+        };
         // `verify_async` has already rejected credentials containing a newline or
         // NUL, so the two-line stdin framing below is unambiguous.
-        let mut child = match tokio::process::Command::new(&self.program)
+        let child = match tokio::process::Command::new(&self.program)
             .args(&self.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -289,11 +314,14 @@ impl CommandAuth {
                 return false;
             }
         };
+        // The guard kills and reaps the child on every exit from here — including
+        // cancellation when the surrounding `timeout` fires mid-run.
+        let mut guard = ChildReaper::new(child);
         // Hand both credential lines to the child as separate chunks, so no single
         // buffer holds both secrets. If delivery fails — the verifier exited or
         // closed stdin before reading them — the credentials never arrived, so
         // fail closed rather than trust a status produced without them.
-        let delivered = match child.stdin.take() {
+        let delivered = match guard.child().stdin.take() {
             Some(mut stdin) => {
                 use tokio::io::AsyncWriteExt;
                 stdin.write_all(username.as_bytes()).await.is_ok()
@@ -305,37 +333,49 @@ impl CommandAuth {
             None => false,
         };
         if !delivered {
-            reap_in_background(child);
-            return false;
+            return false; // The guard reaps the child on drop.
         }
-        // Bound the wait by `timeout`. On expiry the child is killed and reaped
-        // in a detached task — it is still explicitly waited on (not left to
-        // tokio's orphan queue), but reaping does not extend this call past its
-        // deadline, so repeated timeouts neither block the caller nor accumulate
-        // unreaped processes.
-        let waited = tokio::time::timeout(timeout, child.wait()).await;
-        match waited {
-            Ok(Ok(status)) => status.success(),
-            Ok(Err(_)) => false,
-            Err(_) => {
-                tracing::warn!(program = %self.program, "auth.command timed out");
-                reap_in_background(child);
-                false
-            }
-        }
+        let status = guard.child().wait().await;
+        guard.disarm(); // Reaped synchronously by `wait`; nothing left to clean up.
+        matches!(status, Ok(status) if status.success())
     }
 }
 
-/// Kills a verifier child and reaps it in a detached task, so it is explicitly
-/// waited on (not left to tokio's orphan queue) without extending the caller
-/// past its deadline. After the kill the child terminates promptly, so the task
-/// is short-lived; `kill_on_drop` backstops the kill if the task is itself
-/// dropped (e.g. at runtime shutdown).
-fn reap_in_background(mut child: tokio::process::Child) {
-    let _ = child.start_kill();
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+/// Owns a spawned verifier child and guarantees it is killed and reaped even if
+/// the future is cancelled (e.g. the verification timeout fires mid-run).
+/// Reaping runs in a detached task so it neither blocks nor extends the caller;
+/// on the normal path the child is awaited directly and the guard disarmed.
+/// `kill_on_drop` backstops the kill if no runtime is available.
+struct ChildReaper(Option<tokio::process::Child>);
+
+impl ChildReaper {
+    fn new(child: tokio::process::Child) -> Self {
+        ChildReaper(Some(child))
+    }
+
+    fn child(&mut self) -> &mut tokio::process::Child {
+        self.0.as_mut().expect("child present until disarmed")
+    }
+
+    /// Releases the child once it has already been reaped, making `Drop` a no-op.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            // Otherwise `child` drops here and `kill_on_drop` plus tokio's orphan
+            // queue reap it.
+        }
+    }
 }
 
 /// Remembers recently verified credentials so repeat handshakes skip the
