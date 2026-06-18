@@ -6,6 +6,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- `socks` rule `to:` selectors now accept hostname patterns: `.example.com`
+  matches the domain and all subdomains, and a bare `example.com` matches that
+  exact host. They are matched against the requested destination *before* DNS
+  resolution, so a rule allowlists the name the client asked for rather than
+  whatever it resolves to. `from:` selectors and `client` rule `to:` remain
+  IP/CIDR-only.
+
 ## [0.1.1] - 2026-06-17
 
 ### Added

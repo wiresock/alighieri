@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use crate::acl::{Rule, RuleSet, Scope, Verdict};
 use crate::errors::{Error, Result};
-use crate::net::{AddrSpec, Cidr, PortRange};
+use crate::net::{AddrSpec, Cidr, HostPattern, PortRange};
 use crate::socks5::{Command, Method};
 
 /// An authentication kind usable both as a server-offered method and as a
@@ -963,8 +963,8 @@ fn parse_rule(tokens: &[String], lineno: usize) -> Result<Rule> {
             idx += 1;
         }
         match key.as_str() {
-            "from" => from = Some(parse_addr_spec(&vals, lineno)?),
-            "to" => to = Some(parse_addr_spec(&vals, lineno)?),
+            "from" => from = Some(parse_addr_spec(&vals, lineno, false)?),
+            "to" => to = Some(parse_addr_spec(&vals, lineno, scope == Scope::Socks)?),
             "protocol" => protocols = parse_protocols(&vals, lineno)?,
             "command" => commands = parse_commands(&vals, lineno)?,
             "method" => methods = parse_methods(&vals, lineno)?,
@@ -1028,13 +1028,10 @@ fn is_known_body_key(tok: &str) -> bool {
     )
 }
 
-fn parse_addr_spec(vals: &[String], lineno: usize) -> Result<AddrSpec> {
+fn parse_addr_spec(vals: &[String], lineno: usize, allow_hosts: bool) -> Result<AddrSpec> {
     if vals.is_empty() {
         return Err(cfg_err(lineno, "address selector requires a value"));
     }
-    let cidr: Cidr = vals[0]
-        .parse()
-        .map_err(|e| cfg_err(lineno, &format!("invalid address '{}': {e}", vals[0])))?;
 
     let ports = if let Some(pos) = vals.iter().position(|v| v.eq_ignore_ascii_case("port")) {
         let spec = join_value_after(&vals[pos + 1..]);
@@ -1049,7 +1046,25 @@ fn parse_addr_spec(vals: &[String], lineno: usize) -> Result<AddrSpec> {
         None
     };
 
-    Ok(AddrSpec::new(cidr, ports))
+    // The selector address is the first token: a network (CIDR or bare IP), or
+    // — only for a `socks` rule `to:` — a hostname pattern such as
+    // `.example.com` (domain and subdomains) or `example.com` (exact).
+    let addr = &vals[0];
+    match addr.parse::<Cidr>() {
+        Ok(cidr) => Ok(AddrSpec::new(cidr, ports)),
+        Err(_) if allow_hosts => {
+            let pattern = HostPattern::parse(addr)
+                .map_err(|e| cfg_err(lineno, &format!("invalid destination '{addr}': {e}")))?;
+            Ok(AddrSpec::host(pattern, ports))
+        }
+        Err(cidr_err) => Err(cfg_err(
+            lineno,
+            &format!(
+                "invalid address '{addr}': {cidr_err} \
+                 (hostname patterns are only allowed in a socks rule 'to:')"
+            ),
+        )),
+    }
 }
 
 fn parse_protocols(vals: &[String], lineno: usize) -> Result<Vec<Protocol>> {
@@ -1635,6 +1650,37 @@ socks pass {
             cfg.rules.rules[0].to.ports,
             Some(PortRange { min: 443, max: 443 })
         );
+    }
+
+    #[test]
+    fn socks_to_accepts_hostname_patterns() {
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { to: .example.com }")
+            .unwrap();
+        let to = &cfg.rules.rules[0].to;
+        assert_eq!(to.hosts, vec![HostPattern::Suffix("example.com".into())]);
+        assert!(to.cidrs.is_empty());
+
+        let cfg = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nsocks pass { to: api.example.com port 443 }",
+        )
+        .unwrap();
+        let to = &cfg.rules.rules[0].to;
+        assert_eq!(to.hosts, vec![HostPattern::Exact("api.example.com".into())]);
+        assert_eq!(to.ports, Some(PortRange { min: 443, max: 443 }));
+    }
+
+    #[test]
+    fn hostname_patterns_rejected_outside_socks_to() {
+        // `from:` is IP-only (source-hostname matching is unsupported).
+        assert!(Config::parse(
+            "internal: 0.0.0.0 port = 1080\nsocks pass { from: .example.com to: 0.0.0.0/0 }"
+        )
+        .is_err());
+        // A `client` rule `to:` is the proxy's own address — an IP, not a host.
+        assert!(Config::parse(
+            "internal: 0.0.0.0 port = 1080\nclient pass { from: 0.0.0.0/0 to: .example.com }"
+        )
+        .is_err());
     }
 
     #[test]

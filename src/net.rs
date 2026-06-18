@@ -170,13 +170,72 @@ impl std::str::FromStr for PortRange {
     }
 }
 
+/// A destination hostname matcher for a `socks` rule `to:` selector.
+///
+/// Matched against the hostname the client requested *before* resolution, so a
+/// rule allowlists the name the client asked for rather than whatever it
+/// resolves to (resistant to DNS rebinding). Patterns are stored lowercased and
+/// matching is case-insensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostPattern {
+    /// Matches exactly this hostname (e.g. `example.com`).
+    Exact(String),
+    /// The leading-dot form `.example.com`: matches the domain itself and any
+    /// subdomain (`example.com`, `a.example.com`, `a.b.example.com`, ...).
+    Suffix(String),
+}
+
+impl HostPattern {
+    /// Parses a `to:` token as a hostname pattern. A leading dot selects the
+    /// domain and all of its subdomains; otherwise the token is an exact host.
+    pub fn parse(token: &str) -> Result<Self, String> {
+        let lower = token.trim().to_ascii_lowercase();
+        let (domain, suffix) = match lower.strip_prefix('.') {
+            Some(rest) => (rest.to_string(), true),
+            None => (lower, false),
+        };
+        if domain.is_empty()
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+            || domain.contains("..")
+            || !domain
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return Err(format!("'{token}' is not a valid hostname pattern"));
+        }
+        Ok(if suffix {
+            HostPattern::Suffix(domain)
+        } else {
+            HostPattern::Exact(domain)
+        })
+    }
+
+    /// Returns `true` if `host` (the requested hostname) matches this pattern.
+    pub fn matches(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        match self {
+            HostPattern::Exact(h) => host == *h,
+            HostPattern::Suffix(domain) => {
+                host == *domain
+                    || (host.len() > domain.len()
+                        && host.ends_with(domain.as_str())
+                        && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
+            }
+        }
+    }
+}
+
 /// An address specification used as the `from:` / `to:` clause of a rule.
 ///
-/// A spec matches when both the network *and* (if present) the port range
-/// match. A `None` port range matches every port.
+/// A spec matches when the port range matches *and* either a network or (for a
+/// `socks` rule `to:`) a destination hostname pattern matches. A `None` port
+/// range matches every port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddrSpec {
     pub cidrs: Vec<Cidr>,
+    /// Destination hostname patterns; only populated for a `socks` rule `to:`.
+    pub hosts: Vec<HostPattern>,
     pub ports: Option<PortRange>,
 }
 
@@ -188,6 +247,7 @@ impl AddrSpec {
                 "0.0.0.0/0".parse().expect("constant CIDR is valid"),
                 "::/0".parse().expect("constant CIDR is valid"),
             ],
+            hosts: Vec::new(),
             ports: None,
         }
     }
@@ -196,15 +256,39 @@ impl AddrSpec {
     pub fn new(cidr: Cidr, ports: Option<PortRange>) -> Self {
         AddrSpec {
             cidrs: vec![cidr],
+            hosts: Vec::new(),
             ports,
         }
     }
 
-    /// Returns `true` if both the IP and port satisfy this spec.
-    pub fn matches(&self, ip: IpAddr, port: u16) -> bool {
-        if !self.cidrs.iter().any(|cidr| cidr.contains(ip)) {
-            return false;
+    /// A selector matching a destination hostname pattern, optionally
+    /// constrained by port. Used only for `socks` rule `to:` clauses.
+    pub fn host(pattern: HostPattern, ports: Option<PortRange>) -> Self {
+        AddrSpec {
+            cidrs: Vec::new(),
+            hosts: vec![pattern],
+            ports,
         }
+    }
+
+    /// Returns `true` if both the IP and port satisfy this spec. Hostname
+    /// patterns are ignored; this is the IP-only matcher used by `from:` and by
+    /// `client` rule `to:` (the proxy's own accepting address).
+    pub fn matches(&self, ip: IpAddr, port: u16) -> bool {
+        self.cidrs.iter().any(|cidr| cidr.contains(ip)) && self.port_matches(port)
+    }
+
+    /// Returns `true` if this destination spec matches a `socks` request: the
+    /// port must be in range, and either a hostname pattern matches the
+    /// requested host (when the client sent a domain) or a CIDR contains the
+    /// resolved IP.
+    pub fn matches_dest(&self, host: Option<&str>, ip: IpAddr, port: u16) -> bool {
+        self.port_matches(port)
+            && (self.cidrs.iter().any(|cidr| cidr.contains(ip))
+                || host.is_some_and(|h| self.hosts.iter().any(|p| p.matches(h))))
+    }
+
+    fn port_matches(&self, port: u16) -> bool {
         match self.ports {
             Some(range) => range.contains(port),
             None => true,
@@ -298,6 +382,7 @@ mod tests {
     fn addr_spec_matches_ip_and_port() {
         let spec = AddrSpec {
             cidrs: vec!["192.168.0.0/16".parse().unwrap()],
+            hosts: Vec::new(),
             ports: Some(PortRange { min: 80, max: 80 }),
         };
         assert!(spec.matches("192.168.5.5".parse().unwrap(), 80));
@@ -309,6 +394,7 @@ mod tests {
     fn addr_spec_any_port() {
         let spec = AddrSpec {
             cidrs: vec!["0.0.0.0/0".parse().unwrap()],
+            hosts: Vec::new(),
             ports: None,
         };
         assert!(spec.matches("1.2.3.4".parse().unwrap(), 1));
@@ -320,5 +406,45 @@ mod tests {
         let spec = AddrSpec::any();
         assert!(spec.matches("8.8.8.8".parse().unwrap(), 53));
         assert!(spec.matches("2001:db8::1".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn host_pattern_exact_and_suffix_match() {
+        let exact = HostPattern::parse("Example.com").unwrap();
+        assert_eq!(exact, HostPattern::Exact("example.com".into()));
+        assert!(exact.matches("example.com"));
+        assert!(exact.matches("EXAMPLE.COM"));
+        assert!(exact.matches("example.com.")); // trailing dot tolerated
+        assert!(!exact.matches("a.example.com"));
+        assert!(!exact.matches("notexample.com"));
+
+        let suffix = HostPattern::parse(".example.com").unwrap();
+        assert_eq!(suffix, HostPattern::Suffix("example.com".into()));
+        assert!(suffix.matches("example.com")); // the apex itself
+        assert!(suffix.matches("a.example.com"));
+        assert!(suffix.matches("a.b.example.com"));
+        assert!(!suffix.matches("example.com.evil.com"));
+        assert!(!suffix.matches("notexample.com")); // not a label boundary
+        assert!(!suffix.matches("fooexample.com"));
+    }
+
+    #[test]
+    fn host_pattern_rejects_invalid() {
+        for bad in [".", "", "..", "exam ple.com", "a..b.com", "ex@mple.com"] {
+            assert!(HostPattern::parse(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn addr_spec_matches_dest_by_host_or_ip() {
+        let host = AddrSpec::host(HostPattern::Suffix("example.com".into()), None);
+        // Hostname matches the requested domain, regardless of the resolved IP.
+        assert!(host.matches_dest(Some("api.example.com"), "203.0.113.1".parse().unwrap(), 443));
+        // No hostname (IP literal) -> a hostname rule does not match.
+        assert!(!host.matches_dest(None, "203.0.113.1".parse().unwrap(), 443));
+        // CIDR rules still match on the resolved IP and ignore the host.
+        let cidr = AddrSpec::new("10.0.0.0/8".parse().unwrap(), None);
+        assert!(cidr.matches_dest(Some("anything"), "10.1.2.3".parse().unwrap(), 80));
+        assert!(!cidr.matches_dest(Some("anything"), "192.0.2.1".parse().unwrap(), 80));
     }
 }

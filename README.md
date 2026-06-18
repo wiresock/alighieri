@@ -337,7 +337,7 @@ the request is **denied**.
 
 - `client pass/block { from: CIDR [port = N] to: CIDR [port = N] }` —
   evaluated at connection admission.
-- `socks pass/block { from: CIDR [port = N] to: CIDR [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] }` —
+- `socks pass/block { from: CIDR [port = N] to: CIDR|HOSTNAME [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] }` —
   evaluated per SOCKS request.
 
 Rules can optionally be named by placing a single token between the verdict and
@@ -357,6 +357,27 @@ Omitted selectors match both IPv4 and IPv6. Explicit IPv4 CIDRs such as
 `0.0.0.0/0` remain IPv4-only; add `::/0` in a separate rule for explicit
 dual-stack matching. `to:` in a `client` rule refers to the proxy's own
 accepting address; in a `socks` rule it refers to the request destination.
+
+A `socks` rule `to:` can match the **requested destination hostname** instead of
+an IP/CIDR. The hostname is matched **before** DNS resolution, so you allowlist
+the name the client asked for rather than whatever it resolves to:
+
+- `.example.com` — the domain **and all subdomains** (`example.com`,
+  `api.example.com`, …).
+- `example.com` — that exact host only.
+
+```conf
+# Allow only GitHub over TLS; everything else is denied by default.
+socks pass "github" {
+    to: .github.com port = 443
+    command: connect
+}
+```
+
+Hostname patterns are valid only in a `socks` rule `to:` — a `from:` selector
+and a `client` rule `to:` stay IP/CIDR-only. An earlier `block { to: 10.0.0.0/8 }`
+still rejects a domain that *resolves* into a denied range, so deny-by-default
+and DNS-rebinding protection are preserved.
 
 ### Userlist format
 
@@ -645,8 +666,8 @@ version; verify against the version you would deploy.
 | | Alighieri | Dante |
 | --- | --- | --- |
 | Model | Dante-inspired `client` / `socks` rules, deny-by-default | the original `sockd.conf` |
-| Selectors | CIDR, port, command, protocol, auth-method | CIDR, port, command, protocol, user, hostname/domain |
-| Hostname / domain rules | no (IP/CIDR only) | yes |
+| Selectors | CIDR, port, command, protocol, auth-method, destination hostname | CIDR, port, command, protocol, user, hostname/domain |
+| Hostname / domain rules | yes (`socks` `to:` patterns) | yes |
 | libwrap / TCP wrappers | no | yes |
 | Named rules + `include` | yes | no (single config file) |
 | Destination redirect / rewrite | no | yes |
@@ -676,9 +697,8 @@ version; verify against the version you would deploy.
 **Which to choose**
 
 - **Dante** if you need SOCKS4, the BIND command (active FTP / callbacks),
-  GSSAPI/Kerberos or PAM auth, the client-side socksify library, hostname-based
-  rules, run on BSD/Solaris/AIX, or want a permissive license and a
-  decades-proven codebase.
+  GSSAPI/Kerberos or PAM auth, the client-side socksify library, run on
+  BSD/Solaris/AIX, or want a permissive license and a decades-proven codebase.
 - **Alighieri** if you want SOCKS5 on Linux *and* Windows from one memory-safe
   codebase, SOCKS-over-TLS, Prometheus/JSON observability, Argon2id-hashed
   credentials, fixed UDP relay port ranges for firewalling, and a modern ops
