@@ -28,7 +28,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
 | ~~**Hostname / domain ACL rules**~~ | — | — | **Shipped** — `socks` rule `to:` accepts `.example.com` (domain + subdomains) and exact hostnames, matched against the requested host before resolution. |
-| **External auth hook** | High | M | Validate credentials via an external command or HTTP webhook, so LDAP / OIDC / corporate auth work without baking each in. Portable across Linux and Windows; covers most PAM use cases indirectly. |
+| ~~**External auth hook**~~ | — | — | **Shipped** (command form) — `auth.command` verifies credentials via an external program (username/password on stdin, exit 0 = allow), covering LDAP/OIDC/PAM via a script. A native HTTP-webhook form remains a possible follow-up. |
 | **PAM / system auth (Unix)** | Med | M | Native PAM backend for Unix deployments that expect it. Follows the external-auth hook. |
 | **BIND command** | Med | L | RFC 1928 §6 two-stage reverse connect (active FTP, callbacks). Security-sensitive — gated off by default, restricted by `socks` rules. |
 | **SOCKS4 / 4a** | Low | S | Cheap, but legacy; modern clients use SOCKS5. Add only on demand. |
@@ -57,11 +57,11 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 ## Suggested first wave
 
 Ordered for value-to-effort while leaning into Alighieri's identity
-(~~hostname / domain ACL rules~~ and ~~PROXY protocol ingress~~ have shipped):
+(~~hostname / domain ACL rules~~, ~~PROXY protocol ingress~~, and
+~~external auth hook~~ have shipped):
 
-1. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
-2. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
-3. **ARM64 builds + container image** — reach and deployability.
+1. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
+2. **ARM64 builds + container image** — reach and deployability.
 
 Then: BIND, geo/ASN rules, macOS/BSD first-class, audit/OTel. Deprioritized
 unless requested: SOCKS4, GSSAPI.

@@ -230,6 +230,7 @@ socks pass "allow-default" {
 | `proxyprotocol`    | —               | Trusted upstream CIDR(s) allowed to send a PROXY protocol (v1/v2) header; the real client address then drives rules/limits/logs. Unset disables it |
 | `socksmethod`      | `none`          | Offered auth methods (`none`, `username`)            |
 | `userlist`         | —               | Path to `username:password-or-hash` file             |
+| `auth.command`     | —               | External verifier program; runs per credential (username/password on stdin, exit 0 = allow) instead of the userlist |
 | `auth.cachettl`    | `300`           | Reuse successful credential checks for this many seconds (`0` disables) |
 | `connecttimeout`   | `30`            | Seconds to wait for outbound connects                |
 | `handshaketimeout` | `10`            | Seconds to wait for SOCKS greeting/auth/request      |
@@ -433,6 +434,26 @@ a keyed tag derived with a per-process random salt — never the password — on
 caches successes (failed attempts always pay the full hashing cost), and is
 cleared whenever the configuration or userlist is reloaded. Set
 `auth.cachettl: 0` to verify every handshake at full cost.
+
+### External authentication
+
+Set `auth.command` to delegate username/password verification to an external
+program instead of the userlist — useful for LDAP, OIDC, PAM, or a corporate
+auth service:
+
+```conf
+socksmethod: username
+auth.command: /usr/local/bin/verify-user
+```
+
+For each attempt Alighieri runs the program and writes two newline-terminated
+lines to its **stdin** — the username, then the password (never on the command
+line or environment, which can leak). Exit status `0` allows the connection;
+anything else, or a timeout, denies it. The script should read with `read -r`,
+and credentials containing a newline or NUL byte are rejected to keep the
+framing unambiguous. Successful results are cached exactly like the userlist
+(`auth.cachettl`), and with `auth.command` set the `username` method no longer
+requires a `userlist`.
 
 ### Hot reload
 

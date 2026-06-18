@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::abuse::{AbuseControls, ClientByteRecorder};
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
-use crate::auth::UserDb;
+use crate::auth::{CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
 use crate::config::{Config, Protocol};
 use crate::dns::DnsResolver;
@@ -36,6 +36,7 @@ pub struct Connection {
     local: SocketAddr,
     config: Arc<Config>,
     users: Arc<UserDb>,
+    command_auth: Option<Arc<CommandAuth>>,
     metrics: Arc<Metrics>,
     abuse: Arc<AbuseControls>,
     dns_resolver: Arc<DnsResolver>,
@@ -45,6 +46,7 @@ pub struct Connection {
 pub struct ConnectionResources {
     pub config: Arc<Config>,
     pub users: Arc<UserDb>,
+    pub command_auth: Option<Arc<CommandAuth>>,
     pub metrics: Arc<Metrics>,
     pub abuse: Arc<AbuseControls>,
     pub dns_resolver: Arc<DnsResolver>,
@@ -67,6 +69,7 @@ impl Connection {
             local,
             config: resources.config,
             users: resources.users,
+            command_auth: resources.command_auth,
             metrics: resources.metrics,
             abuse: resources.abuse,
             dns_resolver: resources.dns_resolver,
@@ -135,16 +138,31 @@ impl Connection {
                 socks5::read_userpass(&mut self.stream),
             )
             .await?;
-            let ok = match tokio::time::timeout(
-                self.config.handshake_timeout,
-                self.users.verify_async(
-                    &creds.username,
-                    &creds.password,
-                    self.config.auth_cache_ttl,
-                ),
-            )
-            .await
-            {
+            // Verify against the external command hook when configured,
+            // otherwise the userlist. Both cache successful verifications.
+            let verify = async {
+                match &self.command_auth {
+                    Some(cmd) => {
+                        cmd.verify_async(
+                            &creds.username,
+                            &creds.password,
+                            self.config.auth_cache_ttl,
+                            self.config.handshake_timeout,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.users
+                            .verify_async(
+                                &creds.username,
+                                &creds.password,
+                                self.config.auth_cache_ttl,
+                            )
+                            .await
+                    }
+                }
+            };
+            let ok = match tokio::time::timeout(self.config.handshake_timeout, verify).await {
                 Ok(ok) => ok,
                 Err(_) => {
                     socks5::write_userpass_status(&mut self.stream, false).await?;

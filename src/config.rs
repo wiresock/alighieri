@@ -189,6 +189,10 @@ pub struct Config {
     /// How long a successful credential verification may be reused without
     /// re-running the password hash. `None` disables the cache.
     pub auth_cache_ttl: Option<Duration>,
+    /// External credential-verification command (the `auth.command` hook). When
+    /// set, username/password verification runs this command instead of the
+    /// userlist; the first element is the program and the rest are arguments.
+    pub auth_command: Option<Vec<String>>,
     /// Maximum number of concurrent client connections.
     pub max_connections: usize,
     /// Active log sinks.
@@ -366,6 +370,7 @@ struct Builder {
     udp_port_range: Option<PortRange>,
     userlist: Option<PathBuf>,
     auth_cache_ttl: Option<Option<Duration>>,
+    auth_command: Option<Vec<String>>,
     max_connections: Option<usize>,
     log_outputs: Option<Vec<LogOutput>>,
     log_file: Option<PathBuf>,
@@ -398,9 +403,12 @@ impl Builder {
                 "socksmethod must list at least one method".into(),
             ));
         }
-        if socks_methods.contains(&AuthKind::Username) && self.userlist.is_none() {
+        if socks_methods.contains(&AuthKind::Username)
+            && self.userlist.is_none()
+            && self.auth_command.is_none()
+        {
             return Err(Error::Config(
-                "socksmethod 'username' requires a 'userlist' setting".into(),
+                "socksmethod 'username' requires a 'userlist' or 'auth.command' setting".into(),
             ));
         }
 
@@ -452,6 +460,7 @@ impl Builder {
             auth_cache_ttl: self
                 .auth_cache_ttl
                 .unwrap_or(Some(Duration::from_secs(DEFAULT_AUTH_CACHE_TTL_SECS))),
+            auth_command: self.auth_command,
             max_connections: self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS),
             log_outputs,
             log_file: self.log_file,
@@ -578,6 +587,12 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "authcachettl" | "auth.cachettl" | "auth.cache.ttl" => {
             b.auth_cache_ttl = Some(parse_cache_ttl(vals, lineno, "auth.cachettl")?);
+        }
+        "authcommand" | "auth.command" => {
+            if vals.is_empty() {
+                return Err(cfg_err(lineno, "auth.command requires a program path"));
+            }
+            b.auth_command = Some(vals.to_vec());
         }
         "metricslisten" | "metrics.listen" => {
             b.metrics_listen = Some(parse_endpoint(vals, lineno)?)
@@ -1832,6 +1847,33 @@ socks pass "" { command: connect }"#,
     fn proxyprotocol_rejects_empty_or_invalid() {
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nproxyprotocol:").is_err());
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nproxyprotocol: not-a-cidr").is_err());
+    }
+
+    #[test]
+    fn auth_command_parses_program_and_args() {
+        let cfg = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nauth.command: /usr/local/bin/verify --ldap",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.auth_command.as_deref(),
+            Some(["/usr/local/bin/verify".to_string(), "--ldap".to_string()].as_slice())
+        );
+
+        // Disabled by default.
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080")
+            .unwrap()
+            .auth_command
+            .is_none());
+
+        // A program path is required.
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080\nauth.command:").is_err());
+
+        // The `username` method is satisfied by auth.command without a userlist.
+        assert!(Config::parse(
+            "internal: 0.0.0.0 port = 1080\nsocksmethod: username\nauth.command: /bin/true"
+        )
+        .is_ok());
     }
 
     #[test]

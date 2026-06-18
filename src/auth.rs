@@ -205,6 +205,104 @@ impl UserDb {
     }
 }
 
+/// Verifies credentials by invoking an external command (the `auth.command`
+/// hook), so an operator can delegate to LDAP / OIDC / PAM / anything via a
+/// script. The username and password are written to the command's **stdin**
+/// (never argv or the environment, which can leak through `ps` or `/proc`); an
+/// exit status of `0` allows the connection. Successful verifications are cached
+/// exactly like the userlist path so the command is not re-run per handshake.
+#[derive(Debug)]
+pub struct CommandAuth {
+    program: String,
+    args: Vec<String>,
+    verified: VerifiedCache,
+}
+
+impl CommandAuth {
+    /// Builds a verifier from a command line whose first token is the program
+    /// and the remaining tokens are fixed arguments. `None` if `command` is
+    /// empty.
+    pub fn new(command: &[String]) -> Option<Self> {
+        let (program, args) = command.split_first()?;
+        Some(CommandAuth {
+            program: program.clone(),
+            args: args.to_vec(),
+            verified: VerifiedCache::new(),
+        })
+    }
+
+    /// Verifies `username`/`password` by running the command, bounded by
+    /// `timeout`. When `cache_ttl` is set, a success is cached so the command is
+    /// not re-run for the same credentials until the entry expires. Failures
+    /// always take the full path, so the cache cannot cheapen brute force.
+    pub async fn verify_async(
+        &self,
+        username: &str,
+        password: &str,
+        cache_ttl: Option<Duration>,
+        timeout: Duration,
+    ) -> bool {
+        let cached = cache_ttl.and_then(|ttl| Some((self.verified.tag(username, password)?, ttl)));
+        if let Some((tag, _)) = &cached {
+            if self.verified.check(username, tag, Instant::now()) {
+                return true;
+            }
+        }
+        let ok = self.run(username, password, timeout).await;
+        if ok {
+            if let Some((tag, ttl)) = cached {
+                let now = Instant::now();
+                if let Some(expires_at) = now.checked_add(ttl) {
+                    self.verified.store(username, tag, expires_at, now);
+                }
+            }
+        }
+        ok
+    }
+
+    async fn run(&self, username: &str, password: &str, timeout: Duration) -> bool {
+        // Credentials are passed as two newline-terminated lines on stdin. RFC
+        // 1929 fields are arbitrary bytes, so reject any containing the delimiter
+        // (newline) or a NUL to keep the framing unambiguous and free of
+        // injection; such credentials are pathological in practice.
+        if [username, password]
+            .iter()
+            .any(|s| s.contains('\n') || s.contains('\0'))
+        {
+            return false;
+        }
+        let mut child = match tokio::process::Command::new(&self.program)
+            .args(&self.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!(error = %e, program = %self.program, "auth.command failed to spawn");
+                return false;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = format!("{username}\n{password}\n");
+            let _ = stdin.write_all(payload.as_bytes()).await;
+            // `stdin` is dropped here, closing the pipe so the command sees EOF.
+        }
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(_)) => false,
+            Err(_) => {
+                // Timed out: kill the child so it does not linger.
+                let _ = child.start_kill();
+                false
+            }
+        }
+    }
+}
+
 /// Remembers recently verified credentials so repeat handshakes skip the
 /// expensive password hash. Entries hold a keyed tag derived with a cheap
 /// Argon2 instance and a per-process random salt — never the password itself
@@ -684,5 +782,74 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn command_auth_new_rejects_empty_command() {
+        assert!(CommandAuth::new(&[]).is_none());
+    }
+
+    #[cfg(unix)]
+    fn sh_auth(script: &str) -> CommandAuth {
+        CommandAuth::new(&["/bin/sh".to_string(), "-c".to_string(), script.to_string()]).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_allows_only_on_exit_zero() {
+        // Reads the username then the password from stdin; allows alice/secret.
+        let auth = sh_auth("read u; read p; [ \"$u\" = alice ] && [ \"$p\" = secret ]");
+        let t = Duration::from_secs(5);
+        assert!(auth.verify_async("alice", "secret", None, t).await);
+        assert!(!auth.verify_async("alice", "wrong", None, t).await);
+        assert!(!auth.verify_async("bob", "secret", None, t).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_rejects_embedded_delimiters() {
+        // A command that always succeeds; the newline in the password must still
+        // be rejected before it runs, to keep the stdin framing unambiguous.
+        let auth = sh_auth("exit 0");
+        assert!(
+            !auth
+                .verify_async("alice", "sec\nret", None, Duration::from_secs(5))
+                .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_times_out() {
+        let auth = sh_auth("sleep 5");
+        assert!(
+            !auth
+                .verify_async("alice", "secret", None, Duration::from_millis(100))
+                .await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_caches_success() {
+        // The script allows only on its first run (it creates a marker, then
+        // fails when the marker exists). A cached second call must still succeed,
+        // proving the command was not re-run.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let auth = sh_auth(&format!(
+            "[ ! -e '{m}' ] && touch '{m}'",
+            m = marker.display()
+        ));
+        let ttl = Some(Duration::from_secs(60));
+        let t = Duration::from_secs(5);
+        assert!(
+            auth.verify_async("alice", "secret", ttl, t).await,
+            "first run"
+        );
+        assert!(
+            auth.verify_async("alice", "secret", ttl, t).await,
+            "second call should hit the cache"
+        );
     }
 }
