@@ -74,29 +74,46 @@ fn parse_v1_line(line: &[u8]) -> io::Result<Option<SocketAddr>> {
     if parts.next() != Some("PROXY") {
         return Err(invalid("PROXY v1 header malformed"));
     }
-    match parts.next() {
-        Some("TCP4") | Some("TCP6") => {
-            let src_ip = parts
-                .next()
-                .ok_or_else(|| invalid("PROXY v1 missing source IP"))?;
-            let _dst_ip = parts
-                .next()
-                .ok_or_else(|| invalid("PROXY v1 missing dest IP"))?;
-            let src_port = parts
-                .next()
-                .ok_or_else(|| invalid("PROXY v1 missing source port"))?;
-            let ip: IpAddr = src_ip
-                .parse()
-                .map_err(|_| invalid("PROXY v1 invalid source IP"))?;
-            let port: u16 = src_port
-                .parse()
-                .map_err(|_| invalid("PROXY v1 invalid source port"))?;
-            Ok(Some(SocketAddr::new(ip, port)))
-        }
-        // The balancer connected on its own behalf (e.g. a health check).
-        Some("UNKNOWN") => Ok(None),
-        _ => Err(invalid("PROXY v1 unknown protocol")),
+    // The spec requires receivers to reject a malformed header: validate every
+    // field, require the address family to match the protocol, and reject extra
+    // trailing fields.
+    let want_v6 = match parts.next() {
+        Some("TCP4") => false,
+        Some("TCP6") => true,
+        // The balancer connected on its own behalf (e.g. a health check). After
+        // UNKNOWN the spec permits arbitrary bytes up to the CRLF, so ignore the
+        // rest of the line.
+        Some("UNKNOWN") => return Ok(None),
+        _ => return Err(invalid("PROXY v1 unknown protocol")),
+    };
+    let mut next_field = || {
+        parts
+            .next()
+            .ok_or_else(|| invalid("PROXY v1 header truncated"))
+    };
+    let src_ip = next_field()?;
+    let dst_ip = next_field()?;
+    let src_port = next_field()?;
+    let dst_port = next_field()?;
+    if parts.next().is_some() {
+        return Err(invalid("PROXY v1 header has extra fields"));
     }
+    let parse_ip = |s: &str| -> io::Result<IpAddr> {
+        let ip: IpAddr = s.parse().map_err(|_| invalid("PROXY v1 invalid IP"))?;
+        if ip.is_ipv6() != want_v6 {
+            return Err(invalid("PROXY v1 address family does not match protocol"));
+        }
+        Ok(ip)
+    };
+    let src = parse_ip(src_ip)?;
+    parse_ip(dst_ip)?; // validate the destination address too
+    let port: u16 = src_port
+        .parse()
+        .map_err(|_| invalid("PROXY v1 invalid source port"))?;
+    let _dst_port: u16 = dst_port
+        .parse()
+        .map_err(|_| invalid("PROXY v1 invalid dest port"))?;
+    Ok(Some(SocketAddr::new(src, port)))
 }
 
 async fn read_v2<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<SocketAddr>> {
@@ -114,11 +131,19 @@ async fn read_v2<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Sock
     let mut block = vec![0u8; len];
     reader.read_exact(&mut block).await?;
 
-    // Low nibble of the version/command byte: 0 = LOCAL (no real client).
-    if ver_cmd & 0x0F == 0x0 {
-        return Ok(None);
+    // Low nibble of the version/command byte: 0 = LOCAL (no real client), 1 =
+    // PROXY; any other value is invalid and must be rejected.
+    match ver_cmd & 0x0F {
+        0x0 => return Ok(None),
+        0x1 => {}
+        _ => return Err(invalid("PROXY v2 unsupported command")),
     }
+
+    // High nibble of fam_proto = address family, low nibble = transport. For a
+    // TCP listener the transport of an INET/INET6 address must be STREAM (0x1).
+    let transport = fam_proto & 0x0F;
     match fam_proto >> 4 {
+        0x1 | 0x2 if transport != 0x1 => Err(invalid("PROXY v2 transport must be STREAM")),
         // AF_INET: src(4) dst(4) sport(2) dport(2)
         0x1 if block.len() >= 12 => {
             let src = Ipv4Addr::new(block[0], block[1], block[2], block[3]);
@@ -228,5 +253,42 @@ mod tests {
     async fn non_proxy_header_is_rejected() {
         let mut reader: &[u8] = b"\x05\x01\x00 not a proxy header at all";
         assert!(read_header(&mut reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn v1_rejects_family_mismatch_truncation_and_extras() {
+        // IPv6 address tagged TCP4.
+        let (res, _) =
+            read_with_tail(b"PROXY TCP4 2001:db8::1 198.51.100.1 1 2\r\n".to_vec()).await;
+        assert!(res.is_err(), "family mismatch should be rejected");
+        // Missing the destination port.
+        let (res, _) = read_with_tail(b"PROXY TCP4 192.0.2.7 198.51.100.1 1\r\n".to_vec()).await;
+        assert!(res.is_err(), "truncated header should be rejected");
+        // A trailing extra field.
+        let (res, _) =
+            read_with_tail(b"PROXY TCP4 192.0.2.7 198.51.100.1 1 2 extra\r\n".to_vec()).await;
+        assert!(res.is_err(), "extra fields should be rejected");
+    }
+
+    #[tokio::test]
+    async fn v2_rejects_unknown_command_and_non_stream() {
+        // Unknown command nibble (2).
+        let mut h = V2_SIGNATURE.to_vec();
+        h.push(0x22);
+        h.push(0x11);
+        h.extend_from_slice(&12u16.to_be_bytes());
+        h.extend_from_slice(&[0u8; 12]);
+        assert!(
+            read_with_tail(h).await.0.is_err(),
+            "unknown command rejected"
+        );
+
+        // AF_INET but DGRAM transport on a TCP listener.
+        let mut h = V2_SIGNATURE.to_vec();
+        h.push(0x21);
+        h.push(0x12); // AF_INET, DGRAM
+        h.extend_from_slice(&12u16.to_be_bytes());
+        h.extend_from_slice(&[192, 0, 2, 9, 198, 51, 100, 1, 0x9c, 0x40, 0x01, 0xbb]);
+        assert!(read_with_tail(h).await.0.is_err(), "non-STREAM rejected");
     }
 }
