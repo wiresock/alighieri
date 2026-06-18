@@ -8,8 +8,9 @@
 //! 5. command execution (CONNECT relay or UDP associate).
 
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use crate::config::{Config, Protocol};
 use crate::dns::DnsResolver;
 use crate::errors::{Error, Result};
 use crate::metrics::Metrics;
+use crate::net::PortRange;
 use crate::relay;
 use crate::socks5::{self, Command, Method, Reply, Request, TargetAddr};
 
@@ -335,18 +337,20 @@ impl Connection {
     ) -> Result<()> {
         // The relay socket is bound on the same interface the client reached us
         // on, so the address we advertise is reachable by the client.
-        let relay_socket = match UdpSocket::bind((self.local.ip(), 0)).await {
-            Ok(s) => s,
-            Err(e) => {
-                socks5::write_reply(
-                    &mut self.stream,
-                    Reply::GeneralFailure,
-                    socks5::unspecified_v4(),
-                )
-                .await?;
-                return Err(Error::Io(e));
-            }
-        };
+        let relay_socket =
+            match bind_udp_in_range(self.local.ip(), self.config.udp_port_range).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(peer = %self.peer, error = %e, "failed to bind UDP relay socket");
+                    socks5::write_reply(
+                        &mut self.stream,
+                        Reply::GeneralFailure,
+                        socks5::unspecified_v4(),
+                    )
+                    .await?;
+                    return Err(Error::Io(e));
+                }
+            };
         // The outbound socket carries traffic to/from remote peers, sourced
         // from the configured external address.
         let outbound = match UdpSocket::bind((self.config.external, 0)).await {
@@ -504,6 +508,60 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
     None
 }
 
+/// Binds a UDP relay socket on `ip`. With a configured `range`, scans the
+/// inclusive port range starting from a pseudo-random offset — so concurrent
+/// associations spread across the range instead of contending on its low end,
+/// and the advertised `BND.PORT` is not trivially predictable — and returns
+/// `AddrInUse` if no port in the range can be bound. Without a range it binds an
+/// OS-assigned ephemeral port (the historical default).
+async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<UdpSocket> {
+    let Some(range) = range else {
+        return UdpSocket::bind((ip, 0)).await;
+    };
+    let span = u32::from(range.max - range.min) + 1;
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let start = scan_start_offset(seed, COUNTER.fetch_add(1, Ordering::Relaxed), span);
+    for i in 0..span {
+        let port = range.min + ((start + i) % span) as u16;
+        match UdpSocket::bind((ip, port)).await {
+            Ok(socket) => return Ok(socket),
+            // Skip a port we cannot bind right now — already in use, or not
+            // permitted for this process (e.g. a privileged port < 1024 when the
+            // range dips below it) — since a later port in the range may still
+            // bind. Errors that apply to the bind address regardless of port
+            // (e.g. the address is not local) repeat for every port, so fail fast.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "no bindable UDP port in configured udp.portrange {}-{}",
+            range.min, range.max
+        ),
+    ))
+}
+
+/// Pseudo-random start offset (`0..span`) for the UDP port scan. The atomic
+/// `count` is XORed with the clock seed so consecutive associations always get
+/// distinct offsets even when the system clock is coarse (e.g. ~1-15 ms on
+/// Windows and some VMs), where `subsec_nanos()` alone is a multiple of the
+/// resolution and `% span` would collapse to 0 whenever `span` divides it.
+fn scan_start_offset(seed_nanos: u32, count: u32, span: u32) -> u32 {
+    (seed_nanos ^ count) % span
+}
+
 /// Establishes an outbound TCP connection to `target`, optionally bound to the
 /// configured `external` source address, subject to `timeout`.
 async fn connect_remote(
@@ -589,5 +647,63 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_udp_in_range_respects_the_configured_range() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // No range -> an ephemeral bind still succeeds (historical default).
+        let any = bind_udp_in_range(ip, None).await.unwrap();
+        assert!(any.local_addr().unwrap().port() > 0);
+
+        // With a range, the bound port falls inside it.
+        let range = PortRange {
+            min: 40000,
+            max: 40063,
+        };
+        let sock = bind_udp_in_range(ip, Some(range)).await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        assert!(
+            range.contains(port),
+            "bound port {port} is outside {}-{}",
+            range.min,
+            range.max
+        );
+
+        // A fully-occupied (single-port) range reports exhaustion as AddrInUse
+        // rather than panicking or returning an out-of-range port.
+        let occupied = UdpSocket::bind((ip, 0)).await.unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+        let err = bind_udp_in_range(
+            ip,
+            Some(PortRange {
+                min: taken,
+                max: taken,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn scan_start_offset_survives_a_coarse_clock() {
+        // A coarse clock makes subsec_nanos a multiple of its resolution; pick a
+        // span that divides it, so the time seed alone would always yield 0.
+        let coarse_nanos = 5_000_000; // 5 ms, a multiple of a 1 ms tick
+        let span = 100;
+        assert_eq!(coarse_nanos % span, 0, "precondition: the degenerate case");
+
+        // The XORed counter perturbs successive offsets so they are not all 0,
+        // and every offset stays within the range.
+        let offsets: Vec<u32> = (0..4)
+            .map(|count| scan_start_offset(coarse_nanos, count, span))
+            .collect();
+        assert!(
+            offsets.iter().any(|&o| o != 0),
+            "counter failed to perturb the offset: {offsets:?}"
+        );
+        assert!(offsets.iter().all(|&o| o < span));
     }
 }
