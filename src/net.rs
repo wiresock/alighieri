@@ -190,10 +190,15 @@ impl HostPattern {
     /// domain and all of its subdomains; otherwise the token is an exact host.
     pub fn parse(token: &str) -> Result<Self, String> {
         let lower = token.trim().to_ascii_lowercase();
-        let (domain, suffix) = match lower.strip_prefix('.') {
+        let (mut domain, suffix) = match lower.strip_prefix('.') {
             Some(rest) => (rest.to_string(), true),
             None => (lower, false),
         };
+        // Tolerate a single trailing dot so an FQDN like `example.com.` is
+        // accepted in config; the checks below still reject `example.com..`.
+        if domain.ends_with('.') && !domain.ends_with("..") {
+            domain.pop();
+        }
         if domain.is_empty()
             || domain.starts_with('.')
             || domain.ends_with('.')
@@ -212,15 +217,22 @@ impl HostPattern {
     }
 
     /// Returns `true` if `host` (the requested hostname) matches this pattern.
+    ///
+    /// Allocation-free and case-insensitive: patterns are already stored
+    /// lowercased, so this compares against the borrowed host directly. The UDP
+    /// authorisation path calls this per datagram, so the hot path must not
+    /// allocate.
     pub fn matches(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let host = host.trim_end_matches('.');
         match self {
-            HostPattern::Exact(h) => host == *h,
+            HostPattern::Exact(h) => host.eq_ignore_ascii_case(h),
             HostPattern::Suffix(domain) => {
-                host == *domain
+                host.eq_ignore_ascii_case(domain)
                     || (host.len() > domain.len()
-                        && host.ends_with(domain.as_str())
-                        && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
+                        // The boundary byte is an ASCII '.', so the index is a
+                        // char boundary even when `host` contains non-ASCII.
+                        && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+                        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
             }
         }
     }
@@ -433,6 +445,21 @@ mod tests {
         for bad in [".", "", "..", "exam ple.com", "a..b.com", "ex@mple.com"] {
             assert!(HostPattern::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn host_pattern_tolerates_trailing_dot() {
+        // An FQDN-style trailing dot in the pattern is normalised away.
+        assert_eq!(
+            HostPattern::parse("example.com.").unwrap(),
+            HostPattern::Exact("example.com".into())
+        );
+        assert_eq!(
+            HostPattern::parse(".example.com.").unwrap(),
+            HostPattern::Suffix("example.com".into())
+        );
+        // A double trailing dot is still rejected.
+        assert!(HostPattern::parse("example.com..").is_err());
     }
 
     #[test]
