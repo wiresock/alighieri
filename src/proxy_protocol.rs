@@ -69,6 +69,13 @@ async fn read_v1<R: AsyncRead + Unpin>(
 }
 
 fn parse_v1_line(line: &[u8]) -> io::Result<Option<SocketAddr>> {
+    // The balancer connected on its own behalf (e.g. a health check). After
+    // `UNKNOWN` the spec permits arbitrary, possibly non-UTF-8 bytes up to the
+    // CRLF that the receiver must ignore, so detect it on the raw bytes before
+    // UTF-8 decoding the rest of the line.
+    if line == b"PROXY UNKNOWN" || line.starts_with(b"PROXY UNKNOWN ") {
+        return Ok(None);
+    }
     let line = std::str::from_utf8(line).map_err(|_| invalid("PROXY v1 header is not UTF-8"))?;
     let mut parts = line.split(' ');
     if parts.next() != Some("PROXY") {
@@ -80,10 +87,6 @@ fn parse_v1_line(line: &[u8]) -> io::Result<Option<SocketAddr>> {
     let want_v6 = match parts.next() {
         Some("TCP4") => false,
         Some("TCP6") => true,
-        // The balancer connected on its own behalf (e.g. a health check). After
-        // UNKNOWN the spec permits arbitrary bytes up to the CRLF, so ignore the
-        // rest of the line.
-        Some("UNKNOWN") => return Ok(None),
         _ => return Err(invalid("PROXY v1 unknown protocol")),
     };
     let mut next_field = || {
@@ -188,6 +191,18 @@ mod tests {
     #[tokio::test]
     async fn v1_unknown_yields_none() {
         let (res, tail) = read_with_tail(b"PROXY UNKNOWN\r\n".to_vec()).await;
+        assert_eq!(res.unwrap(), None);
+        assert_eq!(tail, b"SOCKSDATA");
+    }
+
+    #[tokio::test]
+    async fn v1_unknown_ignores_non_utf8_remainder() {
+        // The bytes after UNKNOWN may be arbitrary and non-UTF-8; they must be
+        // ignored rather than rejected as invalid UTF-8.
+        let mut header = b"PROXY UNKNOWN ".to_vec();
+        header.extend_from_slice(&[0xFF, 0xFE, 0x01]);
+        header.extend_from_slice(b"\r\n");
+        let (res, tail) = read_with_tail(header).await;
         assert_eq!(res.unwrap(), None);
         assert_eq!(tail, b"SOCKSDATA");
     }
