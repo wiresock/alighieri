@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -512,32 +512,54 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
 /// inclusive port range starting from a pseudo-random offset — so concurrent
 /// associations spread across the range instead of contending on its low end,
 /// and the advertised `BND.PORT` is not trivially predictable — and returns
-/// `AddrInUse` if every port in the range is already taken. Without a range it
-/// binds an OS-assigned ephemeral port (the historical default).
+/// `AddrInUse` if no port in the range can be bound. Without a range it binds an
+/// OS-assigned ephemeral port (the historical default).
 async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<UdpSocket> {
     let Some(range) = range else {
         return UdpSocket::bind((ip, 0)).await;
     };
     let span = u32::from(range.max - range.min) + 1;
-    let start = std::time::SystemTime::now()
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos())
-        % span;
+        .map_or(0, |d| d.subsec_nanos());
+    let start = scan_start_offset(seed, COUNTER.fetch_add(1, Ordering::Relaxed), span);
     for i in 0..span {
         let port = range.min + ((start + i) % span) as u16;
         match UdpSocket::bind((ip, port)).await {
             Ok(socket) => return Ok(socket),
-            Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+            // Skip a port we cannot bind right now — already in use, or not
+            // permitted for this process (e.g. a privileged port < 1024 when the
+            // range dips below it) — since a later port in the range may still
+            // bind. Errors that apply to the bind address regardless of port
+            // (e.g. the address is not local) repeat for every port, so fail fast.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                continue
+            }
             Err(e) => return Err(e),
         }
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
-            "no free UDP port in configured udp.portrange {}-{}",
+            "no bindable UDP port in configured udp.portrange {}-{}",
             range.min, range.max
         ),
     ))
+}
+
+/// Pseudo-random start offset (`0..span`) for the UDP port scan. The atomic
+/// `count` is XORed with the clock seed so consecutive associations always get
+/// distinct offsets even when the system clock is coarse (e.g. ~1-15 ms on
+/// Windows and some VMs), where `subsec_nanos()` alone is a multiple of the
+/// resolution and `% span` would collapse to 0 whenever `span` divides it.
+fn scan_start_offset(seed_nanos: u32, count: u32, span: u32) -> u32 {
+    (seed_nanos ^ count) % span
 }
 
 /// Establishes an outbound TCP connection to `target`, optionally bound to the
@@ -663,5 +685,25 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn scan_start_offset_survives_a_coarse_clock() {
+        // A coarse clock makes subsec_nanos a multiple of its resolution; pick a
+        // span that divides it, so the time seed alone would always yield 0.
+        let coarse_nanos = 5_000_000; // 5 ms, a multiple of a 1 ms tick
+        let span = 100;
+        assert_eq!(coarse_nanos % span, 0, "precondition: the degenerate case");
+
+        // The XORed counter perturbs successive offsets so they are not all 0,
+        // and every offset stays within the range.
+        let offsets: Vec<u32> = (0..4)
+            .map(|count| scan_start_offset(coarse_nanos, count, span))
+            .collect();
+        assert!(
+            offsets.iter().any(|&o| o != 0),
+            "counter failed to perturb the offset: {offsets:?}"
+        );
+        assert!(offsets.iter().all(|&o| o < span));
     }
 }
