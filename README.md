@@ -50,7 +50,8 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Hot reload** for policy, DNS, timeout, auth, and userlist changes
 - **Configuration wizard** — generate or edit a config from a short-lived, loopback-only web UI
 - **Async** — built on [Tokio](https://tokio.rs) for high-performance I/O
-- **Portable** — Windows and Linux-first; works on macOS and *BSD too
+- **Portable** — first-class on Windows and Linux; macOS and *BSD are not yet
+  officially supported (no CI coverage)
 - **Secure defaults** — no auth required? Think again. The default config still lets you build restrictive rules.
 
 ## Quick start
@@ -614,7 +615,7 @@ version; verify against the version you would deploy.
 | --- | --- | --- |
 | Linux | first-class (CI + systemd manager) | yes |
 | Windows | native Service + Event Log | not supported |
-| macOS / *BSD / Solaris / AIX | likely compiles, console-only, untested | broadly supported |
+| macOS / *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
 | Language | Rust (memory-safe) | C |
 | Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |
 
@@ -626,7 +627,7 @@ version; verify against the version you would deploy.
 | SOCKS4 / 4a | no | yes |
 | CONNECT | yes | yes |
 | UDP ASSOCIATE | yes — dual-stack, IPv4-mapped handling, configurable `udp.portrange` | yes |
-| BIND (reverse connect, e.g. active FTP) | no (replies "command not supported") | yes |
+| BIND (reverse connect, e.g. active FTP) | no — RFC 1928 reply `0x07` (command not supported) | yes |
 | IPv4 / IPv6 | yes / yes (dual-stack listeners) | yes / yes |
 | Client socksify library (LD_PRELOAD) | no (server only) | yes (`socksify` / libsocks) |
 
@@ -670,7 +671,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | new (first release 2026) | decades in production |
+| Maturity | new (current release v0.1.0) | decades in production |
 
 **Which to choose**
 
