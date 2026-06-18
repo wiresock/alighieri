@@ -1101,7 +1101,13 @@ async fn external_command_auth_gates_username_password() {
     use std::os::unix::fs::PermissionsExt;
 
     // A verifier script that allows only alice/secret (read from stdin).
-    let dir = tempfile::tempdir().unwrap();
+    // Create it under /tmp (space-free) rather than honoring TMPDIR, which may
+    // contain spaces: auth.command is whitespace-split, so a spaced path would
+    // break config parsing and make this test flaky.
+    let dir = tempfile::Builder::new()
+        .prefix("alighieri-auth")
+        .tempdir_in("/tmp")
+        .unwrap();
     let script = dir.path().join("verify.sh");
     {
         let mut f = std::fs::File::create(&script).unwrap();

@@ -297,8 +297,14 @@ impl CommandAuth {
         let delivered = match child.stdin.take() {
             Some(mut stdin) => {
                 use tokio::io::AsyncWriteExt;
-                let payload = format!("{username}\n{password}\n");
-                stdin.write_all(payload.as_bytes()).await.is_ok()
+                // Write the two lines as separate chunks rather than allocating a
+                // single buffer holding both secrets at once. The delimiter check
+                // above guarantees neither field contains a newline, so the line
+                // framing stays unambiguous.
+                stdin.write_all(username.as_bytes()).await.is_ok()
+                    && stdin.write_all(b"\n").await.is_ok()
+                    && stdin.write_all(password.as_bytes()).await.is_ok()
+                    && stdin.write_all(b"\n").await.is_ok()
                 // `stdin` is dropped here, closing the pipe so the command sees EOF.
             }
             None => false,
