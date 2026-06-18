@@ -341,7 +341,12 @@ impl CommandAuth {
             return false; // The guard reaps the child on drop.
         }
         let status = guard.child().wait().await;
-        guard.disarm(); // Reaped synchronously by `wait`; nothing left to clean up.
+        if status.is_ok() {
+            // Reaped synchronously by `wait`; nothing left for `Drop` to do.
+            guard.disarm();
+        }
+        // On a `wait` error the child may still be running, so leave the guard
+        // armed to kill and reap it on drop.
         matches!(status, Ok(status) if status.success())
     }
 }
