@@ -138,40 +138,37 @@ impl Connection {
                 socks5::read_userpass(&mut self.stream),
             )
             .await?;
-            // Verify against the external command hook when configured,
-            // otherwise the userlist. Both cache successful verifications and are
-            // bounded by the single handshake timeout below — the one deadline
-            // owner, like the other handshake steps. For the command hook, that
-            // timeout firing drops the future, killing/reaping the child.
-            let verify = async {
-                match &self.command_auth {
-                    Some(cmd) => {
-                        cmd.verify_async(
-                            &creds.username,
-                            &creds.password,
-                            self.config.auth_cache_ttl,
-                        )
-                        .await
-                    }
-                    None => {
-                        self.users
-                            .verify_async(
-                                &creds.username,
-                                &creds.password,
-                                self.config.auth_cache_ttl,
-                            )
-                            .await
-                    }
+            // Verify against the external command hook when configured, otherwise
+            // the userlist; both cache successful verifications. Each owns the
+            // single deadline for its path: CommandAuth bounds itself by the
+            // handshake timeout (and kills/reaps the child), while the userlist
+            // path has no internal deadline and is bounded here.
+            let ok = match &self.command_auth {
+                Some(cmd) => {
+                    cmd.verify_async(
+                        &creds.username,
+                        &creds.password,
+                        self.config.auth_cache_ttl,
+                        self.config.handshake_timeout,
+                    )
+                    .await
                 }
-            };
-            let ok = match tokio::time::timeout(self.config.handshake_timeout, verify).await {
-                Ok(ok) => ok,
-                Err(_) => {
-                    socks5::write_userpass_status(&mut self.stream, false).await?;
-                    self.metrics.auth_failed();
-                    self.record_auth_failure();
-                    warn!(peer = %self.peer, user = %creds.username, "authentication timed out");
-                    return Err(Error::Timeout);
+                None => {
+                    let verify = self.users.verify_async(
+                        &creds.username,
+                        &creds.password,
+                        self.config.auth_cache_ttl,
+                    );
+                    match tokio::time::timeout(self.config.handshake_timeout, verify).await {
+                        Ok(ok) => ok,
+                        Err(_) => {
+                            socks5::write_userpass_status(&mut self.stream, false).await?;
+                            self.metrics.auth_failed();
+                            self.record_auth_failure();
+                            warn!(peer = %self.peer, user = %creds.username, "authentication timed out");
+                            return Err(Error::Timeout);
+                        }
+                    }
                 }
             };
             socks5::write_userpass_status(&mut self.stream, ok).await?;
