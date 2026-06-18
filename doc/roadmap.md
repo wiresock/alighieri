@@ -27,7 +27,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
-| **Hostname / domain ACL rules** | High | M | Match `client`/`socks` rules on the requested destination hostname (suffix/glob, e.g. `to: .example.com`) *before* resolution — what operators most often want, and the largest single parity gap. Builds on the existing domain targets and DNS resolver. |
+| ~~**Hostname / domain ACL rules**~~ | — | — | **Shipped** — `socks` rule `to:` accepts `.example.com` (domain + subdomains) and exact hostnames, matched against the requested host before resolution. |
 | **External auth hook** | High | M | Validate credentials via an external command or HTTP webhook, so LDAP / OIDC / corporate auth work without baking each in. Portable across Linux and Windows; covers most PAM use cases indirectly. |
 | **PAM / system auth (Unix)** | Med | M | Native PAM backend for Unix deployments that expect it. Follows the external-auth hook. |
 | **BIND command** | Med | L | RFC 1928 §6 two-stage reverse connect (active FTP, callbacks). Security-sensitive — gated off by default, restricted by `socks` rules. |
@@ -56,13 +56,13 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 
 ## Suggested first wave
 
-Ordered for value-to-effort while leaning into Alighieri's identity:
+Ordered for value-to-effort while leaning into Alighieri's identity
+(~~hostname / domain ACL rules~~ — the first item — has shipped):
 
-1. **Hostname / domain ACL rules** — the biggest parity win.
-2. **PROXY protocol ingress** — cloud leapfrog, small effort.
-3. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
-4. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
-5. **ARM64 builds + container image** — reach and deployability.
+1. **PROXY protocol ingress** — cloud leapfrog, small effort.
+2. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
+3. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
+4. **ARM64 builds + container image** — reach and deployability.
 
 Then: BIND, geo/ASN rules, macOS/BSD first-class, audit/OTel. Deprioritized
 unless requested: SOCKS4, GSSAPI.

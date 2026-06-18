@@ -229,6 +229,13 @@ impl Connection {
             }
         };
 
+        // Hostname the client requested (for `to:` hostname rules), matched
+        // before resolution. `None` for IP-literal requests.
+        let req_host = match &request.dest {
+            TargetAddr::Domain(host, _) => Some(host.as_str()),
+            TargetAddr::Ip(_) => None,
+        };
+
         let candidates = if self.config.dns.try_all {
             targets
         } else {
@@ -239,7 +246,7 @@ impl Connection {
         let mut last_error = None;
         let mut connected = None;
         for target in candidates {
-            let decision = self.authorize_connect_target(target, method);
+            let decision = self.authorize_connect_target(req_host, target, method);
             self.metrics.rule_hit(
                 Scope::Socks,
                 decision.verdict,
@@ -314,12 +321,14 @@ impl Connection {
 
     fn authorize_connect_target(
         &self,
+        host: Option<&str>,
         target: SocketAddr,
         method: crate::config::AuthKind,
     ) -> crate::acl::RuleDecision {
         let ctx = SocksContext {
             client_ip: self.peer.ip(),
             client_port: self.peer.port(),
+            dest_host: host,
             dest_ip: target.ip(),
             dest_port: target.port(),
             command: Command::Connect,
@@ -385,10 +394,11 @@ impl Connection {
         let metrics = self.metrics.clone();
         let client_ip = self.peer.ip();
         let client_port = self.peer.port();
-        let authorize = move |dest_ip: IpAddr, dest_port: u16| -> bool {
+        let authorize = move |host: Option<&str>, dest_ip: IpAddr, dest_port: u16| -> bool {
             let ctx = SocksContext {
                 client_ip,
                 client_port,
+                dest_host: host,
                 dest_ip,
                 dest_port,
                 command: Command::UdpAssociate,

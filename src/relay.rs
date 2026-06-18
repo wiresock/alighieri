@@ -281,7 +281,7 @@ pub async fn run_udp_associate<C, F>(
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
-    F: Fn(IpAddr, u16) -> bool + Send + Sync + 'static,
+    F: Fn(Option<&str>, IpAddr, u16) -> bool + Send + Sync + 'static,
 {
     let relay_socket = Arc::new(relay_socket);
     let outbound = Arc::new(outbound);
@@ -409,7 +409,7 @@ async fn relay_client_to_remote<F>(
     authorize: F,
 ) -> Result<()>
 where
-    F: Fn(IpAddr, u16) -> bool,
+    F: Fn(Option<&str>, IpAddr, u16) -> bool,
 {
     let mut buf = vec![0u8; UDP_BUF];
     let mut recv_errors = 0u32;
@@ -434,20 +434,26 @@ where
         }
         // IP literals — the common case for UDP — skip the resolver and its
         // address-list allocation entirely.
-        let dest = match header.dest {
+        let dest = match &header.dest {
             TargetAddr::Ip(sa) => {
                 if !dns::address_allowed(sa.ip(), &dns_policy) {
                     continue;
                 }
-                sa
+                *sa
             }
-            ref domain => match dns_resolver.resolve_one(domain, &dns_policy).await {
+            domain => match dns_resolver.resolve_one(domain, &dns_policy).await {
                 Ok(Some(sa)) => sa,
                 Ok(None) => continue,
                 Err(_) => continue,
             },
         };
-        if !authorize(dest.ip(), dest.port()) {
+        // Hostname the client requested in the SOCKS UDP header (for `to:`
+        // hostname rules), matched before resolution; `None` for an IP literal.
+        let host = match &header.dest {
+            TargetAddr::Domain(d, _) => Some(d.as_str()),
+            TargetAddr::Ip(_) => None,
+        };
+        if !authorize(host, dest.ip(), dest.port()) {
             continue;
         }
         let _ = client_endpoint.set(src);

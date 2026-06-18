@@ -73,9 +73,12 @@ pub struct ClientContext {
 
 /// Context for evaluating a [`Scope::Socks`] rule (request authorisation).
 #[derive(Debug, Clone, Copy)]
-pub struct SocksContext {
+pub struct SocksContext<'a> {
     pub client_ip: IpAddr,
     pub client_port: u16,
+    /// The hostname the client requested, if it sent a domain rather than an IP
+    /// literal. Matched against `to:` hostname patterns before resolution.
+    pub dest_host: Option<&'a str>,
     pub dest_ip: IpAddr,
     pub dest_port: u16,
     pub command: Command,
@@ -100,10 +103,12 @@ impl Rule {
             && self.to.matches(ctx.proxy_ip, ctx.proxy_port)
     }
 
-    fn matches_socks(&self, ctx: &SocksContext) -> bool {
+    fn matches_socks(&self, ctx: &SocksContext<'_>) -> bool {
         self.scope == Scope::Socks
             && self.from.matches(ctx.client_ip, ctx.client_port)
-            && self.to.matches(ctx.dest_ip, ctx.dest_port)
+            && self
+                .to
+                .matches_dest(ctx.dest_host, ctx.dest_ip, ctx.dest_port)
             && (self.commands.is_empty() || self.commands.contains(&ctx.command))
             && (self.protocols.is_empty() || self.protocols.contains(&ctx.protocol))
             && (self.methods.is_empty() || self.methods.contains(&ctx.method))
@@ -149,12 +154,12 @@ impl RuleSet {
 
     /// Evaluates request authorisation. Returns the matching rule's verdict, or
     /// `Block` if no `socks` rule matches.
-    pub fn evaluate_socks(&self, ctx: &SocksContext) -> Verdict {
+    pub fn evaluate_socks(&self, ctx: &SocksContext<'_>) -> Verdict {
         self.evaluate_socks_detail(ctx).verdict
     }
 
     /// Evaluates request authorisation and includes the matching rule line.
-    pub fn evaluate_socks_detail(&self, ctx: &SocksContext) -> RuleDecision {
+    pub fn evaluate_socks_detail(&self, ctx: &SocksContext<'_>) -> RuleDecision {
         for rule in &self.rules {
             if rule.matches_socks(ctx) {
                 return RuleDecision {
@@ -223,16 +228,60 @@ mod tests {
         }
     }
 
-    fn socks_ctx(dest: &str, cmd: Command) -> SocksContext {
+    fn socks_ctx(dest: &str, cmd: Command) -> SocksContext<'static> {
         SocksContext {
             client_ip: "10.0.0.5".parse().unwrap(),
             client_port: 5000,
+            dest_host: None,
             dest_ip: dest.parse().unwrap(),
             dest_port: 443,
             command: cmd,
             protocol: Protocol::Tcp,
             method: AuthKind::None,
         }
+    }
+
+    fn socks_ctx_host<'a>(host: &'a str, dest: &str, cmd: Command) -> SocksContext<'a> {
+        SocksContext {
+            dest_host: Some(host),
+            ..socks_ctx(dest, cmd)
+        }
+    }
+
+    #[test]
+    fn socks_rule_matches_requested_hostname() {
+        use crate::net::HostPattern;
+        let rs = RuleSet::new(vec![Rule {
+            name: None,
+            verdict: Verdict::Pass,
+            scope: Scope::Socks,
+            from: AddrSpec::any(),
+            to: AddrSpec::host(HostPattern::Suffix("example.com".into()), None),
+            commands: vec![],
+            protocols: vec![],
+            methods: vec![],
+            source_line: 1,
+        }]);
+
+        // The requested host (or a subdomain) is allowed regardless of the IP.
+        assert_eq!(
+            rs.evaluate_socks(&socks_ctx_host(
+                "api.example.com",
+                "203.0.113.7",
+                Command::Connect
+            )),
+            Verdict::Pass
+        );
+        // A different host, even resolving to the same IP, does not match.
+        assert_eq!(
+            rs.evaluate_socks(&socks_ctx_host("evil.com", "203.0.113.7", Command::Connect)),
+            Verdict::Block
+        );
+        // An IP-literal request (no hostname) never matches a hostname rule.
+        assert_eq!(
+            rs.evaluate_socks(&socks_ctx("203.0.113.7", Command::Connect)),
+            Verdict::Block
+        );
     }
 
     #[test]
