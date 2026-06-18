@@ -8,6 +8,7 @@
 //! 5. command execution (CONNECT relay or UDP associate).
 
 use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use crate::config::{Config, Protocol};
 use crate::dns::DnsResolver;
 use crate::errors::{Error, Result};
 use crate::metrics::Metrics;
+use crate::net::PortRange;
 use crate::relay;
 use crate::socks5::{self, Command, Method, Reply, Request, TargetAddr};
 
@@ -335,18 +337,20 @@ impl Connection {
     ) -> Result<()> {
         // The relay socket is bound on the same interface the client reached us
         // on, so the address we advertise is reachable by the client.
-        let relay_socket = match UdpSocket::bind((self.local.ip(), 0)).await {
-            Ok(s) => s,
-            Err(e) => {
-                socks5::write_reply(
-                    &mut self.stream,
-                    Reply::GeneralFailure,
-                    socks5::unspecified_v4(),
-                )
-                .await?;
-                return Err(Error::Io(e));
-            }
-        };
+        let relay_socket =
+            match bind_udp_in_range(self.local.ip(), self.config.udp_port_range).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(peer = %self.peer, error = %e, "failed to bind UDP relay socket");
+                    socks5::write_reply(
+                        &mut self.stream,
+                        Reply::GeneralFailure,
+                        socks5::unspecified_v4(),
+                    )
+                    .await?;
+                    return Err(Error::Io(e));
+                }
+            };
         // The outbound socket carries traffic to/from remote peers, sourced
         // from the configured external address.
         let outbound = match UdpSocket::bind((self.config.external, 0)).await {
@@ -504,6 +508,38 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
     None
 }
 
+/// Binds a UDP relay socket on `ip`. With a configured `range`, scans the
+/// inclusive port range starting from a pseudo-random offset — so concurrent
+/// associations spread across the range instead of contending on its low end,
+/// and the advertised `BND.PORT` is not trivially predictable — and returns
+/// `AddrInUse` if every port in the range is already taken. Without a range it
+/// binds an OS-assigned ephemeral port (the historical default).
+async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<UdpSocket> {
+    let Some(range) = range else {
+        return UdpSocket::bind((ip, 0)).await;
+    };
+    let span = u32::from(range.max - range.min) + 1;
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos())
+        % span;
+    for i in 0..span {
+        let port = range.min + ((start + i) % span) as u16;
+        match UdpSocket::bind((ip, port)).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "no free UDP port in configured udp.portrange {}-{}",
+            range.min, range.max
+        ),
+    ))
+}
+
 /// Establishes an outbound TCP connection to `target`, optionally bound to the
 /// configured `external` source address, subject to `timeout`.
 async fn connect_remote(
@@ -589,5 +625,43 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_udp_in_range_respects_the_configured_range() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // No range -> an ephemeral bind still succeeds (historical default).
+        let any = bind_udp_in_range(ip, None).await.unwrap();
+        assert!(any.local_addr().unwrap().port() > 0);
+
+        // With a range, the bound port falls inside it.
+        let range = PortRange {
+            min: 40000,
+            max: 40063,
+        };
+        let sock = bind_udp_in_range(ip, Some(range)).await.unwrap();
+        let port = sock.local_addr().unwrap().port();
+        assert!(
+            range.contains(port),
+            "bound port {port} is outside {}-{}",
+            range.min,
+            range.max
+        );
+
+        // A fully-occupied (single-port) range reports exhaustion as AddrInUse
+        // rather than panicking or returning an out-of-range port.
+        let occupied = UdpSocket::bind((ip, 0)).await.unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+        let err = bind_udp_in_range(
+            ip,
+            Some(PortRange {
+                min: taken,
+                max: taken,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
 }

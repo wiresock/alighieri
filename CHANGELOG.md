@@ -6,6 +6,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- `udp.portrange` config option to bind the client-facing UDP relay socket (the
+  `BND.PORT` advertised in the UDP ASSOCIATE reply) within a fixed inclusive
+  port range instead of an OS-assigned ephemeral port, so the inbound UDP ports
+  can be opened predictably on a firewall. Unset keeps the previous ephemeral
+  behaviour.
+
 ## [0.1.0] - 2026-06-17
 
 Initial public release. Dual-licensed under `AGPL-3.0-or-later`, with a

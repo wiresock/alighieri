@@ -232,6 +232,7 @@ socks pass "allow-default" {
 | `handshaketimeout` | `10`            | Seconds to wait for SOCKS greeting/auth/request      |
 | `iotimeout`        | `0` (disabled)  | Idle timeout for established TCP relays (seconds)    |
 | `udptimeout`       | `60`            | Idle timeout for UDP associations (seconds)          |
+| `udp.portrange`    | —               | Bind the client-facing UDP relay port (`BND.PORT`) within a fixed `MIN-MAX` range for firewalling; unset uses an ephemeral port |
 | `maxconnections`   | `1024`          | Maximum concurrent client TCP connections            |
 | `logoutput`        | `stdout`        | One or more of `stdout`, `stderr`, `file`            |
 | `logfile`          | —               | File path used when `logoutput` includes `file`      |

@@ -172,6 +172,11 @@ pub struct Config {
     pub io_timeout: Duration,
     /// Idle timeout for UDP associations.
     pub udp_timeout: Duration,
+    /// Inclusive UDP port range for the client-facing relay socket (the
+    /// `BND.PORT` advertised in the ASSOCIATE reply, where clients send their
+    /// datagrams). `None` lets the OS pick an ephemeral port. Useful for
+    /// firewalling: open exactly this range to the proxy for inbound UDP.
+    pub udp_port_range: Option<PortRange>,
     /// Path to the username/password database (required if `username` is
     /// offered as a method).
     pub userlist: Option<PathBuf>,
@@ -351,6 +356,7 @@ struct Builder {
     handshake_timeout: Option<Duration>,
     io_timeout: Option<Duration>,
     udp_timeout: Option<Duration>,
+    udp_port_range: Option<PortRange>,
     userlist: Option<PathBuf>,
     auth_cache_ttl: Option<Option<Duration>>,
     max_connections: Option<usize>,
@@ -433,6 +439,7 @@ impl Builder {
             udp_timeout: self
                 .udp_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_UDP_TIMEOUT_SECS)),
+            udp_port_range: self.udp_port_range,
             userlist: self.userlist,
             auth_cache_ttl: self
                 .auth_cache_ttl
@@ -489,6 +496,22 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "udptimeout" | "udp.timeout" => {
             b.udp_timeout = Some(Duration::from_secs(parse_u64(vals, lineno)?));
+        }
+        "udpportrange" | "udp.portrange" => {
+            if vals.is_empty() {
+                return Err(cfg_err(
+                    lineno,
+                    "udp.portrange requires a value (MIN-MAX or a single PORT)",
+                ));
+            }
+            let spec = vals.join(" ");
+            let range: PortRange = spec
+                .parse()
+                .map_err(|e| cfg_err(lineno, &format!("invalid udp.portrange '{spec}': {e}")))?;
+            if range.min == 0 {
+                return Err(cfg_err(lineno, "udp.portrange must not include port 0"));
+            }
+            b.udp_port_range = Some(range);
         }
         "userlist" => {
             if vals.is_empty() {
@@ -1662,6 +1685,45 @@ socks pass "" { command: connect }"#,
     fn unknown_keyword_rejected() {
         let err = Config::parse("internal: 0.0.0.0 port = 1080\nbogus: 1").unwrap_err();
         assert!(err.to_string().contains("unknown keyword 'bogus'"));
+    }
+
+    #[test]
+    fn udp_port_range_parses_with_default_none() {
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080").unwrap();
+        assert_eq!(cfg.udp_port_range, None);
+
+        let cfg =
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.portrange: 20000-21000").unwrap();
+        assert_eq!(
+            cfg.udp_port_range,
+            Some(PortRange {
+                min: 20000,
+                max: 21000
+            })
+        );
+
+        // The concatenated alias and the single-port form both work.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudpportrange: 30000").unwrap();
+        assert_eq!(
+            cfg.udp_port_range,
+            Some(PortRange {
+                min: 30000,
+                max: 30000
+            })
+        );
+    }
+
+    #[test]
+    fn udp_port_range_rejects_invalid() {
+        for bad in [
+            "udp.portrange:",             // missing value
+            "udp.portrange: 0-100",       // includes the ephemeral sentinel 0
+            "udp.portrange: 21000-20000", // min > max
+            "udp.portrange: nope",        // not a number
+        ] {
+            let src = format!("internal: 0.0.0.0 port = 1080\n{bad}");
+            assert!(Config::parse(&src).is_err(), "expected error for: {bad}");
+        }
     }
 
     #[test]
