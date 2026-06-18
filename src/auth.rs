@@ -285,22 +285,43 @@ impl CommandAuth {
                 return false;
             }
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let payload = format!("{username}\n{password}\n");
-            let _ = stdin.write_all(payload.as_bytes()).await;
-            // `stdin` is dropped here, closing the pipe so the command sees EOF.
+        // Hand both credential lines to the child. If the stdin pipe is missing
+        // or the write fails (the verifier exited or closed stdin before reading
+        // them), the credentials were never delivered, so fail closed rather
+        // than trust a status the verifier produced without seeing them.
+        let delivered = match child.stdin.take() {
+            Some(mut stdin) => {
+                use tokio::io::AsyncWriteExt;
+                let payload = format!("{username}\n{password}\n");
+                stdin.write_all(payload.as_bytes()).await.is_ok()
+                // `stdin` is dropped here, closing the pipe so the command sees EOF.
+            }
+            None => false,
+        };
+        if !delivered {
+            reap(&mut child).await;
+            return false;
         }
         match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(status)) => status.success(),
             Ok(Err(_)) => false,
             Err(_) => {
-                // Timed out: kill the child so it does not linger.
-                let _ = child.start_kill();
+                // Timed out: kill and reap the child so it neither lingers nor
+                // is left as a zombie awaiting a `wait()`.
+                reap(&mut child).await;
                 false
             }
         }
     }
+}
+
+/// Best-effort terminate and reap a child so it neither keeps running nor is
+/// left as a zombie. Bounded so a child wedged in an uninterruptible state
+/// cannot extend the caller; `kill_on_drop` still reaps it eventually in that
+/// case.
+async fn reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
 }
 
 /// Remembers recently verified credentials so repeat handshakes skip the
@@ -837,8 +858,10 @@ mod tests {
         // proving the command was not re-run.
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
+        // Drain stdin first, as a real verifier consuming the credentials does,
+        // then allow only on the first run.
         let auth = sh_auth(&format!(
-            "[ ! -e '{m}' ] && touch '{m}'",
+            "cat >/dev/null; [ ! -e '{m}' ] && touch '{m}'",
             m = marker.display()
         ));
         let ttl = Some(Duration::from_secs(60));

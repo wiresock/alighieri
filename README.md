@@ -455,6 +455,13 @@ framing unambiguous. Successful results are cached exactly like the userlist
 (`auth.cachettl`), and with `auth.command` set the `username` method no longer
 requires a `userlist`.
 
+The value is split on whitespace into the program path and its arguments, with
+no quoting — so a program path that itself contains spaces (for example
+`C:\Program Files\...`) cannot be expressed directly. Point `auth.command` at a
+space-free wrapper script (the usual pattern anyway, since the verifier
+typically shells out to `ldapsearch`, `curl`, `pamtester`, and the like) and put
+the real path inside it.
+
 ### Hot reload
 
 On Unix, send SIGHUP to reload the configuration without restarting the
