@@ -41,6 +41,11 @@ const MAX_CONCURRENT_PASSWORD_VERIFICATIONS: usize = 4;
 /// CPU-bound `MAX_CONCURRENT_PASSWORD_VERIFICATIONS`; excess handshakes wait for
 /// a slot and are denied if they cannot obtain one within the handshake timeout.
 const MAX_CONCURRENT_AUTH_COMMANDS: usize = 64;
+/// Upper bound on how long the detached reaper waits for a killed verifier child
+/// to terminate before giving up. A SIGKILLed process dies almost immediately;
+/// this only guards against one briefly stuck uninterruptibly, after which the
+/// `Child` handle is dropped and tokio's orphan queue reaps anything slower.
+const REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RFC1929_FIELD_MAX: usize = u8::MAX as usize;
 const MAX_VERIFIED_CACHE_ENTRIES: usize = 1024;
 /// Cache tags use a deliberately cheap Argon2 instance (microseconds): the
@@ -369,10 +374,15 @@ impl Drop for ChildReaper {
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = child.wait().await;
+                    // Reap the killed child, but bounded: a process briefly stuck
+                    // uninterruptibly must not hang this task forever — that would
+                    // also pin the `Child` handle and stop `kill_on_drop` from ever
+                    // running. On timeout `child` drops here, so `kill_on_drop`
+                    // plus tokio's orphan queue take over the reap.
+                    let _ = tokio::time::timeout(REAP_WAIT_TIMEOUT, child.wait()).await;
                 });
             }
-            // Otherwise `child` drops here and `kill_on_drop` plus tokio's orphan
+            // With no runtime, `child` drops now; `kill_on_drop` plus the orphan
             // queue reap it.
         }
     }
