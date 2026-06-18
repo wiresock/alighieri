@@ -227,6 +227,7 @@ socks pass "allow-default" {
 | `include`          | —               | Include another config file or final-component glob  |
 | `internal`         | — (required)    | Listening address (`IP port = N` or `IP:PORT`)       |
 | `external`         | `0.0.0.0`       | Source address for outbound connections              |
+| `proxyprotocol`    | —               | Trusted upstream CIDR(s) allowed to send a PROXY protocol (v1/v2) header; the real client address then drives rules/limits/logs. Unset disables it |
 | `socksmethod`      | `none`          | Offered auth methods (`none`, `username`)            |
 | `userlist`         | —               | Path to `username:password-or-hash` file             |
 | `auth.cachettl`    | `300`           | Reuse successful credential checks for this many seconds (`0` disables) |
@@ -256,6 +257,19 @@ socks pass "allow-default" {
 When `logfile` is set, file logging is enabled even if `file` is omitted from
 `logoutput`. Size suffixes accept bytes or `K`, `KB`, `KiB`, `M`, `MB`, `MiB`,
 `G`, `GB`, and `GiB`.
+
+When Alighieri runs behind a TCP load balancer (HAProxy, nginx `stream`, an
+AWS/GCP Network Load Balancer), set `proxyprotocol` to the balancer's address
+range so the original client address is recovered from the PROXY protocol header
+it prepends:
+
+```conf
+proxyprotocol: 10.0.0.0/8        # one or more trusted upstream CIDRs
+```
+
+Both v1 (text) and v2 (binary) are accepted. Only connections from the listed
+CIDRs are trusted (and must send a header); any other source is rejected, so a
+client cannot forge its address — keep the listener firewalled to the balancer.
 
 `include` loads additional configuration files before continuing with the
 current file. Relative include paths are resolved from the file that declares

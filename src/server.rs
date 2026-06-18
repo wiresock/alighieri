@@ -165,7 +165,7 @@ impl Server {
                 }
             };
 
-            let (stream, peer) = match self.listener.accept().await {
+            let (mut stream, peer) = match self.listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
                     // Transient accept errors (e.g. EMFILE) should not kill the
@@ -186,16 +186,32 @@ impl Server {
                 }
             };
 
-            let client_permit = match self.abuse.admit(peer.ip()) {
-                Ok(permit) => permit,
-                Err(reason) => {
-                    self.metrics.rate_limited();
-                    warn!(peer = %peer, reason = reason.as_str(), "connection rejected by rate limit");
-                    drop(permit);
-                    continue;
-                }
+            // Snapshot the live config up front: the PROXY-protocol gate needs
+            // the trusted-upstream set and the connection task needs the rest.
+            let state = self.state.read().await;
+            let config = state.config.clone();
+            let users = state.users.clone();
+            let dns_resolver = state.dns_resolver.clone();
+            drop(state);
+
+            // PROXY-protocol admission gate. The cheap source-IP check is done
+            // here; the header read itself is deferred to the task so a silent
+            // upstream cannot stall the accept loop. When enabled, only trusted
+            // upstreams may connect — a direct client must not reach this
+            // listener, or it could forge its advertised source address.
+            let expect_proxy = if config.proxy_protocol.is_empty() {
+                false
+            } else if config
+                .proxy_protocol
+                .iter()
+                .any(|cidr| cidr.contains(peer.ip()))
+            {
+                true
+            } else {
+                warn!(peer = %peer, "rejecting connection: proxyprotocol is enabled and the source is not a trusted upstream");
+                drop(permit);
+                continue;
             };
-            self.metrics.accepted_connection();
 
             // Disable Nagle's algorithm: proxied interactive traffic benefits
             // from low latency more than from coalescing.
@@ -203,17 +219,51 @@ impl Server {
                 debug!(peer = %peer, error = %e, "failed to set TCP_NODELAY");
             }
 
-            let state = self.state.read().await;
-            let config = state.config.clone();
-            let users = state.users.clone();
-            let dns_resolver = state.dns_resolver.clone();
-            drop(state);
             let metrics = self.metrics.clone();
             let tls_acceptor = self.tls_acceptor.clone();
             let abuse = self.abuse.clone();
-            let byte_recorder = client_permit.byte_recorder();
             let handshake_timeout = config.handshake_timeout;
             tokio::spawn(async move {
+                // Resolve the real client address from a trusted upstream's
+                // PROXY header before admitting and handling the connection.
+                let peer = if expect_proxy {
+                    match tokio::time::timeout(
+                        handshake_timeout,
+                        crate::proxy_protocol::read_header(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(real))) => real,
+                        // LOCAL / UNSPEC (e.g. a health check): keep the peer.
+                        Ok(Ok(None)) => peer,
+                        Ok(Err(e)) => {
+                            debug!(peer = %peer, error = %e, "invalid PROXY protocol header; dropping");
+                            drop(permit);
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(peer = %peer, "PROXY protocol header timed out; dropping");
+                            drop(permit);
+                            return;
+                        }
+                    }
+                } else {
+                    peer
+                };
+
+                // Per-client abuse admission, keyed on the real client address.
+                let client_permit = match abuse.admit(peer.ip()) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        metrics.rate_limited();
+                        warn!(peer = %peer, reason = reason.as_str(), "connection rejected by rate limit");
+                        drop(permit);
+                        return;
+                    }
+                };
+                metrics.accepted_connection();
+                let byte_recorder = client_permit.byte_recorder();
+
                 let resources = ConnectionResources {
                     config,
                     users,
