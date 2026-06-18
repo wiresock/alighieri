@@ -8,6 +8,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- `proxyprotocol` config option: accept the PROXY protocol (v1 text and v2
+  binary) from trusted upstream load balancers (HAProxy, nginx, AWS/GCP NLBs),
+  so `client` rules, abuse limits, metrics, and logs key on the real client
+  address rather than the balancer. Only connections from the configured trusted
+  CIDRs are honoured — and required to carry a header — while others are
+  rejected, which prevents source-address spoofing.
 - `socks` rule `to:` selectors now accept hostname patterns: `.example.com`
   matches the domain and all subdomains, and a bare `example.com` matches that
   exact host. They are matched against the requested destination *before* DNS

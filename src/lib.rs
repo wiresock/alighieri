@@ -30,6 +30,7 @@ pub mod errors;
 pub mod metrics;
 pub mod net;
 pub mod platform;
+pub mod proxy_protocol;
 pub mod relay;
 pub mod runtime;
 pub mod server;

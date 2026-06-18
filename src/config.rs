@@ -162,6 +162,12 @@ pub struct Config {
     /// Local address used as the source for outbound connections
     /// (Dante `external`). `0.0.0.0` lets the OS choose.
     pub external: IpAddr,
+    /// Trusted upstream CIDRs permitted to send a PROXY protocol header. Empty
+    /// disables PROXY protocol. When non-empty, a connection from a listed
+    /// source must begin with a v1/v2 header (its advertised client address then
+    /// drives rules, abuse limits, metrics, and logs), and connections from any
+    /// other source are rejected.
+    pub proxy_protocol: Vec<Cidr>,
     /// Authentication methods offered to clients, in preference order.
     pub socks_methods: Vec<AuthKind>,
     /// Maximum time allowed to establish an outbound connection.
@@ -351,6 +357,7 @@ pub const DEFAULT_LOG_ROTATE_KEEP: usize = 5;
 struct Builder {
     internal: Option<SocketAddr>,
     external: Option<IpAddr>,
+    proxy_protocol: Option<Vec<Cidr>>,
     socks_methods: Option<Vec<AuthKind>>,
     connect_timeout: Option<Duration>,
     handshake_timeout: Option<Duration>,
@@ -428,6 +435,7 @@ impl Builder {
         Ok(Config {
             internal,
             external: self.external.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            proxy_protocol: self.proxy_protocol.unwrap_or_default(),
             socks_methods,
             connect_timeout: self
                 .connect_timeout
@@ -479,6 +487,22 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
     match key {
         "internal" => b.internal = Some(parse_endpoint(vals, lineno)?),
         "external" => b.external = Some(parse_ip(vals, lineno)?),
+        "proxyprotocol" | "proxy.protocol" => {
+            if vals.is_empty() {
+                return Err(cfg_err(
+                    lineno,
+                    "proxyprotocol requires at least one trusted upstream CIDR",
+                ));
+            }
+            let mut cidrs = Vec::with_capacity(vals.len());
+            for v in vals {
+                let cidr: Cidr = v.parse().map_err(|e| {
+                    cfg_err(lineno, &format!("invalid proxyprotocol CIDR '{v}': {e}"))
+                })?;
+                cidrs.push(cidr);
+            }
+            b.proxy_protocol = Some(cidrs);
+        }
         "socksmethod" | "clientmethod" => {
             // clientmethod is accepted for Dante familiarity; Alighieri performs
             // authentication at the SOCKS layer, so both populate the offered
@@ -1787,6 +1811,27 @@ socks pass "" { command: connect }"#,
             let src = format!("internal: 0.0.0.0 port = 1080\n{bad}");
             assert!(Config::parse(&src).is_err(), "expected error for: {bad}");
         }
+    }
+
+    #[test]
+    fn proxyprotocol_parses_trusted_cidrs() {
+        let cfg = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nproxyprotocol: 10.0.0.0/8 192.168.0.0/16",
+        )
+        .unwrap();
+        assert_eq!(cfg.proxy_protocol.len(), 2);
+        assert!(cfg.proxy_protocol[0].contains("10.1.2.3".parse().unwrap()));
+        assert!(cfg.proxy_protocol[1].contains("192.168.5.5".parse().unwrap()));
+
+        // Disabled by default.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080").unwrap();
+        assert!(cfg.proxy_protocol.is_empty());
+    }
+
+    #[test]
+    fn proxyprotocol_rejects_empty_or_invalid() {
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080\nproxyprotocol:").is_err());
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080\nproxyprotocol: not-a-cidr").is_err());
     }
 
     #[test]

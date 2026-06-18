@@ -1043,3 +1043,53 @@ socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
         assert_eq!(&echoed, b"after reload");
     }
 }
+
+/// A config that trusts `trusted` for PROXY protocol and only admits
+/// `allowed_client` at the `client` rule, so admission proves which address is
+/// used for rule evaluation.
+fn proxy_protocol_config(trusted: &str, allowed_client: &str) -> Config {
+    Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+proxyprotocol: {trusted}
+client pass {{ from: {allowed_client} to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
+"#
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn proxy_protocol_v1_uses_real_client_for_rules() {
+    // Trust loopback as the upstream, but only admit the PROXY-advertised client
+    // IP (203.0.113.5) — not the loopback transport peer. A successful connect
+    // proves the header address drives `client`-rule evaluation.
+    let (_proxy, proxy_addr) =
+        start_proxy_with_config(proxy_protocol_config("127.0.0.0/8", "203.0.113.5/32")).await;
+
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = target.accept().await;
+    });
+
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP4 203.0.113.5 127.0.0.1 40000 1080\r\n")
+        .await
+        .unwrap();
+    handshake_noauth(&mut stream).await;
+    request_connect(&mut stream, target_addr).await;
+}
+
+#[tokio::test]
+async fn proxy_protocol_rejects_untrusted_source() {
+    // PROXY protocol is enabled but only 10.0.0.0/8 is trusted; the loopback
+    // test client is not, so the connection is dropped before any handshake.
+    let (_proxy, proxy_addr) =
+        start_proxy_with_config(proxy_protocol_config("10.0.0.0/8", "0.0.0.0/0")).await;
+    let stream = TcpStream::connect(proxy_addr).await.unwrap();
+    expect_connection_closed(stream).await;
+}

@@ -38,7 +38,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
-| **PROXY protocol (v1/v2) ingress** | High | S–M | Run behind a TCP load balancer (HAProxy, cloud NLB) while preserving the real client IP for `client` rules, metrics, and logs. Dante does not do this; high value for cloud deployments. |
+| ~~**PROXY protocol (v1/v2) ingress**~~ | — | — | **Shipped** — `proxyprotocol` accepts v1/v2 headers from trusted upstream CIDRs, keying rules, limits, metrics, and logs on the real client. |
 | **Token-bucket bandwidth throttle** | Med–High | M | Replace/augment the hard fixed-window `ratelimit.byterate` drop cap with a smooth per-client (and per-rule) throttle that *slows* rather than drops/tears down. Strictly better than both today's behaviour and Dante's. |
 | **Geo / ASN access rules** | Med | M | `from`/`to` by country or ASN (optional MaxMind dataset). Modern access control Dante lacks natively. |
 | **Audit log + OpenTelemetry** | Med | S–M | Per-rule metrics, a structured audit stream (who → where, rule hit, bytes), and optional OTel traces. Extends an existing strength. |
@@ -57,12 +57,11 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 ## Suggested first wave
 
 Ordered for value-to-effort while leaning into Alighieri's identity
-(~~hostname / domain ACL rules~~ — the first item — has shipped):
+(~~hostname / domain ACL rules~~ and ~~PROXY protocol ingress~~ have shipped):
 
-1. **PROXY protocol ingress** — cloud leapfrog, small effort.
-2. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
-3. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
-4. **ARM64 builds + container image** — reach and deployability.
+1. **External auth hook** — unlocks LDAP/OIDC/corporate auth portably.
+2. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
+3. **ARM64 builds + container image** — reach and deployability.
 
 Then: BIND, geo/ASN rules, macOS/BSD first-class, audit/OTel. Deprioritized
 unless requested: SOCKS4, GSSAPI.
