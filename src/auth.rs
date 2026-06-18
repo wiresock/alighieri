@@ -28,7 +28,7 @@ use password_hash::{
     rand_core::{OsRng, RngCore},
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::{Error, Result};
 
@@ -227,7 +227,7 @@ pub struct CommandAuth {
     program: String,
     args: Vec<String>,
     verified: VerifiedCache,
-    limiter: Semaphore,
+    limiter: Arc<Semaphore>,
 }
 
 impl CommandAuth {
@@ -240,17 +240,18 @@ impl CommandAuth {
             program: program.clone(),
             args: args.to_vec(),
             verified: VerifiedCache::new(),
-            limiter: Semaphore::new(MAX_CONCURRENT_AUTH_COMMANDS),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_AUTH_COMMANDS)),
         })
     }
 
-    /// Verifies `username`/`password` by running the command, strictly bounded by
-    /// `timeout` over the whole operation — acquiring a concurrency slot, spawning
-    /// the verifier, delivering the credentials, and awaiting its verdict — so the
-    /// call always returns within the deadline (an overrun child is killed and
-    /// reaped out of band). When `cache_ttl` is set, a success is cached so the
-    /// command is not re-run for the same credentials until the entry expires.
-    /// Failures always take the full path, so the cache cannot cheapen brute force.
+    /// Verifies `username`/`password` by running the command. The command
+    /// execution — acquiring a concurrency slot, spawning the verifier, delivering
+    /// the credentials, and awaiting its verdict — is bounded by `timeout` (an
+    /// overrun child is killed and reaped out of band); a cheap cache-tag
+    /// derivation and lookup precede it. When `cache_ttl` is set, a success is
+    /// cached so the command is not re-run for the same credentials until the
+    /// entry expires. Failures always take the full path, so the cache cannot
+    /// cheapen brute force.
     pub async fn verify_async(
         &self,
         username: &str,
@@ -298,9 +299,11 @@ impl CommandAuth {
     async fn run(&self, username: &str, password: &str) -> bool {
         // Cap concurrent verifier processes so a burst of handshakes cannot fork
         // an unbounded number of children. When saturated this awaits a free slot
-        // until the surrounding `timeout` denies the attempt; the permit is held
-        // for the child's whole lifetime and released on return or cancellation.
-        let Ok(_permit) = self.limiter.acquire().await else {
+        // until the surrounding `timeout` denies the attempt. The owned permit is
+        // handed to the guard, which holds it until the child is fully reaped
+        // (including the out-of-band reap after cancellation), so the slot is not
+        // freed while a killed child is still terminating.
+        let Ok(permit) = self.limiter.clone().acquire_owned().await else {
             return false; // The limiter is never closed; fail closed regardless.
         };
         // `verify_async` has already rejected credentials containing a newline or
@@ -316,12 +319,13 @@ impl CommandAuth {
             Ok(child) => child,
             Err(e) => {
                 tracing::warn!(error = %e, program = %self.program, "auth.command failed to spawn");
-                return false;
+                return false; // `permit` drops here, freeing the slot.
             }
         };
         // The guard kills and reaps the child on every exit from here — including
-        // cancellation when the surrounding `timeout` fires mid-run.
-        let mut guard = ChildReaper::new(child);
+        // cancellation when the surrounding `timeout` fires mid-run — and holds
+        // the permit until that reap completes.
+        let mut guard = ChildReaper::new(child, permit);
         // Deliver the two credential lines as separate chunks, so stdin delivery
         // does not allocate one buffer holding both secrets. If delivery fails —
         // the verifier exited or closed stdin before reading them — the
@@ -352,31 +356,42 @@ impl CommandAuth {
     }
 }
 
-/// Owns a spawned verifier child and guarantees it is killed and reaped even if
-/// the future is cancelled (e.g. the verification timeout fires mid-run).
-/// Reaping runs in a detached task so it neither blocks nor extends the caller;
-/// on the normal path the child is awaited directly and the guard disarmed.
-/// `kill_on_drop` backstops the kill if no runtime is available.
-struct ChildReaper(Option<tokio::process::Child>);
+/// Owns a spawned verifier child (and its concurrency permit) and guarantees the
+/// child is killed and reaped even if the future is cancelled (e.g. the
+/// verification timeout fires mid-run). Reaping runs in a detached task so it
+/// neither blocks nor extends the caller; on the normal path the child is
+/// awaited directly and the guard disarmed. The permit is held until the reap
+/// completes, so the concurrency slot is not freed while the child is still
+/// terminating. `kill_on_drop` backstops the kill if no runtime is available.
+struct ChildReaper {
+    child: Option<tokio::process::Child>,
+    permit: Option<OwnedSemaphorePermit>,
+}
 
 impl ChildReaper {
-    fn new(child: tokio::process::Child) -> Self {
-        ChildReaper(Some(child))
+    fn new(child: tokio::process::Child, permit: OwnedSemaphorePermit) -> Self {
+        ChildReaper {
+            child: Some(child),
+            permit: Some(permit),
+        }
     }
 
     fn child(&mut self) -> &mut tokio::process::Child {
-        self.0.as_mut().expect("child present until disarmed")
+        self.child.as_mut().expect("child present until disarmed")
     }
 
-    /// Releases the child once it has already been reaped, making `Drop` a no-op.
+    /// Releases the child and its permit once the child has already been reaped,
+    /// making `Drop` a no-op.
     fn disarm(&mut self) {
-        self.0 = None;
+        self.child = None;
+        self.permit = None;
     }
 }
 
 impl Drop for ChildReaper {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
+            let permit = self.permit.take();
             let _ = child.start_kill();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -386,10 +401,12 @@ impl Drop for ChildReaper {
                     // running. On timeout `child` drops here, so `kill_on_drop`
                     // plus tokio's orphan queue take over the reap.
                     let _ = tokio::time::timeout(REAP_WAIT_TIMEOUT, child.wait()).await;
+                    // Release the concurrency slot only now the child is reaped.
+                    drop(permit);
                 });
             }
-            // With no runtime, `child` drops now; `kill_on_drop` plus the orphan
-            // queue reap it.
+            // With no runtime, `child` and `permit` drop now; `kill_on_drop` plus
+            // the orphan queue reap the child.
         }
     }
 }
