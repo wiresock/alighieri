@@ -195,18 +195,23 @@ impl HostPattern {
             None => (lower, false),
         };
         // Tolerate a single trailing dot so an FQDN like `example.com.` is
-        // accepted in config; the checks below still reject `example.com..`.
+        // accepted in config; the per-label check below still rejects
+        // `example.com..` (which leaves an empty label).
         if domain.ends_with('.') && !domain.ends_with("..") {
             domain.pop();
         }
-        if domain.is_empty()
-            || domain.starts_with('.')
-            || domain.ends_with('.')
-            || domain.contains("..")
-            || !domain
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        {
+        // Every label must be a valid DNS label: 1-63 chars of [a-z0-9-] that
+        // neither starts nor ends with a hyphen. This also rejects empty labels
+        // from consecutive, leading, or trailing dots.
+        let labels_valid = domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+        if !labels_valid {
             return Err(format!("'{token}' is not a valid hostname pattern"));
         }
         Ok(if suffix {
@@ -447,7 +452,16 @@ mod tests {
 
     #[test]
     fn host_pattern_rejects_invalid() {
-        for bad in [".", "", "..", "exam ple.com", "a..b.com", "ex@mple.com"] {
+        for bad in [
+            ".",
+            "",
+            "..",
+            "exam ple.com",
+            "a..b.com",
+            "ex@mple.com",
+            "-example.com", // label may not start with a hyphen
+            "example-.com", // label may not end with a hyphen
+        ] {
             assert!(HostPattern::parse(bad).is_err(), "should reject {bad:?}");
         }
     }

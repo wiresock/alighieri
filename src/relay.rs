@@ -434,14 +434,14 @@ where
         }
         // IP literals — the common case for UDP — skip the resolver and its
         // address-list allocation entirely.
-        let dest = match header.dest {
+        let dest = match &header.dest {
             TargetAddr::Ip(sa) => {
                 if !dns::address_allowed(sa.ip(), &dns_policy) {
                     continue;
                 }
-                sa
+                *sa
             }
-            ref domain => match dns_resolver.resolve_one(domain, &dns_policy).await {
+            domain => match dns_resolver.resolve_one(domain, &dns_policy).await {
                 Ok(Some(sa)) => sa,
                 Ok(None) => continue,
                 Err(_) => continue,

@@ -1052,11 +1052,19 @@ fn parse_addr_spec(vals: &[String], lineno: usize, allow_hosts: bool) -> Result<
     let addr = &vals[0];
     match addr.parse::<Cidr>() {
         Ok(cidr) => Ok(AddrSpec::new(cidr, ports)),
-        Err(_) if allow_hosts => {
-            let pattern = HostPattern::parse(addr)
-                .map_err(|e| cfg_err(lineno, &format!("invalid destination '{addr}': {e}")))?;
-            Ok(AddrSpec::host(pattern, ports))
-        }
+        Err(cidr_err) if allow_hosts => match HostPattern::parse(addr) {
+            Ok(pattern) => Ok(AddrSpec::host(pattern, ports)),
+            // Neither a network nor a hostname: surface both errors so a
+            // mistyped CIDR (e.g. `10.0.0.0/33`) is not mislabelled as a bad
+            // hostname pattern.
+            Err(host_err) => Err(cfg_err(
+                lineno,
+                &format!(
+                    "invalid destination '{addr}': not a network ({cidr_err}) \
+                     or hostname pattern ({host_err})"
+                ),
+            )),
+        },
         Err(cidr_err) => Err(cfg_err(
             lineno,
             &format!(
@@ -1681,6 +1689,15 @@ socks pass {
             "internal: 0.0.0.0 port = 1080\nclient pass { from: 0.0.0.0/0 to: .example.com }"
         )
         .is_err());
+    }
+
+    #[test]
+    fn socks_to_mistyped_cidr_reports_network_error() {
+        // A bad CIDR in a socks `to:` must not be mislabelled as a bad hostname;
+        // the error should mention the network failure too.
+        let err = Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { to: 10.0.0.0/33 }")
+            .unwrap_err();
+        assert!(err.to_string().contains("not a network"), "got: {err}");
     }
 
     #[test]
