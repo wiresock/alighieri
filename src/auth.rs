@@ -216,6 +216,19 @@ impl UserDb {
     }
 }
 
+/// The result of a username/password verification, so a backend timeout is
+/// distinguishable from a wrong-credentials denial at the call site and both
+/// auth backends produce consistent logs and error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Credentials accepted.
+    Allowed,
+    /// Credentials rejected.
+    Denied,
+    /// Verification did not finish within the allotted time.
+    TimedOut,
+}
+
 /// Verifies credentials by invoking an external command (the `auth.command`
 /// hook), so an operator can delegate to LDAP / OIDC / PAM / anything via a
 /// script. The username and password are written to the command's **stdin**
@@ -258,7 +271,7 @@ impl CommandAuth {
         password: &str,
         cache_ttl: Option<Duration>,
         timeout: Duration,
-    ) -> bool {
+    ) -> AuthOutcome {
         // Reject credentials containing the stdin line delimiter (newline) or a
         // NUL up front — before any cache/tag work — so such pathological input
         // can neither reach the command nor waste a tag derivation. RFC 1929
@@ -267,33 +280,35 @@ impl CommandAuth {
             .iter()
             .any(|s| s.contains('\n') || s.contains('\0'))
         {
-            return false;
+            return AuthOutcome::Denied;
         }
         let cached = cache_ttl.and_then(|ttl| Some((self.verified.tag(username, password)?, ttl)));
         if let Some((tag, _)) = &cached {
             if self.verified.check(username, tag, Instant::now()) {
-                return true;
+                return AuthOutcome::Allowed;
             }
         }
         // Bound the entire run — permit acquisition, spawn, credential delivery
         // and the wait for a verdict — by `timeout`. On expiry the in-flight
-        // child is killed and reaped out of band by its guard.
-        let ok = match tokio::time::timeout(timeout, self.run(username, password)).await {
+        // child is killed and reaped out of band by its guard, and the timeout is
+        // surfaced distinctly so callers log it like the userlist path.
+        let allowed = match tokio::time::timeout(timeout, self.run(username, password)).await {
             Ok(ok) => ok,
             Err(_) => {
                 tracing::warn!(program = %self.program, "auth.command timed out");
-                false
+                return AuthOutcome::TimedOut;
             }
         };
-        if ok {
-            if let Some((tag, ttl)) = cached {
-                let now = Instant::now();
-                if let Some(expires_at) = now.checked_add(ttl) {
-                    self.verified.store(username, tag, expires_at, now);
-                }
+        if !allowed {
+            return AuthOutcome::Denied;
+        }
+        if let Some((tag, ttl)) = cached {
+            let now = Instant::now();
+            if let Some(expires_at) = now.checked_add(ttl) {
+                self.verified.store(username, tag, expires_at, now);
             }
         }
-        ok
+        AuthOutcome::Allowed
     }
 
     async fn run(&self, username: &str, password: &str) -> bool {
@@ -908,9 +923,18 @@ mod tests {
         // Reads the username then the password from stdin; allows alice/secret.
         let auth = sh_auth("read u; read p; [ \"$u\" = alice ] && [ \"$p\" = secret ]");
         let t = Duration::from_secs(5);
-        assert!(auth.verify_async("alice", "secret", None, t).await);
-        assert!(!auth.verify_async("alice", "wrong", None, t).await);
-        assert!(!auth.verify_async("bob", "secret", None, t).await);
+        assert_eq!(
+            auth.verify_async("alice", "secret", None, t).await,
+            AuthOutcome::Allowed
+        );
+        assert_eq!(
+            auth.verify_async("alice", "wrong", None, t).await,
+            AuthOutcome::Denied
+        );
+        assert_eq!(
+            auth.verify_async("bob", "secret", None, t).await,
+            AuthOutcome::Denied
+        );
     }
 
     #[cfg(unix)]
@@ -919,10 +943,10 @@ mod tests {
         // A command that always succeeds; the newline in the password must still
         // be rejected before it runs, to keep the stdin framing unambiguous.
         let auth = sh_auth("exit 0");
-        assert!(
-            !auth
-                .verify_async("alice", "sec\nret", None, Duration::from_secs(5))
-                .await
+        assert_eq!(
+            auth.verify_async("alice", "sec\nret", None, Duration::from_secs(5))
+                .await,
+            AuthOutcome::Denied
         );
     }
 
@@ -930,12 +954,13 @@ mod tests {
     #[tokio::test]
     async fn command_auth_times_out() {
         // A verifier that never exits is bounded by CommandAuth's own deadline,
-        // which kills the child (reaping it out of band) and reports failure.
+        // which kills the child (reaping it out of band) and reports the timeout
+        // distinctly so the caller can log it like the userlist path.
         let auth = sh_auth("sleep 5");
-        assert!(
-            !auth
-                .verify_async("alice", "secret", None, Duration::from_millis(100))
-                .await
+        assert_eq!(
+            auth.verify_async("alice", "secret", None, Duration::from_millis(100))
+                .await,
+            AuthOutcome::TimedOut
         );
     }
 
@@ -955,12 +980,14 @@ mod tests {
         ));
         let ttl = Some(Duration::from_secs(60));
         let t = Duration::from_secs(5);
-        assert!(
+        assert_eq!(
             auth.verify_async("alice", "secret", ttl, t).await,
+            AuthOutcome::Allowed,
             "first run"
         );
-        assert!(
+        assert_eq!(
             auth.verify_async("alice", "secret", ttl, t).await,
+            AuthOutcome::Allowed,
             "second call should hit the cache"
         );
     }

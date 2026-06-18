@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::abuse::{AbuseControls, ClientByteRecorder};
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
-use crate::auth::{CommandAuth, UserDb};
+use crate::auth::{AuthOutcome, CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
 use crate::config::{Config, Protocol};
 use crate::dns::DnsResolver;
@@ -145,7 +145,7 @@ impl Connection {
             // the handshake timeout, killing and reaping any overrun child out of
             // band, while the userlist path has no internal deadline and is
             // bounded here.
-            let ok = match &self.command_auth {
+            let outcome = match &self.command_auth {
                 Some(cmd) => {
                     cmd.verify_async(
                         &creds.username,
@@ -162,25 +162,32 @@ impl Connection {
                         self.config.auth_cache_ttl,
                     );
                     match tokio::time::timeout(self.config.handshake_timeout, verify).await {
-                        Ok(ok) => ok,
-                        Err(_) => {
-                            socks5::write_userpass_status(&mut self.stream, false).await?;
-                            self.metrics.auth_failed();
-                            self.record_auth_failure();
-                            warn!(peer = %self.peer, user = %creds.username, "authentication timed out");
-                            return Err(Error::Timeout);
-                        }
+                        Ok(true) => AuthOutcome::Allowed,
+                        Ok(false) => AuthOutcome::Denied,
+                        Err(_) => AuthOutcome::TimedOut,
                     }
                 }
             };
-            socks5::write_userpass_status(&mut self.stream, ok).await?;
-            if !ok {
-                self.metrics.auth_failed();
-                self.record_auth_failure();
-                warn!(peer = %self.peer, user = %creds.username, "authentication failed");
-                return Err(Error::AuthFailed);
+            match outcome {
+                AuthOutcome::Allowed => {
+                    socks5::write_userpass_status(&mut self.stream, true).await?;
+                    debug!(peer = %self.peer, user = %creds.username, "authenticated");
+                }
+                AuthOutcome::Denied => {
+                    socks5::write_userpass_status(&mut self.stream, false).await?;
+                    self.metrics.auth_failed();
+                    self.record_auth_failure();
+                    warn!(peer = %self.peer, user = %creds.username, "authentication failed");
+                    return Err(Error::AuthFailed);
+                }
+                AuthOutcome::TimedOut => {
+                    socks5::write_userpass_status(&mut self.stream, false).await?;
+                    self.metrics.auth_failed();
+                    self.record_auth_failure();
+                    warn!(peer = %self.peer, user = %creds.username, "authentication timed out");
+                    return Err(Error::Timeout);
+                }
             }
-            debug!(peer = %self.peer, user = %creds.username, "authenticated");
         }
 
         // 4. Request.
