@@ -1098,12 +1098,12 @@ async fn proxy_protocol_rejects_untrusted_source() {
 #[tokio::test]
 async fn external_command_auth_gates_username_password() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
 
-    // A verifier script that allows only alice/secret (read from stdin).
-    // Create it under /tmp (space-free) rather than honoring TMPDIR, which may
-    // contain spaces: auth.command is whitespace-split, so a spaced path would
-    // break config parsing and make this test flaky.
+    // A verifier script that allows only alice/secret (read from stdin). Create
+    // it under /tmp (space-free) rather than honoring TMPDIR, which may contain
+    // spaces: auth.command is whitespace-split, so a spaced path would break
+    // config parsing. Invoke it via `/bin/sh <script>` so the test depends on
+    // neither the exec bit nor a non-noexec mount.
     let dir = tempfile::Builder::new()
         .prefix("alighieri-auth")
         .tempdir_in("/tmp")
@@ -1113,18 +1113,17 @@ async fn external_command_auth_gates_username_password() {
         let mut f = std::fs::File::create(&script).unwrap();
         writeln!(
             f,
-            "#!/bin/sh\nread u\nread p\n[ \"$u\" = alice ] && [ \"$p\" = secret ]"
+            "read u\nread p\n[ \"$u\" = alice ] && [ \"$p\" = secret ]"
         )
         .unwrap();
     }
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let cfg = Config::parse(&format!(
         r#"
 internal: 127.0.0.1:0
 external: 127.0.0.1
 socksmethod: username
-auth.command: {}
+auth.command: /bin/sh {}
 client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
 socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
 "#,

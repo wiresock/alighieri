@@ -322,10 +322,11 @@ impl CommandAuth {
         // The guard kills and reaps the child on every exit from here — including
         // cancellation when the surrounding `timeout` fires mid-run.
         let mut guard = ChildReaper::new(child);
-        // Hand both credential lines to the child as separate chunks, so no single
-        // buffer holds both secrets. If delivery fails — the verifier exited or
-        // closed stdin before reading them — the credentials never arrived, so
-        // fail closed rather than trust a status produced without them.
+        // Deliver the two credential lines as separate chunks, so stdin delivery
+        // does not allocate one buffer holding both secrets. If delivery fails —
+        // the verifier exited or closed stdin before reading them — the
+        // credentials never arrived, so fail closed rather than trust a status
+        // produced without them.
         let delivered = match guard.child().stdin.take() {
             Some(mut stdin) => {
                 use tokio::io::AsyncWriteExt;
