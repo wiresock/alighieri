@@ -6,6 +6,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-17
+
 ### Added
 
 - `udp.portrange` config option to bind the client-facing UDP relay socket (the
@@ -53,5 +55,6 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/wiresock/alighieri/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/wiresock/alighieri/releases/tag/v0.1.0

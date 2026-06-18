@@ -1,6 +1,6 @@
 [package]
 name = "alighieri"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server with Dante-inspired configuration"
