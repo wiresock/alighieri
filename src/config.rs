@@ -991,6 +991,7 @@ fn parse_rule(tokens: &[String], lineno: usize) -> Result<Rule> {
     let mut protocols: Vec<Protocol> = Vec::new();
     let mut commands: Vec<Command> = Vec::new();
     let mut methods: Vec<AuthKind> = Vec::new();
+    let mut bandwidth: Option<RateLimit> = None;
 
     let mut idx = 0;
     while idx < body.len() {
@@ -1007,6 +1008,12 @@ fn parse_rule(tokens: &[String], lineno: usize) -> Result<Rule> {
             "protocol" => protocols = parse_protocols(&vals, lineno)?,
             "command" => commands = parse_commands(&vals, lineno)?,
             "method" => methods = parse_methods(&vals, lineno)?,
+            "bandwidth" => {
+                if scope != Scope::Socks {
+                    return Err(cfg_err(lineno, "bandwidth is only valid in a socks rule"));
+                }
+                bandwidth = Some(parse_byte_rate_limit(&vals, lineno, "bandwidth")?);
+            }
             "log" => { /* accepted for familiarity; per-rule logging is implicit */ }
             other => {
                 return Err(cfg_err(
@@ -1026,6 +1033,7 @@ fn parse_rule(tokens: &[String], lineno: usize) -> Result<Rule> {
         commands,
         protocols,
         methods,
+        bandwidth,
         source_line: lineno,
     })
 }
@@ -1063,7 +1071,7 @@ fn unquote_rule_name(name: &str, lineno: usize) -> Result<String> {
 fn is_known_body_key(tok: &str) -> bool {
     matches!(
         tok.trim_end_matches(':').to_ascii_lowercase().as_str(),
-        "from" | "to" | "protocol" | "command" | "method" | "log"
+        "from" | "to" | "protocol" | "command" | "method" | "bandwidth" | "log"
     )
 }
 
@@ -1682,6 +1690,39 @@ socks pass {
             })
         );
         assert_eq!(rule.commands, vec![Command::Connect]);
+    }
+
+    #[test]
+    fn socks_rule_bandwidth_parses() {
+        let cfg = Config::parse(
+            r#"internal: 0.0.0.0 port = 1080
+socks pass {
+    to: 0.0.0.0/0
+    command: connect
+    bandwidth: 5MiB/2
+}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.rules.rules[0].bandwidth,
+            Some(RateLimit {
+                limit: 5 * 1024 * 1024,
+                window: Duration::from_secs(2),
+            })
+        );
+    }
+
+    #[test]
+    fn bandwidth_on_client_rule_is_rejected() {
+        let err = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nclient pass { from: 0.0.0.0/0 bandwidth: 1MiB/1 }",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bandwidth is only valid in a socks rule"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

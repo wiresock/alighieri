@@ -39,7 +39,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
 | ~~**PROXY protocol (v1/v2) ingress**~~ | — | — | **Shipped** — `proxyprotocol` accepts v1/v2 headers from trusted upstream CIDRs, keying rules, limits, metrics, and logs on the real client. |
-| **Token-bucket bandwidth throttle** | Med–High | M | Replace/augment the hard fixed-window `ratelimit.byterate` drop cap with a smooth per-client (and per-rule) throttle that *slows* rather than drops/tears down. Strictly better than both today's behaviour and Dante's. |
+| ~~**Token-bucket bandwidth throttle**~~ | — | — | **Shipped** — `ratelimit.byterate` is now a smooth per-client token-bucket throttle (TCP shaped, UDP policed), plus a per-rule `bandwidth:` selector that throttles each matching CONNECT session. Slows rather than drops/tears down. |
 | **Geo / ASN access rules** | Med | M | `from`/`to` by country or ASN (optional MaxMind dataset). Modern access control Dante lacks natively. |
 | **Audit log + OpenTelemetry** | Med | S–M | Per-rule metrics, a structured audit stream (who → where, rule hit, bytes), and optional OTel traces. Extends an existing strength. |
 | **Transparent / intercept mode (Linux)** | Med | L | TPROXY/redirect ingress so unmodified apps are proxied without SOCKS awareness — the modern answer to Dante's socksify preload library. |
@@ -57,11 +57,10 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 ## Suggested first wave
 
 Ordered for value-to-effort while leaning into Alighieri's identity
-(~~hostname / domain ACL rules~~, ~~PROXY protocol ingress~~, and
-~~external auth hook~~ have shipped):
+(~~hostname / domain ACL rules~~, ~~PROXY protocol ingress~~,
+~~external auth hook~~, and ~~token-bucket bandwidth throttle~~ have shipped):
 
-1. **Token-bucket bandwidth throttle** — fixes the byterate footgun and beats Dante.
-2. **ARM64 builds + container image** — reach and deployability.
+1. **ARM64 builds + container image** — reach and deployability.
 
 Then: BIND, geo/ASN rules, macOS/BSD first-class, audit/OTel. Deprioritized
 unless requested: SOCKS4, GSSAPI.

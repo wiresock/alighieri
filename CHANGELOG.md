@@ -19,6 +19,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Per-rule `bandwidth: BYTES/WINDOW_SECONDS` selector on `socks` rules: throttles
+  each matching CONNECT relay with a per-session token bucket (sustained
+  `BYTES / WINDOW`, burst up to `BYTES`), shaped like `ratelimit.byterate`. A
+  session is bounded by both its per-client `byterate` and the matched rule's
+  limit, whichever is tighter. Valid only in `socks` rules and applied to CONNECT
+  (UDP keeps the per-client limit).
 - `auth.command` external authentication hook: when set, username/password
   verification runs an external program (the username and password are written
   to its stdin; exit `0` allows) instead of the userlist, so credentials can be

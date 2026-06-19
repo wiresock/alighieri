@@ -314,28 +314,29 @@ scope, verdict, and config source line. Named ACL rule hits are also reported
 through `alighieri_rule_named_hits_total`, which adds the optional rule name as
 a label. It also reports rate-limit events.
 
-Optional per-client rate limits use fixed windows and are keyed by source IP:
+Optional per-client abuse controls are keyed by source IP. The connection and
+auth-failure rates use fixed windows; `byterate` is a token-bucket bandwidth
+throttle:
 
 ```conf
 ratelimit.connectionrate: 60/60       # 60 accepted TCP connections per minute
 ratelimit.authfailurerate: 5/300      # 5 failed auth attempts per 5 minutes
 ratelimit.concurrentconnections: 10   # 10 active accepted TCP connections
-ratelimit.byterate: 10MiB/60          # HARD per-window cap (drops UDP / cuts TCP) — see below
+ratelimit.byterate: 10MiB/60          # bandwidth throttle (both directions) — see below
 ```
 
-Rate limit changes are applied on hot reload for new connections and later auth
-failure accounting. Existing relay connections continue with the byte-rate
-settings they accepted under.
+Changes apply on hot reload: the per-client throttle bucket is re-tuned in place
+(so a client's existing flows pick up a new rate), and connection/auth-failure
+accounting updates for new admissions.
 
-> **`ratelimit.byterate` is a hard cap, not a throttle.** It counts relayed
-> bytes (both directions) in a fixed window; once the budget is exhausted it
-> **drops further UDP datagrams until the window resets, and tears down TCP
-> relays** — a sustained flow that exceeds it *stalls* (UDP) or is *cut* (TCP)
-> rather than slowing down. Size it well above your expected sustained
-> throughput × window (a 250 Mbps tunnel moves ~1.8 GiB/min, so `10MiB/60` would
-> stall it within a second), or leave it unset and rely on the connection and
-> concurrency limits plus authentication. A client that trips the cap is logged
-> with a `byte rate limit … exceeded` warning.
+> **`ratelimit.byterate` is a bandwidth throttle, not a hard cap.** The
+> `BYTES/WINDOW_SECONDS` value is a sustained rate (`BYTES / WINDOW`) with a
+> burst up to `BYTES`, metering both directions against one per-client budget.
+> TCP relays are *shaped* — slowed with read backpressure — and UDP datagrams
+> over the rate are *policed* (dropped, since delaying real-time traffic is
+> worse), so a sustained flow is throttled smoothly instead of stalling or being
+> cut. For per-destination throttling, a `socks` rule can add a per-session
+> [`bandwidth`](#rules) limit.
 
 When both `tls.certfile` and `tls.keyfile` are set, Alighieri expects clients to
 complete a TLS handshake before sending the SOCKS5 greeting. SOCKS5 clients
@@ -353,7 +354,7 @@ the request is **denied**.
 
 - `client pass/block { from: CIDR [port = N] to: CIDR [port = N] }` —
   evaluated at connection admission.
-- `socks pass/block { from: CIDR [port = N] to: CIDR|HOSTNAME [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] }` —
+- `socks pass/block { from: CIDR [port = N] to: CIDR|HOSTNAME [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] [bandwidth: BYTES/WINDOW_SECONDS] }` —
   evaluated per SOCKS request.
 
 Rules can optionally be named by placing a single token between the verdict and
@@ -394,6 +395,23 @@ Hostname patterns are valid only in a `socks` rule `to:` — a `from:` selector
 and a `client` rule `to:` stay IP/CIDR-only. An earlier `block { to: 10.0.0.0/8 }`
 still rejects a domain that *resolves* into a denied range, so deny-by-default
 and DNS-rebinding protection are preserved.
+
+A `socks` rule may carry a **`bandwidth: BYTES/WINDOW_SECONDS`** limit that
+throttles each matching **CONNECT** relay (a per-session token bucket: sustained
+`BYTES / WINDOW` with a burst up to `BYTES`). It is enforced like
+`ratelimit.byterate` — the flow is *shaped* (slowed), not torn down — and a
+session is bounded by both its per-client `byterate` and the matched rule's
+limit, whichever is tighter. `bandwidth` is valid only in a `socks` rule and
+applies to CONNECT; UDP keeps the per-client limit.
+
+```conf
+# Throttle each bulk-download session to ~5 MiB/s, leave everything else alone.
+socks pass "downloads" {
+    to: .cdn.example.com port = 443
+    command: connect
+    bandwidth: 5MiB/1
+}
+```
 
 ### Userlist format
 
@@ -727,7 +745,7 @@ version; verify against the version you would deploy.
 | Hot reload | SIGHUP (Unix) + Windows SCM | SIGHUP |
 | Service tooling | systemd install/upgrade/uninstall script; Windows Service | distro init/systemd packaging |
 | Config wizard / validation | loopback wizard, `--check`, `--check --json` | startup config check |
-| Per-client abuse limits | connection-rate, auth-failure-rate, concurrency, byterate cap | session limits (+ bandwidth in some builds) |
+| Bandwidth / abuse limits | connection-rate, auth-failure-rate, concurrency, token-bucket throttle (per-client `byterate` + per-rule `bandwidth`) | session limits (+ bandwidth in some builds) |
 
 **Security & project**
 
