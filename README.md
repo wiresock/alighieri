@@ -45,7 +45,8 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **DNS policy controls** for address-family preference, caching, and unsafe ranges
 - **Prometheus-style metrics** on an optional local HTTP endpoint
 - **Optional TLS listener** for clients that can wrap SOCKS5 in TLS
-- **Per-client abuse controls** for connection, auth failure, and byte rates
+- **Per-client abuse controls** for connection and auth-failure rates, plus a
+  token-bucket **bandwidth throttle** (TCP shaped, UDP policed)
 - **Windows Event Log** service lifecycle and startup failure events
 - **Hot reload** for policy, DNS, timeout, auth, and userlist changes
 - **Configuration wizard** — generate or edit a config from a short-lived, loopback-only web UI
@@ -253,7 +254,7 @@ socks pass "allow-default" {
 | `ratelimit.connectionrate` | —        | Per-client TCP accepts as `COUNT/WINDOW_SECONDS`     |
 | `ratelimit.authfailurerate` | —       | Per-client auth failures as `COUNT/WINDOW_SECONDS`   |
 | `ratelimit.concurrentconnections` | —  | Per-client concurrent accepted TCP connections       |
-| `ratelimit.byterate` | —             | Per-client relayed-byte **hard cap** (both directions) as `BYTES/WINDOW_SECONDS` |
+| `ratelimit.byterate` | —             | Per-client bandwidth **throttle** (both directions) as `BYTES/WINDOW_SECONDS`: TCP is shaped (slowed), UDP policed (excess dropped) |
 
 When `logfile` is set, file logging is enabled even if `file` is omitted from
 `logoutput`. Size suffixes accept bytes or `K`, `KB`, `KiB`, `M`, `MB`, `MiB`,
@@ -453,7 +454,9 @@ anything else, or a timeout, denies it. The script should read with `read -r`,
 and credentials containing a newline or NUL byte are rejected to keep the
 framing unambiguous. Successful results are cached exactly like the userlist
 (`auth.cachettl`), and with `auth.command` set the `username` method no longer
-requires a `userlist`.
+requires a `userlist`. To bound resource use, at most 64 verifier processes run
+concurrently; under a heavier burst the excess waits for a slot and is denied
+(treated as a timeout) if it cannot start within the handshake timeout.
 
 The value is split on whitespace into the program path and its arguments, with
 no quoting — so a program path that itself contains spaces (for example

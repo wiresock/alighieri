@@ -1,0 +1,336 @@
+//! Token-bucket bandwidth throttling.
+//!
+//! A [`TokenBucket`] meters bytes: it refills at a fixed rate (bytes per second)
+//! up to a capacity (the burst allowance). Two enforcement styles use it:
+//!
+//! - **Shaping** (TCP): [`Throttle::reserve`] returns how long to wait until the
+//!   requested bytes are covered; the caller sleeps, so the relay *slows* — the
+//!   read loop pauses and TCP backpressure builds — instead of tearing the
+//!   connection down.
+//! - **Policing** (UDP): [`Throttle::police`] consumes without waiting and tells
+//!   the caller to drop the datagram when the bucket cannot cover it, because
+//!   delaying a real-time datagram is worse than dropping it.
+//!
+//! A [`Throttle`] groups the buckets governing one flow (for example a
+//! per-client bucket and, later, a per-rule bucket); the flow must satisfy every
+//! bucket, so the effective limit is the most restrictive one.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A token bucket metering bytes.
+#[derive(Debug)]
+pub struct TokenBucket {
+    /// Maximum tokens (the burst allowance), in bytes.
+    capacity: f64,
+    /// Refill rate, in bytes per second.
+    rate: f64,
+    /// Current tokens, in bytes. May go negative under [`TokenBucket::reserve`]
+    /// to represent bytes promised but not yet refilled, so successive
+    /// reservations queue in order.
+    tokens: f64,
+    /// When `tokens` was last refilled.
+    last: Instant,
+}
+
+impl TokenBucket {
+    /// Creates a bucket that refills at `rate` bytes/sec up to `capacity` bytes,
+    /// starting full so an initially idle client may burst up to `capacity`.
+    pub fn new(rate: f64, capacity: f64, now: Instant) -> Self {
+        TokenBucket {
+            capacity,
+            rate,
+            tokens: capacity,
+            last: now,
+        }
+    }
+
+    /// Builds a bucket from a `BYTES/WINDOW` limit: it sustains `bytes / window`
+    /// per second and bursts up to `bytes`. Returns `None` for a degenerate
+    /// limit (zero bytes or window) that cannot define a rate.
+    pub fn from_rate_window(bytes: u64, window: Duration, now: Instant) -> Option<Self> {
+        let secs = window.as_secs_f64();
+        if bytes == 0 || secs <= 0.0 {
+            return None;
+        }
+        Some(TokenBucket::new(bytes as f64 / secs, bytes as f64, now))
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// Reserves `bytes` for shaping, returning how long the caller should wait
+    /// before sending them. Tokens may go negative so that back-to-back
+    /// reservations queue in order and the long-run rate is held to `rate`.
+    fn reserve(&mut self, bytes: u64, now: Instant) -> Duration {
+        self.refill(now);
+        self.tokens -= bytes as f64;
+        if self.tokens >= 0.0 || self.rate <= 0.0 {
+            Duration::ZERO
+        } else {
+            // A degenerate (tiny) rate can make the wait overflow `Duration`;
+            // `from_secs_f64` would panic, so fall back to the maximum wait.
+            Duration::try_from_secs_f64(-self.tokens / self.rate).unwrap_or(Duration::MAX)
+        }
+    }
+
+    /// Refills and reports whether `bytes` are available now, without consuming
+    /// them — the peek half of policing.
+    fn has(&mut self, bytes: u64, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= bytes as f64
+    }
+
+    /// Consumes `bytes` a prior [`TokenBucket::has`] confirmed are available.
+    fn take(&mut self, bytes: u64) {
+        self.tokens -= bytes as f64;
+    }
+
+    /// Re-tunes the bucket to a new `BYTES/WINDOW` limit in place, so a config
+    /// reload applies to a client's existing (shared) bucket. Current tokens are
+    /// clamped to the new capacity; a degenerate limit is ignored.
+    pub fn update_rate_window(&mut self, bytes: u64, window: Duration, now: Instant) {
+        let secs = window.as_secs_f64();
+        if bytes == 0 || secs <= 0.0 {
+            return;
+        }
+        // Credit elapsed time at the old rate before switching, so the new rate
+        // only governs time after the reload (otherwise the next refill would
+        // apply it retroactively to the whole gap since `last`).
+        self.refill(now);
+        self.rate = bytes as f64 / secs;
+        self.capacity = bytes as f64;
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
+    /// Refills and reports whether the bucket is full (no outstanding debt), so
+    /// a caller can tell an idle bucket from one still owing throttled bytes.
+    pub fn is_full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= self.capacity
+    }
+}
+
+/// The token buckets governing one relayed flow. A flow must satisfy every
+/// bucket, so the effective limit is the most restrictive one. An empty
+/// `Throttle` imposes no limit.
+#[derive(Clone, Default)]
+pub struct Throttle {
+    buckets: Vec<Arc<Mutex<TokenBucket>>>,
+}
+
+impl Throttle {
+    /// An unlimited throttle (no buckets).
+    pub fn new() -> Self {
+        Throttle::default()
+    }
+
+    /// Adds a bucket the flow must satisfy. Order does not matter:
+    /// [`Throttle::police`] locks buckets in a canonical (pointer) order, so
+    /// throttles sharing buckets cannot deadlock regardless of insertion order.
+    /// A duplicate of an already-added bucket is ignored, so `police` never locks
+    /// the same mutex twice (a self-deadlock) or double-charges it.
+    pub fn with_bucket(mut self, bucket: Arc<Mutex<TokenBucket>>) -> Self {
+        if !self.buckets.iter().any(|b| Arc::ptr_eq(b, &bucket)) {
+            self.buckets.push(bucket);
+        }
+        self
+    }
+
+    /// True when no bucket limits the flow.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Reserves `bytes` across every bucket for shaping, returning how long the
+    /// caller must wait before forwarding them (zero when within budget). The
+    /// caller does the sleeping, so it can stay responsive during a long wait
+    /// (e.g. refresh an idle clock) instead of blocking on one opaque sleep.
+    pub fn reserve(&self, bytes: u64) -> Duration {
+        let now = Instant::now();
+        let mut wait = Duration::ZERO;
+        for bucket in &self.buckets {
+            let mut bucket = bucket.lock().unwrap_or_else(|e| e.into_inner());
+            wait = wait.max(bucket.reserve(bytes, now));
+        }
+        wait
+    }
+
+    /// Polices a UDP datagram: returns `true` to forward (consuming `bytes` from
+    /// every bucket) or `false` to drop it when any bucket is short.
+    /// Consumption is all-or-nothing, so a dropped datagram costs no tokens.
+    pub fn police(&self, bytes: u64) -> bool {
+        let now = Instant::now();
+        match self.buckets.as_slice() {
+            // Fast paths: the UDP hot path is almost always 0 or 1 bucket, so
+            // avoid allocating a guard vector for them.
+            [] => true,
+            [bucket] => {
+                let mut bucket = bucket.lock().unwrap_or_else(|e| e.into_inner());
+                if bucket.has(bytes, now) {
+                    bucket.take(bytes);
+                    true
+                } else {
+                    false
+                }
+            }
+            buckets => {
+                // Lock in a canonical (pointer) order so two throttles holding
+                // the same buckets in different sequences cannot deadlock.
+                let mut ordered: Vec<&Arc<Mutex<TokenBucket>>> = buckets.iter().collect();
+                ordered.sort_unstable_by_key(|b| Arc::as_ptr(b) as usize);
+                let mut guards: Vec<_> = ordered
+                    .iter()
+                    .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()))
+                    .collect();
+                if guards.iter_mut().all(|g| g.has(bytes, now)) {
+                    for g in guards.iter_mut() {
+                        g.take(bytes);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket(rate: f64, capacity: f64) -> Arc<Mutex<TokenBucket>> {
+        Arc::new(Mutex::new(TokenBucket::new(rate, capacity, Instant::now())))
+    }
+
+    #[test]
+    fn from_rate_window_rejects_degenerate_limits() {
+        let now = Instant::now();
+        assert!(TokenBucket::from_rate_window(0, Duration::from_secs(1), now).is_none());
+        assert!(TokenBucket::from_rate_window(10, Duration::ZERO, now).is_none());
+        assert!(TokenBucket::from_rate_window(10, Duration::from_secs(1), now).is_some());
+    }
+
+    #[test]
+    fn reserve_is_free_within_burst_then_charges_time() {
+        let now = Instant::now();
+        // 100 B/s, burst 100 B.
+        let mut b = TokenBucket::new(100.0, 100.0, now);
+        // The first 100 bytes fit in the burst and cost no wait.
+        assert_eq!(b.reserve(100, now), Duration::ZERO);
+        // The next 50 bytes must wait ~0.5s for the refill.
+        let wait = b.reserve(50, now);
+        assert!(
+            (wait.as_secs_f64() - 0.5).abs() < 1e-6,
+            "unexpected wait {wait:?}"
+        );
+    }
+
+    #[test]
+    fn update_rate_window_retunes_in_place() {
+        let now = Instant::now();
+        let mut b = TokenBucket::new(100.0, 100.0, now);
+        let _ = b.reserve(100, now); // empty the burst
+                                     // Re-tune to a faster rate and larger burst; the outstanding debt stays.
+        b.update_rate_window(1000, Duration::from_secs(1), now); // 1000 B/s, burst 1000
+                                                                 // 50 bytes now wait 50/1000 = 0.05s, far less than 0.5s at the old rate.
+        let wait = b.reserve(50, now);
+        assert!((wait.as_secs_f64() - 0.05).abs() < 1e-6, "wait {wait:?}");
+    }
+
+    #[test]
+    fn is_full_tracks_outstanding_debt() {
+        let start = Instant::now();
+        let mut b = TokenBucket::new(100.0, 100.0, start);
+        assert!(b.is_full(start)); // starts full
+        let _ = b.reserve(100, start); // drain the burst
+        assert!(!b.is_full(start)); // now owes nothing-but-not-full
+                                    // A full window later, the bucket has refilled to capacity.
+        assert!(b.is_full(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn reserve_does_not_panic_on_degenerate_tiny_rate() {
+        let now = Instant::now();
+        // 1 byte per ~584e9 years: the wait for any debt overflows Duration, but
+        // `reserve` must saturate rather than panic.
+        let mut b = TokenBucket::new(f64::MIN_POSITIVE, 0.0, now);
+        assert_eq!(b.reserve(1, now), Duration::MAX);
+    }
+
+    #[test]
+    fn reserve_debt_is_repaid_by_elapsed_time() {
+        let start = Instant::now();
+        let mut b = TokenBucket::new(100.0, 100.0, start);
+        let _ = b.reserve(100, start); // empties the burst
+        let _ = b.reserve(100, start); // goes 100 into debt
+                                       // After 1s, 100 bytes have refilled, clearing the debt: the next small
+                                       // reserve is free again.
+        let later = start + Duration::from_secs(1);
+        assert_eq!(b.reserve(0, later), Duration::ZERO);
+    }
+
+    #[test]
+    fn police_forwards_within_capacity_and_drops_when_short() {
+        let now = Instant::now();
+        let throttle =
+            Throttle::new().with_bucket(Arc::new(Mutex::new(TokenBucket::new(10.0, 10.0, now))));
+        assert!(throttle.police(10)); // spends the whole bucket
+        assert!(!throttle.police(1)); // now empty → drop
+    }
+
+    #[test]
+    fn police_is_all_or_nothing_across_buckets() {
+        // A generous bucket and a tiny one: a datagram larger than the tiny
+        // bucket is dropped, and must not have spent the generous bucket.
+        let big = bucket(1000.0, 1000.0);
+        let small = bucket(2.0, 2.0);
+        let throttle = Throttle::new()
+            .with_bucket(big.clone())
+            .with_bucket(small.clone());
+
+        assert!(!throttle.police(5));
+        // The big bucket was not charged (police is all-or-nothing). Assert on
+        // tokens directly so a refill cannot mask a spurious partial charge.
+        assert_eq!(big.lock().unwrap().tokens, 1000.0);
+    }
+
+    #[test]
+    fn with_bucket_ignores_duplicates() {
+        // Adding the same bucket twice keeps a single logical bucket. Reserve
+        // locks sequentially, so a non-deduped [b, b] would double-charge and
+        // make the full burst cost a wait; deduped, the burst stays free.
+        let b = bucket(100.0, 100.0);
+        let throttle = Throttle::new()
+            .with_bucket(b.clone())
+            .with_bucket(b.clone());
+        assert_eq!(throttle.reserve(100), Duration::ZERO);
+        assert!(throttle.reserve(1) > Duration::ZERO);
+    }
+
+    #[test]
+    fn empty_throttle_never_limits() {
+        let throttle = Throttle::new();
+        assert!(throttle.is_empty());
+        assert!(throttle.police(1_000_000));
+    }
+
+    #[test]
+    fn reserve_returns_the_wait_to_hold_the_rate() {
+        // 1000 B/s, burst 1000 B. The burst is free; a further 1000 B then needs
+        // ~1s before it may be sent.
+        let throttle = Throttle::new().with_bucket(bucket(1000.0, 1000.0));
+        assert_eq!(throttle.reserve(1000), Duration::ZERO);
+        let wait = throttle.reserve(1000);
+        assert!(
+            (wait.as_secs_f64() - 1.0).abs() < 1e-3,
+            "expected ~1s, got {wait:?}"
+        );
+    }
+}

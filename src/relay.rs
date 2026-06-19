@@ -21,9 +21,14 @@ use crate::dns::{self, DnsResolver};
 use crate::errors::Result;
 use crate::metrics::Metrics;
 use crate::socks5::{self, TargetAddr};
+use crate::throttle::Throttle;
 
 /// A read buffer size that balances syscall overhead against memory use.
 const TCP_BUF: usize = 32 * 1024;
+/// Upper bound on a single shaping sleep. A normal reservation is far shorter;
+/// this just keeps a degenerate (saturated) one from handing the timer an
+/// unreasonable duration, and bounds how long a shaped pause goes unmarked.
+const MAX_SHAPED_NAP: Duration = Duration::from_secs(3600);
 /// Maximum UDP datagram we will buffer (covers a full IPv4 payload).
 const UDP_BUF: usize = 65535;
 /// Best-effort per-socket UDP buffer target. On Linux the kernel clamps this to
@@ -96,8 +101,6 @@ async fn recv_resilient(
     }
 }
 
-pub type ByteLimiter = Arc<dyn Fn(u64) -> bool + Send + Sync>;
-
 /// Runtime options for a UDP ASSOCIATE relay.
 pub struct UdpAssociateOptions {
     pub client_ip: IpAddr,
@@ -106,7 +109,7 @@ pub struct UdpAssociateOptions {
     pub dns_policy: DnsPolicy,
     pub dns_resolver: Arc<DnsResolver>,
     pub metrics: Arc<Metrics>,
-    pub byte_limiter: Option<ByteLimiter>,
+    pub throttle: Option<Throttle>,
 }
 
 /// Relays data in both directions between `client` and `remote` until both
@@ -117,7 +120,7 @@ pub async fn relay_tcp(
     client: ClientStream,
     remote: TcpStream,
     idle: Duration,
-    byte_limiter: Option<ByteLimiter>,
+    throttle: Option<Throttle>,
 ) -> io::Result<(u64, u64)> {
     let (rr, rw) = remote.into_split();
     let idle_opt = if idle.is_zero() { None } else { Some(idle) };
@@ -125,11 +128,11 @@ pub async fn relay_tcp(
     match client {
         ClientStream::Tcp(client) => {
             let (cr, cw) = client.into_split();
-            relay_streams(cr, cw, rr, rw, idle_opt, byte_limiter).await
+            relay_streams(cr, cw, rr, rw, idle_opt, throttle).await
         }
         ClientStream::Tls(client) => {
             let (cr, cw) = tokio::io::split(client);
-            relay_streams(cr, cw, rr, rw, idle_opt, byte_limiter).await
+            relay_streams(cr, cw, rr, rw, idle_opt, throttle).await
         }
     }
 }
@@ -143,7 +146,7 @@ async fn relay_streams<CR, CW, RR, RW>(
     mut remote_read: RR,
     mut remote_write: RW,
     idle: Option<Duration>,
-    byte_limiter: Option<ByteLimiter>,
+    throttle: Option<Throttle>,
 ) -> io::Result<(u64, u64)>
 where
     CR: AsyncRead + Unpin,
@@ -158,16 +161,18 @@ where
         let up = copy_direction(
             &mut client_read,
             &mut remote_write,
-            byte_limiter.as_ref(),
+            throttle.as_ref(),
             &activity,
             &up_total,
+            idle,
         );
         let down = copy_direction(
             &mut remote_read,
             &mut client_write,
-            byte_limiter.as_ref(),
+            throttle.as_ref(),
             &activity,
             &down_total,
+            idle,
         );
         match idle {
             None => {
@@ -231,9 +236,10 @@ where
 async fn copy_direction<R, W>(
     r: &mut R,
     w: &mut W,
-    byte_limiter: Option<&ByteLimiter>,
+    throttle: Option<&Throttle>,
     activity: &ActivityClock,
     total: &AtomicU64,
+    idle: Option<Duration>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -246,14 +252,43 @@ where
             break;
         }
         activity.mark();
-        if byte_limiter.is_some_and(|limit| !limit(n as u64)) {
-            break;
+        // Shape the flow to the configured rate by waiting for tokens before
+        // forwarding, rather than tearing the relay down — backpressure then
+        // slows the peer. The wait refreshes the activity clock so the idle
+        // watchdog never mistakes a shaped pause for a dead connection.
+        if let Some(throttle) = throttle {
+            shaped_wait(throttle.reserve(n as u64), activity, idle).await;
         }
         w.write_all(&buf[..n]).await?;
         total.fetch_add(n as u64, Ordering::Relaxed);
     }
     let _ = w.shutdown().await;
     Ok(())
+}
+
+/// Sleeps for `wait`, marking `activity` at least every `idle/2` so a long
+/// shaped pause keeps the connection alive instead of tripping the idle
+/// watchdog. Each sleep is also capped at [`MAX_SHAPED_NAP`] so a degenerate
+/// (saturated) reservation never hands an unreasonable duration to the timer.
+async fn shaped_wait(wait: Duration, activity: &ActivityClock, idle: Option<Duration>) {
+    if wait.is_zero() {
+        return;
+    }
+    // Cap each nap at idle/2 (when set) and never above MAX_SHAPED_NAP.
+    let cap = idle
+        .map(|d| d / 2)
+        .filter(|s| !s.is_zero())
+        .map_or(MAX_SHAPED_NAP, |s| s.min(MAX_SHAPED_NAP));
+    let mut remaining = wait;
+    loop {
+        let nap = remaining.min(cap);
+        tokio::time::sleep(nap).await;
+        activity.mark();
+        remaining = remaining.saturating_sub(nap);
+        if remaining.is_zero() {
+            break;
+        }
+    }
 }
 
 /// Runs a UDP associate relay until the controlling TCP connection closes or
@@ -300,7 +335,7 @@ where
         options.dns_policy,
         options.dns_resolver,
         options.metrics.clone(),
-        options.byte_limiter.clone(),
+        options.throttle.clone(),
         client_endpoint.clone(),
         activity.clone(),
         authorize,
@@ -309,7 +344,7 @@ where
         outbound,
         relay_socket,
         options.metrics,
-        options.byte_limiter,
+        options.throttle,
         client_endpoint,
         activity.clone(),
     ));
@@ -403,7 +438,7 @@ async fn relay_client_to_remote<F>(
     dns_policy: DnsPolicy,
     dns_resolver: Arc<DnsResolver>,
     metrics: Arc<Metrics>,
-    byte_limiter: Option<ByteLimiter>,
+    throttle: Option<Throttle>,
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
     authorize: F,
@@ -458,10 +493,13 @@ where
         }
         let _ = client_endpoint.set(src);
         let payload = &buf[header.payload_offset..n];
-        if byte_limiter
+        // Police the datagram against the token bucket: drop it when the bucket
+        // is short rather than delaying real-time traffic.
+        if throttle
             .as_ref()
-            .is_some_and(|limit| !limit(payload.len() as u64))
+            .is_some_and(|t| !t.police(payload.len() as u64))
         {
+            metrics.rate_limited();
             continue;
         }
         if outbound.send_to(payload, dest).await.is_ok() {
@@ -474,7 +512,7 @@ async fn relay_remote_to_client(
     outbound: Arc<UdpSocket>,
     relay_socket: Arc<UdpSocket>,
     metrics: Arc<Metrics>,
-    byte_limiter: Option<ByteLimiter>,
+    throttle: Option<Throttle>,
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
 ) -> Result<()> {
@@ -498,10 +536,11 @@ async fn relay_remote_to_client(
             .expect("prefix slice is UDP_IP_HEADER_MAX bytes");
         let start = socks5::write_udp_header_tail(remote_src, prefix);
         let datagram = &buf[start..socks5::UDP_IP_HEADER_MAX + n];
-        if byte_limiter
+        if throttle
             .as_ref()
-            .is_some_and(|limit| !limit(datagram.len() as u64))
+            .is_some_and(|t| !t.police(datagram.len() as u64))
         {
+            metrics.rate_limited();
             continue;
         }
         if relay_socket.send_to(datagram, caddr).await.is_ok() {
@@ -616,5 +655,70 @@ mod tests {
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_direction_shapes_instead_of_dropping() {
+        use crate::throttle::TokenBucket;
+        use std::sync::Mutex;
+
+        // 1000 B/s with a 1000 B burst. Copying 3000 bytes spends the burst
+        // immediately and then shapes the remaining 2000 B over ~2s — and, unlike
+        // the old hard cap, forwards every byte rather than tearing down.
+        let throttle = Throttle::new().with_bucket(Arc::new(Mutex::new(TokenBucket::new(
+            1000.0,
+            1000.0,
+            std::time::Instant::now(),
+        ))));
+        let data = vec![0u8; 3000];
+        let mut reader = &data[..];
+        let mut writer = tokio::io::sink();
+        let activity = ActivityClock::new();
+        let total = AtomicU64::new(0);
+
+        let start = tokio::time::Instant::now();
+        copy_direction(
+            &mut reader,
+            &mut writer,
+            Some(&throttle),
+            &activity,
+            &total,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(total.load(Ordering::Relaxed), 3000, "all bytes forwarded");
+        assert!(
+            start.elapsed() >= Duration::from_millis(1900),
+            "expected ~2s of shaping, got {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shaped_wait_keeps_connection_alive_under_small_idle() {
+        // A 10s shaped wait with a 2s idle timeout must refresh activity at least
+        // every idle/2, so a watchdog polling every idle never sees the
+        // connection idle for the full timeout (which would tear it down).
+        let activity = ActivityClock::new();
+        let idle = Duration::from_secs(2);
+        let wait = shaped_wait(Duration::from_secs(10), &activity, Some(idle));
+        tokio::pin!(wait);
+
+        let mut tick = tokio::time::interval(idle);
+        tick.tick().await; // consume the immediate tick at t=0
+        loop {
+            tokio::select! {
+                _ = &mut wait => break,
+                _ = tick.tick() => {
+                    assert!(
+                        activity.idle_for() < idle,
+                        "connection looked idle for {:?} while shaping",
+                        activity.idle_for()
+                    );
+                }
+            }
+        }
     }
 }

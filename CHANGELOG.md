@@ -6,6 +6,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- `ratelimit.byterate` is now a per-client **token-bucket bandwidth throttle**
+  instead of a hard fixed-window cap. The `BYTES/WINDOW_SECONDS` value is
+  reinterpreted as a sustained rate (`BYTES / WINDOW`) with a burst up to
+  `BYTES`. TCP relays are *shaped* — slowed via read backpressure rather than
+  torn down when the budget is spent — and UDP datagrams over the rate are
+  policed (dropped), so a sustained legitimate flow is throttled smoothly
+  instead of stalling or being cut. Both directions still share one per-client
+  budget.
+
 ### Added
 
 - `auth.command` external authentication hook: when set, username/password

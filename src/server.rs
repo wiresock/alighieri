@@ -267,7 +267,7 @@ impl Server {
                     }
                 };
                 metrics.accepted_connection();
-                let byte_recorder = client_permit.byte_recorder();
+                let throttle_bucket = client_permit.throttle_bucket();
 
                 let resources = ConnectionResources {
                     config,
@@ -276,7 +276,7 @@ impl Server {
                     metrics: metrics.clone(),
                     abuse,
                     dns_resolver,
-                    byte_recorder,
+                    throttle_bucket,
                 };
                 if let Some(acceptor) = tls_acceptor {
                     match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
