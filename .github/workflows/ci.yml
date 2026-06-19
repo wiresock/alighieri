@@ -106,12 +106,12 @@ jobs:
   # job above: their output drifts across releases, so pinning them here would
   # freeze tooling at the MSRV instead of tracking current stable.
   msrv:
-    name: build on MSRV (1.85)
+    name: build on MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
       - name: Build all targets on the MSRV toolchain

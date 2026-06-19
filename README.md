@@ -61,7 +61,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 
 Prebuilt Linux and Windows binaries are attached to each
 [release](https://github.com/wiresock/alighieri/releases). To build
-from source instead, you need a stable Rust toolchain (1.85 or newer):
+from source instead, you need a stable Rust toolchain (1.88 or newer):
 
 ```sh
 cargo build --release

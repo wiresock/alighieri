@@ -4,7 +4,7 @@
 # build host arch differs from the target, cross-compiles to it (no QEMU of the
 # Rust build), then the binary ships in a minimal distroless runtime. Pinned to
 # the project MSRV so rebuilding a release tag stays reproducible.
-FROM --platform=$BUILDPLATFORM rust:1.85-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /src
 
