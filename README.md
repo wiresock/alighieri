@@ -390,6 +390,10 @@ certificates so they survive restarts without re-requesting (which would hit
 Let's Encrypt's rate limits), and certificates renew in the background with no
 restart. `tls.acme.*` is mutually exclusive with `tls.certfile`/`tls.keyfile`.
 
+For a complete end-to-end walkthrough on a fresh public server — DNS, firewall,
+running it, watching issuance, and proxying a request through the TLS listener —
+see [doc/acme-tls-test.md](doc/acme-tls-test.md).
+
 ### Rules
 
 Rules are evaluated **top-to-bottom**, **first match wins**. If no rule matches,
