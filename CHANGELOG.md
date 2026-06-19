@@ -8,6 +8,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- Minimum supported Rust version raised from 1.85 to **1.88**, required by the
+  RUSTSEC-2026-0009-patched `time` crate that the ACME (Let's Encrypt) support
+  pulls in transitively. Prebuilt binaries and the container image are
+  unaffected; only building from source needs the newer toolchain.
 - `ratelimit.byterate` is now a per-client **token-bucket bandwidth throttle**
   instead of a hard fixed-window cap. The `BYTES/WINDOW_SECONDS` value is
   reinterpreted as a sustained rate (`BYTES / WINDOW`) with a burst up to
@@ -19,6 +23,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Automatic TLS certificates from Let's Encrypt (ACME) for the TLS listener:
+  set `tls.acme.domains` (plus a `tls.acme.cache` directory and optional
+  `tls.acme.email`) instead of `tls.certfile`/`tls.keyfile`, and Alighieri
+  obtains and renews certificates in the background. Validation uses the
+  TLS-ALPN-01 challenge answered on the listener itself, so it needs no port 80
+  or DNS API but requires the listener reachable on port 443. A
+  `tls.acme.staging` toggle selects the Let's Encrypt staging environment for
+  testing.
 - Official multi-arch (`linux/amd64`, `linux/arm64`) container image published to
   the GitHub Container Registry (`ghcr.io/wiresock/alighieri`) on each release,
   built on a distroless non-root base (no shell, `--read-only`-friendly). A

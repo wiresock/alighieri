@@ -2,7 +2,9 @@
 name = "alighieri"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.85"
+# Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009
+# patched `time` (>=0.3.47) requires rustc 1.88.
+rust-version = "1.88"
 description = "Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server with Dante-inspired configuration"
 repository = "https://github.com/wiresock/alighieri"
 homepage = "https://github.com/wiresock/alighieri"
@@ -39,6 +41,11 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # Pinned to the ring provider: aws-lc-rs (the rustls default) needs CMake and
 # NASM to build on Windows, which this project's contributors cannot assume.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+# Automatic certificates (ACME / Let's Encrypt) for the TLS listener. Pinned to
+# the ring provider for the same reason as tokio-rustls above.
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "tls12", "webpki-roots"] }
+# StreamExt to drive the rustls-acme certificate-renewal state.
+tokio-stream = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

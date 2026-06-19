@@ -609,7 +609,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode_utf8(encoded: &str) -> std::result::Result<String, String> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return Err("encoded username must have an even number of hex digits".into());
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);

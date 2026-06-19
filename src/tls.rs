@@ -5,43 +5,160 @@
 //! unaware of whether the client stream is plaintext TCP or TLS-wrapped TCP.
 
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_stream::StreamExt;
 
-use crate::config::{Config, TlsConfig};
+use crate::config::{AcmeConfig, Config, TlsConfig};
 use crate::errors::{Error, Result};
 
+/// A future that drives ACME certificate issuance and renewal. The server spawns
+/// it once; issued certificates are then served through the acceptor's resolver
+/// and renewed in the background without a restart.
+pub type AcmeDriver = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The TLS acceptor for the listener, plus — for ACME — the renewal driver.
+pub struct TlsSetup {
+    pub acceptor: TlsAcceptor,
+    pub acme_driver: Option<AcmeDriver>,
+}
+
 pub fn validate_config(config: &Config) -> Result<()> {
-    let _ = load_acceptor(config.tls.as_ref())?;
+    // Pure validation for `--check` / service-install: build the acceptor (and,
+    // for ACME, the renewal state) with no network I/O and no filesystem side
+    // effects — in particular, do not create or write the ACME cache directory.
+    let _ = build_acceptor(config.tls.as_ref(), false)?;
     Ok(())
 }
 
-pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsAcceptor>> {
+pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsSetup>> {
+    // Runtime setup: also prepares (creates and write-probes) the ACME cache dir.
+    build_acceptor(config, true)
+}
+
+fn build_acceptor(config: Option<&TlsConfig>, prepare_cache: bool) -> Result<Option<TlsSetup>> {
     let Some(config) = config else {
         return Ok(None);
     };
+    let setup = match config {
+        TlsConfig::Files {
+            cert_file,
+            key_file,
+        } => file_setup(cert_file, key_file)?,
+        TlsConfig::Acme(acme) => acme_setup(acme, prepare_cache)?,
+    };
+    Ok(Some(setup))
+}
 
-    let certs = load_certs(&config.cert_file)?;
+fn file_setup(cert_file: &Path, key_file: &Path) -> Result<TlsSetup> {
+    let certs = load_certs(cert_file)?;
     if certs.is_empty() {
         return Err(Error::Config(format!(
             "TLS certificate file {} did not contain any certificates",
-            config.cert_file.display()
+            cert_file.display()
         )));
     }
-
-    let key = load_private_key(&config.key_file)?;
+    let key = load_private_key(key_file)?;
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| Error::Config(format!("invalid TLS certificate/key pair: {e}")))?;
+    Ok(TlsSetup {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        acme_driver: None,
+    })
+}
 
-    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
+fn acme_setup(acme: &AcmeConfig, prepare_cache: bool) -> Result<TlsSetup> {
+    // At runtime, create and write-probe the cache directory so an unwritable
+    // path fails at startup rather than silently in the background renewal task.
+    // Skipped for `--check`, which must not touch the filesystem.
+    if prepare_cache {
+        ensure_writable_dir(&acme.cache_dir)?;
+    }
+    // The state owns the resolver shared with the rustls config below, persists
+    // the account/certs to the cache dir, and runs the order + renewal loop when
+    // polled. TLS-ALPN-01 challenges are answered by the same acceptor.
+    let mut state = rustls_acme::AcmeConfig::new(acme.domains.clone())
+        .contact(acme.email.iter().map(|email| format!("mailto:{email}")))
+        .cache(rustls_acme::caches::DirCache::new(acme.cache_dir.clone()))
+        .directory_lets_encrypt(!acme.staging)
+        .state();
+    let acceptor = TlsAcceptor::from(state.default_rustls_config());
+    let driver: AcmeDriver = Box::pin(async move {
+        loop {
+            match state.next().await {
+                Some(Ok(ok)) => tracing::info!("acme: {ok:?}"),
+                Some(Err(err)) => tracing::error!("acme error: {err:?}"),
+                None => {
+                    tracing::warn!(
+                        "acme renewal task ended; TLS certificates will no longer be renewed"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    Ok(TlsSetup {
+        acceptor,
+        acme_driver: Some(driver),
+    })
+}
+
+/// Ensures `dir` exists and is writable, failing fast at startup otherwise.
+/// `create_dir_all` alone is not enough: it succeeds on an existing directory
+/// even when it is not writable, so probe by writing and removing a temp file.
+fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        Error::Config(format!(
+            "failed to create ACME cache directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    // Probe with a per-run-unique name (pid + a high-resolution nonce) created
+    // exclusively (create_new), so the probe never follows a symlink or clobbers
+    // an existing file — the cache dir may be writable by a less-trusted user
+    // than this process — and a stale probe left by a crashed run with a reused
+    // pid cannot cause a false "not writable".
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".alighieri-acme-write-test.{}.{nonce}",
+        std::process::id()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file); // close before removing (Windows cannot remove an open file)
+                        // The write already proved the directory writable, so a failed cleanup
+                        // does not block startup, but warn so the leftover probe is visible.
+            if let Err(e) = std::fs::remove_file(&probe) {
+                tracing::warn!(
+                    path = %probe.display(),
+                    error = %e,
+                    "could not remove ACME cache write-probe file"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(Error::Config(format!(
+            "ACME cache directory {} is not writable: {e}",
+            dir.display()
+        ))),
+    }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -147,12 +264,48 @@ TJmcpHqqAD9nQAqB4GvHPA==
         fs::write(&cert_file, CERT).unwrap();
         fs::write(&key_file, KEY).unwrap();
 
-        let config = TlsConfig {
+        let config = TlsConfig::Files {
             cert_file,
             key_file,
         };
 
-        assert!(load_acceptor(Some(&config)).unwrap().is_some());
+        let setup = load_acceptor(Some(&config)).unwrap().unwrap();
+        assert!(setup.acme_driver.is_none());
+    }
+
+    #[test]
+    fn acme_config_builds_an_acceptor_and_driver() {
+        // Constructing the ACME state and acceptor does no network I/O, so this
+        // exercises the wiring offline.
+        let dir = tempfile::tempdir().unwrap();
+        let config = TlsConfig::Acme(crate::config::AcmeConfig {
+            domains: vec!["proxy.example.com".into()],
+            email: Some("admin@example.com".into()),
+            cache_dir: dir.path().to_path_buf(),
+            staging: true,
+        });
+        let setup = load_acceptor(Some(&config)).unwrap().unwrap();
+        assert!(setup.acme_driver.is_some());
+    }
+
+    #[test]
+    fn validation_is_side_effect_free_but_runtime_prepares_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("not-created-yet");
+        let config = TlsConfig::Acme(crate::config::AcmeConfig {
+            domains: vec!["proxy.example.com".into()],
+            email: None,
+            cache_dir: cache.clone(),
+            staging: true,
+        });
+
+        // Pure validation must not touch the filesystem.
+        build_acceptor(Some(&config), false).unwrap();
+        assert!(!cache.exists(), "validation must not create the cache dir");
+
+        // Runtime setup creates (and write-probes) it.
+        build_acceptor(Some(&config), true).unwrap();
+        assert!(cache.exists());
     }
 
     #[test]
@@ -163,7 +316,7 @@ TJmcpHqqAD9nQAqB4GvHPA==
         fs::write(&cert_file, CERT).unwrap();
         fs::write(&key_file, "not a private key").unwrap();
 
-        let config = TlsConfig {
+        let config = TlsConfig::Files {
             cert_file,
             key_file,
         };

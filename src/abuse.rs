@@ -72,7 +72,11 @@ impl AbuseControls {
             .clone();
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if self.admissions.fetch_add(1, Ordering::Relaxed) % PRUNE_EVERY_N_ADMISSIONS == 0 {
+        if self
+            .admissions
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS)
+        {
             prune_expired_clients(&mut clients, &config, now);
         }
         let state = clients
@@ -141,7 +145,11 @@ impl AbuseControls {
             .clone();
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if self.admissions.fetch_add(1, Ordering::Relaxed) % PRUNE_EVERY_N_ADMISSIONS == 0 {
+        if self
+            .admissions
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS)
+        {
             prune_expired_clients(&mut clients, &config, now);
         }
         let state = clients
