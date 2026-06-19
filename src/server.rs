@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::abuse::AbuseControls;
 use crate::acl::Scope;
-use crate::auth::UserDb;
+use crate::auth::{CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
 use crate::config::Config;
 use crate::connection::{Connection, ConnectionResources};
@@ -39,6 +39,7 @@ pub struct Server {
 struct ServerState {
     config: Arc<Config>,
     users: Arc<UserDb>,
+    command_auth: Option<Arc<CommandAuth>>,
     dns_resolver: Arc<DnsResolver>,
 }
 
@@ -84,6 +85,7 @@ impl Server {
             state: Arc::new(RwLock::new(ServerState {
                 config: process_config.clone(),
                 users: Arc::new(users),
+                command_auth: build_command_auth(&config),
                 dns_resolver: Arc::new(DnsResolver::new()),
             })),
             process_config,
@@ -119,9 +121,11 @@ impl Server {
         preserve_process_config(&mut config, &self.process_config);
         self.abuse.update_config(config.rate_limits.clone());
 
+        let command_auth = build_command_auth(&config);
         let mut state = self.state.write().await;
         state.config = Arc::new(config);
         state.users = Arc::new(users);
+        state.command_auth = command_auth;
         state.dns_resolver = Arc::new(DnsResolver::new());
         info!("configuration reloaded");
         Ok(())
@@ -191,6 +195,7 @@ impl Server {
             let state = self.state.read().await;
             let config = state.config.clone();
             let users = state.users.clone();
+            let command_auth = state.command_auth.clone();
             let dns_resolver = state.dns_resolver.clone();
             drop(state);
 
@@ -267,6 +272,7 @@ impl Server {
                 let resources = ConnectionResources {
                     config,
                     users,
+                    command_auth,
                     metrics: metrics.clone(),
                     abuse,
                     dns_resolver,
@@ -316,6 +322,20 @@ fn load_users(config: &Config) -> Result<UserDb> {
             Ok(db)
         }
         None => Ok(UserDb::new()),
+    }
+}
+
+/// Builds the external auth verifier when `auth.command` is configured. The
+/// verified-credential cache lives inside it, so it is rebuilt (and the cache
+/// reset) on reload, matching how the userlist cache behaves.
+fn build_command_auth(config: &Config) -> Option<Arc<CommandAuth>> {
+    let command = config.auth_command.as_ref()?;
+    match CommandAuth::new(command) {
+        Some(auth) => {
+            info!(program = %command[0], "external auth command enabled");
+            Some(Arc::new(auth))
+        }
+        None => None,
     }
 }
 

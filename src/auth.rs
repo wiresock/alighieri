@@ -28,13 +28,24 @@ use password_hash::{
     rand_core::{OsRng, RngCore},
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::{Error, Result};
 
 const ARGON2_DIRECTIVE_PREFIX: &str = "# alighieri:user:argon2:";
 const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXJhbmRvbXNhbHQ$C7It2r7AayL9ud0k5lZByEYkYBm2MDc36XwDo7OZH34";
 const MAX_CONCURRENT_PASSWORD_VERIFICATIONS: usize = 4;
+/// Cap on concurrently running `auth.command` verifier processes, so a burst of
+/// username handshakes cannot fork an unbounded number of children. External
+/// verifiers are typically I/O-bound (LDAP/HTTP), so this is higher than the
+/// CPU-bound `MAX_CONCURRENT_PASSWORD_VERIFICATIONS`; excess handshakes wait for
+/// a slot and are denied if they cannot obtain one within the handshake timeout.
+const MAX_CONCURRENT_AUTH_COMMANDS: usize = 64;
+/// Upper bound on how long the detached reaper waits for a killed verifier child
+/// to terminate before giving up. A SIGKILLed process dies almost immediately;
+/// this only guards against one briefly stuck uninterruptibly, after which the
+/// `Child` handle is dropped and tokio's orphan queue reaps anything slower.
+const REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RFC1929_FIELD_MAX: usize = u8::MAX as usize;
 const MAX_VERIFIED_CACHE_ENTRIES: usize = 1024;
 /// Cache tags use a deliberately cheap Argon2 instance (microseconds): the
@@ -202,6 +213,219 @@ impl UserDb {
             }
         }
         ok
+    }
+}
+
+/// The result of a username/password verification, so a backend timeout is
+/// distinguishable from a wrong-credentials denial at the call site and both
+/// auth backends produce consistent logs and error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Credentials accepted.
+    Allowed,
+    /// Credentials rejected.
+    Denied,
+    /// Verification did not finish within the allotted time.
+    TimedOut,
+}
+
+/// Verifies credentials by invoking an external command (the `auth.command`
+/// hook), so an operator can delegate to LDAP / OIDC / PAM / anything via a
+/// script. The username and password are written to the command's **stdin**
+/// (never argv or the environment, which can leak through `ps` or `/proc`); an
+/// exit status of `0` allows the connection. Successful verifications are cached
+/// exactly like the userlist path so the command is not re-run per handshake.
+#[derive(Debug)]
+pub struct CommandAuth {
+    program: String,
+    args: Vec<String>,
+    verified: VerifiedCache,
+    limiter: Arc<Semaphore>,
+}
+
+impl CommandAuth {
+    /// Builds a verifier from a command line whose first token is the program
+    /// and the remaining tokens are fixed arguments. `None` if `command` is
+    /// empty.
+    pub fn new(command: &[String]) -> Option<Self> {
+        let (program, args) = command.split_first()?;
+        Some(CommandAuth {
+            program: program.clone(),
+            args: args.to_vec(),
+            verified: VerifiedCache::new(),
+            limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_AUTH_COMMANDS)),
+        })
+    }
+
+    /// Verifies `username`/`password` by running the command. The command
+    /// execution — acquiring a concurrency slot, spawning the verifier, delivering
+    /// the credentials, and awaiting its verdict — is bounded by `timeout` (an
+    /// overrun child is killed and reaped out of band); a cheap cache-tag
+    /// derivation and lookup precede it. When `cache_ttl` is set, a success is
+    /// cached so the command is not re-run for the same credentials until the
+    /// entry expires. Failures always take the full path, so the cache cannot
+    /// cheapen brute force.
+    pub async fn verify_async(
+        &self,
+        username: &str,
+        password: &str,
+        cache_ttl: Option<Duration>,
+        timeout: Duration,
+    ) -> AuthOutcome {
+        // Reject credentials containing the stdin line delimiter (newline) or a
+        // NUL up front — before any cache/tag work — so such pathological input
+        // can neither reach the command nor waste a tag derivation. RFC 1929
+        // fields are arbitrary bytes, but these values do not occur in practice.
+        if [username, password]
+            .iter()
+            .any(|s| s.contains('\n') || s.contains('\0'))
+        {
+            return AuthOutcome::Denied;
+        }
+        let cached = cache_ttl.and_then(|ttl| Some((self.verified.tag(username, password)?, ttl)));
+        if let Some((tag, _)) = &cached {
+            if self.verified.check(username, tag, Instant::now()) {
+                return AuthOutcome::Allowed;
+            }
+        }
+        // Bound the entire run — permit acquisition, spawn, credential delivery
+        // and the wait for a verdict — by `timeout`. On expiry the in-flight
+        // child is killed and reaped out of band by its guard, and the timeout is
+        // surfaced distinctly so callers log it like the userlist path.
+        let allowed = match tokio::time::timeout(timeout, self.run(username, password)).await {
+            Ok(ok) => ok,
+            Err(_) => {
+                // The connection layer logs the timeout at WARN (with peer/user);
+                // keep this program-specific detail at DEBUG so a timeout is not
+                // logged twice at WARN.
+                tracing::debug!(program = %self.program, "auth.command timed out");
+                return AuthOutcome::TimedOut;
+            }
+        };
+        if !allowed {
+            return AuthOutcome::Denied;
+        }
+        if let Some((tag, ttl)) = cached {
+            let now = Instant::now();
+            if let Some(expires_at) = now.checked_add(ttl) {
+                self.verified.store(username, tag, expires_at, now);
+            }
+        }
+        AuthOutcome::Allowed
+    }
+
+    async fn run(&self, username: &str, password: &str) -> bool {
+        // Cap concurrent verifier processes so a burst of handshakes cannot fork
+        // an unbounded number of children. When saturated this awaits a free slot
+        // until the surrounding `timeout` denies the attempt. The owned permit is
+        // handed to the guard, which holds it until the child is fully reaped
+        // (including the out-of-band reap after cancellation), so the slot is not
+        // freed while a killed child is still terminating.
+        let Ok(permit) = self.limiter.clone().acquire_owned().await else {
+            return false; // The limiter is never closed; fail closed regardless.
+        };
+        // `verify_async` has already rejected credentials containing a newline or
+        // NUL, so the two-line stdin framing below is unambiguous.
+        let child = match tokio::process::Command::new(&self.program)
+            .args(&self.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                tracing::warn!(error = %e, program = %self.program, "auth.command failed to spawn");
+                return false; // `permit` drops here, freeing the slot.
+            }
+        };
+        // The guard kills and reaps the child on every exit from here — including
+        // cancellation when the surrounding `timeout` fires mid-run — and holds
+        // the permit until that reap completes.
+        let mut guard = ChildReaper::new(child, permit);
+        // Deliver the two credential lines as separate chunks, so stdin delivery
+        // does not allocate one buffer holding both secrets. If delivery fails —
+        // the verifier exited or closed stdin before reading them — the
+        // credentials never arrived, so fail closed rather than trust a status
+        // produced without them.
+        let delivered = match guard.child().stdin.take() {
+            Some(mut stdin) => {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(username.as_bytes()).await.is_ok()
+                    && stdin.write_all(b"\n").await.is_ok()
+                    && stdin.write_all(password.as_bytes()).await.is_ok()
+                    && stdin.write_all(b"\n").await.is_ok()
+                // `stdin` is dropped here, closing the pipe so the command sees EOF.
+            }
+            None => false,
+        };
+        if !delivered {
+            return false; // The guard reaps the child on drop.
+        }
+        let status = guard.child().wait().await;
+        if status.is_ok() {
+            // Reaped synchronously by `wait`; nothing left for `Drop` to do.
+            guard.disarm();
+        }
+        // On a `wait` error the child may still be running, so leave the guard
+        // armed to kill and reap it on drop.
+        matches!(status, Ok(status) if status.success())
+    }
+}
+
+/// Owns a spawned verifier child (and its concurrency permit) and guarantees the
+/// child is killed and reaped even if the future is cancelled (e.g. the
+/// verification timeout fires mid-run). Reaping runs in a detached task so it
+/// neither blocks nor extends the caller; on the normal path the child is
+/// awaited directly and the guard disarmed. The permit is held until the reap
+/// completes, so the concurrency slot is not freed while the child is still
+/// terminating. `kill_on_drop` backstops the kill if no runtime is available.
+struct ChildReaper {
+    child: Option<tokio::process::Child>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ChildReaper {
+    fn new(child: tokio::process::Child, permit: OwnedSemaphorePermit) -> Self {
+        ChildReaper {
+            child: Some(child),
+            permit: Some(permit),
+        }
+    }
+
+    fn child(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("child present until disarmed")
+    }
+
+    /// Releases the child and its permit once the child has already been reaped,
+    /// making `Drop` a no-op.
+    fn disarm(&mut self) {
+        self.child = None;
+        self.permit = None;
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let permit = self.permit.take();
+            let _ = child.start_kill();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    // Reap the killed child, but bounded: a process briefly stuck
+                    // uninterruptibly must not hang this task forever — that would
+                    // also pin the `Child` handle and stop `kill_on_drop` from ever
+                    // running. On timeout `child` drops here, so `kill_on_drop`
+                    // plus tokio's orphan queue take over the reap.
+                    let _ = tokio::time::timeout(REAP_WAIT_TIMEOUT, child.wait()).await;
+                    // Release the concurrency slot only now the child is reaped.
+                    drop(permit);
+                });
+            }
+            // With no runtime, `child` and `permit` drop now; `kill_on_drop` plus
+            // the orphan queue reap the child.
+        }
     }
 }
 
@@ -684,5 +908,90 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn command_auth_new_rejects_empty_command() {
+        assert!(CommandAuth::new(&[]).is_none());
+    }
+
+    #[cfg(unix)]
+    fn sh_auth(script: &str) -> CommandAuth {
+        CommandAuth::new(&["/bin/sh".to_string(), "-c".to_string(), script.to_string()]).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_allows_only_on_exit_zero() {
+        // Reads the username then the password from stdin; allows alice/secret.
+        let auth = sh_auth("read u; read p; [ \"$u\" = alice ] && [ \"$p\" = secret ]");
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            auth.verify_async("alice", "secret", None, t).await,
+            AuthOutcome::Allowed
+        );
+        assert_eq!(
+            auth.verify_async("alice", "wrong", None, t).await,
+            AuthOutcome::Denied
+        );
+        assert_eq!(
+            auth.verify_async("bob", "secret", None, t).await,
+            AuthOutcome::Denied
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_rejects_embedded_delimiters() {
+        // A command that always succeeds; the newline in the password must still
+        // be rejected before it runs, to keep the stdin framing unambiguous.
+        let auth = sh_auth("exit 0");
+        assert_eq!(
+            auth.verify_async("alice", "sec\nret", None, Duration::from_secs(5))
+                .await,
+            AuthOutcome::Denied
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_times_out() {
+        // A verifier that never exits is bounded by CommandAuth's own deadline,
+        // which kills the child (reaping it out of band) and reports the timeout
+        // distinctly so the caller can log it like the userlist path.
+        let auth = sh_auth("sleep 5");
+        assert_eq!(
+            auth.verify_async("alice", "secret", None, Duration::from_millis(100))
+                .await,
+            AuthOutcome::TimedOut
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_auth_caches_success() {
+        // The script allows only on its first run (it creates a marker, then
+        // fails when the marker exists). A cached second call must still succeed,
+        // proving the command was not re-run.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        // Drain stdin first, as a real verifier consuming the credentials does,
+        // then allow only on the first run.
+        let auth = sh_auth(&format!(
+            "cat >/dev/null; [ ! -e '{m}' ] && touch '{m}'",
+            m = marker.display()
+        ));
+        let ttl = Some(Duration::from_secs(60));
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            auth.verify_async("alice", "secret", ttl, t).await,
+            AuthOutcome::Allowed,
+            "first run"
+        );
+        assert_eq!(
+            auth.verify_async("alice", "secret", ttl, t).await,
+            AuthOutcome::Allowed,
+            "second call should hit the cache"
+        );
     }
 }

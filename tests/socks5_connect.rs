@@ -1093,3 +1093,50 @@ async fn proxy_protocol_rejects_untrusted_source() {
     let stream = TcpStream::connect(proxy_addr).await.unwrap();
     expect_connection_closed(stream).await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn external_command_auth_gates_username_password() {
+    use std::io::Write;
+
+    // A verifier script that allows only alice/secret (read from stdin). Create
+    // it under /tmp (space-free) rather than honoring TMPDIR, which may contain
+    // spaces: auth.command is whitespace-split, so a spaced path would break
+    // config parsing. Invoke it via `/bin/sh <script>` so the test depends on
+    // neither the exec bit nor a non-noexec mount.
+    let dir = tempfile::Builder::new()
+        .prefix("alighieri-auth")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let script = dir.path().join("verify.sh");
+    {
+        let mut f = std::fs::File::create(&script).unwrap();
+        writeln!(
+            f,
+            "read u\nread p\n[ \"$u\" = alice ] && [ \"$p\" = secret ]"
+        )
+        .unwrap();
+    }
+
+    let cfg = Config::parse(&format!(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: username
+auth.command: /bin/sh {}
+client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}
+socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
+"#,
+        script.display()
+    ))
+    .unwrap();
+    let (_proxy, addr) = start_proxy_with_config(cfg).await;
+
+    // Correct credentials authenticate via the external command.
+    let mut ok = TcpStream::connect(addr).await.unwrap();
+    assert!(handshake_username(&mut ok, "alice", "secret").await);
+
+    // Wrong credentials are rejected.
+    let mut bad = TcpStream::connect(addr).await.unwrap();
+    assert!(!handshake_username(&mut bad, "alice", "wrong").await);
+}

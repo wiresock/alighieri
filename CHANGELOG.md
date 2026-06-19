@@ -8,6 +8,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- `auth.command` external authentication hook: when set, username/password
+  verification runs an external program (the username and password are written
+  to its stdin; exit `0` allows) instead of the userlist, so credentials can be
+  checked against LDAP / OIDC / PAM / anything via a script. Successful results
+  are cached like the userlist path, and the `username` method no longer
+  requires a `userlist` when a command is configured.
 - `proxyprotocol` config option: accept the PROXY protocol (v1 text and v2
   binary) from trusted upstream load balancers (HAProxy, nginx, AWS/GCP NLBs),
   so `client` rules, abuse limits, metrics, and logs key on the real client
