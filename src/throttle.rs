@@ -3,9 +3,10 @@
 //! A [`TokenBucket`] meters bytes: it refills at a fixed rate (bytes per second)
 //! up to a capacity (the burst allowance). Two enforcement styles use it:
 //!
-//! - **Shaping** (TCP): [`Throttle::shape`] awaits until the requested bytes are
-//!   covered, so the relay *slows* — the read loop pauses and TCP backpressure
-//!   builds — instead of tearing the connection down.
+//! - **Shaping** (TCP): [`Throttle::reserve`] returns how long to wait until the
+//!   requested bytes are covered; the caller sleeps, so the relay *slows* — the
+//!   read loop pauses and TCP backpressure builds — instead of tearing the
+//!   connection down.
 //! - **Policing** (UDP): [`Throttle::police`] consumes without waiting and tells
 //!   the caller to drop the datagram when the bucket cannot cover it, because
 //!   delaying a real-time datagram is worse than dropping it.
@@ -129,9 +130,9 @@ impl Throttle {
         Throttle::default()
     }
 
-    /// Adds a bucket the flow must satisfy. Buckets are added most-general
-    /// first (per-client, then per-rule) so every flow locks them in the same
-    /// order under [`Throttle::police`].
+    /// Adds a bucket the flow must satisfy. Order does not matter:
+    /// [`Throttle::police`] locks buckets in a canonical (pointer) order, so
+    /// throttles sharing buckets cannot deadlock regardless of insertion order.
     pub fn with_bucket(mut self, bucket: Arc<Mutex<TokenBucket>>) -> Self {
         self.buckets.push(bucket);
         self
@@ -175,7 +176,11 @@ impl Throttle {
                 }
             }
             buckets => {
-                let mut guards: Vec<_> = buckets
+                // Lock in a canonical (pointer) order so two throttles holding
+                // the same buckets in different sequences cannot deadlock.
+                let mut ordered: Vec<&Arc<Mutex<TokenBucket>>> = buckets.iter().collect();
+                ordered.sort_unstable_by_key(|b| Arc::as_ptr(b) as usize);
+                let mut guards: Vec<_> = ordered
                     .iter()
                     .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()))
                     .collect();
