@@ -1,0 +1,8 @@
+# Keep the build context small and the build reproducible: the builder runs
+# `cargo build` from source, so the host's compiled artifacts and VCS metadata
+# must not leak in.
+target
+.git
+.github
+Dockerfile
+.dockerignore
