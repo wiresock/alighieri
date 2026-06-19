@@ -133,8 +133,12 @@ impl Throttle {
     /// Adds a bucket the flow must satisfy. Order does not matter:
     /// [`Throttle::police`] locks buckets in a canonical (pointer) order, so
     /// throttles sharing buckets cannot deadlock regardless of insertion order.
+    /// A duplicate of an already-added bucket is ignored, so `police` never locks
+    /// the same mutex twice (a self-deadlock) or double-charges it.
     pub fn with_bucket(mut self, bucket: Arc<Mutex<TokenBucket>>) -> Self {
-        self.buckets.push(bucket);
+        if !self.buckets.iter().any(|b| Arc::ptr_eq(b, &bucket)) {
+            self.buckets.push(bucket);
+        }
         self
     }
 
@@ -294,6 +298,19 @@ mod tests {
         assert!(!throttle.police(5));
         // The big bucket still has its full capacity (nothing was consumed).
         assert!(big.lock().unwrap().has(1000, Instant::now()));
+    }
+
+    #[test]
+    fn with_bucket_ignores_duplicates() {
+        // Adding the same bucket twice keeps a single logical bucket. Reserve
+        // locks sequentially, so a non-deduped [b, b] would double-charge and
+        // make the full burst cost a wait; deduped, the burst stays free.
+        let b = bucket(100.0, 100.0);
+        let throttle = Throttle::new()
+            .with_bucket(b.clone())
+            .with_bucket(b.clone());
+        assert_eq!(throttle.reserve(100), Duration::ZERO);
+        assert!(throttle.reserve(1) > Duration::ZERO);
     }
 
     #[test]
