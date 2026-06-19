@@ -142,22 +142,18 @@ impl Throttle {
         self.buckets.is_empty()
     }
 
-    /// Shapes a TCP write: waits until every bucket covers `bytes`, applying
-    /// backpressure to the relay rather than dropping data. No lock is held
-    /// across the await.
-    pub async fn shape(&self, bytes: u64) {
-        let wait = {
-            let now = Instant::now();
-            let mut wait = Duration::ZERO;
-            for bucket in &self.buckets {
-                let mut bucket = bucket.lock().unwrap_or_else(|e| e.into_inner());
-                wait = wait.max(bucket.reserve(bytes, now));
-            }
-            wait
-        };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+    /// Reserves `bytes` across every bucket for shaping, returning how long the
+    /// caller must wait before forwarding them (zero when within budget). The
+    /// caller does the sleeping, so it can stay responsive during a long wait
+    /// (e.g. refresh an idle clock) instead of blocking on one opaque sleep.
+    pub fn reserve(&self, bytes: u64) -> Duration {
+        let now = Instant::now();
+        let mut wait = Duration::ZERO;
+        for bucket in &self.buckets {
+            let mut bucket = bucket.lock().unwrap_or_else(|e| e.into_inner());
+            wait = wait.max(bucket.reserve(bytes, now));
         }
+        wait
     }
 
     /// Polices a UDP datagram: returns `true` to forward (consuming `bytes` from
@@ -302,19 +298,16 @@ mod tests {
         assert!(throttle.police(1_000_000));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn shape_sleeps_to_hold_the_rate() {
-        // 1000 B/s, burst 1000 B. Spend the burst, then a further 1000 B must
-        // take ~1s of shaped waiting. The sleep advances tokio's (paused) clock,
-        // so measure that rather than wall-clock time.
+    #[test]
+    fn reserve_returns_the_wait_to_hold_the_rate() {
+        // 1000 B/s, burst 1000 B. The burst is free; a further 1000 B then needs
+        // ~1s before it may be sent.
         let throttle = Throttle::new().with_bucket(bucket(1000.0, 1000.0));
-        throttle.shape(1000).await; // free (burst)
-        let start = tokio::time::Instant::now();
-        throttle.shape(1000).await; // waits ~1s of virtual time
+        assert_eq!(throttle.reserve(1000), Duration::ZERO);
+        let wait = throttle.reserve(1000);
         assert!(
-            start.elapsed() >= Duration::from_millis(990),
-            "shaped wait was only {:?}",
-            start.elapsed()
+            (wait.as_secs_f64() - 1.0).abs() < 1e-3,
+            "expected ~1s, got {wait:?}"
         );
     }
 }

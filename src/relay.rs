@@ -160,6 +160,7 @@ where
             throttle.as_ref(),
             &activity,
             &up_total,
+            idle,
         );
         let down = copy_direction(
             &mut remote_read,
@@ -167,6 +168,7 @@ where
             throttle.as_ref(),
             &activity,
             &down_total,
+            idle,
         );
         match idle {
             None => {
@@ -233,6 +235,7 @@ async fn copy_direction<R, W>(
     throttle: Option<&Throttle>,
     activity: &ActivityClock,
     total: &AtomicU64,
+    idle: Option<Duration>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -246,16 +249,37 @@ where
         }
         activity.mark();
         // Shape the flow to the configured rate by waiting for tokens before
-        // forwarding, rather than tearing the relay down. Pausing the read loop
-        // lets TCP backpressure slow the peer.
+        // forwarding, rather than tearing the relay down — backpressure then
+        // slows the peer. The wait refreshes the activity clock so the idle
+        // watchdog never mistakes a shaped pause for a dead connection.
         if let Some(throttle) = throttle {
-            throttle.shape(n as u64).await;
+            shaped_wait(throttle.reserve(n as u64), activity, idle).await;
         }
         w.write_all(&buf[..n]).await?;
         total.fetch_add(n as u64, Ordering::Relaxed);
     }
     let _ = w.shutdown().await;
     Ok(())
+}
+
+/// Sleeps for `wait`, marking `activity` at least every `idle/2` so a long
+/// shaped pause keeps the connection alive instead of tripping the idle
+/// watchdog. With no idle timeout the whole wait is a single sleep.
+async fn shaped_wait(wait: Duration, activity: &ActivityClock, idle: Option<Duration>) {
+    if wait.is_zero() {
+        return;
+    }
+    let step = idle.map(|d| d / 2).filter(|s| !s.is_zero());
+    let mut remaining = wait;
+    loop {
+        let nap = step.map_or(remaining, |s| remaining.min(s));
+        tokio::time::sleep(nap).await;
+        activity.mark();
+        remaining = remaining.saturating_sub(nap);
+        if remaining.is_zero() {
+            break;
+        }
+    }
 }
 
 /// Runs a UDP associate relay until the controlling TCP connection closes or
@@ -644,9 +668,16 @@ mod tests {
         let total = AtomicU64::new(0);
 
         let start = tokio::time::Instant::now();
-        copy_direction(&mut reader, &mut writer, Some(&throttle), &activity, &total)
-            .await
-            .unwrap();
+        copy_direction(
+            &mut reader,
+            &mut writer,
+            Some(&throttle),
+            &activity,
+            &total,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(total.load(Ordering::Relaxed), 3000, "all bytes forwarded");
         assert!(
@@ -654,5 +685,31 @@ mod tests {
             "expected ~2s of shaping, got {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shaped_wait_keeps_connection_alive_under_small_idle() {
+        // A 10s shaped wait with a 2s idle timeout must refresh activity at least
+        // every idle/2, so a watchdog polling every idle never sees the
+        // connection idle for the full timeout (which would tear it down).
+        let activity = ActivityClock::new();
+        let idle = Duration::from_secs(2);
+        let wait = shaped_wait(Duration::from_secs(10), &activity, Some(idle));
+        tokio::pin!(wait);
+
+        let mut tick = tokio::time::interval(idle);
+        tick.tick().await; // consume the immediate tick at t=0
+        loop {
+            tokio::select! {
+                _ = &mut wait => break,
+                _ = tick.tick() => {
+                    assert!(
+                        activity.idle_for() < idle,
+                        "connection looked idle for {:?} while shaping",
+                        activity.idle_for()
+                    );
+                }
+            }
+        }
     }
 }
