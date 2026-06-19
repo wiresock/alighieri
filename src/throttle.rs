@@ -93,11 +93,15 @@ impl TokenBucket {
     /// Re-tunes the bucket to a new `BYTES/WINDOW` limit in place, so a config
     /// reload applies to a client's existing (shared) bucket. Current tokens are
     /// clamped to the new capacity; a degenerate limit is ignored.
-    pub fn update_rate_window(&mut self, bytes: u64, window: Duration) {
+    pub fn update_rate_window(&mut self, bytes: u64, window: Duration, now: Instant) {
         let secs = window.as_secs_f64();
         if bytes == 0 || secs <= 0.0 {
             return;
         }
+        // Credit elapsed time at the old rate before switching, so the new rate
+        // only governs time after the reload (otherwise the next refill would
+        // apply it retroactively to the whole gap since `last`).
+        self.refill(now);
         self.rate = bytes as f64 / secs;
         self.capacity = bytes as f64;
         self.tokens = self.tokens.min(self.capacity);
@@ -229,8 +233,8 @@ mod tests {
         let mut b = TokenBucket::new(100.0, 100.0, now);
         let _ = b.reserve(100, now); // empty the burst
                                      // Re-tune to a faster rate and larger burst; the outstanding debt stays.
-        b.update_rate_window(1000, Duration::from_secs(1)); // 1000 B/s, burst 1000
-                                                            // 50 bytes now wait 50/1000 = 0.05s, far less than 0.5s at the old rate.
+        b.update_rate_window(1000, Duration::from_secs(1), now); // 1000 B/s, burst 1000
+                                                                 // 50 bytes now wait 50/1000 = 0.05s, far less than 0.5s at the old rate.
         let wait = b.reserve(50, now);
         assert!((wait.as_secs_f64() - 0.05).abs() < 1e-6, "wait {wait:?}");
     }

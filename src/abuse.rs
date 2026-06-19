@@ -103,8 +103,9 @@ impl AbuseControls {
 
         state_guard.active_connections += 1;
         // Reconcile the per-client bandwidth bucket with the current config so a
-        // reload that adds or removes `byterate` takes effect on new admissions.
-        // A changed rate keeps the existing bucket until the state is pruned.
+        // reload takes effect: add or drop the bucket when `byterate` is enabled
+        // or disabled, and re-tune the existing shared bucket in place when the
+        // rate changes, applying to the client's ongoing flows at once.
         match (&config.byte_rate, &state_guard.bandwidth) {
             (Some(limit), None) => {
                 state_guard.bandwidth =
@@ -117,7 +118,7 @@ impl AbuseControls {
                 bucket
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .update_rate_window(limit.limit, limit.window);
+                    .update_rate_window(limit.limit, limit.window, now);
             }
             (None, Some(_)) => state_guard.bandwidth = None,
             (None, None) => {}
