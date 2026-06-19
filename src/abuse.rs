@@ -263,10 +263,12 @@ impl ClientState {
         self.active_connections == 0
             && window_is_prunable(&self.connections, config.connection_rate.as_ref(), now)
             && window_is_prunable(&self.auth_failures, config.auth_failure_rate.as_ref(), now)
-            && self
-                .bandwidth
-                .as_ref()
-                .is_none_or(|b| b.lock().unwrap_or_else(|e| e.into_inner()).is_full(now))
+            && self.bandwidth.as_ref().is_none_or(|b| {
+                // Best-effort: the prune sweep holds the global clients lock, so
+                // never block it on a bucket a relay may be using. A bucket we
+                // cannot lock is in active use, hence not prunable.
+                b.try_lock().is_ok_and(|mut g| g.is_full(now))
+            })
     }
 }
 
