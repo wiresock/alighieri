@@ -5,43 +5,95 @@
 //! unaware of whether the client stream is plaintext TCP or TLS-wrapped TCP.
 
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio_stream::StreamExt;
 
-use crate::config::{Config, TlsConfig};
+use crate::config::{AcmeConfig, Config, TlsConfig};
 use crate::errors::{Error, Result};
 
+/// A future that drives ACME certificate issuance and renewal. The server spawns
+/// it once; issued certificates are then served through the acceptor's resolver
+/// and renewed in the background without a restart.
+pub type AcmeDriver = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The TLS acceptor for the listener, plus — for ACME — the renewal driver.
+pub struct TlsSetup {
+    pub acceptor: TlsAcceptor,
+    pub acme_driver: Option<AcmeDriver>,
+}
+
 pub fn validate_config(config: &Config) -> Result<()> {
+    // Builds the acceptor (and, for ACME, the renewal state) without any network
+    // I/O, so `--check` validates the TLS settings offline.
     let _ = load_acceptor(config.tls.as_ref())?;
     Ok(())
 }
 
-pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsAcceptor>> {
+pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsSetup>> {
     let Some(config) = config else {
         return Ok(None);
     };
+    let setup = match config {
+        TlsConfig::Files {
+            cert_file,
+            key_file,
+        } => file_setup(cert_file, key_file)?,
+        TlsConfig::Acme(acme) => acme_setup(acme),
+    };
+    Ok(Some(setup))
+}
 
-    let certs = load_certs(&config.cert_file)?;
+fn file_setup(cert_file: &Path, key_file: &Path) -> Result<TlsSetup> {
+    let certs = load_certs(cert_file)?;
     if certs.is_empty() {
         return Err(Error::Config(format!(
             "TLS certificate file {} did not contain any certificates",
-            config.cert_file.display()
+            cert_file.display()
         )));
     }
-
-    let key = load_private_key(&config.key_file)?;
+    let key = load_private_key(key_file)?;
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| Error::Config(format!("invalid TLS certificate/key pair: {e}")))?;
+    Ok(TlsSetup {
+        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        acme_driver: None,
+    })
+}
 
-    Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
+fn acme_setup(acme: &AcmeConfig) -> TlsSetup {
+    // The state owns the resolver shared with the rustls config below, persists
+    // the account/certs to the cache dir, and runs the order + renewal loop when
+    // polled. TLS-ALPN-01 challenges are answered by the same acceptor.
+    let mut state = rustls_acme::AcmeConfig::new(acme.domains.clone())
+        .contact(acme.email.iter().map(|email| format!("mailto:{email}")))
+        .cache(rustls_acme::caches::DirCache::new(acme.cache_dir.clone()))
+        .directory_lets_encrypt(!acme.staging)
+        .state();
+    let acceptor = TlsAcceptor::from(state.default_rustls_config());
+    let driver: AcmeDriver = Box::pin(async move {
+        loop {
+            match state.next().await {
+                Some(Ok(ok)) => tracing::info!("acme: {ok:?}"),
+                Some(Err(err)) => tracing::error!("acme error: {err:?}"),
+                None => break,
+            }
+        }
+    });
+    TlsSetup {
+        acceptor,
+        acme_driver: Some(driver),
+    }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -147,12 +199,28 @@ TJmcpHqqAD9nQAqB4GvHPA==
         fs::write(&cert_file, CERT).unwrap();
         fs::write(&key_file, KEY).unwrap();
 
-        let config = TlsConfig {
+        let config = TlsConfig::Files {
             cert_file,
             key_file,
         };
 
-        assert!(load_acceptor(Some(&config)).unwrap().is_some());
+        let setup = load_acceptor(Some(&config)).unwrap().unwrap();
+        assert!(setup.acme_driver.is_none());
+    }
+
+    #[test]
+    fn acme_config_builds_an_acceptor_and_driver() {
+        // Constructing the ACME state and acceptor does no network I/O, so this
+        // exercises the wiring offline.
+        let dir = tempfile::tempdir().unwrap();
+        let config = TlsConfig::Acme(crate::config::AcmeConfig {
+            domains: vec!["proxy.example.com".into()],
+            email: Some("admin@example.com".into()),
+            cache_dir: dir.path().to_path_buf(),
+            staging: true,
+        });
+        let setup = load_acceptor(Some(&config)).unwrap().unwrap();
+        assert!(setup.acme_driver.is_some());
     }
 
     #[test]
@@ -163,7 +231,7 @@ TJmcpHqqAD9nQAqB4GvHPA==
         fs::write(&cert_file, CERT).unwrap();
         fs::write(&key_file, "not a private key").unwrap();
 
-        let config = TlsConfig {
+        let config = TlsConfig::Files {
             cert_file,
             key_file,
         };

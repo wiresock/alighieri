@@ -51,7 +51,17 @@ impl Server {
     pub async fn bind(config: Config) -> Result<Server> {
         let users = load_users(&config)?;
         warn_config_footguns(&config);
-        let tls_acceptor = tls::load_acceptor(config.tls.as_ref())?;
+        let tls_acceptor = match tls::load_acceptor(config.tls.as_ref())? {
+            Some(setup) => {
+                if let Some(driver) = setup.acme_driver {
+                    // Drive ACME certificate issuance and renewal for the life of
+                    // the server; certificates are served as they are obtained.
+                    tokio::spawn(driver);
+                }
+                Some(setup.acceptor)
+            }
+            None => None,
+        };
 
         let (metrics_addr, metrics_listener) = match config.metrics_listen {
             Some(addr) => {
@@ -69,8 +79,14 @@ impl Server {
         };
         let listener = TcpListener::bind(config.internal).await?;
         let listen = listener.local_addr()?;
-        if config.tls.is_some() {
+        if let Some(tls) = &config.tls {
             info!(listen = %listen, "listening with TLS");
+            if matches!(tls, crate::config::TlsConfig::Acme(_)) && listen.port() != 443 {
+                warn!(
+                    listen = %listen,
+                    "ACME uses TLS-ALPN-01, which Let's Encrypt validates on port 443; ensure this listener is reachable on port 443 (directly or via forwarding) or certificate issuance will fail"
+                );
+            }
         } else {
             info!(listen = %listen, "listening");
         }

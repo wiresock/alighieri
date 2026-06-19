@@ -40,6 +40,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 | --- | --- | --- | --- |
 | ~~**PROXY protocol (v1/v2) ingress**~~ | — | — | **Shipped** — `proxyprotocol` accepts v1/v2 headers from trusted upstream CIDRs, keying rules, limits, metrics, and logs on the real client. |
 | ~~**Token-bucket bandwidth throttle**~~ | — | — | **Shipped** — `ratelimit.byterate` is now a smooth per-client token-bucket throttle (TCP shaped, UDP policed), plus a per-rule `bandwidth:` selector that throttles each matching CONNECT session. Slows rather than drops/tears down. |
+| ~~**ACME / Let's Encrypt TLS**~~ | — | — | **Shipped** — `tls.acme.*` obtains and auto-renews certificates via the TLS-ALPN-01 challenge on the TLS listener (port 443), no certbot/cron. Dante has no TLS at all. |
 | **Geo / ASN access rules** | Med | M | `from`/`to` by country or ASN (optional MaxMind dataset). Modern access control Dante lacks natively. |
 | **Audit log + OpenTelemetry** | Med | S–M | Per-rule metrics, a structured audit stream (who → where, rule hit, bytes), and optional OTel traces. Extends an existing strength. |
 | **Transparent / intercept mode (Linux)** | Med | L | TPROXY/redirect ingress so unmodified apps are proxied without SOCKS awareness — the modern answer to Dante's socksify preload library. |

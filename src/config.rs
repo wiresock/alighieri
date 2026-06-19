@@ -131,11 +131,34 @@ pub struct DnsPolicy {
 }
 
 /// TLS listener settings. When present, accepted client TCP connections are
-/// upgraded to TLS before the SOCKS5 greeting is read.
+/// upgraded to TLS before the SOCKS5 greeting is read. The certificate is
+/// either operator-provided files or obtained automatically over ACME.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsConfig {
-    pub cert_file: PathBuf,
-    pub key_file: PathBuf,
+pub enum TlsConfig {
+    /// Operator-provided certificate and private key (PEM).
+    Files {
+        cert_file: PathBuf,
+        key_file: PathBuf,
+    },
+    /// Automatic certificates from an ACME provider (Let's Encrypt), answered
+    /// with the TLS-ALPN-01 challenge on the TLS listener itself.
+    Acme(AcmeConfig),
+}
+
+/// ACME (Let's Encrypt) settings for automatic TLS certificates. Validation uses
+/// TLS-ALPN-01, so the listener must be reachable at each domain on port 443.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeConfig {
+    /// Domains the certificate covers (the SANs).
+    pub domains: Vec<String>,
+    /// Optional account contact e-mail (e.g. for expiry notices).
+    pub email: Option<String>,
+    /// Directory persisting the ACME account and issued certificates across
+    /// restarts, so they are not re-requested (which would hit rate limits).
+    pub cache_dir: PathBuf,
+    /// Use the provider's staging environment — for testing, with far looser
+    /// rate limits but untrusted certificates.
+    pub staging: bool,
 }
 
 /// A fixed-window rate limit.
@@ -384,6 +407,10 @@ struct Builder {
     metrics_listen: Option<SocketAddr>,
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
+    tls_acme_domains: Vec<String>,
+    tls_acme_email: Option<String>,
+    tls_acme_cache: Option<PathBuf>,
+    tls_acme_staging: Option<bool>,
     rate_connection: Option<RateLimit>,
     rate_auth_failure: Option<RateLimit>,
     rate_concurrent: Option<usize>,
@@ -422,22 +449,54 @@ impl Builder {
             ));
         }
 
-        let tls = match (self.tls_cert_file, self.tls_key_file) {
-            (Some(cert_file), Some(key_file)) => Some(TlsConfig {
-                cert_file,
-                key_file,
-            }),
-            (Some(_), None) => {
+        let has_files = self.tls_cert_file.is_some() || self.tls_key_file.is_some();
+        let has_acme = !self.tls_acme_domains.is_empty()
+            || self.tls_acme_email.is_some()
+            || self.tls_acme_cache.is_some()
+            || self.tls_acme_staging.is_some();
+        if has_files && has_acme {
+            return Err(Error::Config(
+                "TLS cannot use both 'tls.certfile'/'tls.keyfile' and 'tls.acme.*'; choose one"
+                    .into(),
+            ));
+        }
+        let tls = if has_acme {
+            if self.tls_acme_domains.is_empty() {
                 return Err(Error::Config(
-                    "tls.certfile requires a matching 'tls.keyfile' setting".into(),
+                    "tls.acme requires at least one domain in 'tls.acme.domains'".into(),
                 ));
             }
-            (None, Some(_)) => {
-                return Err(Error::Config(
-                    "tls.keyfile requires a matching 'tls.certfile' setting".into(),
-                ));
+            let cache_dir = self.tls_acme_cache.ok_or_else(|| {
+                Error::Config(
+                    "tls.acme requires 'tls.acme.cache' (a directory to persist the account and \
+                     certificates so they are not re-requested on restart)"
+                        .into(),
+                )
+            })?;
+            Some(TlsConfig::Acme(AcmeConfig {
+                domains: self.tls_acme_domains,
+                email: self.tls_acme_email,
+                cache_dir,
+                staging: self.tls_acme_staging.unwrap_or(false),
+            }))
+        } else {
+            match (self.tls_cert_file, self.tls_key_file) {
+                (Some(cert_file), Some(key_file)) => Some(TlsConfig::Files {
+                    cert_file,
+                    key_file,
+                }),
+                (Some(_), None) => {
+                    return Err(Error::Config(
+                        "tls.certfile requires a matching 'tls.keyfile' setting".into(),
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::Config(
+                        "tls.keyfile requires a matching 'tls.certfile' setting".into(),
+                    ));
+                }
+                (None, None) => None,
             }
-            (None, None) => None,
         };
 
         Ok(Config {
@@ -602,6 +661,27 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "tlskeyfile" | "tls.keyfile" | "tls.key" => {
             b.tls_key_file = Some(parse_path(vals, lineno, "tls.keyfile")?);
+        }
+        "tlsacmedomains" | "tls.acme.domains" | "tls.acme.domain" => {
+            if vals.is_empty() {
+                return Err(cfg_err(
+                    lineno,
+                    "tls.acme.domains requires at least one domain",
+                ));
+            }
+            b.tls_acme_domains = vals.to_vec();
+        }
+        "tlsacmeemail" | "tls.acme.email" => {
+            if vals.is_empty() {
+                return Err(cfg_err(lineno, "tls.acme.email requires an address"));
+            }
+            b.tls_acme_email = Some(vals.join(" "));
+        }
+        "tlsacmecache" | "tls.acme.cache" | "tls.acme.cachedir" => {
+            b.tls_acme_cache = Some(parse_path(vals, lineno, "tls.acme.cache")?);
+        }
+        "tlsacmestaging" | "tls.acme.staging" => {
+            b.tls_acme_staging = Some(parse_bool(vals, lineno)?);
         }
         "ratelimit.connectionrate" | "ratelimit.connection.rate" | "ratelimit.connections" => {
             b.rate_connection = Some(parse_rate_limit(vals, lineno, "ratelimit.connectionrate")?);
@@ -1445,7 +1525,7 @@ socks pass {
         assert_eq!(cfg.metrics_listen, Some("127.0.0.1:9090".parse().unwrap()));
         assert_eq!(
             cfg.tls,
-            Some(TlsConfig {
+            Some(TlsConfig::Files {
                 cert_file: PathBuf::from("/etc/alighieri/tls/server.crt"),
                 key_file: PathBuf::from("/etc/alighieri/tls/server.key")
             })
@@ -1510,6 +1590,45 @@ socks pass {
 
         let err = Config::parse("internal: 127.0.0.1:1080\ntls.keyfile: server.key").unwrap_err();
         assert!(err.to_string().contains("tls.keyfile requires"));
+    }
+
+    #[test]
+    fn acme_tls_parses() {
+        let cfg = Config::parse(
+            r#"
+internal: 0.0.0.0:443
+tls.acme.domains: a.example.com b.example.com
+tls.acme.email: admin@example.com
+tls.acme.cache: /var/lib/alighieri/acme
+tls.acme.staging: on
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tls,
+            Some(TlsConfig::Acme(AcmeConfig {
+                domains: vec!["a.example.com".into(), "b.example.com".into()],
+                email: Some("admin@example.com".into()),
+                cache_dir: PathBuf::from("/var/lib/alighieri/acme"),
+                staging: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn acme_and_certfile_are_mutually_exclusive() {
+        let err = Config::parse(
+            "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme\ntls.certfile: server.crt\ntls.keyfile: server.key",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot use both"), "got: {err}");
+    }
+
+    #[test]
+    fn acme_requires_a_cache_dir() {
+        let err =
+            Config::parse("internal: 0.0.0.0:443\ntls.acme.domains: x.example.com").unwrap_err();
+        assert!(err.to_string().contains("tls.acme.cache"), "got: {err}");
     }
 
     #[test]

@@ -45,7 +45,8 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Structured logs** with optional file output and size-based rotation
 - **DNS policy controls** for address-family preference, caching, and unsafe ranges
 - **Prometheus-style metrics** on an optional local HTTP endpoint
-- **Optional TLS listener** for clients that can wrap SOCKS5 in TLS
+- **Optional TLS listener** for clients that can wrap SOCKS5 in TLS, with
+  automatic **Let's Encrypt (ACME)** certificates via TLS-ALPN-01
 - **Per-client abuse controls** for connection and auth-failure rates, plus a
   token-bucket **bandwidth throttle** (TCP shaped, UDP policed)
 - **Windows Event Log** service lifecycle and startup failure events
@@ -271,6 +272,10 @@ socks pass "allow-default" {
 | `metrics.listen`   | —               | Optional HTTP metrics endpoint address               |
 | `tls.certfile`     | —               | PEM certificate chain for TLS-wrapped client traffic |
 | `tls.keyfile`      | —               | PEM private key for TLS-wrapped client traffic       |
+| `tls.acme.domains` | —               | Domains for automatic Let's Encrypt certs (TLS-ALPN-01, needs port 443) |
+| `tls.acme.email`   | —               | Optional ACME account contact e-mail                 |
+| `tls.acme.cache`   | —               | Directory persisting the ACME account and certificates |
+| `tls.acme.staging` | `off`           | Use Let's Encrypt staging (testing; untrusted certs) |
 | `ratelimit.connectionrate` | —        | Per-client TCP accepts as `COUNT/WINDOW_SECONDS`     |
 | `ratelimit.authfailurerate` | —       | Per-client auth failures as `COUNT/WINDOW_SECONDS`   |
 | `ratelimit.concurrentconnections` | —  | Per-client concurrent accepted TCP connections       |
@@ -366,6 +371,24 @@ must explicitly support TLS or connect through a local TLS wrapper:
 tls.certfile: /etc/alighieri/tls/server.crt
 tls.keyfile: /etc/alighieri/tls/server.key
 ```
+
+Instead of certificate files, Alighieri can obtain and renew certificates
+automatically from **Let's Encrypt (ACME)** — no certbot, no cron:
+
+```conf
+tls.acme.domains: proxy.example.com
+tls.acme.email: admin@example.com         # optional account contact
+tls.acme.cache: /var/lib/alighieri/acme   # persists the account + certs
+# tls.acme.staging: on                    # Let's Encrypt staging while testing
+```
+
+Validation uses the **TLS-ALPN-01** challenge, answered on the TLS listener
+itself — so it needs no port 80 and no DNS API, but the listener **must be
+reachable at each domain on port 443** (set `internal` to `:443`, directly or
+behind a forwarder). The cache directory persists the ACME account and issued
+certificates so they survive restarts without re-requesting (which would hit
+Let's Encrypt's rate limits), and certificates renew in the background with no
+restart. `tls.acme.*` is mutually exclusive with `tls.certfile`/`tls.keyfile`.
 
 ### Rules
 
