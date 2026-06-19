@@ -14,7 +14,12 @@ RUN set -eux; \
       amd64) target=x86_64-unknown-linux-gnu ;; \
       arm64) target=aarch64-unknown-linux-gnu; \
              apt-get update; \
-             apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu; \
+             # gcc-aarch64-linux-gnu is the cross compiler/linker;
+             # libc6-dev-arm64-cross provides the target libc headers ring's
+             # build needs (a Recommends, so it must be named under
+             # --no-install-recommends).
+             apt-get install -y --no-install-recommends \
+                 gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
              rm -rf /var/lib/apt/lists/* ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
