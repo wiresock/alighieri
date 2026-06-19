@@ -123,10 +123,19 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
             dir.display()
         ))
     })?;
-    // Probe with a per-process-unique name created exclusively (create_new), so
-    // the probe never follows a symlink or clobbers an existing file — the cache
-    // dir may be writable by a less-trusted user than this process.
-    let probe = dir.join(format!(".alighieri-acme-write-test.{}", std::process::id()));
+    // Probe with a per-run-unique name (pid + a high-resolution nonce) created
+    // exclusively (create_new), so the probe never follows a symlink or clobbers
+    // an existing file — the cache dir may be writable by a less-trusted user
+    // than this process — and a stale probe left by a crashed run with a reused
+    // pid cannot cause a false "not writable".
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".alighieri-acme-write-test.{}.{nonce}",
+        std::process::id()
+    ));
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
