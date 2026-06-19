@@ -296,8 +296,9 @@ mod tests {
             .with_bucket(small.clone());
 
         assert!(!throttle.police(5));
-        // The big bucket still has its full capacity (nothing was consumed).
-        assert!(big.lock().unwrap().has(1000, Instant::now()));
+        // The big bucket was not charged (police is all-or-nothing). Assert on
+        // tokens directly so a refill cannot mask a spurious partial charge.
+        assert_eq!(big.lock().unwrap().tokens, 1000.0);
     }
 
     #[test]

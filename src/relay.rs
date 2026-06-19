@@ -25,6 +25,10 @@ use crate::throttle::Throttle;
 
 /// A read buffer size that balances syscall overhead against memory use.
 const TCP_BUF: usize = 32 * 1024;
+/// Upper bound on a single shaping sleep. A normal reservation is far shorter;
+/// this just keeps a degenerate (saturated) one from handing the timer an
+/// unreasonable duration, and bounds how long a shaped pause goes unmarked.
+const MAX_SHAPED_NAP: Duration = Duration::from_secs(3600);
 /// Maximum UDP datagram we will buffer (covers a full IPv4 payload).
 const UDP_BUF: usize = 65535;
 /// Best-effort per-socket UDP buffer target. On Linux the kernel clamps this to
@@ -264,15 +268,20 @@ where
 
 /// Sleeps for `wait`, marking `activity` at least every `idle/2` so a long
 /// shaped pause keeps the connection alive instead of tripping the idle
-/// watchdog. With no idle timeout the whole wait is a single sleep.
+/// watchdog. Each sleep is also capped at [`MAX_SHAPED_NAP`] so a degenerate
+/// (saturated) reservation never hands an unreasonable duration to the timer.
 async fn shaped_wait(wait: Duration, activity: &ActivityClock, idle: Option<Duration>) {
     if wait.is_zero() {
         return;
     }
-    let step = idle.map(|d| d / 2).filter(|s| !s.is_zero());
+    // Cap each nap at idle/2 (when set) and never above MAX_SHAPED_NAP.
+    let cap = idle
+        .map(|d| d / 2)
+        .filter(|s| !s.is_zero())
+        .map_or(MAX_SHAPED_NAP, |s| s.min(MAX_SHAPED_NAP));
     let mut remaining = wait;
     loop {
-        let nap = step.map_or(remaining, |s| remaining.min(s));
+        let nap = remaining.min(cap);
         tokio::time::sleep(nap).await;
         activity.mark();
         remaining = remaining.saturating_sub(nap);
