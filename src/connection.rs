@@ -10,14 +10,14 @@
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
-use crate::abuse::{AbuseControls, ClientByteRecorder};
+use crate::abuse::AbuseControls;
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
 use crate::auth::{AuthOutcome, CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
@@ -28,6 +28,7 @@ use crate::metrics::Metrics;
 use crate::net::PortRange;
 use crate::relay;
 use crate::socks5::{self, Command, Method, Reply, Request, TargetAddr};
+use crate::throttle::{Throttle, TokenBucket};
 
 /// A single client connection together with the shared server state it needs.
 pub struct Connection {
@@ -40,7 +41,7 @@ pub struct Connection {
     metrics: Arc<Metrics>,
     abuse: Arc<AbuseControls>,
     dns_resolver: Arc<DnsResolver>,
-    byte_recorder: Option<ClientByteRecorder>,
+    throttle_bucket: Option<Arc<Mutex<TokenBucket>>>,
 }
 
 pub struct ConnectionResources {
@@ -50,7 +51,7 @@ pub struct ConnectionResources {
     pub metrics: Arc<Metrics>,
     pub abuse: Arc<AbuseControls>,
     pub dns_resolver: Arc<DnsResolver>,
-    pub byte_recorder: Option<ClientByteRecorder>,
+    pub throttle_bucket: Option<Arc<Mutex<TokenBucket>>>,
 }
 
 impl Connection {
@@ -73,7 +74,7 @@ impl Connection {
             metrics: resources.metrics,
             abuse: resources.abuse,
             dns_resolver: resources.dns_resolver,
-            byte_recorder: resources.byte_recorder,
+            throttle_bucket: resources.throttle_bucket,
         }
     }
 
@@ -337,9 +338,9 @@ impl Connection {
             "connect established"
         );
 
-        let byte_limiter = self.byte_limiter();
+        let throttle = self.throttle();
         let (up, down) =
-            relay::relay_tcp(self.stream, remote, self.config.io_timeout, byte_limiter).await?;
+            relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?;
         self.metrics.tcp_relay_closed(up, down);
         debug!(peer = %self.peer, dest = %target, up, down, "connect closed");
         Ok(())
@@ -461,7 +462,7 @@ impl Connection {
 
         self.metrics.udp_association_started();
         let metrics = self.metrics.clone();
-        let byte_limiter = self.byte_limiter();
+        let throttle = self.throttle();
         let run_result = relay::run_udp_associate(
             self.stream,
             relay_socket,
@@ -473,7 +474,7 @@ impl Connection {
                 dns_policy: self.config.dns.clone(),
                 dns_resolver: self.dns_resolver.clone(),
                 metrics: self.metrics.clone(),
-                byte_limiter,
+                throttle,
             },
             authorize,
         )
@@ -489,33 +490,12 @@ impl Connection {
         self.abuse.record_auth_failure(self.peer.ip());
     }
 
-    fn byte_limiter(&self) -> Option<relay::ByteLimiter> {
-        let recorder = self.byte_recorder.clone()?;
-        let metrics = self.metrics.clone();
-        let peer_ip = self.peer.ip();
-        // Warn the first time this connection is cut off by the byte-rate cap.
-        // Exceeding `ratelimit.byterate` otherwise silently drops UDP datagrams
-        // (until the window resets) or tears down a TCP relay, which is
-        // indistinguishable from a server hang. The closure is shared by both
-        // relay directions and runs per datagram/chunk on the hot path, so it
-        // owns a single AtomicBool (no Arc/indirection) and short-circuits on a
-        // relaxed load: sustained over-limit calls avoid the read-modify-write.
-        // The two relay directions can both observe the initial `false` and swap
-        // once each (a few RMWs at most), but only one wins and logs.
-        let warned = AtomicBool::new(false);
-        Some(Arc::new(move |bytes| {
-            let allowed = recorder.record_bytes(bytes).is_ok();
-            if !allowed {
-                metrics.rate_limited();
-                if !warned.load(Ordering::Relaxed) && !warned.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        peer = %peer_ip,
-                        "byte rate limit (ratelimit.byterate) exceeded; UDP datagrams are dropped until the window resets and TCP relays are torn down — raise or remove the cap if this is legitimate traffic"
-                    );
-                }
-            }
-            allowed
-        }))
+    /// Builds the throttle governing this connection's relay from the shared
+    /// per-client bandwidth bucket (`byterate`). `None` when no limit applies,
+    /// so the relay hot path stays allocation- and lock-free.
+    fn throttle(&self) -> Option<Throttle> {
+        let bucket = self.throttle_bucket.clone()?;
+        Some(Throttle::new().with_bucket(bucket))
     }
 }
 

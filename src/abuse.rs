@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::config::{RateLimit, RateLimits};
+use crate::throttle::TokenBucket;
 
 /// How many admissions may pass between sweeps of expired client entries.
 /// Pruning scans the whole client map, so doing it on every accepted
@@ -30,7 +31,6 @@ pub enum DenialReason {
     ConnectionRate,
     AuthFailureRate,
     ConcurrentConnections,
-    ByteRate,
 }
 
 impl DenialReason {
@@ -39,7 +39,6 @@ impl DenialReason {
             DenialReason::ConnectionRate => "connection rate limit exceeded",
             DenialReason::AuthFailureRate => "auth failure rate limit exceeded",
             DenialReason::ConcurrentConnections => "concurrent connection limit exceeded",
-            DenialReason::ByteRate => "byte rate limit exceeded",
         }
     }
 }
@@ -48,14 +47,8 @@ impl DenialReason {
 pub struct ClientPermit {
     controls: Arc<AbuseControls>,
     state: Arc<Mutex<ClientState>>,
-    byte_rate: Option<RateLimit>,
+    bandwidth: Option<Arc<Mutex<TokenBucket>>>,
     active: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClientByteRecorder {
-    state: Arc<Mutex<ClientState>>,
-    byte_rate: RateLimit,
 }
 
 impl AbuseControls {
@@ -109,11 +102,24 @@ impl AbuseControls {
         }
 
         state_guard.active_connections += 1;
+        // Reconcile the per-client bandwidth bucket with the current config so a
+        // reload that adds or removes `byterate` takes effect on new admissions.
+        // A changed rate keeps the existing bucket until the state is pruned.
+        match (&config.byte_rate, &state_guard.bandwidth) {
+            (Some(limit), None) => {
+                state_guard.bandwidth =
+                    TokenBucket::from_rate_window(limit.limit, limit.window, now)
+                        .map(|b| Arc::new(Mutex::new(b)));
+            }
+            (None, Some(_)) => state_guard.bandwidth = None,
+            _ => {}
+        }
+        let bandwidth = state_guard.bandwidth.clone();
         drop(state_guard);
         Ok(ClientPermit {
             controls: self.clone(),
             state,
-            byte_rate: config.byte_rate,
+            bandwidth,
             active: true,
         })
     }
@@ -148,11 +154,11 @@ impl AbuseControls {
 }
 
 impl ClientPermit {
-    pub fn byte_recorder(&self) -> Option<ClientByteRecorder> {
-        self.byte_rate.clone().map(|byte_rate| ClientByteRecorder {
-            state: self.state.clone(),
-            byte_rate,
-        })
+    /// The shared per-client token bucket (when `byterate` is configured), used
+    /// to throttle this client's relays. All of one client's connections share
+    /// it, so the limit is an aggregate over both directions of every flow.
+    pub fn throttle_bucket(&self) -> Option<Arc<Mutex<TokenBucket>>> {
+        self.bandwidth.clone()
     }
 
     pub fn disarm(mut self) {
@@ -168,26 +174,12 @@ impl Drop for ClientPermit {
     }
 }
 
-impl ClientByteRecorder {
-    pub fn record_bytes(&self, bytes: u64) -> Result<(), DenialReason> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if add_window_bytes(
-            &mut state.bytes,
-            Some(&self.byte_rate),
-            Instant::now(),
-            bytes,
-        ) {
-            return Err(DenialReason::ByteRate);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 struct ClientState {
     connections: Window,
     auth_failures: Window,
-    bytes: Window,
+    /// Shared per-client bandwidth bucket; `None` until `byterate` applies.
+    bandwidth: Option<Arc<Mutex<TokenBucket>>>,
     active_connections: usize,
 }
 
@@ -196,7 +188,7 @@ impl ClientState {
         Self {
             connections: Window::new(now),
             auth_failures: Window::new(now),
-            bytes: Window::new(now),
+            bandwidth: None,
             active_connections: 0,
         }
     }
@@ -241,24 +233,6 @@ fn increment_window(window: &mut Window, limit: Option<&RateLimit>, now: Instant
     window.count > limit.limit
 }
 
-fn add_window_bytes(
-    window: &mut Window,
-    limit: Option<&RateLimit>,
-    now: Instant,
-    bytes: u64,
-) -> bool {
-    let Some(limit) = limit else {
-        return false;
-    };
-    reset_if_expired(window, limit, now);
-    let next = window.count.saturating_add(bytes);
-    if next > limit.limit {
-        return true;
-    }
-    window.count = next;
-    false
-}
-
 fn prune_expired_clients(
     clients: &mut HashMap<IpAddr, Arc<Mutex<ClientState>>>,
     config: &RateLimits,
@@ -272,10 +246,12 @@ fn prune_expired_clients(
 
 impl ClientState {
     fn is_expired(&self, config: &RateLimits, now: Instant) -> bool {
+        // The bandwidth bucket does not keep a state alive: with no active
+        // connections nothing is relaying, so dropping it (and its bucket) is
+        // safe — a reconnecting client simply gets a fresh, full bucket.
         self.active_connections == 0
             && window_is_prunable(&self.connections, config.connection_rate.as_ref(), now)
             && window_is_prunable(&self.auth_failures, config.auth_failure_rate.as_ref(), now)
-            && window_is_prunable(&self.bytes, config.byte_rate.as_ref(), now)
     }
 }
 
@@ -344,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_rate_rejects_over_limit_write() {
+    fn byte_rate_yields_a_shared_per_client_bucket() {
         let controls = AbuseControls::new(RateLimits {
             byte_rate: Some(RateLimit {
                 limit: 4,
@@ -353,13 +329,19 @@ mod tests {
             ..RateLimits::default()
         });
 
+        // Two connections from the same client share one bandwidth bucket.
+        let a = controls.admit(ip()).unwrap();
+        let b = controls.admit(ip()).unwrap();
+        let bucket_a = a.throttle_bucket().expect("byterate yields a bucket");
+        let bucket_b = b.throttle_bucket().expect("byterate yields a bucket");
+        assert!(Arc::ptr_eq(&bucket_a, &bucket_b));
+    }
+
+    #[test]
+    fn no_byte_rate_yields_no_bucket() {
+        let controls = AbuseControls::new(RateLimits::default());
         let permit = controls.admit(ip()).unwrap();
-        let recorder = permit.byte_recorder().unwrap();
-        recorder.record_bytes(4).unwrap();
-        assert_eq!(
-            recorder.record_bytes(1).unwrap_err(),
-            DenialReason::ByteRate
-        );
+        assert!(permit.throttle_bucket().is_none());
     }
 
     #[test]

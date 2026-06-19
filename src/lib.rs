@@ -35,4 +35,5 @@ pub mod relay;
 pub mod runtime;
 pub mod server;
 pub mod socks5;
+pub mod throttle;
 pub mod tls;
