@@ -76,12 +76,17 @@ tls.acme.cache: /var/lib/alighieri/acme
 tls.acme.staging: on           # STAGING first; turn off for a real cert (Step 6)
 
 logoutput: stdout
+# Reject destinations that resolve into private/loopback/link-local/reserved
+# ranges (SSRF + DNS-rebinding protection), regardless of address family.
+dns.deny: private linklocal loopback reserved
 
-# Block proxying to loopback/link-local (SSRF mitigation), allow the rest.
-client pass "clients" { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks block "deny-loopback" { from: 0.0.0.0/0 to: 127.0.0.0/8 }
+# Omitting from:/to: matches both IPv4 and IPv6 (an explicit 0.0.0.0/0 would be
+# IPv4-only — a footgun on the [::]:443 dual-stack listener). The loopback
+# blocks are belt-and-suspenders ahead of dns.deny above.
+client pass "clients" { }
+socks block "deny-loopback-v4" { to: 127.0.0.0/8 }
+socks block "deny-loopback-v6" { to: ::1/128 }
 socks pass "allow" {
-    from: 0.0.0.0/0 to: 0.0.0.0/0
     protocol: tcp udp
     command: connect udpassociate
 }
@@ -102,9 +107,12 @@ Binding port 443 needs privilege, so for a quick test run it as root:
 sudo alighieri /etc/alighieri/alighieri.conf
 ```
 
-For a persistent, hardened setup instead, use the systemd installer
-(`sudo ./scripts/alighieri.sh`); to run as a non-root service on 443, grant the
-unit `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
+For a persistent, hardened setup, run it under **systemd** instead. To let a
+non-root service bind 443, give the unit
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` (and
+`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`). From a repository checkout, the
+[`scripts/alighieri.sh`](../scripts/alighieri.sh) lifecycle manager automates
+installing such a service.
 
 ## Step 4 — Watch the certificate get issued
 
@@ -160,9 +168,11 @@ Once the staging flow works, get a production certificate:
 3. Restart Alighieri and watch the log issue a new cert.
 
 Now the certificate is publicly trusted, so the client can verify it normally —
-set `verifyChain = yes` and `CAfile = /etc/ssl/certs/ca-certificates.crt` in
-stunnel (or drop `verify=0` from socat). Restarting Alighieri again should
-**load the cached cert without re-issuing** — confirm the log shows no new order.
+set `verifyChain = yes` in stunnel against your system CA store (on Linux add
+`CAfile = /etc/ssl/certs/ca-certificates.crt`; on macOS/Windows stunnel uses the
+OS trust store, so no `CAfile` is needed), or drop `verify=0` from socat.
+Restarting Alighieri again should **load the cached cert without re-issuing** —
+confirm the log shows no new order.
 
 ## Troubleshooting
 
