@@ -314,28 +314,29 @@ scope, verdict, and config source line. Named ACL rule hits are also reported
 through `alighieri_rule_named_hits_total`, which adds the optional rule name as
 a label. It also reports rate-limit events.
 
-Optional per-client rate limits use fixed windows and are keyed by source IP:
+Optional per-client abuse controls are keyed by source IP. The connection and
+auth-failure rates use fixed windows; `byterate` is a token-bucket bandwidth
+throttle:
 
 ```conf
 ratelimit.connectionrate: 60/60       # 60 accepted TCP connections per minute
 ratelimit.authfailurerate: 5/300      # 5 failed auth attempts per 5 minutes
 ratelimit.concurrentconnections: 10   # 10 active accepted TCP connections
-ratelimit.byterate: 10MiB/60          # HARD per-window cap (drops UDP / cuts TCP) — see below
+ratelimit.byterate: 10MiB/60          # bandwidth throttle (both directions) — see below
 ```
 
-Rate limit changes are applied on hot reload for new connections and later auth
-failure accounting. Existing relay connections continue with the byte-rate
-settings they accepted under.
+Changes apply on hot reload: the per-client throttle bucket is re-tuned in place
+(so a client's existing flows pick up a new rate), and connection/auth-failure
+accounting updates for new admissions.
 
-> **`ratelimit.byterate` is a hard cap, not a throttle.** It counts relayed
-> bytes (both directions) in a fixed window; once the budget is exhausted it
-> **drops further UDP datagrams until the window resets, and tears down TCP
-> relays** — a sustained flow that exceeds it *stalls* (UDP) or is *cut* (TCP)
-> rather than slowing down. Size it well above your expected sustained
-> throughput × window (a 250 Mbps tunnel moves ~1.8 GiB/min, so `10MiB/60` would
-> stall it within a second), or leave it unset and rely on the connection and
-> concurrency limits plus authentication. A client that trips the cap is logged
-> with a `byte rate limit … exceeded` warning.
+> **`ratelimit.byterate` is a bandwidth throttle, not a hard cap.** The
+> `BYTES/WINDOW_SECONDS` value is a sustained rate (`BYTES / WINDOW`) with a
+> burst up to `BYTES`, metering both directions against one per-client budget.
+> TCP relays are *shaped* — slowed with read backpressure — and UDP datagrams
+> over the rate are *policed* (dropped, since delaying real-time traffic is
+> worse), so a sustained flow is throttled smoothly instead of stalling or being
+> cut. For per-destination throttling, a `socks` rule can add a per-session
+> [`bandwidth`](#rules) limit.
 
 When both `tls.certfile` and `tls.keyfile` are set, Alighieri expects clients to
 complete a TLS handshake before sending the SOCKS5 greeting. SOCKS5 clients
