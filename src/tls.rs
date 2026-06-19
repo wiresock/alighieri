@@ -143,7 +143,15 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
     {
         Ok(file) => {
             drop(file); // close before removing (Windows cannot remove an open file)
-            let _ = std::fs::remove_file(&probe);
+                        // The write already proved the directory writable, so a failed cleanup
+                        // does not block startup, but warn so the leftover probe is visible.
+            if let Err(e) = std::fs::remove_file(&probe) {
+                tracing::warn!(
+                    path = %probe.display(),
+                    error = %e,
+                    "could not remove ACME cache write-probe file"
+                );
+            }
             Ok(())
         }
         Err(e) => Err(Error::Config(format!(
