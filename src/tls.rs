@@ -32,13 +32,19 @@ pub struct TlsSetup {
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
-    // Builds the acceptor (and, for ACME, the renewal state) without any network
-    // I/O, so `--check` validates the TLS settings offline.
-    let _ = load_acceptor(config.tls.as_ref())?;
+    // Pure validation for `--check` / service-install: build the acceptor (and,
+    // for ACME, the renewal state) with no network I/O and no filesystem side
+    // effects — in particular, do not create or write the ACME cache directory.
+    let _ = build_acceptor(config.tls.as_ref(), false)?;
     Ok(())
 }
 
 pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsSetup>> {
+    // Runtime setup: also prepares (creates and write-probes) the ACME cache dir.
+    build_acceptor(config, true)
+}
+
+fn build_acceptor(config: Option<&TlsConfig>, prepare_cache: bool) -> Result<Option<TlsSetup>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -47,7 +53,7 @@ pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsSetup>> {
             cert_file,
             key_file,
         } => file_setup(cert_file, key_file)?,
-        TlsConfig::Acme(acme) => acme_setup(acme)?,
+        TlsConfig::Acme(acme) => acme_setup(acme, prepare_cache)?,
     };
     Ok(Some(setup))
 }
@@ -71,15 +77,13 @@ fn file_setup(cert_file: &Path, key_file: &Path) -> Result<TlsSetup> {
     })
 }
 
-fn acme_setup(acme: &AcmeConfig) -> Result<TlsSetup> {
-    // Create the cache directory up front so an unwritable path fails at startup
-    // rather than silently in the background renewal task later.
-    std::fs::create_dir_all(&acme.cache_dir).map_err(|e| {
-        Error::Config(format!(
-            "failed to create ACME cache directory {}: {e}",
-            acme.cache_dir.display()
-        ))
-    })?;
+fn acme_setup(acme: &AcmeConfig, prepare_cache: bool) -> Result<TlsSetup> {
+    // At runtime, create and write-probe the cache directory so an unwritable
+    // path fails at startup rather than silently in the background renewal task.
+    // Skipped for `--check`, which must not touch the filesystem.
+    if prepare_cache {
+        ensure_writable_dir(&acme.cache_dir)?;
+    }
     // The state owns the resolver shared with the rustls config below, persists
     // the account/certs to the cache dir, and runs the order + renewal loop when
     // polled. TLS-ALPN-01 challenges are answered by the same acceptor.
@@ -107,6 +111,27 @@ fn acme_setup(acme: &AcmeConfig) -> Result<TlsSetup> {
         acceptor,
         acme_driver: Some(driver),
     })
+}
+
+/// Ensures `dir` exists and is writable, failing fast at startup otherwise.
+/// `create_dir_all` alone is not enough: it succeeds on an existing directory
+/// even when it is not writable, so probe by writing and removing a temp file.
+fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        Error::Config(format!(
+            "failed to create ACME cache directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let probe = dir.join(".alighieri-acme-write-test");
+    std::fs::write(&probe, [])
+        .and_then(|()| std::fs::remove_file(&probe))
+        .map_err(|e| {
+            Error::Config(format!(
+                "ACME cache directory {} is not writable: {e}",
+                dir.display()
+            ))
+        })
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -234,6 +259,26 @@ TJmcpHqqAD9nQAqB4GvHPA==
         });
         let setup = load_acceptor(Some(&config)).unwrap().unwrap();
         assert!(setup.acme_driver.is_some());
+    }
+
+    #[test]
+    fn validation_is_side_effect_free_but_runtime_prepares_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("not-created-yet");
+        let config = TlsConfig::Acme(crate::config::AcmeConfig {
+            domains: vec!["proxy.example.com".into()],
+            email: None,
+            cache_dir: cache.clone(),
+            staging: true,
+        });
+
+        // Pure validation must not touch the filesystem.
+        build_acceptor(Some(&config), false).unwrap();
+        assert!(!cache.exists(), "validation must not create the cache dir");
+
+        // Runtime setup creates (and write-probes) it.
+        build_acceptor(Some(&config), true).unwrap();
+        assert!(cache.exists());
     }
 
     #[test]
