@@ -47,7 +47,7 @@ pub fn load_acceptor(config: Option<&TlsConfig>) -> Result<Option<TlsSetup>> {
             cert_file,
             key_file,
         } => file_setup(cert_file, key_file)?,
-        TlsConfig::Acme(acme) => acme_setup(acme),
+        TlsConfig::Acme(acme) => acme_setup(acme)?,
     };
     Ok(Some(setup))
 }
@@ -71,7 +71,15 @@ fn file_setup(cert_file: &Path, key_file: &Path) -> Result<TlsSetup> {
     })
 }
 
-fn acme_setup(acme: &AcmeConfig) -> TlsSetup {
+fn acme_setup(acme: &AcmeConfig) -> Result<TlsSetup> {
+    // Create the cache directory up front so an unwritable path fails at startup
+    // rather than silently in the background renewal task later.
+    std::fs::create_dir_all(&acme.cache_dir).map_err(|e| {
+        Error::Config(format!(
+            "failed to create ACME cache directory {}: {e}",
+            acme.cache_dir.display()
+        ))
+    })?;
     // The state owns the resolver shared with the rustls config below, persists
     // the account/certs to the cache dir, and runs the order + renewal loop when
     // polled. TLS-ALPN-01 challenges are answered by the same acceptor.
@@ -86,14 +94,19 @@ fn acme_setup(acme: &AcmeConfig) -> TlsSetup {
             match state.next().await {
                 Some(Ok(ok)) => tracing::info!("acme: {ok:?}"),
                 Some(Err(err)) => tracing::error!("acme error: {err:?}"),
-                None => break,
+                None => {
+                    tracing::warn!(
+                        "acme renewal task ended; TLS certificates will no longer be renewed"
+                    );
+                    break;
+                }
             }
         }
     });
-    TlsSetup {
+    Ok(TlsSetup {
         acceptor,
         acme_driver: Some(driver),
-    }
+    })
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {

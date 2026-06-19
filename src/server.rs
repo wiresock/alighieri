@@ -51,17 +51,10 @@ impl Server {
     pub async fn bind(config: Config) -> Result<Server> {
         let users = load_users(&config)?;
         warn_config_footguns(&config);
-        let tls_acceptor = match tls::load_acceptor(config.tls.as_ref())? {
-            Some(setup) => {
-                if let Some(driver) = setup.acme_driver {
-                    // Drive ACME certificate issuance and renewal for the life of
-                    // the server; certificates are served as they are obtained.
-                    tokio::spawn(driver);
-                }
-                Some(setup.acceptor)
-            }
-            None => None,
-        };
+        // Build the acceptor and (for ACME) the renewal driver up front so config
+        // errors surface before binding, but defer spawning the driver until the
+        // listener is bound (below).
+        let tls_setup = tls::load_acceptor(config.tls.as_ref())?;
 
         let (metrics_addr, metrics_listener) = match config.metrics_listen {
             Some(addr) => {
@@ -90,6 +83,18 @@ impl Server {
         } else {
             info!(listen = %listen, "listening");
         }
+        // Now the listener is bound, spawn the ACME renewal driver (if any): a
+        // failed bind above cannot leak it, and validation cannot start before
+        // the listener can answer the TLS-ALPN-01 challenge.
+        let tls_acceptor = match tls_setup {
+            Some(setup) => {
+                if let Some(driver) = setup.acme_driver {
+                    tokio::spawn(driver);
+                }
+                Some(setup.acceptor)
+            }
+            None => None,
+        };
         let max_connections = config.max_connections;
         let abuse = AbuseControls::new(config.rate_limits.clone());
         let mut process_config = config.clone();

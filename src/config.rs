@@ -671,12 +671,16 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             }
             b.tls_acme_domains = vals.to_vec();
         }
-        "tlsacmeemail" | "tls.acme.email" => {
-            if vals.is_empty() {
-                return Err(cfg_err(lineno, "tls.acme.email requires an address"));
+        "tlsacmeemail" | "tls.acme.email" => match vals {
+            [] => return Err(cfg_err(lineno, "tls.acme.email requires an address")),
+            [email] => b.tls_acme_email = Some(email.clone()),
+            _ => {
+                return Err(cfg_err(
+                    lineno,
+                    "tls.acme.email accepts only a single address",
+                ))
             }
-            b.tls_acme_email = Some(vals.join(" "));
-        }
+        },
         "tlsacmecache" | "tls.acme.cache" | "tls.acme.cachedir" => {
             b.tls_acme_cache = Some(parse_path(vals, lineno, "tls.acme.cache")?);
         }
@@ -1613,6 +1617,15 @@ tls.acme.staging: on
                 staging: true,
             }))
         );
+    }
+
+    #[test]
+    fn acme_email_rejects_multiple_addresses() {
+        let err = Config::parse(
+            "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme\ntls.acme.email: a@example.com b@example.com",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("single address"), "got: {err}");
     }
 
     #[test]
