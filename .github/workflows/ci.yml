@@ -64,12 +64,17 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
-      - name: Install cross linker (Linux aarch64)
+      - name: Install aarch64 cross toolchain (Linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.linker }}
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          # Linker for cargo, and CC so cc-rs build scripts (e.g. ring) use the
+          # cross compiler instead of the host toolchain.
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+          } >> "$GITHUB_ENV"
       - name: Cross-compile (release, build-only)
         run: cargo build --release --locked --target ${{ matrix.target }}
 
