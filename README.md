@@ -20,6 +20,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 
 - [Features](#features)
 - [Quick start](#quick-start)
+  - [Container image](#container-image)
 - [Configuration wizard](#configuration-wizard)
 - [Configuration](#configuration)
   - [Settings](#settings)
@@ -120,6 +121,23 @@ alighieri service install --config "C:\ProgramData\Alighieri\alighieri.conf"
 alighieri service start
 alighieri service reload
 ```
+
+### Container image
+
+Multi-arch (`linux/amd64`, `linux/arm64`) images are published to the GitHub
+Container Registry. Mount a config and publish the port:
+
+```sh
+docker run --rm -p 1080:1080 \
+  -v "$(pwd)/alighieri.conf:/etc/alighieri/alighieri.conf:ro" \
+  ghcr.io/wiresock/alighieri:latest
+```
+
+In that config set `internal: 0.0.0.0 port = 1080` so the listener is reachable
+from outside the container, and `logoutput: stdout` so logs reach `docker logs`.
+The image is distroless and runs as a non-root user with no shell, so it also
+works under `--read-only`. Use `:latest` or pin a release with
+`ghcr.io/wiresock/alighieri:X.Y.Z`.
 
 ## Configuration wizard
 

@@ -19,6 +19,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- Official multi-arch (`linux/amd64`, `linux/arm64`) container image published to
+  the GitHub Container Registry (`ghcr.io/wiresock/alighieri`) on each release,
+  built on a distroless non-root base (no shell, `--read-only`-friendly). A
+  `Dockerfile` builds it from source by cross-compiling per target arch.
+- ARM64 release binaries: `aarch64-unknown-linux-gnu` and
+  `aarch64-pc-windows-msvc` are now built and attached to releases, validated on
+  every change by a CI cross-build job.
 - Per-rule `bandwidth: BYTES/WINDOW_SECONDS` selector on `socks` rules: throttles
   each matching CONNECT relay with a per-session token bucket (sustained
   `BYTES / WINDOW`, burst up to `BYTES`), shaped like `ratelimit.byterate`. A
