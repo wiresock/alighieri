@@ -16,10 +16,14 @@ RUN set -eux; \
     host="$(dpkg --print-architecture)"; \
     : > /cross.env; \
     case "$TARGETARCH" in \
-      amd64) target=x86_64-unknown-linux-gnu; \
-             pkgs="gcc-x86-64-linux-gnu libc6-dev-amd64-cross"; cc=x86_64-linux-gnu-gcc ;; \
-      arm64) target=aarch64-unknown-linux-gnu; \
-             pkgs="gcc-aarch64-linux-gnu libc6-dev-arm64-cross"; cc=aarch64-linux-gnu-gcc ;; \
+      amd64) target=x86_64-unknown-linux-gnu; cc=x86_64-linux-gnu-gcc; \
+             pkgs="gcc-x86-64-linux-gnu libc6-dev-amd64-cross"; \
+             linker_var=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER; \
+             cc_var=CC_x86_64_unknown_linux_gnu ;; \
+      arm64) target=aarch64-unknown-linux-gnu; cc=aarch64-linux-gnu-gcc; \
+             pkgs="gcc-aarch64-linux-gnu libc6-dev-arm64-cross"; \
+             linker_var=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER; \
+             cc_var=CC_aarch64_unknown_linux_gnu ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "$target" > /target; \
@@ -28,10 +32,7 @@ RUN set -eux; \
       apt-get update; \
       apt-get install -y --no-install-recommends $pkgs; \
       rm -rf /var/lib/apt/lists/*; \
-      upper="$(echo "$target" | tr 'a-z-' 'A-Z_')"; \
-      lower="$(echo "$target" | tr - _)"; \
-      printf 'export CARGO_TARGET_%s_LINKER=%s\nexport CC_%s=%s\n' \
-          "$upper" "$cc" "$lower" "$cc" > /cross.env; \
+      printf 'export %s=%s\nexport %s=%s\n' "$linker_var" "$cc" "$cc_var" "$cc" > /cross.env; \
     fi
 
 COPY . .
