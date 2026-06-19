@@ -219,6 +219,41 @@ async fn full_connect_relay_ipv4() {
 }
 
 #[tokio::test]
+async fn connect_relays_under_per_rule_bandwidth() {
+    // A generous per-rule bandwidth (well above the tiny payload's burst) must
+    // not disturb relaying — it proves the per-session rule bucket is wired into
+    // the CONNECT relay without shaping the traffic noticeably.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: connect
+    bandwidth: 10MiB/1
+}
+"#,
+    )
+    .unwrap();
+    let (_proxy, addr) = start_proxy_with_config(cfg).await;
+    let echo = start_echo_server().await;
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+    let _bound = request_connect(&mut client, echo).await;
+
+    let payload = b"shaped but flowing";
+    client.write_all(payload).await.unwrap();
+    client.shutdown().await.ok();
+
+    let mut received = Vec::new();
+    client.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, payload);
+}
+
+#[tokio::test]
 async fn connection_rate_limit_rejects_excess_client_connections() {
     let cfg = Config::parse(
         r#"

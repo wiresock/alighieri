@@ -12,7 +12,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
@@ -21,7 +21,7 @@ use crate::abuse::AbuseControls;
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
 use crate::auth::{AuthOutcome, CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
-use crate::config::{Config, Protocol};
+use crate::config::{Config, Protocol, RateLimit};
 use crate::dns::DnsResolver;
 use crate::errors::{Error, Result};
 use crate::metrics::Metrics;
@@ -338,7 +338,7 @@ impl Connection {
             "connect established"
         );
 
-        let throttle = self.throttle();
+        let throttle = self.throttle(decision.bandwidth.as_ref());
         let (up, down) =
             relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?;
         self.metrics.tcp_relay_closed(up, down);
@@ -462,7 +462,9 @@ impl Connection {
 
         self.metrics.udp_association_started();
         let metrics = self.metrics.clone();
-        let throttle = self.throttle();
+        // Per-rule bandwidth applies to CONNECT relays; UDP uses the per-client
+        // limit only (datagrams may match different rules each).
+        let throttle = self.throttle(None);
         let run_result = relay::run_udp_associate(
             self.stream,
             relay_socket,
@@ -490,12 +492,27 @@ impl Connection {
         self.abuse.record_auth_failure(self.peer.ip());
     }
 
-    /// Builds the throttle governing this connection's relay from the shared
-    /// per-client bandwidth bucket (`byterate`). `None` when no limit applies,
-    /// so the relay hot path stays allocation- and lock-free.
-    fn throttle(&self) -> Option<Throttle> {
-        let bucket = self.throttle_bucket.clone()?;
-        Some(Throttle::new().with_bucket(bucket))
+    /// Builds the throttle governing this connection's relay: the shared
+    /// per-client bucket (`byterate`) and, for a CONNECT whose matching `socks`
+    /// rule sets `bandwidth`, a fresh per-session bucket. `None` when neither
+    /// applies, so the relay hot path stays allocation- and lock-free.
+    fn throttle(&self, rule_bandwidth: Option<&RateLimit>) -> Option<Throttle> {
+        let client_bucket = self.throttle_bucket.clone();
+        let rule_bucket = rule_bandwidth.and_then(|limit| {
+            TokenBucket::from_rate_window(limit.limit, limit.window, Instant::now())
+                .map(|b| Arc::new(Mutex::new(b)))
+        });
+        if client_bucket.is_none() && rule_bucket.is_none() {
+            return None;
+        }
+        let mut throttle = Throttle::new();
+        if let Some(bucket) = client_bucket {
+            throttle = throttle.with_bucket(bucket);
+        }
+        if let Some(bucket) = rule_bucket {
+            throttle = throttle.with_bucket(bucket);
+        }
+        Some(throttle)
     }
 }
 

@@ -353,7 +353,7 @@ the request is **denied**.
 
 - `client pass/block { from: CIDR [port = N] to: CIDR [port = N] }` —
   evaluated at connection admission.
-- `socks pass/block { from: CIDR [port = N] to: CIDR|HOSTNAME [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] }` —
+- `socks pass/block { from: CIDR [port = N] to: CIDR|HOSTNAME [port = N] [command: ...] [protocol: tcp|udp] [method: none|username] [bandwidth: BYTES/WINDOW_SECONDS] }` —
   evaluated per SOCKS request.
 
 Rules can optionally be named by placing a single token between the verdict and
@@ -394,6 +394,23 @@ Hostname patterns are valid only in a `socks` rule `to:` — a `from:` selector
 and a `client` rule `to:` stay IP/CIDR-only. An earlier `block { to: 10.0.0.0/8 }`
 still rejects a domain that *resolves* into a denied range, so deny-by-default
 and DNS-rebinding protection are preserved.
+
+A `socks` rule may carry a **`bandwidth: BYTES/WINDOW_SECONDS`** limit that
+throttles each matching **CONNECT** relay (a per-session token bucket: sustained
+`BYTES / WINDOW` with a burst up to `BYTES`). It is enforced like
+`ratelimit.byterate` — the flow is *shaped* (slowed), not torn down — and a
+session is bounded by both its per-client `byterate` and the matched rule's
+limit, whichever is tighter. `bandwidth` is valid only in a `socks` rule and
+applies to CONNECT; UDP keeps the per-client limit.
+
+```conf
+# Throttle each bulk-download session to ~5 MiB/s, leave everything else alone.
+socks pass "downloads" {
+    to: .cdn.example.com port = 443
+    command: connect
+    bandwidth: 5MiB/1
+}
+```
 
 ### Userlist format
 
@@ -727,7 +744,7 @@ version; verify against the version you would deploy.
 | Hot reload | SIGHUP (Unix) + Windows SCM | SIGHUP |
 | Service tooling | systemd install/upgrade/uninstall script; Windows Service | distro init/systemd packaging |
 | Config wizard / validation | loopback wizard, `--check`, `--check --json` | startup config check |
-| Per-client abuse limits | connection-rate, auth-failure-rate, concurrency, byterate cap | session limits (+ bandwidth in some builds) |
+| Bandwidth / abuse limits | connection-rate, auth-failure-rate, concurrency, token-bucket throttle (per-client `byterate` + per-rule `bandwidth`) | session limits (+ bandwidth in some builds) |
 
 **Security & project**
 

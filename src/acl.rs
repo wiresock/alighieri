@@ -17,7 +17,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::config::{AuthKind, Protocol};
+use crate::config::{AuthKind, Protocol, RateLimit};
 use crate::net::AddrSpec;
 use crate::socks5::Command;
 
@@ -58,6 +58,9 @@ pub struct Rule {
     pub protocols: Vec<Protocol>,
     /// Allowed auth methods; empty means "any method".
     pub methods: Vec<AuthKind>,
+    /// Optional per-session bandwidth limit (`socks` rules only): each matching
+    /// CONNECT relay is shaped to this rate. `None` means unlimited.
+    pub bandwidth: Option<RateLimit>,
     /// 1-based line number in the source config (for diagnostics).
     pub source_line: usize,
 }
@@ -94,6 +97,8 @@ pub struct RuleDecision {
     pub verdict: Verdict,
     pub source_line: Option<usize>,
     pub rule_name: Option<Arc<str>>,
+    /// The matching `socks` rule's per-session bandwidth limit, if any.
+    pub bandwidth: Option<RateLimit>,
 }
 
 impl Rule {
@@ -142,6 +147,8 @@ impl RuleSet {
                     verdict: rule.verdict,
                     source_line: Some(rule.source_line),
                     rule_name: rule.name.clone(),
+                    // `client` rules carry no bandwidth limit.
+                    bandwidth: None,
                 };
             }
         }
@@ -149,6 +156,7 @@ impl RuleSet {
             verdict: Verdict::Block,
             source_line: None,
             rule_name: None,
+            bandwidth: None,
         }
     }
 
@@ -166,6 +174,7 @@ impl RuleSet {
                     verdict: rule.verdict,
                     source_line: Some(rule.source_line),
                     rule_name: rule.name.clone(),
+                    bandwidth: rule.bandwidth.clone(),
                 };
             }
         }
@@ -173,6 +182,7 @@ impl RuleSet {
             verdict: Verdict::Block,
             source_line: None,
             rule_name: None,
+            bandwidth: None,
         }
     }
 
@@ -201,6 +211,7 @@ mod tests {
             commands: vec![],
             protocols: vec![],
             methods: vec![],
+            bandwidth: None,
             source_line: 0,
         }
     }
@@ -215,6 +226,7 @@ mod tests {
             commands,
             protocols: vec![],
             methods: vec![],
+            bandwidth: None,
             source_line: 0,
         }
     }
@@ -260,6 +272,7 @@ mod tests {
             commands: vec![],
             protocols: vec![],
             methods: vec![],
+            bandwidth: None,
             source_line: 1,
         }]);
 
@@ -282,6 +295,27 @@ mod tests {
             rs.evaluate_socks(&socks_ctx("203.0.113.7", Command::Connect)),
             Verdict::Block
         );
+    }
+
+    #[test]
+    fn socks_decision_carries_rule_bandwidth() {
+        // A CONNECT-only rule with a bandwidth limit.
+        let mut rule = socks_rule(Verdict::Pass, "0.0.0.0/0", vec![Command::Connect]);
+        rule.bandwidth = Some(RateLimit {
+            limit: 1024,
+            window: std::time::Duration::from_secs(1),
+        });
+        let rs = RuleSet::new(vec![rule]);
+
+        // A matching request surfaces the rule's bandwidth.
+        let allowed = rs.evaluate_socks_detail(&socks_ctx("8.8.8.8", Command::Connect));
+        assert_eq!(allowed.verdict, Verdict::Pass);
+        assert_eq!(allowed.bandwidth.as_ref().map(|b| b.limit), Some(1024));
+
+        // A non-matching request denies by default, with no bandwidth.
+        let denied = rs.evaluate_socks_detail(&socks_ctx("8.8.8.8", Command::UdpAssociate));
+        assert_eq!(denied.verdict, Verdict::Block);
+        assert_eq!(denied.bandwidth, None);
     }
 
     #[test]

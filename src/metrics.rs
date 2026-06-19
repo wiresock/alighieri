@@ -505,11 +505,13 @@ mod tests {
             verdict: Verdict::Block,
             source_line: Some(19),
             rule_name: Some("blocked-loopback".into()),
+            bandwidth: None,
         });
         metrics.client_allowed(&RuleDecision {
             verdict: Verdict::Pass,
             source_line: None,
             rule_name: None,
+            bandwidth: None,
         });
 
         let rendered = metrics.render_prometheus();
