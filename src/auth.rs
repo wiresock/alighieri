@@ -295,7 +295,10 @@ impl CommandAuth {
         let allowed = match tokio::time::timeout(timeout, self.run(username, password)).await {
             Ok(ok) => ok,
             Err(_) => {
-                tracing::warn!(program = %self.program, "auth.command timed out");
+                // The connection layer logs the timeout at WARN (with peer/user);
+                // keep this program-specific detail at DEBUG so a timeout is not
+                // logged twice at WARN.
+                tracing::debug!(program = %self.program, "auth.command timed out");
                 return AuthOutcome::TimedOut;
             }
         };
