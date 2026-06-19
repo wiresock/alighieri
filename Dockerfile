@@ -1,36 +1,48 @@
 # syntax=docker/dockerfile:1
 
-# Multi-arch image. The builder always runs on the native build platform and
-# cross-compiles to the requested target arch (no QEMU emulation of the Rust
-# build), then the binary ships in a minimal distroless runtime.
-FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
+# Multi-arch image. The builder runs on the native build platform and, when the
+# build host arch differs from the target, cross-compiles to it (no QEMU of the
+# Rust build), then the binary ships in a minimal distroless runtime. Pinned to
+# the project MSRV so rebuilding a release tag stays reproducible.
+FROM --platform=$BUILDPLATFORM rust:1.85-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /src
 
-# Map the Docker target arch to a Rust target, installing the cross toolchain
-# (linker + C compiler for cc-rs build scripts such as ring) for aarch64.
+# Pick the Rust target for the requested arch. When cross-compiling (build host
+# arch != target) install the cross toolchain — the compiler/linker plus the
+# target libc headers that cc-rs build scripts such as ring need — and record
+# the env that selects it. A native build keeps the default host compiler.
 RUN set -eux; \
+    host="$(dpkg --print-architecture)"; \
+    : > /cross.env; \
     case "$TARGETARCH" in \
-      amd64) target=x86_64-unknown-linux-gnu ;; \
+      amd64) target=x86_64-unknown-linux-gnu; \
+             pkgs="gcc-x86-64-linux-gnu libc6-dev-amd64-cross"; cc=x86_64-linux-gnu-gcc ;; \
       arm64) target=aarch64-unknown-linux-gnu; \
-             apt-get update; \
-             # gcc-aarch64-linux-gnu is the cross compiler/linker;
-             # libc6-dev-arm64-cross provides the target libc headers ring's
-             # build needs (a Recommends, so it must be named under
-             # --no-install-recommends).
-             apt-get install -y --no-install-recommends \
-                 gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
-             rm -rf /var/lib/apt/lists/* ;; \
+             pkgs="gcc-aarch64-linux-gnu libc6-dev-arm64-cross"; cc=aarch64-linux-gnu-gcc ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "$target" > /target; \
-    rustup target add "$target"
-
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+    rustup target add "$target"; \
+    if [ "$host" != "$TARGETARCH" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends $pkgs; \
+      rm -rf /var/lib/apt/lists/*; \
+      upper="$(echo "$target" | tr 'a-z-' 'A-Z_')"; \
+      lower="$(echo "$target" | tr - _)"; \
+      printf 'export CARGO_TARGET_%s_LINKER=%s\nexport CC_%s=%s\n' \
+          "$upper" "$cc" "$lower" "$cc" > /cross.env; \
+    fi
 
 COPY . .
-RUN target="$(cat /target)"; \
+# Cache the cargo registry/git across builds. The compile is not cached (a
+# shared target dir would serialise the parallel per-arch builds), and the
+# binary is copied out of the build tree within the same layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    set -eux; \
+    . /cross.env; \
+    target="$(cat /target)"; \
     cargo build --release --locked --target "$target"; \
     cp "target/$target/release/alighieri" /alighieri
 

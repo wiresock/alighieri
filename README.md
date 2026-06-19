@@ -135,9 +135,11 @@ docker run --rm -p 1080:1080 \
 
 In that config set `internal: 0.0.0.0 port = 1080` so the listener is reachable
 from outside the container, and `logoutput: stdout` so logs reach `docker logs`.
-The image is distroless and runs as a non-root user with no shell, so it also
-works under `--read-only`. Use `:latest` or pin a release with
-`ghcr.io/wiresock/alighieri:X.Y.Z`.
+The image is distroless and runs as a non-root user (uid 65532) with no shell,
+so it also works under `--read-only`. Because of the non-root user, the
+bind-mounted config must be readable by it — a host-only `chmod 600` config will
+fail with a permission error, so make it world-readable or owned by uid 65532.
+Use `:latest` or pin a release with `ghcr.io/wiresock/alighieri:X.Y.Z`.
 
 ## Configuration wizard
 
