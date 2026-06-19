@@ -123,15 +123,25 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
             dir.display()
         ))
     })?;
-    let probe = dir.join(".alighieri-acme-write-test");
-    std::fs::write(&probe, [])
-        .and_then(|()| std::fs::remove_file(&probe))
-        .map_err(|e| {
-            Error::Config(format!(
-                "ACME cache directory {} is not writable: {e}",
-                dir.display()
-            ))
-        })
+    // Probe with a per-process-unique name created exclusively (create_new), so
+    // the probe never follows a symlink or clobbers an existing file — the cache
+    // dir may be writable by a less-trusted user than this process.
+    let probe = dir.join(format!(".alighieri-acme-write-test.{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file); // close before removing (Windows cannot remove an open file)
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(Error::Config(format!(
+            "ACME cache directory {} is not writable: {e}",
+            dir.display()
+        ))),
+    }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
