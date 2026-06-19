@@ -453,7 +453,9 @@ anything else, or a timeout, denies it. The script should read with `read -r`,
 and credentials containing a newline or NUL byte are rejected to keep the
 framing unambiguous. Successful results are cached exactly like the userlist
 (`auth.cachettl`), and with `auth.command` set the `username` method no longer
-requires a `userlist`.
+requires a `userlist`. To bound resource use, at most 64 verifier processes run
+concurrently; under a heavier burst the excess waits for a slot and is denied
+(treated as a timeout) if it cannot start within the handshake timeout.
 
 The value is split on whitespace into the program path and its arguments, with
 no quoting — so a program path that itself contains spaces (for example
