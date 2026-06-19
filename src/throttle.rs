@@ -72,7 +72,9 @@ impl TokenBucket {
         if self.tokens >= 0.0 || self.rate <= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(-self.tokens / self.rate)
+            // A degenerate (tiny) rate can make the wait overflow `Duration`;
+            // `from_secs_f64` would panic, so fall back to the maximum wait.
+            Duration::try_from_secs_f64(-self.tokens / self.rate).unwrap_or(Duration::MAX)
         }
     }
 
@@ -86,6 +88,26 @@ impl TokenBucket {
     /// Consumes `bytes` a prior [`TokenBucket::has`] confirmed are available.
     fn take(&mut self, bytes: u64) {
         self.tokens -= bytes as f64;
+    }
+
+    /// Re-tunes the bucket to a new `BYTES/WINDOW` limit in place, so a config
+    /// reload applies to a client's existing (shared) bucket. Current tokens are
+    /// clamped to the new capacity; a degenerate limit is ignored.
+    pub fn update_rate_window(&mut self, bytes: u64, window: Duration) {
+        let secs = window.as_secs_f64();
+        if bytes == 0 || secs <= 0.0 {
+            return;
+        }
+        self.rate = bytes as f64 / secs;
+        self.capacity = bytes as f64;
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
+    /// Refills and reports whether the bucket is full (no outstanding debt), so
+    /// a caller can tell an idle bucket from one still owing throttled bytes.
+    pub fn is_full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= self.capacity
     }
 }
 
@@ -138,22 +160,34 @@ impl Throttle {
     /// every bucket) or `false` to drop it when any bucket is short.
     /// Consumption is all-or-nothing, so a dropped datagram costs no tokens.
     pub fn police(&self, bytes: u64) -> bool {
-        if self.buckets.is_empty() {
-            return true;
-        }
         let now = Instant::now();
-        let mut guards: Vec<_> = self
-            .buckets
-            .iter()
-            .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()))
-            .collect();
-        if guards.iter_mut().all(|g| g.has(bytes, now)) {
-            for g in guards.iter_mut() {
-                g.take(bytes);
+        match self.buckets.as_slice() {
+            // Fast paths: the UDP hot path is almost always 0 or 1 bucket, so
+            // avoid allocating a guard vector for them.
+            [] => true,
+            [bucket] => {
+                let mut bucket = bucket.lock().unwrap_or_else(|e| e.into_inner());
+                if bucket.has(bytes, now) {
+                    bucket.take(bytes);
+                    true
+                } else {
+                    false
+                }
             }
-            true
-        } else {
-            false
+            buckets => {
+                let mut guards: Vec<_> = buckets
+                    .iter()
+                    .map(|b| b.lock().unwrap_or_else(|e| e.into_inner()))
+                    .collect();
+                if guards.iter_mut().all(|g| g.has(bytes, now)) {
+                    for g in guards.iter_mut() {
+                        g.take(bytes);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 }
@@ -187,6 +221,38 @@ mod tests {
             (wait.as_secs_f64() - 0.5).abs() < 1e-6,
             "unexpected wait {wait:?}"
         );
+    }
+
+    #[test]
+    fn update_rate_window_retunes_in_place() {
+        let now = Instant::now();
+        let mut b = TokenBucket::new(100.0, 100.0, now);
+        let _ = b.reserve(100, now); // empty the burst
+                                     // Re-tune to a faster rate and larger burst; the outstanding debt stays.
+        b.update_rate_window(1000, Duration::from_secs(1)); // 1000 B/s, burst 1000
+                                                            // 50 bytes now wait 50/1000 = 0.05s, far less than 0.5s at the old rate.
+        let wait = b.reserve(50, now);
+        assert!((wait.as_secs_f64() - 0.05).abs() < 1e-6, "wait {wait:?}");
+    }
+
+    #[test]
+    fn is_full_tracks_outstanding_debt() {
+        let start = Instant::now();
+        let mut b = TokenBucket::new(100.0, 100.0, start);
+        assert!(b.is_full(start)); // starts full
+        let _ = b.reserve(100, start); // drain the burst
+        assert!(!b.is_full(start)); // now owes nothing-but-not-full
+                                    // A full window later, the bucket has refilled to capacity.
+        assert!(b.is_full(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn reserve_does_not_panic_on_degenerate_tiny_rate() {
+        let now = Instant::now();
+        // 1 byte per ~584e9 years: the wait for any debt overflows Duration, but
+        // `reserve` must saturate rather than panic.
+        let mut b = TokenBucket::new(f64::MIN_POSITIVE, 0.0, now);
+        assert_eq!(b.reserve(1, now), Duration::MAX);
     }
 
     #[test]

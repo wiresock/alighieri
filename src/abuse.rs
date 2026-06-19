@@ -111,8 +111,16 @@ impl AbuseControls {
                     TokenBucket::from_rate_window(limit.limit, limit.window, now)
                         .map(|b| Arc::new(Mutex::new(b)));
             }
+            (Some(limit), Some(bucket)) => {
+                // Re-tune the existing shared bucket in place so a reloaded rate
+                // applies to this client's ongoing flows, not just new clients.
+                bucket
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .update_rate_window(limit.limit, limit.window);
+            }
             (None, Some(_)) => state_guard.bandwidth = None,
-            _ => {}
+            (None, None) => {}
         }
         let bandwidth = state_guard.bandwidth.clone();
         drop(state_guard);
@@ -246,12 +254,18 @@ fn prune_expired_clients(
 
 impl ClientState {
     fn is_expired(&self, config: &RateLimits, now: Instant) -> bool {
-        // The bandwidth bucket does not keep a state alive: with no active
-        // connections nothing is relaying, so dropping it (and its bucket) is
-        // safe — a reconnecting client simply gets a fresh, full bucket.
+        // Keep the state alive while its bandwidth bucket still owes throttled
+        // bytes (is not full), so a client cannot shed accumulated debt — and
+        // regain a fresh burst — by briefly disconnecting and reconnecting. Once
+        // the bucket has refilled, the client has earned that burst and pruning
+        // (which only resets it to full anyway) is safe.
         self.active_connections == 0
             && window_is_prunable(&self.connections, config.connection_rate.as_ref(), now)
             && window_is_prunable(&self.auth_failures, config.auth_failure_rate.as_ref(), now)
+            && self
+                .bandwidth
+                .as_ref()
+                .is_none_or(|b| b.lock().unwrap_or_else(|e| e.into_inner()).is_full(now))
     }
 }
 
@@ -342,6 +356,62 @@ mod tests {
         let controls = AbuseControls::new(RateLimits::default());
         let permit = controls.admit(ip()).unwrap();
         assert!(permit.throttle_bucket().is_none());
+    }
+
+    #[test]
+    fn reload_retunes_existing_bucket_in_place() {
+        let controls = AbuseControls::new(RateLimits {
+            byte_rate: Some(RateLimit {
+                limit: 1000,
+                window: Duration::from_secs(1),
+            }),
+            ..RateLimits::default()
+        });
+        let first = controls.admit(ip()).unwrap();
+        let bucket = first.throttle_bucket().unwrap();
+
+        // Reload with a different rate, then re-admit the same client.
+        controls.update_config(RateLimits {
+            byte_rate: Some(RateLimit {
+                limit: 5000,
+                window: Duration::from_secs(1),
+            }),
+            ..RateLimits::default()
+        });
+        let second = controls.admit(ip()).unwrap();
+
+        // The bucket is re-tuned in place (the same instance), not recreated, so
+        // the new rate applies to the client's ongoing flows immediately.
+        assert!(Arc::ptr_eq(&bucket, &second.throttle_bucket().unwrap()));
+    }
+
+    #[test]
+    fn drained_bandwidth_state_survives_prune_until_refilled() {
+        use crate::throttle::Throttle;
+        // Only byterate is set, so nothing but the bandwidth bucket gates pruning.
+        let controls = AbuseControls::new(RateLimits {
+            byte_rate: Some(RateLimit {
+                limit: 1000,
+                window: Duration::from_secs(60),
+            }),
+            ..RateLimits::default()
+        });
+        let drained = "127.0.0.9".parse().unwrap();
+        let permit = controls.admit(drained).unwrap();
+        let bucket = permit.throttle_bucket().unwrap();
+        // Spend the whole bucket, then go idle.
+        assert!(Throttle::new().with_bucket(bucket).police(1000));
+        drop(permit);
+
+        // Drive enough admissions of another client to trigger a prune sweep.
+        let other = ip();
+        for _ in 0..PRUNE_EVERY_N_ADMISSIONS {
+            drop(controls.admit(other).unwrap());
+        }
+
+        // The drained client still owes throttled bytes, so its state was kept —
+        // it cannot reconnect into a fresh burst.
+        assert!(controls.clients.lock().unwrap().contains_key(&drained));
     }
 
     #[test]
