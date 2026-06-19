@@ -36,12 +36,11 @@ RUN set -eux; \
     fi
 
 COPY . .
-# Cache the cargo registry/git across builds. The compile is not cached (a
-# shared target dir would serialise the parallel per-arch builds), and the
-# binary is copied out of the build tree within the same layer.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    set -eux; \
+# No BuildKit cargo cache mount: the amd64 and arm64 stages build in parallel,
+# and a shared `type=cache` registry mount corrupts under their concurrent crate
+# unpacking (".cargo-ok" race -> "failed to unpack"). These images are built
+# infrequently (release tags), so a clean compile is the right trade-off.
+RUN set -eux; \
     . /cross.env; \
     target="$(cat /target)"; \
     cargo build --release --locked --target "$target"; \
