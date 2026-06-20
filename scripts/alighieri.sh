@@ -369,14 +369,15 @@ ensure_user() {
     fi
 }
 
-# Ports the configured listeners bind, one per line, as base-10 integers.
-# Handles both `internal: host:port` (including bracketed [ipv6]:port) and the
-# `internal: host port = N` form, ignores trailing comments, normalises any
-# leading zeros (so the caller never feeds bash an octal-looking value), and
-# emits nothing when a listener has no explicit port.
-listener_ports() {
+# Per-line config signals relevant to capability detection, one per line, in
+# file order: `acme` for any tls.acme.* setting, `port <n|->` for an `internal:`
+# listener (its port, normalised to base-10, or `-` when none is given — both
+# `host:port`/[ipv6]:port and `host port = N` forms), and `include <pattern>`
+# for an include directive. Trailing comments are ignored.
+_config_tokens() {
     local config_file="$1"
     awk '
+        /^[[:space:]]*tls\.acme\./ { print "acme"; next }
         /^[[:space:]]*internal:/ {
             v = $0
             sub(/^[[:space:]]*internal:[[:space:]]*/, "", v)
@@ -384,80 +385,78 @@ listener_ports() {
             if (v ~ /port[[:space:]]*=/) {
                 sub(/.*port[[:space:]]*=[[:space:]]*/, "", v)
                 sub(/[^0-9].*/, "", v)
-                if (v != "") print v + 0
+                if (v != "") { print "port " (v + 0) } else { print "port -" }
                 next
             }
             sub(/[[:space:]].*/, "", v)
-            if (v ~ /:[0-9]+$/) {
-                sub(/.*:/, "", v)
-                print v + 0
-            }
+            if (v ~ /:[0-9]+$/) { sub(/.*:/, "", v); print "port " (v + 0) }
+            else { print "port -" }
+            next
         }
-    ' < "$config_file"
-}
-
-# `include:` patterns declared in a single config file, one per line.
-include_patterns() {
-    local config_file="$1"
-    awk '
         /^[[:space:]]*include:/ {
             sub(/^[[:space:]]*include:[[:space:]]*/, "")
             sub(/#.*/, "")
             sub(/[[:space:]]+$/, "")
-            if ($0 != "") print
+            if ($0 != "") print "include " $0
+            next
         }
     ' < "$config_file"
 }
 
-# Whether the service needs CAP_NET_BIND_SERVICE to start. ACME forces the
-# TLS-ALPN-01 challenge onto :443, and any listener on a port in 1..1023 is
-# privileged; the capability is granted only when one of these holds. Follows
-# `include:` files (resolved relative to each file's directory, with
-# final-component globs) like src/config.rs and guards against include cycles,
-# so keys living in fragments are detected too.
-needs_net_bind_capability() {
-    _scan_net_bind "$1"
-}
-
-_scan_net_bind() {
+# Emit the config's signals (`acme` / `port N`) in true load order, expanding
+# `include:` inline — relative to each file's directory, final-component globs,
+# cycle-guarded — exactly as src/config.rs does. The caller relies on this order
+# because repeated `internal:` settings overwrite (last wins), so only the final
+# listener's port decides whether a privileged bind is needed.
+_emit_config_signals() {
     local file="$1"; shift   # remaining args: ancestor files, for the cycle guard
-    [ -f "$file" ] || return 1
+    [ -f "$file" ] || return 0
     local ancestor
     for ancestor in "$@"; do
-        [ "$ancestor" = "$file" ] && return 1
+        [ "$ancestor" = "$file" ] && return 0
     done
 
-    if grep -Eq '^[[:space:]]*tls\.acme\.' < "$file"; then
-        return 0
-    fi
-    local port
-    while IFS= read -r port; do
-        [ -n "$port" ] || continue
-        if [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]; then
-            return 0
-        fi
-    done < <(listener_ports "$file")
-
-    local dir pattern target
+    local dir kind rest target pattern
     dir="$(dirname -- "$file")"
-    while IFS= read -r pattern; do
-        [ -n "$pattern" ] || continue
-        case "$pattern" in
-            /*) : ;;                       # absolute pattern, used as-is
-            *) pattern="$dir/$pattern" ;;  # relative to this file's directory
+    while IFS=' ' read -r kind rest; do
+        case "$kind" in
+            acme) printf 'acme\n' ;;
+            port) printf 'port %s\n' "$rest" ;;
+            include)
+                pattern="$rest"
+                case "$pattern" in
+                    /*) : ;;                       # absolute pattern, used as-is
+                    *) pattern="$dir/$pattern" ;;  # relative to this file's dir
+                esac
+                # Intentional word-splitting + globbing: an include pattern may
+                # end in a final-component wildcard such as conf.d/*.conf.
+                # shellcheck disable=SC2086
+                for target in $pattern; do
+                    [ -f "$target" ] && _emit_config_signals "$target" "$@" "$file"
+                done
+                ;;
         esac
-        # Intentional word-splitting + globbing: an include pattern may end in a
-        # final-component wildcard such as conf.d/*.conf.
-        # shellcheck disable=SC2086
-        for target in $pattern; do
-            [ -f "$target" ] || continue
-            if _scan_net_bind "$target" "$@" "$file"; then
-                return 0
-            fi
-        done
-    done < <(include_patterns "$file")
+    done < <(_config_tokens "$file")
+}
 
-    return 1
+# Whether the service needs CAP_NET_BIND_SERVICE to start. ACME forces the
+# TLS-ALPN-01 challenge onto :443 (and cannot be turned off by a later setting,
+# so it is decisive wherever it appears); otherwise the *effective* listener —
+# the last `internal:` in load order — decides: a port in 1..1023 is privileged.
+needs_net_bind_capability() {
+    local kind rest acme=0 last_port="-"
+    while IFS=' ' read -r kind rest; do
+        case "$kind" in
+            acme) acme=1 ;;
+            port) last_port="$rest" ;;
+        esac
+    done < <(_emit_config_signals "$1")
+
+    [ "$acme" -eq 1 ] && return 0
+    case "$last_port" in
+        '' | *[!0-9]*) return 1 ;;  # no/undetected port (e.g. "-") — not privileged
+    esac
+    [ "$last_port" -gt 0 ] && [ "$last_port" -lt 1024 ]
 }
 
 write_unit() {
