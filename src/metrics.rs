@@ -86,26 +86,6 @@ impl Metrics {
         self.socks_denied_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn socks_allowed(&self, decision: &RuleDecision) {
-        self.socks_request_allowed();
-        self.rule_hit(
-            Scope::Socks,
-            Verdict::Pass,
-            decision.source_line,
-            decision.rule_name.clone(),
-        );
-    }
-
-    pub fn socks_denied(&self, decision: &RuleDecision) {
-        self.socks_request_denied();
-        self.rule_hit(
-            Scope::Socks,
-            Verdict::Block,
-            decision.source_line,
-            decision.rule_name.clone(),
-        );
-    }
-
     pub fn auth_failed(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -501,12 +481,15 @@ mod tests {
     #[test]
     fn renders_rule_hits() {
         let metrics = Metrics::default();
-        metrics.socks_denied(&RuleDecision {
-            verdict: Verdict::Block,
-            source_line: Some(19),
-            rule_name: Some("blocked-loopback".into()),
-            bandwidth: None,
-        });
+        // Mirror the data path: a denied socks request bumps the counter and
+        // records a rule hit separately.
+        metrics.socks_request_denied();
+        metrics.rule_hit(
+            Scope::Socks,
+            Verdict::Block,
+            Some(19),
+            Some("blocked-loopback".into()),
+        );
         metrics.client_allowed(&RuleDecision {
             verdict: Verdict::Pass,
             source_line: None,

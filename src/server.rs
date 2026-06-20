@@ -147,7 +147,11 @@ impl Server {
         state.config = Arc::new(config);
         state.users = Arc::new(users);
         state.command_auth = command_auth;
-        state.dns_resolver = Arc::new(DnsResolver::new());
+        // The DNS resolver (and its TTL cache) is intentionally preserved across
+        // reloads: the resolution *policy* lives in the config and is read per
+        // lookup, so a reload takes effect on the next resolve without discarding
+        // the cache and triggering a re-resolve storm. The deny policy is also
+        // applied per call, so newly denied categories take effect immediately.
         info!("configuration reloaded");
         Ok(())
     }
@@ -205,7 +209,9 @@ impl Server {
                 Ok(a) => a,
                 Err(e) => {
                     warn!(error = %e, "could not read local address; dropping connection");
-                    self.metrics.closed_connection();
+                    // No `accepted_connection()` ran for this socket yet (that
+                    // happens after admission below), so do not call
+                    // `closed_connection()` here — it would drift the active gauge.
                     drop(permit);
                     continue;
                 }
