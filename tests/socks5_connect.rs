@@ -424,6 +424,46 @@ socks block { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 }
 
 #[tokio::test]
+async fn connect_to_ipv4_mapped_loopback_is_blocked_by_v4_cidr_rule() {
+    // A `to: 127.0.0.0/8` block must catch the IPv4-mapped form
+    // ::ffff:127.0.0.1, or a client bypasses loopback protection (SSRF). The
+    // pass rule matches both families, so without canonicalisation the mapped
+    // address slipped past the v4 block straight to it.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+client pass { }
+socks block { to: 127.0.0.0/8 }
+socks pass { protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.unwrap();
+    let proxy_addr = server.local_addr().unwrap();
+    tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+
+    // CONNECT to ::ffff:127.0.0.1 (ATYP=0x04, IPv4-mapped loopback).
+    let mapped: std::net::Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x04];
+    req.extend_from_slice(&mapped.octets());
+    req.extend_from_slice(&9u16.to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(
+        reply[1], 0x02,
+        "mapped loopback must be blocked, got reply 0x{:02x}",
+        reply[1]
+    );
+}
+
+#[tokio::test]
 async fn udp_associate_handshake() {
     let (_handle, proxy_addr) = start_proxy().await;
 

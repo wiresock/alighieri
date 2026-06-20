@@ -24,6 +24,7 @@ pub async fn resolve_all(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Ve
         TargetAddr::Ip(sa) => vec![*sa],
         TargetAddr::Domain(host, port) => lookup_domain(host, *port).await?,
     };
+    canonicalize_addrs(&mut addrs);
     order_addresses(&mut addrs, policy.preference);
     addrs.retain(|addr| address_allowed(addr.ip(), policy));
     Ok(addrs)
@@ -110,6 +111,7 @@ impl DnsResolver {
                 self.resolve_domain(host, *port, policy.cache_ttl).await?
             }
         };
+        canonicalize_addrs(&mut addrs);
         order_addresses(&mut addrs, policy.preference);
         addrs.retain(|addr| address_allowed(addr.ip(), policy));
         Ok(addrs)
@@ -341,10 +343,29 @@ fn order_addresses(addrs: &mut [SocketAddr], preference: DnsPreference) {
 /// for per-packet paths that check IP literals without building an address
 /// list.
 pub fn address_allowed(ip: IpAddr, policy: &DnsPolicy) -> bool {
+    // Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form
+    // before matching: the deny categories below recognise the real IPv4
+    // address, but not its mapped wrapper, so without this a request to
+    // `::ffff:127.0.0.1` would slip past a `loopback` (or `private`, etc.) deny.
+    let ip = ip.to_canonical();
     !policy
         .deny
         .iter()
         .any(|category| ip_matches_category(ip, *category))
+}
+
+/// Collapses IPv4-mapped IPv6 addresses to their IPv4 form so every downstream
+/// consumer — the deny policy, ACL CIDR matching, and the outbound connection —
+/// sees the real destination rather than the mapped wrapper that would dodge
+/// IPv4 rules.
+fn canonicalize_addrs(addrs: &mut [SocketAddr]) {
+    for addr in addrs.iter_mut() {
+        // `set_ip` keeps the port and — for a genuine IPv6 address, where
+        // `to_canonical` is a no-op — its `flowinfo`/`scope_id`. Only an actually
+        // mapped address changes family. Rebuilding via `SocketAddr::new` would
+        // instead strip those fields from scoped (e.g. link-local) destinations.
+        addr.set_ip(addr.ip().to_canonical());
+    }
 }
 
 fn ip_matches_category(ip: IpAddr, category: DnsDenyCategory) -> bool {
@@ -602,6 +623,51 @@ mod tests {
         .await
         .unwrap();
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn address_allowed_canonicalizes_ipv4_mapped() {
+        // The v4-oriented deny categories must catch a mapped v6 form too, or a
+        // request to ::ffff:127.0.0.1 would dodge a loopback deny (SSRF).
+        let deny = policy(DnsPreference::System, vec![DnsDenyCategory::Loopback]);
+        assert!(!address_allowed("::ffff:127.0.0.1".parse().unwrap(), &deny));
+        assert!(!address_allowed("127.0.0.1".parse().unwrap(), &deny));
+        // A genuine public address (mapped or not) still passes.
+        assert!(address_allowed("::ffff:8.8.8.8".parse().unwrap(), &deny));
+    }
+
+    #[tokio::test]
+    async fn denies_ipv4_mapped_loopback_and_private() {
+        for (literal, category) in [
+            ("[::ffff:127.0.0.1]:80", DnsDenyCategory::Loopback),
+            ("[::ffff:10.0.0.1]:80", DnsDenyCategory::Private),
+        ] {
+            let sa: SocketAddr = literal.parse().unwrap();
+            let resolved = resolve_all(
+                &TargetAddr::Ip(sa),
+                &policy(DnsPreference::System, vec![category]),
+            )
+            .await
+            .unwrap();
+            assert!(
+                resolved.is_empty(),
+                "{literal} should be denied as {category:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_all_canonicalizes_mapped_addresses() {
+        // A mapped literal that passes policy comes back as plain IPv4, so ACL
+        // CIDR matching and the outbound connect see the real address.
+        let sa: SocketAddr = "[::ffff:8.8.8.8]:53".parse().unwrap();
+        let resolved = resolve_all(
+            &TargetAddr::Ip(sa),
+            &policy(DnsPreference::System, Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, vec!["8.8.8.8:53".parse().unwrap()]);
     }
 
     #[test]

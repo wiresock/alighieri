@@ -81,11 +81,14 @@ impl Connection {
     /// Drives the connection to completion. Errors are returned for logging;
     /// the appropriate SOCKS5 reply (if any) has already been sent.
     pub async fn handle(mut self) -> Result<()> {
-        // 1. Connection admission.
+        // 1. Connection admission. Canonicalise IPv4-mapped IPv6 addresses (an
+        // IPv4 client on a dual-stack `[::]` listener arrives as `::ffff:a.b.c.d`)
+        // so `from:`/`to:` IPv4 CIDR rules match the real address rather than
+        // being silently skipped.
         let client_ctx = ClientContext {
-            client_ip: self.peer.ip(),
+            client_ip: self.peer.ip().to_canonical(),
             client_port: self.peer.port(),
-            proxy_ip: self.local.ip(),
+            proxy_ip: self.local.ip().to_canonical(),
             proxy_port: self.local.port(),
         };
         let client_decision = self.config.rules.evaluate_client_detail(&client_ctx);
@@ -353,10 +356,13 @@ impl Connection {
         method: crate::config::AuthKind,
     ) -> crate::acl::RuleDecision {
         let ctx = SocksContext {
-            client_ip: self.peer.ip(),
+            client_ip: self.peer.ip().to_canonical(),
             client_port: self.peer.port(),
             dest_host: host,
-            dest_ip: target.ip(),
+            // `target` is already canonical (the resolver collapses mapped
+            // addresses); canonicalise again defensively so a CIDR `to:` rule
+            // can never be dodged with an `::ffff:` literal.
+            dest_ip: target.ip().to_canonical(),
             dest_port: target.port(),
             command: Command::Connect,
             protocol: Protocol::Tcp,
@@ -423,10 +429,13 @@ impl Connection {
         let client_port = self.peer.port();
         let authorize = move |host: Option<&str>, dest_ip: IpAddr, dest_port: u16| -> bool {
             let ctx = SocksContext {
-                client_ip,
+                // Canonicalise for rule matching so IPv4 CIDR rules apply to
+                // mapped addresses; `client_ip` keeps its original form for the
+                // relay's source check and logging.
+                client_ip: client_ip.to_canonical(),
                 client_port,
                 dest_host: host,
-                dest_ip,
+                dest_ip: dest_ip.to_canonical(),
                 dest_port,
                 command: Command::UdpAssociate,
                 protocol: Protocol::Udp,
