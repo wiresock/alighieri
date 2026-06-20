@@ -382,6 +382,18 @@ needs_net_bind_capability() {
     case "$summary" in
         *'"acme":true'*) return 0 ;;
     esac
+    # A binary new enough always reports "listen". If it is absent the installed
+    # binary predates these fields (e.g. an older --binary), so we cannot tell
+    # whether a privileged bind is needed — warn rather than silently emit a unit
+    # that may fail to start.
+    case "$summary" in
+        *'"listen":"'*) : ;;
+        *)
+            warn "installed alighieri does not report listener details in --check --json;" \
+                 "if the config binds a port below 1024 or uses ACME, add CAP_NET_BIND_SERVICE" \
+                 "to $UNIT_FILE or upgrade the binary"
+            return 1 ;;
+    esac
     port="$(printf '%s\n' "$summary" | sed -n 's/.*"listen":"\([^"]*\)".*/\1/p')"
     port="${port##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
     case "$port" in
@@ -647,17 +659,31 @@ do_uninstall() {
         info "no systemd unit at $UNIT_FILE; service and binary already absent"
     fi
 
+    # Refuse to remove through a symlink (we would delete an unexpected link),
+    # matching the symlink guards on the install path.
     if [ "$PURGE_CONFIG" -eq 1 ]; then
-        warn "removing config directory $CONFIG_DIR (userlist and any TLS keys)"
-        rm -rf -- "$CONFIG_DIR"
+        if [ -L "$CONFIG_DIR" ]; then
+            warn "config directory $CONFIG_DIR is a symlink; not removing it"
+        else
+            warn "removing config directory $CONFIG_DIR (userlist and any TLS keys)"
+            rm -rf -- "$CONFIG_DIR"
+        fi
     fi
     if [ "$PURGE_LOGS" -eq 1 ]; then
-        info "removing log directory $LOG_DIR"
-        rm -rf -- "$LOG_DIR"
+        if [ -L "$LOG_DIR" ]; then
+            warn "log directory $LOG_DIR is a symlink; not removing it"
+        else
+            info "removing log directory $LOG_DIR"
+            rm -rf -- "$LOG_DIR"
+        fi
     fi
     if [ "$PURGE_STATE" -eq 1 ]; then
-        warn "removing state directory $STATE_DIR (ACME account and certificates)"
-        rm -rf -- "$STATE_DIR"
+        if [ -L "$STATE_DIR" ]; then
+            warn "state directory $STATE_DIR is a symlink; not removing it"
+        else
+            warn "removing state directory $STATE_DIR (ACME account and certificates)"
+            rm -rf -- "$STATE_DIR"
+        fi
     fi
     if [ "$PURGE_USER" -eq 1 ]; then
         if id "$SERVICE_USER" >/dev/null 2>&1; then
