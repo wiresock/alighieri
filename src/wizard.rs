@@ -291,10 +291,12 @@ fn route_request(request: &HttpRequest, state: &WizardState) -> Result<HttpRespo
     }
 }
 
-/// Whether the request's `token` query parameter matches the per-run token, in
-/// constant time. The token is 192 bits of `OsRng`, so a timing oracle is not a
-/// realistic threat here, but a constant-time compare costs nothing and avoids a
-/// non-constant-time secret comparison on principle.
+/// Whether the request's `token` query parameter matches the per-run token. A
+/// missing token or a length mismatch short-circuits, but the token length is
+/// fixed and printed in the URL, so it is not secret; the per-byte comparison of
+/// an equal-length token is position-independent (it does not reveal how many
+/// leading bytes matched). The token is 192 bits of `OsRng`, so a timing oracle
+/// is not a realistic threat regardless — this is defense-in-depth.
 fn token_matches(provided: Option<&String>, expected: &str) -> bool {
     provided.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
 }
