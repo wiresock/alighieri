@@ -199,15 +199,16 @@ CAfile = /etc/ssl/certs/ca-certificates.crt
 ```
 
 `verifyChain = yes` *requires* a CA source. stunnel is built on OpenSSL and does
-**not** fall back to the OS trust store (the macOS Keychain or Windows
-CryptoAPI), so on every platform you must point `CAfile`/`CApath` at a bundle or
-it refuses to start (`Either "CAengine", "CAfile" or "CApath" has to be
-configured`):
+**not**, by default, use the OS trust store (the macOS Keychain or Windows
+CryptoAPI), so point `CAfile`/`CApath` at a bundle or it refuses to start
+(`Either "CAengine", "CAfile" or "CApath" has to be configured`):
 
 - Debian/Ubuntu — `/etc/ssl/certs/ca-certificates.crt`
 - Fedora/RHEL — `/etc/pki/tls/certs/ca-bundle.crt`
-- macOS — `/etc/ssl/cert.pem`, or `/opt/homebrew/etc/ca-certificates/cert.pem` with Homebrew
-- Windows — the `ca-certs.pem` shipped in stunnel's install directory
+- macOS — `/etc/ssl/cert.pem`, or Homebrew's `cert.pem` under
+  `/opt/homebrew/etc/...` (Apple Silicon) or `/usr/local/etc/...` (Intel)
+- Windows — the `ca-certs.pem` in stunnel's install directory (or
+  `CAengine = capi` to use the Windows certificate store instead)
 
 (For the socat alternative, drop the `verify=0`.) Restarting Alighieri again
 should **load the cached cert without re-issuing** — confirm the log shows no
