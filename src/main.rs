@@ -134,9 +134,17 @@ fn parse_args_from(args: Vec<String>) -> Result<Command, String> {
                 return Ok(Command::Version);
             }
             _ => {
-                if config_path.is_none() {
-                    config_path = Some(PathBuf::from(arg));
+                if arg.starts_with('-') {
+                    return Err(format!(
+                        "unknown option '{arg}' (use --help to list options; pass a path starting with '-' via --config)"
+                    ));
                 }
+                if config_path.is_some() {
+                    return Err(format!(
+                        "unexpected argument '{arg}': the config path is already set"
+                    ));
+                }
+                config_path = Some(PathBuf::from(arg));
             }
         }
     }
@@ -1347,6 +1355,34 @@ mod tests {
         assert_eq!(
             parse_args_from(vec!["--config".into(), "p.conf".into(), "--version".into()]).unwrap(),
             Command::Version
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_option() {
+        let err = parse_args_from(vec!["--frobnicate".into()]).unwrap_err();
+        assert!(err.contains("unknown option"), "{err}");
+        // A typo'd known flag is reported, not silently treated as a config path.
+        let err = parse_args_from(vec!["--chek".into()]).unwrap_err();
+        assert!(err.contains("unknown option"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_second_positional_argument() {
+        let err = parse_args_from(vec!["a.conf".into(), "b.conf".into()]).unwrap_err();
+        assert!(err.contains("unexpected argument"), "{err}");
+    }
+
+    #[test]
+    fn accepts_flags_after_the_config_path() {
+        // A flag after the positional config path is still parsed (only an
+        // unknown option or a second positional is an error).
+        assert_eq!(
+            parse_args_from(vec!["a.conf".into(), "--check".into()]).unwrap(),
+            Command::Check {
+                config_path: PathBuf::from("a.conf"),
+                format: CheckOutputFormat::Text,
+            }
         );
     }
 
