@@ -118,8 +118,11 @@ cache. So with ACME configured you can simply:
 sudo ./scripts/alighieri.sh        # or `install` to reconfigure an existing unit
 ```
 
-(If you hand-write your own unit, replicate those two settings:
-`AmbientCapabilities=CAP_NET_BIND_SERVICE` and `StateDirectory=alighieri`.)
+(If you hand-write your own unit, replicate the three settings the installer
+uses: `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`,
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, and `StateDirectory=alighieri` — an
+ambient capability has no effect unless it is also in the bounding set, which a
+hardened unit otherwise empties.)
 
 ## Step 4 — Watch the certificate get issued
 

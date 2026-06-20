@@ -622,12 +622,16 @@ Editing `/etc/alighieri/alighieri.conf` and running `systemctl reload alighieri`
 applies policy, DNS, auth, and timeout changes to *new* connections; existing
 connections keep running under the configuration they were accepted with (see
 [Hot reload](#hot-reload)). Binding a port below 1024 — including the `:443`
-that ACME's TLS-ALPN-01 challenge needs — works out of the box: the installer
-grants `CAP_NET_BIND_SERVICE` automatically when the config uses a privileged
-`internal:` port or `tls.acme.*`, and otherwise leaves the capability set empty.
-It also provisions a writable `StateDirectory=` (`/var/lib/alighieri`) for the
-ACME certificate cache, so `tls.acme.cache: /var/lib/alighieri/acme` works under
-`ProtectSystem=strict` with no manual setup.
+that ACME's TLS-ALPN-01 challenge needs — requires no hand-editing: when it
+generates the unit, the installer grants `CAP_NET_BIND_SERVICE` if the config
+uses a privileged `internal:` port or `tls.acme.*` (following `include:` files
+too), and otherwise leaves the capability set empty. It also provisions a
+writable `StateDirectory=` (`/var/lib/alighieri`) for the ACME certificate
+cache, so `tls.acme.cache: /var/lib/alighieri/acme` works under
+`ProtectSystem=strict`. Because the capability is baked into the unit at install
+time, after switching to a privileged port or enabling ACME in an existing
+deployment re-run `sudo ./scripts/alighieri.sh install` to regenerate the unit —
+a plain `systemctl reload` keeps the old capability set.
 
 ### Tuning for sustained high-rate UDP
 

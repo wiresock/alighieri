@@ -369,9 +369,11 @@ ensure_user() {
     fi
 }
 
-# Ports the configured listeners bind, one per line. Handles both the
-# `internal: host:port` form (including bracketed [ipv6]:port) and the
-# `internal: host port = N` form, and ignores trailing comments.
+# Ports the configured listeners bind, one per line, as base-10 integers.
+# Handles both `internal: host:port` (including bracketed [ipv6]:port) and the
+# `internal: host port = N` form, ignores trailing comments, normalises any
+# leading zeros (so the caller never feeds bash an octal-looking value), and
+# emits nothing when a listener has no explicit port.
 listener_ports() {
     local config_file="$1"
     awk '
@@ -382,32 +384,79 @@ listener_ports() {
             if (v ~ /port[[:space:]]*=/) {
                 sub(/.*port[[:space:]]*=[[:space:]]*/, "", v)
                 sub(/[^0-9].*/, "", v)
-                if (v != "") print v
+                if (v != "") print v + 0
                 next
             }
             sub(/[[:space:]].*/, "", v)
-            n = split(v, parts, ":")
-            p = parts[n]
-            sub(/[^0-9].*/, "", p)
-            if (p != "") print p
+            if (v ~ /:[0-9]+$/) {
+                sub(/.*:/, "", v)
+                print v + 0
+            }
+        }
+    ' < "$config_file"
+}
+
+# `include:` patterns declared in a single config file, one per line.
+include_patterns() {
+    local config_file="$1"
+    awk '
+        /^[[:space:]]*include:/ {
+            sub(/^[[:space:]]*include:[[:space:]]*/, "")
+            sub(/#.*/, "")
+            sub(/[[:space:]]+$/, "")
+            if ($0 != "") print
         }
     ' < "$config_file"
 }
 
 # Whether the service needs CAP_NET_BIND_SERVICE to start. ACME forces the
-# TLS-ALPN-01 challenge onto :443, and any listener on a port below 1024 is
-# privileged; the capability is granted only when one of these holds.
+# TLS-ALPN-01 challenge onto :443, and any listener on a port in 1..1023 is
+# privileged; the capability is granted only when one of these holds. Follows
+# `include:` files (resolved relative to each file's directory, with
+# final-component globs) like src/config.rs and guards against include cycles,
+# so keys living in fragments are detected too.
 needs_net_bind_capability() {
-    local config_file="$1" port
-    if grep -Eq '^[[:space:]]*tls\.acme\.' < "$config_file"; then
+    _scan_net_bind "$1"
+}
+
+_scan_net_bind() {
+    local file="$1"; shift   # remaining args: ancestor files, for the cycle guard
+    [ -f "$file" ] || return 1
+    local ancestor
+    for ancestor in "$@"; do
+        [ "$ancestor" = "$file" ] && return 1
+    done
+
+    if grep -Eq '^[[:space:]]*tls\.acme\.' < "$file"; then
         return 0
     fi
+    local port
     while IFS= read -r port; do
         [ -n "$port" ] || continue
-        if [ "$port" -lt 1024 ]; then
+        if [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]; then
             return 0
         fi
-    done < <(listener_ports "$config_file")
+    done < <(listener_ports "$file")
+
+    local dir pattern target
+    dir="$(dirname -- "$file")"
+    while IFS= read -r pattern; do
+        [ -n "$pattern" ] || continue
+        case "$pattern" in
+            /*) : ;;                       # absolute pattern, used as-is
+            *) pattern="$dir/$pattern" ;;  # relative to this file's directory
+        esac
+        # Intentional word-splitting + globbing: an include pattern may end in a
+        # final-component wildcard such as conf.d/*.conf.
+        # shellcheck disable=SC2086
+        for target in $pattern; do
+            [ -f "$target" ] || continue
+            if _scan_net_bind "$target" "$@" "$file"; then
+                return 0
+            fi
+        done
+    done < <(include_patterns "$file")
+
     return 1
 }
 
