@@ -24,8 +24,9 @@ use crate::config::{AcmeConfig, Config, TlsConfig};
 use crate::errors::{Error, Result};
 
 /// A future that drives ACME certificate issuance and renewal. The server spawns
-/// it once; issued certificates are then served through the acceptor's resolver
-/// and renewed in the background without a restart.
+/// it once; issued certificates are then served through the listener's rustls
+/// configs (which share the renewing resolver) and renewed in the background
+/// without a restart.
 pub type AcmeDriver = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// The TLS listener for the server, plus — for ACME — the renewal driver.
@@ -67,9 +68,13 @@ impl TlsListener {
             TlsListener::Acme { default, challenge } => {
                 let handshake = LazyConfigAcceptor::new(Acceptor::default(), stream).await?;
                 if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
-                    // Complete the handshake with the challenge certificate; the
-                    // connection then has no further use, so let it drop.
-                    let _challenge = handshake.into_stream(challenge.clone()).await?;
+                    // `into_stream(..).await` drives the handshake to completion,
+                    // sending the challenge certificate Let's Encrypt validates.
+                    // Then close cleanly with a close_notify — the connection
+                    // carries no application data — rather than dropping it abruptly.
+                    use tokio::io::AsyncWriteExt;
+                    let mut challenge_tls = handshake.into_stream(challenge.clone()).await?;
+                    let _ = challenge_tls.shutdown().await;
                     Ok(None)
                 } else {
                     handshake.into_stream(default.clone()).await.map(Some)
