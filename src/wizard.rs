@@ -9,6 +9,7 @@ use std::time::Duration;
 use alighieri::acl::{RuleSet, Scope, Verdict};
 use alighieri::config::{AuthKind, Config, LogOutput};
 use alighieri::net::Cidr;
+use alighieri::util::constant_time_eq;
 use password_hash::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -245,7 +246,7 @@ fn route_request(request: &HttpRequest, state: &WizardState) -> Result<HttpRespo
     if request.path == "/favicon.ico" {
         return Err(HttpResponse::text(404, "Not Found", "not found"));
     }
-    if request.query.get("token") != Some(&state.token) {
+    if !token_matches(request.query.get("token"), &state.token) {
         return Err(HttpResponse::html(
             403,
             "Forbidden",
@@ -290,10 +291,22 @@ fn route_request(request: &HttpRequest, state: &WizardState) -> Result<HttpRespo
     }
 }
 
+/// Whether the request's `token` query parameter matches the per-run token. A
+/// missing token or a length mismatch short-circuits, but the token length is
+/// fixed and printed in the URL, so it is not secret; the per-byte comparison of
+/// an equal-length token is position-independent (it does not reveal how many
+/// leading bytes matched). The token is 192 bits of `OsRng`, so a timing oracle
+/// is not a realistic threat regardless — this is defense-in-depth.
+fn token_matches(provided: Option<&String>, expected: &str) -> bool {
+    provided.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
+}
+
 async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
+    // `_untimed` carries the size bounds (MAX_HTTP_BYTES / MAX_FORM_BYTES); this
+    // wrapper adds the wall-clock timeout.
     match tokio::time::timeout(
         Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS),
-        read_http_request_unbounded(stream),
+        read_http_request_untimed(stream),
     )
     .await
     {
@@ -302,9 +315,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
     }
 }
 
-async fn read_http_request_unbounded(
-    stream: &mut TcpStream,
-) -> Result<Option<HttpRequest>, String> {
+async fn read_http_request_untimed(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
     let mut data = Vec::new();
     let header_end = loop {
         let mut chunk = [0u8; 4096];
@@ -701,18 +712,18 @@ fn render_config(form: &WizardForm) -> String {
     .unwrap();
     writeln!(text, "external: 0.0.0.0").unwrap();
     writeln!(text).unwrap();
+    // `template` is the single source of truth for the generated structure (it
+    // also drives the `socks` rules below); `if let Some` avoids the `unwrap`
+    // panic if the template/userlist invariant ever shifts.
     match form.template {
         WizardTemplate::LocalNoAuth => {
             writeln!(text, "socksmethod: none").unwrap();
         }
         WizardTemplate::LanUsername => {
             writeln!(text, "socksmethod: username").unwrap();
-            writeln!(
-                text,
-                "userlist: {}",
-                form.userlist_path.as_ref().unwrap().display()
-            )
-            .unwrap();
+            if let Some(userlist) = &form.userlist_path {
+                writeln!(text, "userlist: {}", userlist.display()).unwrap();
+            }
         }
     }
     writeln!(text).unwrap();
@@ -2424,5 +2435,15 @@ mod tests {
             html_escape("<tag attr=\"one\">&'</tag>"),
             "&lt;tag attr=&quot;one&quot;&gt;&amp;&#39;&lt;/tag&gt;"
         );
+    }
+
+    #[test]
+    fn token_matches_only_the_exact_token() {
+        let token = "0a1b2c3d".to_string();
+        assert!(token_matches(Some(&token), &token));
+        assert!(!token_matches(Some(&"0a1b2c3e".to_string()), &token)); // one byte off
+        assert!(!token_matches(Some(&"0a1b".to_string()), &token)); // shorter
+        assert!(!token_matches(Some(&String::new()), &token));
+        assert!(!token_matches(None, &token));
     }
 }

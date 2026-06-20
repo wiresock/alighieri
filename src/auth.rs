@@ -31,6 +31,7 @@ use password_hash::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::{Error, Result};
+use crate::util::constant_time_eq;
 
 const ARGON2_DIRECTIVE_PREFIX: &str = "# alighieri:user:argon2:";
 const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXJhbmRvbXNhbHQ$C7It2r7AayL9ud0k5lZByEYkYBm2MDc36XwDo7OZH34";
@@ -661,22 +662,6 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compares two byte slices in constant time relative to their contents.
-///
-/// Returns `false` immediately if lengths differ (length is not itself a
-/// secret here), otherwise XOR-accumulates every byte so the running time does
-/// not depend on the position of the first mismatch.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,13 +886,6 @@ mod tests {
         assert_eq!(entries.len(), MAX_VERIFIED_CACHE_ENTRIES);
         // The soonest-to-expire entry was evicted to make room.
         assert!(!entries.contains_key("user0"));
-    }
-
-    #[test]
-    fn constant_time_eq_basic() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 
     #[test]
