@@ -38,6 +38,9 @@ SERVICE_NAME="alighieri"
 SERVICE_USER="alighieri"
 CONFIG_DIR="/etc/alighieri"
 LOG_DIR="/var/log/alighieri"
+# systemd StateDirectory: created on start, owned by the service user, and kept
+# writable under ProtectSystem=strict. Holds the ACME certificate cache.
+STATE_DIR="/var/lib/${SERVICE_NAME}"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CONFIG_FILE="${CONFIG_DIR}/${SERVICE_NAME}.conf"
 
@@ -48,6 +51,7 @@ BINARY=""
 RESTART_ON_UPGRADE=1
 PURGE_CONFIG=0
 PURGE_LOGS=0
+PURGE_STATE=0
 PURGE_USER=0
 ACTION="auto"
 COMMAND_SEEN=0
@@ -100,8 +104,9 @@ Options:
   --no-restart       (upgrade) Replace the binary but do not restart the service.
   --purge-config     (uninstall) Also remove ${CONFIG_DIR} (userlist, TLS keys!).
   --purge-logs       (uninstall) Also remove ${LOG_DIR}.
+  --purge-state      (uninstall) Also remove ${STATE_DIR} (ACME certs/account!).
   --purge-user       (uninstall) Also remove the ${SERVICE_USER} system user.
-  --purge-all        (uninstall) --purge-config --purge-logs --purge-user.
+  --purge-all        (uninstall) --purge-config --purge-logs --purge-state --purge-user.
   -h, --help         Show this help.
 
 Examples:
@@ -125,8 +130,9 @@ while [ $# -gt 0 ]; do
         --no-restart) RESTART_ON_UPGRADE=0 ;;
         --purge-config) PURGE_CONFIG=1 ;;
         --purge-logs) PURGE_LOGS=1 ;;
+        --purge-state) PURGE_STATE=1 ;;
         --purge-user) PURGE_USER=1 ;;
-        --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_USER=1 ;;
+        --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
         *) usage >&2; die "unknown argument: $1" ;;
     esac
     shift
@@ -363,8 +369,56 @@ ensure_user() {
     fi
 }
 
+# Ports the configured listeners bind, one per line. Handles both the
+# `internal: host:port` form (including bracketed [ipv6]:port) and the
+# `internal: host port = N` form, and ignores trailing comments.
+listener_ports() {
+    local config_file="$1"
+    awk '
+        /^[[:space:]]*internal:/ {
+            v = $0
+            sub(/^[[:space:]]*internal:[[:space:]]*/, "", v)
+            sub(/#.*/, "", v)
+            if (v ~ /port[[:space:]]*=/) {
+                sub(/.*port[[:space:]]*=[[:space:]]*/, "", v)
+                sub(/[^0-9].*/, "", v)
+                if (v != "") print v
+                next
+            }
+            sub(/[[:space:]].*/, "", v)
+            n = split(v, parts, ":")
+            p = parts[n]
+            sub(/[^0-9].*/, "", p)
+            if (p != "") print p
+        }
+    ' < "$config_file"
+}
+
+# Whether the service needs CAP_NET_BIND_SERVICE to start. ACME forces the
+# TLS-ALPN-01 challenge onto :443, and any listener on a port below 1024 is
+# privileged; the capability is granted only when one of these holds.
+needs_net_bind_capability() {
+    local config_file="$1" port
+    if grep -Eq '^[[:space:]]*tls\.acme\.' < "$config_file"; then
+        return 0
+    fi
+    while IFS= read -r port; do
+        [ -n "$port" ] || continue
+        if [ "$port" -lt 1024 ]; then
+            return 0
+        fi
+    done < <(listener_ports "$config_file")
+    return 1
+}
+
 write_unit() {
     local install_bin="$1" config_file="$2"
+    # Grant the minimal capability to bind a privileged port only when the
+    # config actually needs one; otherwise keep all capabilities dropped.
+    local caps=""
+    if needs_net_bind_capability "$config_file"; then
+        caps="CAP_NET_BIND_SERVICE"
+    fi
     cat >"$UNIT_FILE" <<UNIT
 [Unit]
 Description=Alighieri SOCKS5 proxy server
@@ -381,9 +435,9 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 
-# Hardening. The default config listens on an unprivileged port; to bind a
-# port below 1024, add CAP_NET_BIND_SERVICE to AmbientCapabilities and
-# CapabilityBoundingSet.
+# Hardening. CAP_NET_BIND_SERVICE is granted (below) only when the config needs
+# a privileged port — an internal: port under 1024, or ACME, whose TLS-ALPN-01
+# challenge is answered on :443; otherwise all capabilities are dropped.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -398,9 +452,14 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=$caps
+AmbientCapabilities=$caps
 ReadWritePaths=$LOG_DIR
+# StateDirectory keeps /var/lib/${SERVICE_NAME} writable under
+# ProtectSystem=strict (created on start, owned by the service user); it holds
+# the ACME certificate cache (tls.acme.cache).
+StateDirectory=${SERVICE_NAME}
+StateDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
@@ -617,6 +676,10 @@ do_uninstall() {
         info "removing log directory $LOG_DIR"
         rm -rf -- "$LOG_DIR"
     fi
+    if [ "$PURGE_STATE" -eq 1 ]; then
+        warn "removing state directory $STATE_DIR (ACME account and certificates)"
+        rm -rf -- "$STATE_DIR"
+    fi
     if [ "$PURGE_USER" -eq 1 ]; then
         if id "$SERVICE_USER" >/dev/null 2>&1; then
             info "removing system user $SERVICE_USER"
@@ -628,10 +691,11 @@ do_uninstall() {
     fi
 
     [ "$removed" -eq 1 ] && ok "Alighieri service and binary removed."
-    if [ "$PURGE_CONFIG" -eq 0 ] || [ "$PURGE_LOGS" -eq 0 ] || [ "$PURGE_USER" -eq 0 ]; then
+    if [ "$PURGE_CONFIG" -eq 0 ] || [ "$PURGE_LOGS" -eq 0 ] || [ "$PURGE_STATE" -eq 0 ] || [ "$PURGE_USER" -eq 0 ]; then
         info "Left in place (remove manually if you want them gone):"
         [ "$PURGE_CONFIG" -eq 1 ] || info "  Config: $CONFIG_DIR"
         [ "$PURGE_LOGS" -eq 1 ] || info "  Logs:   $LOG_DIR"
+        { [ "$PURGE_STATE" -eq 1 ] || [ ! -d "$STATE_DIR" ]; } || info "  State:  $STATE_DIR"
         [ "$PURGE_USER" -eq 1 ] || info "  User:   userdel $SERVICE_USER"
     fi
 }
@@ -678,7 +742,7 @@ uninstall_menu() {
     printf '   1) Remove service and binary (keep config, logs, user)\n'
     printf '   2) Also purge config (%s)\n' "$CONFIG_DIR"
     printf '   3) Also purge config and logs\n'
-    printf '   4) Purge everything (config, logs, user)\n'
+    printf '   4) Purge everything (config, logs, state, user)\n'
     printf '   5) Cancel\n'
     local opt=""
     until [[ "$opt" =~ ^[1-5]$ ]]; do
@@ -688,7 +752,7 @@ uninstall_menu() {
         1) ;;
         2) PURGE_CONFIG=1 ;;
         3) PURGE_CONFIG=1; PURGE_LOGS=1 ;;
-        4) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_USER=1 ;;
+        4) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
         5) info "cancelled"; return ;;
     esac
     do_uninstall

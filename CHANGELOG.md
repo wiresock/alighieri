@@ -8,6 +8,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- The systemd installer (`scripts/alighieri.sh`) now makes Let's Encrypt work
+  under the hardened unit with no manual edits: it provisions a writable
+  `StateDirectory=` (`/var/lib/alighieri`) for the ACME certificate cache —
+  previously `ProtectSystem=strict` left it read-only — and automatically grants
+  `CAP_NET_BIND_SERVICE` when the config enables `tls.acme.*` or binds an
+  `internal:` port below 1024, so the non-root service can bind `:443`.
+  Otherwise the capability set stays empty. A new `--purge-state` uninstall flag
+  (included in `--purge-all`) removes the cache directory.
 - Minimum supported Rust version raised from 1.85 to **1.88**, required by the
   RUSTSEC-2026-0009-patched `time` crate that the ACME (Let's Encrypt) support
   pulls in transitively. Prebuilt binaries and the container image are
