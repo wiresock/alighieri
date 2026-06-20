@@ -184,8 +184,8 @@ Once the staging flow works, get a production certificate:
 
 Now the certificate is publicly trusted, so verify it on the client. Turn on
 verification in `stunnel.conf` — `verifyChain = yes` checks the chain and
-`checkHost` checks the hostname (the chain alone does not), pointed at the
-system CA store:
+`checkHost` checks the hostname (the chain alone does not), pointed at a CA
+bundle (paths below):
 
 ```ini
 # stunnel.conf
@@ -198,13 +198,20 @@ checkHost = proxy.example.com
 CAfile = /etc/ssl/certs/ca-certificates.crt
 ```
 
-`verifyChain = yes` *requires* a CA source — without `CAfile`/`CApath` stunnel
-refuses to start (`Either "CAengine", "CAfile" or "CApath" has to be
-configured`). On Debian/Ubuntu the bundle is `/etc/ssl/certs/ca-certificates.crt`
-(Fedora/RHEL: `/etc/pki/tls/certs/ca-bundle.crt`); on macOS/Windows stunnel uses
-the OS trust store, so drop `CAfile`. (For the socat alternative, drop the
-`verify=0`.) Restarting Alighieri again should **load the cached cert without
-re-issuing** — confirm the log shows no new order.
+`verifyChain = yes` *requires* a CA source. stunnel is built on OpenSSL and does
+**not** fall back to the OS trust store (the macOS Keychain or Windows
+CryptoAPI), so on every platform you must point `CAfile`/`CApath` at a bundle or
+it refuses to start (`Either "CAengine", "CAfile" or "CApath" has to be
+configured`):
+
+- Debian/Ubuntu — `/etc/ssl/certs/ca-certificates.crt`
+- Fedora/RHEL — `/etc/pki/tls/certs/ca-bundle.crt`
+- macOS — `/etc/ssl/cert.pem`, or `/opt/homebrew/etc/ca-certificates/cert.pem` with Homebrew
+- Windows — the `ca-certs.pem` shipped in stunnel's install directory
+
+(For the socat alternative, drop the `verify=0`.) Restarting Alighieri again
+should **load the cached cert without re-issuing** — confirm the log shows no
+new order.
 
 ## Troubleshooting
 
