@@ -92,17 +92,20 @@ impl AbuseControls {
         ) {
             return Err(DenialReason::AuthFailureRate);
         }
+        // Check the concurrent-connection limit before the connection-rate
+        // window so a connection rejected for concurrency does not also consume
+        // rate budget (it was never admitted).
+        if let Some(limit) = config.concurrent_connections {
+            if state_guard.active_connections >= limit {
+                return Err(DenialReason::ConcurrentConnections);
+            }
+        }
         if increment_window(
             &mut state_guard.connections,
             config.connection_rate.as_ref(),
             now,
         ) {
             return Err(DenialReason::ConnectionRate);
-        }
-        if let Some(limit) = config.concurrent_connections {
-            if state_guard.active_connections >= limit {
-                return Err(DenialReason::ConcurrentConnections);
-            }
         }
 
         state_guard.active_connections += 1;
