@@ -182,13 +182,37 @@ Once the staging flow works, get a production certificate:
    `sudo rm -rf /var/lib/alighieri/acme/*`
 3. Restart Alighieri and watch the log issue a new cert.
 
-Now the certificate is publicly trusted, so the client can verify it normally.
-In stunnel set `verifyChain = yes` and add `checkHost = proxy.example.com` (chain
-verification alone does not check the hostname) against your system CA store — on
-Linux add `CAfile = /etc/ssl/certs/ca-certificates.crt`; on macOS/Windows stunnel
-uses the OS trust store, so no `CAfile` is needed — or drop `verify=0` from socat.
-Restarting Alighieri again should **load the cached cert without re-issuing** —
-confirm the log shows no new order.
+Now the certificate is publicly trusted, so verify it on the client. Turn on
+verification in `stunnel.conf` — `verifyChain = yes` checks the chain and
+`checkHost` checks the hostname (the chain alone does not), pointed at a CA
+bundle (paths below):
+
+```ini
+# stunnel.conf
+[alighieri]
+client = yes
+accept = 127.0.0.1:1080
+connect = proxy.example.com:443
+verifyChain = yes
+checkHost = proxy.example.com
+CAfile = /etc/ssl/certs/ca-certificates.crt
+```
+
+`verifyChain = yes` *requires* a CA source. stunnel is built on OpenSSL and does
+**not**, by default, use the OS trust store (the macOS Keychain or Windows
+CryptoAPI), so point `CAfile`/`CApath` at a bundle or it refuses to start
+(`Either "CAengine", "CAfile" or "CApath" has to be configured`):
+
+- Debian/Ubuntu — `/etc/ssl/certs/ca-certificates.crt`
+- Fedora/RHEL — `/etc/pki/tls/certs/ca-bundle.crt`
+- macOS — `/etc/ssl/cert.pem`, or Homebrew's `cert.pem` under
+  `/opt/homebrew/etc/...` (Apple Silicon) or `/usr/local/etc/...` (Intel)
+- Windows — the `ca-certs.pem` in stunnel's install directory (or
+  `CAengine = capi` to use the Windows certificate store instead)
+
+(For the socat alternative, drop the `verify=0`.) Restarting Alighieri again
+should **load the cached cert without re-issuing** — confirm the log shows no
+new order.
 
 ## Troubleshooting
 
