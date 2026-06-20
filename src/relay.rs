@@ -471,10 +471,15 @@ where
         // address-list allocation entirely.
         let dest = match &header.dest {
             TargetAddr::Ip(sa) => {
+                // Canonicalise a mapped literal (`::ffff:a.b.c.d`) so the deny
+                // check, the per-packet authoriser, and the forward all act on
+                // the real IPv4 address. (The resolver already canonicalises the
+                // domain branch below.)
+                let sa = SocketAddr::new(sa.ip().to_canonical(), sa.port());
                 if !dns::address_allowed(sa.ip(), &dns_policy) {
                     continue;
                 }
-                *sa
+                sa
             }
             domain => match dns_resolver.resolve_one(domain, &dns_policy).await {
                 Ok(Some(sa)) => sa,
