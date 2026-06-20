@@ -107,12 +107,22 @@ Binding port 443 needs privilege, so for a quick test run it as root:
 sudo alighieri /etc/alighieri/alighieri.conf
 ```
 
-For a persistent, hardened setup, run it under **systemd** instead. To let a
-non-root service bind 443, give the unit
-`AmbientCapabilities=CAP_NET_BIND_SERVICE` (and
-`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`). From a repository checkout, the
-[`scripts/alighieri.sh`](../scripts/alighieri.sh) lifecycle manager automates
-installing such a service.
+For a persistent, hardened setup, run it under **systemd** instead. The
+[`scripts/alighieri.sh`](../scripts/alighieri.sh) lifecycle manager installs a
+sandboxed unit and, when it sees `tls.acme.*` in the config (or any `internal:`
+port below 1024), automatically grants `CAP_NET_BIND_SERVICE` so the non-root
+service can bind 443 and provisions a writable `StateDirectory=` for the ACME
+cache. So with ACME configured you can simply:
+
+```sh
+sudo ./scripts/alighieri.sh        # or `install` to reconfigure an existing unit
+```
+
+(If you hand-write your own unit, replicate the three settings the installer
+uses: `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`,
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, and `StateDirectory=alighieri` — an
+ambient capability has no effect unless it is also in the bounding set, which a
+hardened unit otherwise empties.)
 
 ## Step 4 — Watch the certificate get issued
 

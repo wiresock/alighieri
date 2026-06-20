@@ -606,9 +606,10 @@ dedicated unprivileged `alighieri` system user, installs a default config to
 `/etc/systemd/system/alighieri.service` before enabling and starting it.
 
 The unit runs as the `alighieri` user with `NoNewPrivileges`,
-`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, an empty capability set,
-and a `@system-service` syscall filter. The default config logs to stdout,
-which systemd captures into the journal:
+`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a capability set restricted
+to at most `CAP_NET_BIND_SERVICE` (see below), and a `@system-service` syscall
+filter. The default config logs to stdout, which systemd captures into the
+journal:
 
 ```sh
 systemctl status alighieri      # service state
@@ -620,9 +621,17 @@ systemctl stop alighieri
 Editing `/etc/alighieri/alighieri.conf` and running `systemctl reload alighieri`
 applies policy, DNS, auth, and timeout changes to *new* connections; existing
 connections keep running under the configuration they were accepted with (see
-[Hot reload](#hot-reload)). Binding a port below 1024 requires adding
-`CAP_NET_BIND_SERVICE` to the unit's capability directives (noted inline in the
-generated unit).
+[Hot reload](#hot-reload)). Binding a port below 1024 — including the `:443`
+that ACME's TLS-ALPN-01 challenge needs — requires no hand-editing: when it
+generates the unit, the installer grants `CAP_NET_BIND_SERVICE` if the config
+uses a privileged `internal:` port or `tls.acme.*` (following `include:` files
+too), and otherwise leaves the capability set empty. It also provisions a
+writable `StateDirectory=` (`/var/lib/alighieri`) for the ACME certificate
+cache, so `tls.acme.cache: /var/lib/alighieri/acme` works under
+`ProtectSystem=strict`. Because the capability is baked into the unit at install
+time, after switching to a privileged port or enabling ACME in an existing
+deployment re-run `sudo ./scripts/alighieri.sh install` to regenerate the unit —
+a plain `systemctl reload` keeps the old capability set.
 
 ### Tuning for sustained high-rate UDP
 

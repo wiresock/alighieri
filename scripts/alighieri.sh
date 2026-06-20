@@ -38,6 +38,9 @@ SERVICE_NAME="alighieri"
 SERVICE_USER="alighieri"
 CONFIG_DIR="/etc/alighieri"
 LOG_DIR="/var/log/alighieri"
+# systemd StateDirectory: created on start, owned by the service user, and kept
+# writable under ProtectSystem=strict. Holds the ACME certificate cache.
+STATE_DIR="/var/lib/${SERVICE_NAME}"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CONFIG_FILE="${CONFIG_DIR}/${SERVICE_NAME}.conf"
 
@@ -48,6 +51,7 @@ BINARY=""
 RESTART_ON_UPGRADE=1
 PURGE_CONFIG=0
 PURGE_LOGS=0
+PURGE_STATE=0
 PURGE_USER=0
 ACTION="auto"
 COMMAND_SEEN=0
@@ -100,8 +104,9 @@ Options:
   --no-restart       (upgrade) Replace the binary but do not restart the service.
   --purge-config     (uninstall) Also remove ${CONFIG_DIR} (userlist, TLS keys!).
   --purge-logs       (uninstall) Also remove ${LOG_DIR}.
+  --purge-state      (uninstall) Also remove ${STATE_DIR} (ACME certs/account!).
   --purge-user       (uninstall) Also remove the ${SERVICE_USER} system user.
-  --purge-all        (uninstall) --purge-config --purge-logs --purge-user.
+  --purge-all        (uninstall) --purge-config --purge-logs --purge-state --purge-user.
   -h, --help         Show this help.
 
 Examples:
@@ -125,8 +130,9 @@ while [ $# -gt 0 ]; do
         --no-restart) RESTART_ON_UPGRADE=0 ;;
         --purge-config) PURGE_CONFIG=1 ;;
         --purge-logs) PURGE_LOGS=1 ;;
+        --purge-state) PURGE_STATE=1 ;;
         --purge-user) PURGE_USER=1 ;;
-        --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_USER=1 ;;
+        --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
         *) usage >&2; die "unknown argument: $1" ;;
     esac
     shift
@@ -363,8 +369,47 @@ ensure_user() {
     fi
 }
 
+# Whether the service needs CAP_NET_BIND_SERVICE to start. Rather than reparse
+# the config here — its keywords are case-insensitive, `include:` files expand
+# inline, and `internal:` is last-wins — we ask the binary: `--check --json`
+# loads it with the real parser and reports the effective `listen` address and
+# whether `acme` is enabled. ACME forces the TLS-ALPN-01 challenge onto :443; a
+# listener port in 1..1023 is privileged. A binary too old to emit those fields
+# (or an invalid config) yields neither match, so the capability stays unset.
+needs_net_bind_capability() {
+    local install_bin="$1" config_file="$2" summary port
+    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 1
+    case "$summary" in
+        *'"acme":true'*) return 0 ;;
+    esac
+    # A binary new enough always reports "listen". If it is absent the installed
+    # binary predates these fields (e.g. an older --binary), so we cannot tell
+    # whether a privileged bind is needed — warn rather than silently emit a unit
+    # that may fail to start.
+    case "$summary" in
+        *'"listen":"'*) : ;;
+        *)
+            warn "installed alighieri does not report listener details in --check --json;" \
+                 "if the config binds a port below 1024 or uses ACME, add CAP_NET_BIND_SERVICE" \
+                 "to $UNIT_FILE or upgrade the binary"
+            return 1 ;;
+    esac
+    port="$(printf '%s\n' "$summary" | sed -n 's/.*"listen":"\([^"]*\)".*/\1/p')"
+    port="${port##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
+    case "$port" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
+}
+
 write_unit() {
     local install_bin="$1" config_file="$2"
+    # Grant the minimal capability to bind a privileged port only when the
+    # config actually needs one; otherwise keep all capabilities dropped.
+    local caps=""
+    if needs_net_bind_capability "$install_bin" "$config_file"; then
+        caps="CAP_NET_BIND_SERVICE"
+    fi
     cat >"$UNIT_FILE" <<UNIT
 [Unit]
 Description=Alighieri SOCKS5 proxy server
@@ -381,9 +426,9 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 
-# Hardening. The default config listens on an unprivileged port; to bind a
-# port below 1024, add CAP_NET_BIND_SERVICE to AmbientCapabilities and
-# CapabilityBoundingSet.
+# Hardening. CAP_NET_BIND_SERVICE is granted (below) only when the config needs
+# a privileged port — an internal: port under 1024, or ACME, whose TLS-ALPN-01
+# challenge is answered on :443; otherwise all capabilities are dropped.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -398,9 +443,14 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=$caps
+AmbientCapabilities=$caps
 ReadWritePaths=$LOG_DIR
+# StateDirectory keeps /var/lib/${SERVICE_NAME} writable under
+# ProtectSystem=strict (created on start, owned by the service user); it holds
+# the ACME certificate cache (tls.acme.cache).
+StateDirectory=${SERVICE_NAME}
+StateDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
@@ -609,13 +659,31 @@ do_uninstall() {
         info "no systemd unit at $UNIT_FILE; service and binary already absent"
     fi
 
+    # Refuse to remove through a symlink (we would delete an unexpected link),
+    # matching the symlink guards on the install path.
     if [ "$PURGE_CONFIG" -eq 1 ]; then
-        warn "removing config directory $CONFIG_DIR (userlist and any TLS keys)"
-        rm -rf -- "$CONFIG_DIR"
+        if [ -L "$CONFIG_DIR" ]; then
+            warn "config directory $CONFIG_DIR is a symlink; not removing it"
+        else
+            warn "removing config directory $CONFIG_DIR (userlist and any TLS keys)"
+            rm -rf -- "$CONFIG_DIR"
+        fi
     fi
     if [ "$PURGE_LOGS" -eq 1 ]; then
-        info "removing log directory $LOG_DIR"
-        rm -rf -- "$LOG_DIR"
+        if [ -L "$LOG_DIR" ]; then
+            warn "log directory $LOG_DIR is a symlink; not removing it"
+        else
+            info "removing log directory $LOG_DIR"
+            rm -rf -- "$LOG_DIR"
+        fi
+    fi
+    if [ "$PURGE_STATE" -eq 1 ]; then
+        if [ -L "$STATE_DIR" ]; then
+            warn "state directory $STATE_DIR is a symlink; not removing it"
+        else
+            warn "removing state directory $STATE_DIR (ACME account and certificates)"
+            rm -rf -- "$STATE_DIR"
+        fi
     fi
     if [ "$PURGE_USER" -eq 1 ]; then
         if id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -628,10 +696,11 @@ do_uninstall() {
     fi
 
     [ "$removed" -eq 1 ] && ok "Alighieri service and binary removed."
-    if [ "$PURGE_CONFIG" -eq 0 ] || [ "$PURGE_LOGS" -eq 0 ] || [ "$PURGE_USER" -eq 0 ]; then
+    if [ "$PURGE_CONFIG" -eq 0 ] || [ "$PURGE_LOGS" -eq 0 ] || [ "$PURGE_STATE" -eq 0 ] || [ "$PURGE_USER" -eq 0 ]; then
         info "Left in place (remove manually if you want them gone):"
         [ "$PURGE_CONFIG" -eq 1 ] || info "  Config: $CONFIG_DIR"
         [ "$PURGE_LOGS" -eq 1 ] || info "  Logs:   $LOG_DIR"
+        { [ "$PURGE_STATE" -eq 1 ] || [ ! -d "$STATE_DIR" ]; } || info "  State:  $STATE_DIR"
         [ "$PURGE_USER" -eq 1 ] || info "  User:   userdel $SERVICE_USER"
     fi
 }
@@ -678,7 +747,7 @@ uninstall_menu() {
     printf '   1) Remove service and binary (keep config, logs, user)\n'
     printf '   2) Also purge config (%s)\n' "$CONFIG_DIR"
     printf '   3) Also purge config and logs\n'
-    printf '   4) Purge everything (config, logs, user)\n'
+    printf '   4) Purge everything (config, logs, state, user)\n'
     printf '   5) Cancel\n'
     local opt=""
     until [[ "$opt" =~ ^[1-5]$ ]]; do
@@ -688,7 +757,7 @@ uninstall_menu() {
         1) ;;
         2) PURGE_CONFIG=1 ;;
         3) PURGE_CONFIG=1; PURGE_LOGS=1 ;;
-        4) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_USER=1 ;;
+        4) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
         5) info "cancelled"; return ;;
     esac
     do_uninstall
