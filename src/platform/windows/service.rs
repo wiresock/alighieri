@@ -141,7 +141,10 @@ fn run_service() -> windows_service::Result<()> {
 
     status_handle.set_service_status(service_status(
         ServiceState::Running,
-        ServiceControlAccept::STOP,
+        // Accept SHUTDOWN as well as STOP so an OS shutdown/restart runs the
+        // graceful stop path (final log flush, clean Stopped status) instead of
+        // terminating the process abruptly.
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         0,
         Duration::default(),
         SERVICE_EXIT_OK,
@@ -201,7 +204,9 @@ fn handle_service_control(
 ) -> ServiceControlHandlerResult {
     match control_event {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-        ServiceControl::Stop => {
+        // STOP (explicit) and SHUTDOWN (OS shutting down) both drive the same
+        // graceful stop.
+        ServiceControl::Stop | ServiceControl::Shutdown => {
             let _ = shutdown_tx.send(());
             ServiceControlHandlerResult::NoError
         }
@@ -281,10 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn running_status_accepts_stop() {
+    fn running_status_accepts_stop_and_shutdown() {
         let status = service_status(
             ServiceState::Running,
-            ServiceControlAccept::STOP,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
             0,
             Duration::default(),
             SERVICE_EXIT_OK,
@@ -292,6 +297,9 @@ mod tests {
         assert!(status
             .controls_accepted
             .contains(ServiceControlAccept::STOP));
+        assert!(status
+            .controls_accepted
+            .contains(ServiceControlAccept::SHUTDOWN));
     }
 
     #[test]
@@ -316,6 +324,18 @@ mod tests {
         let (reload_tx, mut reload_rx) = tokio_mpsc::unbounded_channel::<()>();
 
         let result = handle_service_control(ServiceControl::Stop, &shutdown_tx, &reload_tx);
+
+        assert!(matches!(result, ServiceControlHandlerResult::NoError));
+        assert_eq!(shutdown_rx.try_recv(), Ok(()));
+        assert!(reload_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shutdown_control_signals_shutdown_channel() {
+        let (shutdown_tx, shutdown_rx) = std_mpsc::channel::<()>();
+        let (reload_tx, mut reload_rx) = tokio_mpsc::unbounded_channel::<()>();
+
+        let result = handle_service_control(ServiceControl::Shutdown, &shutdown_tx, &reload_tx);
 
         assert!(matches!(result, ServiceControlHandlerResult::NoError));
         assert_eq!(shutdown_rx.try_recv(), Ok(()));
