@@ -336,36 +336,45 @@ impl ServiceController for WindowsServiceController {
             let service = manager
                 .create_service(&service_info, service_access)
                 .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
-            service
-                .set_description(SERVICE_DISPLAY_NAME)
-                .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
-            // Auto-restart on crash, mirroring the systemd unit's
-            // `Restart=on-failure`. Escalating delays avoid a tight restart loop;
-            // the reset period clears the failure count after a stable hour.
-            // (Left at the default of recovering only from real crashes — clean
-            // exits with a config-error code are not restarted, since a restart
+            // Configure the freshly created service. On any failure, best-effort
+            // delete it so a half-configured service is not left behind for the
+            // operator to clean up by hand.
+            //
+            // Auto-restart on crash mirrors the systemd unit's
+            // `Restart=on-failure`: escalating delays avoid a tight restart loop,
+            // and the reset period clears the failure count after a stable hour.
+            // (Left at the default of recovering only from real crashes — a clean
+            // exit with a config-error code is not restarted, since a restart
             // would not fix a broken config.)
-            service
-                .update_failure_actions(ServiceFailureActions {
-                    reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(60 * 60)),
-                    reboot_msg: None,
-                    command: None,
-                    actions: Some(vec![
-                        ServiceAction {
-                            action_type: ServiceActionType::Restart,
-                            delay: Duration::from_secs(5),
-                        },
-                        ServiceAction {
-                            action_type: ServiceActionType::Restart,
-                            delay: Duration::from_secs(30),
-                        },
-                        ServiceAction {
-                            action_type: ServiceActionType::Restart,
-                            delay: Duration::from_secs(60),
-                        },
-                    ]),
-                })
-                .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
+            let configure = service
+                .set_description(SERVICE_DISPLAY_NAME)
+                .and_then(|()| {
+                    service.update_failure_actions(ServiceFailureActions {
+                        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(
+                            60 * 60,
+                        )),
+                        reboot_msg: None,
+                        command: None,
+                        actions: Some(vec![
+                            ServiceAction {
+                                action_type: ServiceActionType::Restart,
+                                delay: Duration::from_secs(5),
+                            },
+                            ServiceAction {
+                                action_type: ServiceActionType::Restart,
+                                delay: Duration::from_secs(30),
+                            },
+                            ServiceAction {
+                                action_type: ServiceActionType::Restart,
+                                delay: Duration::from_secs(60),
+                            },
+                        ]),
+                    })
+                });
+            if let Err(e) = configure {
+                let _ = service.delete();
+                return Err(ServiceCliError::Service(explain_service_error(&e)));
+            }
             Ok(())
         };
 
