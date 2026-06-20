@@ -685,6 +685,9 @@ The installed service uses:
 - account: `NT AUTHORITY\LocalService`
 - log file: `C:\ProgramData\Alighieri\logs\alighieri.log`
 - Event Log source: `Alighieri` in the Windows Application log
+- recovery: restart on crash (after 5s, then 30s, then 60s; failure count resets
+  after an hour), the Windows equivalent of systemd's `Restart=on-failure`
+- accepts STOP and system SHUTDOWN, so an OS restart stops it gracefully
 
 The installer validates the configuration before creating the service and the
 start and reload commands validate the installed configuration before asking

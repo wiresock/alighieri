@@ -94,7 +94,20 @@ service restart.
 
 When the Service Control Manager sends a stop request, Alighieri signals the
 same async server runtime used in console mode. The listener is dropped and the
-process exits after the runtime observes the shutdown signal.
+process exits after the runtime observes the shutdown signal. The service
+advertises both `STOP` and `SHUTDOWN`, so an operating-system shutdown or restart
+runs the same graceful stop (final log flush, clean `Stopped` status) rather than
+terminating the process abruptly.
+
+## Crash Recovery
+
+The installer configures Service Control Manager recovery actions so the service
+restarts automatically if the process crashes — 5 seconds after the first
+failure, then 30, then 60, with the failure count reset after an hour of
+stability. This is the Windows equivalent of the systemd unit's
+`Restart=on-failure`. A clean exit with a configuration-error code is **not**
+restarted (a restart would not fix a broken config); fix the configuration and
+start the service again.
 
 ## Smoke Test
 
