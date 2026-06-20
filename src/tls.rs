@@ -11,24 +11,77 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 use tokio_stream::StreamExt;
 
 use crate::config::{AcmeConfig, Config, TlsConfig};
 use crate::errors::{Error, Result};
 
 /// A future that drives ACME certificate issuance and renewal. The server spawns
-/// it once; issued certificates are then served through the acceptor's resolver
-/// and renewed in the background without a restart.
+/// it once; issued certificates are then served through the listener's rustls
+/// configs (which share the renewing resolver) and renewed in the background
+/// without a restart.
 pub type AcmeDriver = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// The TLS acceptor for the listener, plus — for ACME — the renewal driver.
+/// The TLS listener for the server, plus — for ACME — the renewal driver.
 pub struct TlsSetup {
-    pub acceptor: TlsAcceptor,
+    pub listener: TlsListener,
     pub acme_driver: Option<AcmeDriver>,
+}
+
+/// How accepted connections are wrapped in TLS.
+///
+/// ACME needs two rustls configs: TLS-ALPN-01 challenge handshakes (ALPN
+/// `acme-tls/1`, sent by Let's Encrypt to prove domain control) must be answered
+/// with a special challenge certificate, while everything else is served the
+/// issued certificate. A plain acceptor cannot do this — it never negotiates
+/// `acme-tls/1`, so the challenge fails and no certificate is ever issued — so we
+/// peek each ClientHello and route it to the right config.
+#[derive(Clone)]
+pub enum TlsListener {
+    /// A fixed certificate/key acceptor (`tls.certfile`/`tls.keyfile`).
+    Manual(TlsAcceptor),
+    /// ACME: `acme-tls/1` challenge handshakes go to `challenge`; all other
+    /// connections to `default`, which serves the issued certificate.
+    Acme {
+        default: Arc<ServerConfig>,
+        challenge: Arc<ServerConfig>,
+    },
+}
+
+impl TlsListener {
+    /// Completes the TLS handshake for an accepted connection.
+    ///
+    /// Returns `Ok(None)` when the connection was an ACME TLS-ALPN-01 challenge
+    /// answered internally: Let's Encrypt only needs the handshake to present the
+    /// challenge certificate, so the caller drops it. `Ok(Some(stream))` is a
+    /// normal client connection to drive through SOCKS.
+    pub async fn accept(&self, stream: TcpStream) -> std::io::Result<Option<TlsStream<TcpStream>>> {
+        match self {
+            TlsListener::Manual(acceptor) => acceptor.accept(stream).await.map(Some),
+            TlsListener::Acme { default, challenge } => {
+                let handshake = LazyConfigAcceptor::new(Acceptor::default(), stream).await?;
+                if rustls_acme::is_tls_alpn_challenge(&handshake.client_hello()) {
+                    // `into_stream(..).await` drives the handshake to completion,
+                    // sending the challenge certificate Let's Encrypt validates.
+                    // Then close cleanly with a close_notify — the connection
+                    // carries no application data — rather than dropping it abruptly.
+                    use tokio::io::AsyncWriteExt;
+                    let mut challenge_tls = handshake.into_stream(challenge.clone()).await?;
+                    let _ = challenge_tls.shutdown().await;
+                    Ok(None)
+                } else {
+                    handshake.into_stream(default.clone()).await.map(Some)
+                }
+            }
+        }
+    }
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
@@ -72,7 +125,7 @@ fn file_setup(cert_file: &Path, key_file: &Path) -> Result<TlsSetup> {
         .with_single_cert(certs, key)
         .map_err(|e| Error::Config(format!("invalid TLS certificate/key pair: {e}")))?;
     Ok(TlsSetup {
-        acceptor: TlsAcceptor::from(Arc::new(server_config)),
+        listener: TlsListener::Manual(TlsAcceptor::from(Arc::new(server_config))),
         acme_driver: None,
     })
 }
@@ -84,15 +137,19 @@ fn acme_setup(acme: &AcmeConfig, prepare_cache: bool) -> Result<TlsSetup> {
     if prepare_cache {
         ensure_writable_dir(&acme.cache_dir)?;
     }
-    // The state owns the resolver shared with the rustls config below, persists
-    // the account/certs to the cache dir, and runs the order + renewal loop when
-    // polled. TLS-ALPN-01 challenges are answered by the same acceptor.
+    // The state owns the resolver shared with both rustls configs below,
+    // persists the account/certs to the cache dir, and runs the order + renewal
+    // loop when polled. `default` serves the issued certificate to clients;
+    // `challenge` carries the `acme-tls/1` ALPN and challenge certificate that
+    // answer Let's Encrypt's TLS-ALPN-01 validation. The accept loop routes each
+    // connection to the right one (see `TlsListener::accept`).
     let mut state = rustls_acme::AcmeConfig::new(acme.domains.clone())
         .contact(acme.email.iter().map(|email| format!("mailto:{email}")))
         .cache(rustls_acme::caches::DirCache::new(acme.cache_dir.clone()))
         .directory_lets_encrypt(!acme.staging)
         .state();
-    let acceptor = TlsAcceptor::from(state.default_rustls_config());
+    let default = state.default_rustls_config();
+    let challenge = state.challenge_rustls_config();
     let driver: AcmeDriver = Box::pin(async move {
         loop {
             match state.next().await {
@@ -108,7 +165,7 @@ fn acme_setup(acme: &AcmeConfig, prepare_cache: bool) -> Result<TlsSetup> {
         }
     });
     Ok(TlsSetup {
-        acceptor,
+        listener: TlsListener::Acme { default, challenge },
         acme_driver: Some(driver),
     })
 }
@@ -286,6 +343,36 @@ TJmcpHqqAD9nQAqB4GvHPA==
         });
         let setup = load_acceptor(Some(&config)).unwrap().unwrap();
         assert!(setup.acme_driver.is_some());
+    }
+
+    #[test]
+    fn acme_listener_offers_the_tls_alpn_challenge_protocol() {
+        // Regression: the listener must answer TLS-ALPN-01. The challenge config
+        // has to offer the `acme-tls/1` ALPN (or Let's Encrypt cannot negotiate
+        // the challenge and no certificate is ever issued), while the default
+        // config must NOT force it on ordinary clients.
+        let dir = tempfile::tempdir().unwrap();
+        let config = TlsConfig::Acme(crate::config::AcmeConfig {
+            domains: vec!["proxy.example.com".into()],
+            email: None,
+            cache_dir: dir.path().to_path_buf(),
+            staging: true,
+        });
+        let setup = load_acceptor(Some(&config)).unwrap().unwrap();
+        let acme_tls = b"acme-tls/1".to_vec();
+        match setup.listener {
+            TlsListener::Acme { default, challenge } => {
+                assert!(
+                    challenge.alpn_protocols.contains(&acme_tls),
+                    "challenge config must offer the acme-tls/1 ALPN"
+                );
+                assert!(
+                    !default.alpn_protocols.contains(&acme_tls),
+                    "default config must not force acme-tls/1 on normal clients"
+                );
+            }
+            TlsListener::Manual(_) => panic!("expected an ACME listener"),
+        }
     }
 
     #[test]
