@@ -390,6 +390,13 @@ certificates so they survive restarts without re-requesting (which would hit
 Let's Encrypt's rate limits), and certificates renew in the background with no
 restart. `tls.acme.*` is mutually exclusive with `tls.certfile`/`tls.keyfile`.
 
+Because the challenge is validated by a direct connection from Let's Encrypt,
+ACME is **incompatible with `proxyprotocol`** (those validation connections are
+not a trusted upstream and would be rejected by the proxy-protocol gate — the
+proxy warns at startup if both are set), and you should not set
+`ratelimit.connectionrate`/`ratelimit.concurrentconnections` so tight that the
+handful of validation connections are rejected.
+
 For a complete end-to-end walkthrough on a fresh public server — DNS, firewall,
 running it, watching issuance, and proxying a request through the TLS listener —
 see [doc/acme-tls-test.md](doc/acme-tls-test.md).

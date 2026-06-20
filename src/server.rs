@@ -74,11 +74,18 @@ impl Server {
         let listen = listener.local_addr()?;
         if let Some(tls) = &config.tls {
             info!(listen = %listen, "listening with TLS");
-            if matches!(tls, crate::config::TlsConfig::Acme(_)) && listen.port() != 443 {
-                warn!(
-                    listen = %listen,
-                    "ACME uses TLS-ALPN-01, which Let's Encrypt validates on port 443; ensure this listener is reachable on port 443 (directly or via forwarding) or certificate issuance will fail"
-                );
+            if matches!(tls, crate::config::TlsConfig::Acme(_)) {
+                if listen.port() != 443 {
+                    warn!(
+                        listen = %listen,
+                        "ACME uses TLS-ALPN-01, which Let's Encrypt validates on port 443; ensure this listener is reachable on port 443 (directly or via forwarding) or certificate issuance will fail"
+                    );
+                }
+                if !config.proxy_protocol.is_empty() {
+                    warn!(
+                        "ACME is configured together with proxyprotocol: Let's Encrypt's TLS-ALPN-01 validation connects directly and is not a trusted PROXY upstream, so the proxy-protocol gate rejects it and certificate issuance/renewal will fail. ACME needs direct, ungated access to this listener on port 443."
+                    );
+                }
             }
         } else {
             info!(listen = %listen, "listening");

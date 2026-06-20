@@ -229,6 +229,12 @@ new order.
   dir is persisted (so restarts reuse the cert instead of re-requesting).
 - **TLS handshake fails from a plaintext client** — expected: the listener is
   TLS-only when `tls.*` is set. Use the stunnel/socat wrapper above.
+- **`acme error … connection` but 443 is reachable** — the validation reached
+  the proxy but was rejected before the challenge. ACME is **incompatible with
+  `proxyprotocol`** (Let's Encrypt is not a trusted PROXY upstream — the proxy
+  warns at startup if both are set), and a very tight
+  `ratelimit.connectionrate`/`concurrentconnections` can reject the validation
+  connections too. ACME needs direct, ungated access to this listener on 443.
 
 ## Security note
 
