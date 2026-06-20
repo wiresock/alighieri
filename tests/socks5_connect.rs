@@ -433,7 +433,7 @@ async fn connect_to_ipv4_mapped_loopback_is_blocked_by_v4_cidr_rule() {
         r#"
 internal: 127.0.0.1:0
 external: 127.0.0.1
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+client pass { }
 socks block { to: 127.0.0.0/8 }
 socks pass { protocol: tcp command: connect }
 "#,

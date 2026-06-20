@@ -360,7 +360,11 @@ pub fn address_allowed(ip: IpAddr, policy: &DnsPolicy) -> bool {
 /// IPv4 rules.
 fn canonicalize_addrs(addrs: &mut [SocketAddr]) {
     for addr in addrs.iter_mut() {
-        *addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+        // `set_ip` keeps the port and — for a genuine IPv6 address, where
+        // `to_canonical` is a no-op — its `flowinfo`/`scope_id`. Only an actually
+        // mapped address changes family. Rebuilding via `SocketAddr::new` would
+        // instead strip those fields from scoped (e.g. link-local) destinations.
+        addr.set_ip(addr.ip().to_canonical());
     }
 }
 
