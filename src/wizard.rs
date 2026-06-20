@@ -9,6 +9,7 @@ use std::time::Duration;
 use alighieri::acl::{RuleSet, Scope, Verdict};
 use alighieri::config::{AuthKind, Config, LogOutput};
 use alighieri::net::Cidr;
+use alighieri::util::constant_time_eq;
 use password_hash::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -296,20 +297,6 @@ fn route_request(request: &HttpRequest, state: &WizardState) -> Result<HttpRespo
 /// non-constant-time secret comparison on principle.
 fn token_matches(provided: Option<&String>, expected: &str) -> bool {
     provided.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
-}
-
-/// Length-checked, position-independent byte comparison. Returns `false`
-/// immediately on a length mismatch (the length is not a secret), otherwise
-/// XOR-accumulates every byte so timing does not reveal the first mismatch.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
@@ -723,16 +710,18 @@ fn render_config(form: &WizardForm) -> String {
     .unwrap();
     writeln!(text, "external: 0.0.0.0").unwrap();
     writeln!(text).unwrap();
-    // The auth section follows `userlist_path` directly: it is `Some` exactly
-    // for the username template (enforced in `wizard_form_from_fields`), so this
-    // needs no `unwrap` and cannot panic if that invariant ever shifts.
-    match &form.userlist_path {
-        None => {
+    // `template` is the single source of truth for the generated structure (it
+    // also drives the `socks` rules below); `if let Some` avoids the `unwrap`
+    // panic if the template/userlist invariant ever shifts.
+    match form.template {
+        WizardTemplate::LocalNoAuth => {
             writeln!(text, "socksmethod: none").unwrap();
         }
-        Some(userlist) => {
+        WizardTemplate::LanUsername => {
             writeln!(text, "socksmethod: username").unwrap();
-            writeln!(text, "userlist: {}", userlist.display()).unwrap();
+            if let Some(userlist) = &form.userlist_path {
+                writeln!(text, "userlist: {}", userlist.display()).unwrap();
+            }
         }
     }
     writeln!(text).unwrap();
