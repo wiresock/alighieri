@@ -32,7 +32,7 @@ pub struct Server {
     abuse: Arc<AbuseControls>,
     metrics_addr: Option<SocketAddr>,
     metrics_listener: Mutex<Option<TcpListener>>,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_listener: Option<tls::TlsListener>,
     has_run: AtomicBool,
 }
 
@@ -86,12 +86,12 @@ impl Server {
         // Now the listener is bound, spawn the ACME renewal driver (if any): a
         // failed bind above cannot leak it, and validation cannot start before
         // the listener can answer the TLS-ALPN-01 challenge.
-        let tls_acceptor = match tls_setup {
+        let tls_listener = match tls_setup {
             Some(setup) => {
                 if let Some(driver) = setup.acme_driver {
                     tokio::spawn(driver);
                 }
-                Some(setup.acceptor)
+                Some(setup.listener)
             }
             None => None,
         };
@@ -116,7 +116,7 @@ impl Server {
             abuse,
             metrics_addr,
             metrics_listener: Mutex::new(metrics_listener),
-            tls_acceptor,
+            tls_listener,
             has_run: AtomicBool::new(false),
         })
     }
@@ -246,7 +246,7 @@ impl Server {
             }
 
             let metrics = self.metrics.clone();
-            let tls_acceptor = self.tls_acceptor.clone();
+            let tls_listener = self.tls_listener.clone();
             let abuse = self.abuse.clone();
             let handshake_timeout = config.handshake_timeout;
             tokio::spawn(async move {
@@ -299,9 +299,9 @@ impl Server {
                     dns_resolver,
                     throttle_bucket,
                 };
-                if let Some(acceptor) = tls_acceptor {
-                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => {
+                if let Some(listener) = tls_listener {
+                    match tokio::time::timeout(handshake_timeout, listener.accept(stream)).await {
+                        Ok(Ok(Some(stream))) => {
                             let conn = Connection::new(
                                 ClientStream::Tls(Box::new(stream)),
                                 peer,
@@ -311,6 +311,11 @@ impl Server {
                             if let Err(e) = conn.handle().await {
                                 debug!(peer = %peer, error = %e, "connection ended");
                             }
+                        }
+                        // An ACME TLS-ALPN-01 challenge was answered during the
+                        // handshake; the connection carries no SOCKS traffic.
+                        Ok(Ok(None)) => {
+                            debug!(peer = %peer, "answered ACME TLS-ALPN-01 challenge");
                         }
                         Ok(Err(e)) => {
                             debug!(peer = %peer, error = %e, "TLS handshake failed");
