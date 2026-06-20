@@ -14,8 +14,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   previously `ProtectSystem=strict` left it read-only — and automatically grants
   `CAP_NET_BIND_SERVICE` when the config enables `tls.acme.*` or binds an
   `internal:` port below 1024, so the non-root service can bind `:443`.
-  Otherwise the capability set stays empty. A new `--purge-state` uninstall flag
-  (included in `--purge-all`) removes the cache directory.
+  Otherwise the capability set stays empty. The need is detected by asking the
+  binary (`alighieri --check --json`), so it honours case-insensitive keywords,
+  `include:` files, and `internal:` last-wins. A new `--purge-state` uninstall
+  flag (included in `--purge-all`) removes the cache directory.
 - Minimum supported Rust version raised from 1.85 to **1.88**, required by the
   RUSTSEC-2026-0009-patched `time` crate that the ACME (Let's Encrypt) support
   pulls in transitively. Prebuilt binaries and the container image are
@@ -31,6 +33,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- `alighieri --check --json` now also reports the effective `listen` address
+  (`internal:` is last-wins) and whether `acme` is enabled, so tooling can read
+  the resolved configuration facts without reparsing the file.
 - Automatic TLS certificates from Let's Encrypt (ACME) for the TLS listener:
   set `tls.acme.domains` (plus a `tls.acme.cache` directory and optional
   `tls.acme.email`) instead of `tls.certfile`/`tls.keyfile`, and Alighieri

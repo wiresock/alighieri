@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use alighieri::auth::UserDb;
-use alighieri::config::Config;
+use alighieri::config::{Config, TlsConfig};
 use alighieri::runtime::{
     init_console_logging, reload_signal_channel, run_server_reloading_until_shutdown,
     shutdown_signal,
@@ -211,12 +211,26 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Success JSON for `--check --json`. Beyond `ok`/`path`/`message` it reports
+/// the effective `listen` address (`internal:` is last-wins) and whether `acme`
+/// is enabled, so tooling — e.g. the systemd installer deciding whether to grant
+/// `CAP_NET_BIND_SERVICE` — can read the resolved facts without reparsing config.
+fn check_ok_json(config_path: &Path, config: &Config) -> String {
+    let acme = matches!(config.tls, Some(TlsConfig::Acme(_)));
+    format!(
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{}}}",
+        json_escape(&config_path.display().to_string()),
+        json_escape(&config.internal.to_string()),
+        acme
+    )
+}
+
 fn validate_config(config_path: &Path, format: CheckOutputFormat) -> ExitCode {
     match Config::load(config_path).and_then(|config| {
         tls::validate_config(&config)?;
-        Ok(())
+        Ok(config)
     }) {
-        Ok(()) => {
+        Ok(config) => {
             match format {
                 CheckOutputFormat::Text => {
                     println!(
@@ -224,12 +238,7 @@ fn validate_config(config_path: &Path, format: CheckOutputFormat) -> ExitCode {
                         config_path.display()
                     );
                 }
-                CheckOutputFormat::Json => {
-                    println!(
-                        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\"}}",
-                        json_escape(&config_path.display().to_string())
-                    );
-                }
+                CheckOutputFormat::Json => println!("{}", check_ok_json(config_path, &config)),
             }
             ExitCode::SUCCESS
         }
@@ -1286,6 +1295,22 @@ mod tests {
         assert!(metadata.contains("\"name\":\"internal\",\"reload\":\"restart\""));
         assert!(metadata.contains("\"name\":\"dns.prefer\",\"reload\":\"live\""));
         assert!(metadata.contains("\"name\":\"include\",\"reload\":\"live\""));
+    }
+
+    #[test]
+    fn check_json_reports_listen_and_acme() {
+        let config = Config::parse(
+            "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme",
+        )
+        .unwrap();
+        let json = check_ok_json(Path::new("test.conf"), &config);
+        assert!(json.contains("\"listen\":\"0.0.0.0:443\""), "{json}");
+        assert!(json.contains("\"acme\":true"), "{json}");
+
+        let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
+        let json = check_ok_json(Path::new("test.conf"), &config);
+        assert!(json.contains("\"listen\":\"127.0.0.1:1080\""), "{json}");
+        assert!(json.contains("\"acme\":false"), "{json}");
     }
 
     #[test]

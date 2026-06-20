@@ -369,94 +369,25 @@ ensure_user() {
     fi
 }
 
-# Per-line config signals relevant to capability detection, one per line, in
-# file order: `acme` for any tls.acme.* setting, `port <n|->` for an `internal:`
-# listener (its port, normalised to base-10, or `-` when none is given — both
-# `host:port`/[ipv6]:port and `host port = N` forms), and `include <pattern>`
-# for an include directive. Trailing comments are ignored.
-_config_tokens() {
-    local config_file="$1"
-    awk '
-        /^[[:space:]]*tls\.acme\./ { print "acme"; next }
-        /^[[:space:]]*internal:/ {
-            v = $0
-            sub(/^[[:space:]]*internal:[[:space:]]*/, "", v)
-            sub(/#.*/, "", v)
-            if (v ~ /port[[:space:]]*=/) {
-                sub(/.*port[[:space:]]*=[[:space:]]*/, "", v)
-                sub(/[^0-9].*/, "", v)
-                if (v != "") { print "port " (v + 0) } else { print "port -" }
-                next
-            }
-            sub(/[[:space:]].*/, "", v)
-            if (v ~ /:[0-9]+$/) { sub(/.*:/, "", v); print "port " (v + 0) }
-            else { print "port -" }
-            next
-        }
-        /^[[:space:]]*include:/ {
-            sub(/^[[:space:]]*include:[[:space:]]*/, "")
-            sub(/#.*/, "")
-            sub(/[[:space:]]+$/, "")
-            if ($0 != "") print "include " $0
-            next
-        }
-    ' < "$config_file"
-}
-
-# Emit the config's signals (`acme` / `port N`) in true load order, expanding
-# `include:` inline — relative to each file's directory, final-component globs,
-# cycle-guarded — exactly as src/config.rs does. The caller relies on this order
-# because repeated `internal:` settings overwrite (last wins), so only the final
-# listener's port decides whether a privileged bind is needed.
-_emit_config_signals() {
-    local file="$1"; shift   # remaining args: ancestor files, for the cycle guard
-    [ -f "$file" ] || return 0
-    local ancestor
-    for ancestor in "$@"; do
-        [ "$ancestor" = "$file" ] && return 0
-    done
-
-    local dir kind rest target pattern
-    dir="$(dirname -- "$file")"
-    while IFS=' ' read -r kind rest; do
-        case "$kind" in
-            acme) printf 'acme\n' ;;
-            port) printf 'port %s\n' "$rest" ;;
-            include)
-                pattern="$rest"
-                case "$pattern" in
-                    /*) : ;;                       # absolute pattern, used as-is
-                    *) pattern="$dir/$pattern" ;;  # relative to this file's dir
-                esac
-                # Intentional word-splitting + globbing: an include pattern may
-                # end in a final-component wildcard such as conf.d/*.conf.
-                # shellcheck disable=SC2086
-                for target in $pattern; do
-                    [ -f "$target" ] && _emit_config_signals "$target" "$@" "$file"
-                done
-                ;;
-        esac
-    done < <(_config_tokens "$file")
-}
-
-# Whether the service needs CAP_NET_BIND_SERVICE to start. ACME forces the
-# TLS-ALPN-01 challenge onto :443 (and cannot be turned off by a later setting,
-# so it is decisive wherever it appears); otherwise the *effective* listener —
-# the last `internal:` in load order — decides: a port in 1..1023 is privileged.
+# Whether the service needs CAP_NET_BIND_SERVICE to start. Rather than reparse
+# the config here — its keywords are case-insensitive, `include:` files expand
+# inline, and `internal:` is last-wins — we ask the binary: `--check --json`
+# loads it with the real parser and reports the effective `listen` address and
+# whether `acme` is enabled. ACME forces the TLS-ALPN-01 challenge onto :443; a
+# listener port in 1..1023 is privileged. A binary too old to emit those fields
+# (or an invalid config) yields neither match, so the capability stays unset.
 needs_net_bind_capability() {
-    local kind rest acme=0 last_port="-"
-    while IFS=' ' read -r kind rest; do
-        case "$kind" in
-            acme) acme=1 ;;
-            port) last_port="$rest" ;;
-        esac
-    done < <(_emit_config_signals "$1")
-
-    [ "$acme" -eq 1 ] && return 0
-    case "$last_port" in
-        '' | *[!0-9]*) return 1 ;;  # no/undetected port (e.g. "-") — not privileged
+    local install_bin="$1" config_file="$2" summary port
+    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 1
+    case "$summary" in
+        *'"acme":true'*) return 0 ;;
     esac
-    [ "$last_port" -gt 0 ] && [ "$last_port" -lt 1024 ]
+    port="$(printf '%s\n' "$summary" | sed -n 's/.*"listen":"\([^"]*\)".*/\1/p')"
+    port="${port##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
+    case "$port" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
 write_unit() {
@@ -464,7 +395,7 @@ write_unit() {
     # Grant the minimal capability to bind a privileged port only when the
     # config actually needs one; otherwise keep all capabilities dropped.
     local caps=""
-    if needs_net_bind_capability "$config_file"; then
+    if needs_net_bind_capability "$install_bin" "$config_file"; then
         caps="CAP_NET_BIND_SERVICE"
     fi
     cat >"$UNIT_FILE" <<UNIT
