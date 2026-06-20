@@ -150,13 +150,18 @@ client with a local TLS terminator. With **stunnel** (on your client machine):
 
 ```ini
 # stunnel.conf
+# stunnel has no inline comments: a "# ..." after a value is read as part of
+# the value, so keep any notes on their own line like these.
 [alighieri]
-client     = yes
-accept     = 127.0.0.1:1080            # local plaintext SOCKS port
-connect    = proxy.example.com:443     # the TLS listener
-verifyChain = no                       # STAGING cert is untrusted; see Step 6
-checkHost  = proxy.example.com
+client = yes
+accept = 127.0.0.1:1080
+connect = proxy.example.com:443
+verifyChain = no
 ```
+
+`accept` is the local plaintext SOCKS port; `connect` is the TLS listener.
+`verifyChain = no` accepts the untrusted **staging** certificate — Step 6 turns
+verification on for the production cert.
 
 ```sh
 stunnel stunnel.conf
@@ -177,10 +182,11 @@ Once the staging flow works, get a production certificate:
    `sudo rm -rf /var/lib/alighieri/acme/*`
 3. Restart Alighieri and watch the log issue a new cert.
 
-Now the certificate is publicly trusted, so the client can verify it normally —
-set `verifyChain = yes` in stunnel against your system CA store (on Linux add
-`CAfile = /etc/ssl/certs/ca-certificates.crt`; on macOS/Windows stunnel uses the
-OS trust store, so no `CAfile` is needed), or drop `verify=0` from socat.
+Now the certificate is publicly trusted, so the client can verify it normally.
+In stunnel set `verifyChain = yes` and add `checkHost = proxy.example.com` (chain
+verification alone does not check the hostname) against your system CA store — on
+Linux add `CAfile = /etc/ssl/certs/ca-certificates.crt`; on macOS/Windows stunnel
+uses the OS trust store, so no `CAfile` is needed — or drop `verify=0` from socat.
 Restarting Alighieri again should **load the cached cert without re-issuing** —
 confirm the log shows no new order.
 
