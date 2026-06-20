@@ -74,18 +74,15 @@ impl Server {
         let listen = listener.local_addr()?;
         if let Some(tls) = &config.tls {
             info!(listen = %listen, "listening with TLS");
-            if matches!(tls, crate::config::TlsConfig::Acme(_)) {
-                if listen.port() != 443 {
-                    warn!(
-                        listen = %listen,
-                        "ACME uses TLS-ALPN-01, which Let's Encrypt validates on port 443; ensure this listener is reachable on port 443 (directly or via forwarding) or certificate issuance will fail"
-                    );
-                }
-                if !config.proxy_protocol.is_empty() {
-                    warn!(
-                        "ACME is configured together with proxyprotocol: Let's Encrypt's TLS-ALPN-01 validation connects directly and is not a trusted PROXY upstream, so the proxy-protocol gate rejects it and certificate issuance/renewal will fail. ACME needs direct, ungated access to this listener on port 443."
-                    );
-                }
+            // The port stays fixed for the life of the process (it is not
+            // reloadable), so this startup-only check is sufficient. The
+            // ACME-vs-proxyprotocol check lives in `warn_config_footguns` so it
+            // also fires on reload, where `proxyprotocol` can change.
+            if matches!(tls, crate::config::TlsConfig::Acme(_)) && listen.port() != 443 {
+                warn!(
+                    listen = %listen,
+                    "ACME uses TLS-ALPN-01, which Let's Encrypt validates on port 443; ensure this listener is reachable on port 443 (directly or via forwarding) or certificate issuance will fail"
+                );
             }
         } else {
             info!(listen = %listen, "listening");
@@ -384,6 +381,16 @@ fn warn_config_footguns(config: &Config) {
     }
     if !config.rules.has_scope(Scope::Socks) {
         warn!("no 'socks' rules defined — all requests will be denied");
+    }
+    // Checked here (rather than only at bind) so it also fires on reload, where
+    // `proxyprotocol` can be enabled while ACME stays active.
+    if matches!(config.tls, Some(crate::config::TlsConfig::Acme(_)))
+        && !config.proxy_protocol.is_empty()
+    {
+        warn!(
+            listen = %config.internal,
+            "ACME and proxyprotocol are both configured: TLS-ALPN-01 validation connections that reach this listener without a trusted PROXY header (for example Let's Encrypt connecting directly) are rejected by the proxy-protocol admission gate, so certificate issuance/renewal fails unless every validation connection is proxied through a trusted PROXY-protocol upstream (TCP passthrough)"
+        );
     }
 }
 

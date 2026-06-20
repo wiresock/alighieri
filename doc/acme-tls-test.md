@@ -230,11 +230,13 @@ new order.
 - **TLS handshake fails from a plaintext client** — expected: the listener is
   TLS-only when `tls.*` is set. Use the stunnel/socat wrapper above.
 - **`acme error … connection` but 443 is reachable** — the validation reached
-  the proxy but was rejected before the challenge. ACME is **incompatible with
-  `proxyprotocol`** (Let's Encrypt is not a trusted PROXY upstream — the proxy
-  warns at startup if both are set), and a very tight
+  the proxy but was rejected before the challenge. With `proxyprotocol` enabled,
+  a validation connection that arrives **without** a trusted PROXY header (e.g.
+  Let's Encrypt connecting directly, rather than through a PROXY-protocol load
+  balancer doing TCP passthrough) is rejected by the admission gate — the proxy
+  warns when ACME and `proxyprotocol` are both set. A very tight
   `ratelimit.connectionrate`/`concurrentconnections` can reject the validation
-  connections too. ACME needs direct, ungated access to this listener on 443.
+  connections too.
 
 ## Security note
 
