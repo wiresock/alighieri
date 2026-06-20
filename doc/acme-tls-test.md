@@ -235,8 +235,8 @@ new order.
   Let's Encrypt connecting directly, rather than through a PROXY-protocol load
   balancer doing TCP passthrough) is rejected by the admission gate — the proxy
   warns when ACME and `proxyprotocol` are both set. A very tight
-  `ratelimit.connectionrate`/`concurrentconnections` can reject the validation
-  connections too.
+  `ratelimit.connectionrate`/`ratelimit.concurrentconnections` can reject the
+  validation connections too.
 
 ## Security note
 

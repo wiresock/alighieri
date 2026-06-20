@@ -384,7 +384,7 @@ fn warn_config_footguns(config: &Config) {
     }
     // Checked here (rather than only at bind) so it also fires on reload, where
     // `proxyprotocol` can be enabled while ACME stays active.
-    if matches!(config.tls, Some(crate::config::TlsConfig::Acme(_)))
+    if matches!(config.tls.as_ref(), Some(crate::config::TlsConfig::Acme(_)))
         && !config.proxy_protocol.is_empty()
     {
         warn!(
