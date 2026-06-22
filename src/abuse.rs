@@ -236,9 +236,9 @@ fn increment_window(window: &mut Window, limit: Option<&RateLimit>, now: Instant
 }
 
 /// Looks up or creates the per-client state for `ip` under the already-held
-/// `clients` lock, running the amortized prune (and a forced prune plus eviction
-/// when the map is at its cap) so the map and its prune scan stay bounded.
-/// Shared by `admit` and `record_auth_failure`.
+/// `clients` lock, running the amortized prune and — at the cap — evicting an
+/// idle entry, so the map and its prune scan stay bounded. Shared by `admit`
+/// and `record_auth_failure`.
 fn checkout_state(
     admissions: &AtomicU64,
     clients: &mut HashMap<IpAddr, Arc<Mutex<ClientState>>>,
@@ -249,13 +249,17 @@ fn checkout_state(
     let due = admissions
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS);
-    // Prune on the amortized schedule, and always when the map has reached its
-    // cap, so both the scan cost and the memory stay bounded.
-    if due || clients.len() >= MAX_TRACKED_CLIENTS {
+    // Prune only on the amortized schedule. At the cap, `clients.len() >= cap`
+    // holds on every new-IP connection, so forcing a full O(n) prune there would
+    // run it on *every* connection instead of every Nth — worse than the
+    // unbounded version. The eviction below already keeps the map bounded.
+    if due {
         prune_expired_clients(clients, config, now);
     }
-    // A brand-new client still over the cap: evict idle entries to make room so a
-    // spray from many distinct source IPs cannot grow the map without bound.
+    // A brand-new client at the cap: evict an idle entry to make room so a spray
+    // from many distinct source IPs cannot grow the map without bound. With
+    // `target = cap - 1` only one victim is needed, so this stops at the first
+    // idle (non-active) entry rather than scanning the whole map.
     if clients.len() >= MAX_TRACKED_CLIENTS && !clients.contains_key(&ip) {
         evict_idle_clients(clients, MAX_TRACKED_CLIENTS - 1);
     }
