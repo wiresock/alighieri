@@ -514,12 +514,12 @@ where
         }
         // A dual-stack outbound socket needs IPv4 destinations in `::ffff:`
         // mapped form; `dest` was already canonicalised to a real IPv4 above.
-        let send_dest = match dest {
-            SocketAddr::V4(v4) if outbound_dual => {
-                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        let mut send_dest = dest;
+        if outbound_dual {
+            if let SocketAddr::V4(v4) = dest {
+                send_dest.set_ip(IpAddr::V6(v4.ip().to_ipv6_mapped()));
             }
-            other => other,
-        };
+        }
         match outbound.send_to(payload, send_dest).await {
             Ok(_) => metrics.udp_client_packet_relayed(payload.len() as u64),
             Err(e) => {
