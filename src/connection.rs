@@ -393,10 +393,12 @@ impl Connection {
                     return Err(Error::Io(e));
                 }
             };
-        // The outbound socket carries traffic to/from remote peers, sourced
-        // from the configured external address.
-        let outbound = match UdpSocket::bind((self.config.external, 0)).await {
-            Ok(s) => s,
+        // The outbound socket carries traffic to/from remote peers, sourced from
+        // the configured external address. `outbound_dual` is true when it is a
+        // dual-stack IPv6 socket (so IPv4 destinations are sent in `::ffff:`
+        // mapped form); see `bind_outbound_udp`.
+        let (outbound, outbound_dual) = match bind_outbound_udp(self.config.external).await {
+            Ok(pair) => pair,
             Err(e) => {
                 socks5::write_reply(
                     &mut self.stream,
@@ -486,6 +488,7 @@ impl Connection {
                 dns_resolver: self.dns_resolver.clone(),
                 metrics: self.metrics.clone(),
                 throttle,
+                outbound_dual,
             },
             authorize,
         )
@@ -593,6 +596,48 @@ async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<U
             range.min, range.max
         ),
     ))
+}
+
+/// Binds the remote-facing UDP socket, returning it with a flag that is `true`
+/// when it is a dual-stack IPv6 socket.
+///
+/// When `external` is unspecified (the default `0.0.0.0`, or `::`) the operator
+/// did not pin a source address, so we bind a dual-stack IPv6 socket and can
+/// reach both IPv4 and IPv6 destinations — mirroring the per-target family
+/// choice the TCP path makes. The caller must then send IPv4 destinations in
+/// `::ffff:` mapped form (that is what the returned flag signals). A concrete
+/// `external` pins the source family; the other family is then legitimately
+/// unreachable, and a datagram to it surfaces as a counted `send_to` failure
+/// rather than a silent drop.
+async fn bind_outbound_udp(external: IpAddr) -> io::Result<(UdpSocket, bool)> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::Ipv6Addr;
+
+    let dual = external.is_unspecified();
+    let (domain, bind_addr): (Domain, SocketAddr) = if dual {
+        (
+            Domain::IPV6,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        )
+    } else {
+        let domain = match external {
+            IpAddr::V4(_) => Domain::IPV4,
+            IpAddr::V6(_) => Domain::IPV6,
+        };
+        (domain, SocketAddr::new(external, 0))
+    };
+
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if dual {
+        // Accept and emit IPv4 as `::ffff:` mapped. Windows defaults
+        // IPV6_V6ONLY on, so set it explicitly for portable dual-stack.
+        socket.set_only_v6(false)?;
+    }
+    // tokio's `from_std` requires a non-blocking socket.
+    socket.set_nonblocking(true)?;
+    socket.bind(&bind_addr.into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    Ok((UdpSocket::from_std(std_socket)?, dual))
 }
 
 /// Pseudo-random start offset (`0..span`) for the UDP port scan. The atomic

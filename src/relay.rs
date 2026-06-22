@@ -110,6 +110,9 @@ pub struct UdpAssociateOptions {
     pub dns_resolver: Arc<DnsResolver>,
     pub metrics: Arc<Metrics>,
     pub throttle: Option<Throttle>,
+    /// The outbound socket is a dual-stack IPv6 socket: IPv4 destinations are
+    /// sent in `::ffff:` mapped form. See `connection::bind_outbound_udp`.
+    pub outbound_dual: bool,
 }
 
 /// Relays data in both directions between `client` and `remote` until both
@@ -338,6 +341,7 @@ where
         options.throttle.clone(),
         client_endpoint.clone(),
         activity.clone(),
+        options.outbound_dual,
         authorize,
     ));
     let mut remote_to_client = tokio::spawn(relay_remote_to_client(
@@ -441,6 +445,7 @@ async fn relay_client_to_remote<F>(
     throttle: Option<Throttle>,
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
+    outbound_dual: bool,
     authorize: F,
 ) -> Result<()>
 where
@@ -507,8 +512,22 @@ where
             metrics.rate_limited();
             continue;
         }
-        if outbound.send_to(payload, dest).await.is_ok() {
-            metrics.udp_client_packet_relayed(payload.len() as u64);
+        // A dual-stack outbound socket needs IPv4 destinations in `::ffff:`
+        // mapped form; `dest` was already canonicalised to a real IPv4 above.
+        let send_dest = match dest {
+            SocketAddr::V4(v4) if outbound_dual => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            other => other,
+        };
+        match outbound.send_to(payload, send_dest).await {
+            Ok(_) => metrics.udp_client_packet_relayed(payload.len() as u64),
+            Err(e) => {
+                // Surface the failure instead of dropping silently — e.g. an
+                // IPv6 destination on an IPv4-pinned `external`.
+                metrics.udp_send_failed();
+                debug!(dest = %dest, error = %e, "UDP outbound send failed");
+            }
         }
     }
 }
