@@ -853,6 +853,7 @@ impl std::fmt::Display for UserNotFound {
 
 impl std::error::Error for UserNotFound {}
 
+#[derive(Debug)]
 struct UserlistLock {
     file: std::fs::File,
 }
@@ -863,17 +864,48 @@ impl Drop for UserlistLock {
     }
 }
 
+/// Rejects a userlist `.lock` path that already exists as a symlink. The lock is
+/// created in the userlist's own directory; if an attacker can write there, a
+/// pre-placed symlink would otherwise be truncated (the lock's `set_len(0)`)
+/// when `alighieri user ...` runs with elevated privileges. The lock open also
+/// passes `O_NOFOLLOW` on Unix to make this atomic. This catches the
+/// file-redirect vector on both platforms (`is_symlink` is true for Unix
+/// symlinks and Windows file symlinks); Windows junctions are directory-only
+/// reparse points and so cannot redirect a file sidecar. The temporary file and
+/// the backup are protected differently — the temp uses `create_new` (`O_EXCL`)
+/// and the backup is renamed into place (which replaces a link rather than
+/// following it).
+fn reject_symlink_sidecar(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to use userlist sidecar that is a symlink: {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn acquire_userlist_lock(userlist: &Path) -> std::io::Result<UserlistLock> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
     let path = userlist_lock_path(userlist);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
+    reject_symlink_sidecar(&path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Atomically refuse to open the lock if it is (or races into being) a
+        // symlink, closing the TOCTOU window the check above leaves open.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&path)?;
     lock_userlist_file(&file)?;
     file.set_len(0)?;
     writeln!(file, "pid={}", std::process::id())?;
@@ -1010,12 +1042,25 @@ fn backup_userlist(userlist: &Path, existed: bool) -> std::io::Result<()> {
         return Ok(());
     }
     let backup = userlist_backup_path(userlist);
-    std::fs::copy(userlist, &backup)?;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(backup)?
-        .sync_all()
+    // Stream the backup into a fresh temp file (`create_new` / `O_EXCL`, so it
+    // cannot follow a pre-placed symlink), then atomically rename it over
+    // `.bak`. `rename` replaces the destination link itself rather than writing
+    // through it, closing the check-then-copy race a direct `fs::copy` to `.bak`
+    // would leave. The temp inherits the userlist's mode/uid/gid on Unix (via
+    // `create_userlist_temp`); on Windows it inherits the parent directory ACL,
+    // as the previous `fs::copy` did.
+    let (temp_path, mut temp_file) = create_userlist_temp(userlist, existed)?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut source = std::fs::File::open(userlist)?;
+        std::io::copy(&mut source, &mut temp_file)?;
+        temp_file.sync_all()
+    })();
+    drop(temp_file);
+    if let Err(e) = write_result.and_then(|()| std::fs::rename(&temp_path, &backup)) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn userlist_backup_path(userlist: &Path) -> PathBuf {
@@ -1200,6 +1245,53 @@ fn user_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_userlist_lock_rejects_symlink_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let userlist = dir.path().join("users");
+        let target = dir.path().join("secret");
+        std::fs::write(&target, b"secret-contents").unwrap();
+        // Attacker pre-places the lock path as a symlink to a sensitive file.
+        symlink(&target, userlist_lock_path(&userlist)).unwrap();
+
+        let err = acquire_userlist_lock(&userlist).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // The symlink target must not have been truncated.
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret-contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_userlist_replaces_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let userlist = dir.path().join("users");
+        std::fs::write(&userlist, b"user:$argon2id$hash").unwrap();
+        let target = dir.path().join("secret");
+        std::fs::write(&target, b"secret-contents").unwrap();
+        // Attacker pre-places the backup path as a symlink to a sensitive file.
+        let bak = userlist_backup_path(&userlist);
+        symlink(&target, &bak).unwrap();
+
+        // The backup is written to a temp file and renamed into place, so it
+        // succeeds while replacing the symlink rather than following it.
+        backup_userlist(&userlist, true).unwrap();
+
+        // The symlink target is untouched: credentials were not written through.
+        assert_eq!(std::fs::read(&target).unwrap(), b"secret-contents");
+        // The backup is now a real file (the link was replaced) with the
+        // userlist content.
+        assert!(!std::fs::symlink_metadata(&bak)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&bak).unwrap(), b"user:$argon2id$hash");
+    }
 
     #[test]
     fn config_flag_requires_value() {

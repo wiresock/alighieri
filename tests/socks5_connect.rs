@@ -200,6 +200,21 @@ async fn start_udp_echo_server() -> SocketAddr {
     addr
 }
 
+/// IPv6 UDP echo server on `[::1]:0`. Returns `None` when IPv6 loopback is
+/// unavailable on the host, so the caller can skip rather than fail.
+async fn start_udp_echo_server_v6() -> Option<SocketAddr> {
+    let socket = UdpSocket::bind("[::1]:0").await.ok()?;
+    let addr = socket.local_addr().ok()?;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        loop {
+            let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+            socket.send_to(&buf[..n], peer).await.unwrap();
+        }
+    });
+    Some(addr)
+}
+
 #[tokio::test]
 async fn full_connect_relay_ipv4() {
     let (_handle, proxy_addr) = start_proxy().await;
@@ -514,6 +529,91 @@ async fn udp_associate_relays_datagrams() {
     let header = socks5::parse_udp_header(&buf[..n]).unwrap();
     assert_eq!(header.dest, TargetAddr::Ip(echo));
     assert_eq!(&buf[header.payload_offset..n], b"udp ping");
+}
+
+/// The default `external` (`0.0.0.0`) yields a dual-stack outbound, so the
+/// common case — a v4 destination — must still relay through the `::ffff:`
+/// mapped-send path. Guards against the dual-stack change breaking v4 UDP.
+#[tokio::test]
+async fn udp_associate_dual_stack_outbound_reaches_ipv4() {
+    let echo = start_udp_echo_server().await;
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 0.0.0.0
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"udp4 via dualstack");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("no reply: dual-stack outbound failed to reach the IPv4 destination")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(header.dest, TargetAddr::Ip(echo));
+    assert_eq!(&buf[header.payload_offset..n], b"udp4 via dualstack");
+}
+
+/// With an unspecified `external` the outbound UDP socket is dual-stack, so a
+/// v4 client must be able to relay to an IPv6 destination (regression test for
+/// the single-IPv4-socket bug that silently dropped IPv6 UDP targets).
+#[tokio::test]
+async fn udp_associate_relays_to_ipv6_destination() {
+    let Some(echo) = start_udp_echo_server_v6().await else {
+        eprintln!("skipping udp_associate_relays_to_ipv6_destination: no IPv6 loopback");
+        return;
+    };
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 0.0.0.0
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: ::/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"udp6 ping");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("no reply: dual-stack outbound failed to reach the IPv6 destination")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(header.dest, TargetAddr::Ip(echo));
+    assert_eq!(&buf[header.payload_offset..n], b"udp6 ping");
 }
 
 /// A `command: connect` only policy must reject UDP ASSOCIATE up front with
