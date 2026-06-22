@@ -23,6 +23,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   across reloads. Entries now record their insertion time and liveness is judged
   against the *current* TTL at lookup, so a reduced TTL shortens existing entries
   at once (and a raised one extends them).
+- Userlist management (`alighieri user …`) no longer follows a symlink planted
+  at a `.lock` or `.bak` sidecar path. Both are created in the userlist's own
+  directory; if that directory was attacker-writable, a pre-placed symlink could
+  previously be truncated (the lock's `set_len(0)`) or have credentials copied
+  through it (the backup) when the command ran with elevated privileges. The
+  lock now refuses a symlink and opens with `O_NOFOLLOW` on Unix, and the backup
+  is written to a fresh `create_new` temp file and atomically renamed into place
+  (rename replaces the link instead of following it). The temporary file was
+  already safe (`create_new`/`O_EXCL`).
 
 ## [0.2.0] - 2026-06-21
 
