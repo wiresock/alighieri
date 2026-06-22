@@ -478,6 +478,8 @@ mod tests {
         metrics.tcp_relay_closed(12, 34);
         metrics.udp_association_closed();
         metrics.udp_client_packet_denied();
+        metrics.udp_send_failed();
+        metrics.udp_send_failed();
 
         let rendered = metrics.render_prometheus();
 
@@ -489,6 +491,7 @@ mod tests {
         assert!(rendered.contains("alighieri_tcp_relay_bytes_down_total 34\n"));
         assert!(rendered.contains("alighieri_udp_associations_active 0\n"));
         assert!(rendered.contains("alighieri_udp_packets_denied_total 1\n"));
+        assert!(rendered.contains("alighieri_udp_send_failures_total 2\n"));
     }
 
     #[test]
