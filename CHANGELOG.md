@@ -8,6 +8,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
+  socket was bound to `external` (default `0.0.0.0`, IPv4-only), so datagrams to
+  an IPv6 target failed to send — and the error was discarded — while the TCP
+  path already chose the socket family per target. When `external` is
+  unspecified the outbound is now a dual-stack socket that reaches both families
+  (IPv4 sent as `::ffff:` mapped); a concrete `external` still pins the source
+  family. Outbound `send_to` failures are now counted via a new
+  `alighieri_udp_send_failures_total` metric instead of being dropped silently.
 - A `dns.cachettl` change now takes effect immediately on hot reload. Cache
   entries previously stored an absolute expiry computed from the TTL in force
   when they were cached, so lowering `dns.cachettl` (e.g. 1h → 60s) left existing
