@@ -6,6 +6,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- Userlist management (`alighieri user …`) now refuses to use a `.lock` or
+  `.bak` sidecar that is a symlink/reparse point. Both are created in the
+  userlist's own directory; if that directory was attacker-writable, a
+  pre-placed symlink could previously be truncated (the lock's `set_len(0)`) or
+  have credentials copied through it (the backup) when the command ran with
+  elevated privileges. The lock additionally opens with `O_NOFOLLOW` on Unix to
+  close the check-then-open race. The temporary file was already safe
+  (`create_new`/`O_EXCL`).
+
 ## [0.2.0] - 2026-06-21
 
 ### Changed
