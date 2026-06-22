@@ -1042,15 +1042,17 @@ fn backup_userlist(userlist: &Path, existed: bool) -> std::io::Result<()> {
         return Ok(());
     }
     let backup = userlist_backup_path(userlist);
-    // Write the backup to a fresh temp file (`create_new` / `O_EXCL`, so it
-    // cannot follow a pre-placed symlink) created with the userlist's own
-    // permissions, then atomically rename it over `.bak`. `rename` replaces the
-    // destination link itself rather than writing through it, closing the
-    // check-then-copy race a direct `fs::copy` to `.bak` would leave.
+    // Stream the backup into a fresh temp file (`create_new` / `O_EXCL`, so it
+    // cannot follow a pre-placed symlink), then atomically rename it over
+    // `.bak`. `rename` replaces the destination link itself rather than writing
+    // through it, closing the check-then-copy race a direct `fs::copy` to `.bak`
+    // would leave. The temp inherits the userlist's mode/uid/gid on Unix (via
+    // `create_userlist_temp`); on Windows it inherits the parent directory ACL,
+    // as the previous `fs::copy` did.
     let (temp_path, mut temp_file) = create_userlist_temp(userlist, existed)?;
     let write_result = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        temp_file.write_all(&std::fs::read(userlist)?)?;
+        let mut source = std::fs::File::open(userlist)?;
+        std::io::copy(&mut source, &mut temp_file)?;
         temp_file.sync_all()
     })();
     drop(temp_file);
