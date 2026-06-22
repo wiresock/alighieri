@@ -35,6 +35,7 @@ pub struct Metrics {
     udp_packets_up: AtomicU64,
     udp_packets_down: AtomicU64,
     udp_packets_denied: AtomicU64,
+    udp_send_failures: AtomicU64,
     udp_relay_bytes_up: AtomicU64,
     udp_relay_bytes_down: AtomicU64,
     rule_hits: Mutex<BTreeMap<RuleHitKey, u64>>,
@@ -123,6 +124,13 @@ impl Metrics {
         self.udp_packets_denied.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A datagram could not be forwarded to its destination (e.g. an IPv6 target
+    /// on an IPv4-only outbound socket, or a transient socket error). Makes the
+    /// otherwise-silent `send_to` failure observable.
+    pub fn udp_send_failed(&self) {
+        self.udp_send_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
         write_metric(
@@ -199,6 +207,11 @@ impl Metrics {
             &mut out,
             "alighieri_udp_packets_denied_total",
             self.udp_packets_denied.load(Ordering::Relaxed),
+        );
+        write_metric(
+            &mut out,
+            "alighieri_udp_send_failures_total",
+            self.udp_send_failures.load(Ordering::Relaxed),
         );
         write_metric(
             &mut out,
@@ -465,6 +478,8 @@ mod tests {
         metrics.tcp_relay_closed(12, 34);
         metrics.udp_association_closed();
         metrics.udp_client_packet_denied();
+        metrics.udp_send_failed();
+        metrics.udp_send_failed();
 
         let rendered = metrics.render_prometheus();
 
@@ -476,6 +491,7 @@ mod tests {
         assert!(rendered.contains("alighieri_tcp_relay_bytes_down_total 34\n"));
         assert!(rendered.contains("alighieri_udp_associations_active 0\n"));
         assert!(rendered.contains("alighieri_udp_packets_denied_total 1\n"));
+        assert!(rendered.contains("alighieri_udp_send_failures_total 2\n"));
     }
 
     #[test]
