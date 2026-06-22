@@ -166,6 +166,32 @@ impl RuleSet {
         self.evaluate_socks_detail(ctx).verdict
     }
 
+    /// Whether any `pass` rule could authorise a `UdpAssociate` for this client,
+    /// ignoring the not-yet-known datagram destination.
+    ///
+    /// Used to reject a UDP ASSOCIATE up front — before binding sockets and
+    /// replying success — when the policy categorically forbids UDP for the
+    /// client (e.g. only `command: connect` rules), so such a client cannot hold
+    /// a relay socket open until the idle timeout. It is deliberately permissive
+    /// about the destination: a client with at least one UDP-permitting rule is
+    /// admitted and the per-datagram authoriser still filters the actual targets,
+    /// so destination-restricted UDP configs are never falsely rejected here.
+    pub fn udp_associate_reachable(
+        &self,
+        client_ip: IpAddr,
+        client_port: u16,
+        method: AuthKind,
+    ) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.scope == Scope::Socks
+                && rule.verdict == Verdict::Pass
+                && rule.from.matches(client_ip, client_port)
+                && (rule.commands.is_empty() || rule.commands.contains(&Command::UdpAssociate))
+                && (rule.protocols.is_empty() || rule.protocols.contains(&Protocol::Udp))
+                && (rule.methods.is_empty() || rule.methods.contains(&method))
+        })
+    }
+
     /// Evaluates request authorisation and includes the matching rule line.
     pub fn evaluate_socks_detail(&self, ctx: &SocksContext<'_>) -> RuleDecision {
         for rule in &self.rules {
@@ -258,6 +284,51 @@ mod tests {
             dest_host: Some(host),
             ..socks_ctx(dest, cmd)
         }
+    }
+
+    #[test]
+    fn udp_associate_reachable_gates_on_command() {
+        // Only CONNECT permitted: UDP is categorically unreachable, so an
+        // ASSOCIATE is rejected before any socket is bound.
+        let connect_only = RuleSet::new(vec![socks_rule(
+            Verdict::Pass,
+            "0.0.0.0/0",
+            vec![Command::Connect],
+        )]);
+        assert!(!connect_only.udp_associate_reachable(
+            "10.0.0.5".parse().unwrap(),
+            5000,
+            AuthKind::None
+        ));
+
+        // A UDP-permitting rule admits the association even if its destination is
+        // narrow (the per-datagram authoriser still filters actual targets).
+        let with_udp = RuleSet::new(vec![socks_rule(
+            Verdict::Pass,
+            "10.0.0.0/8",
+            vec![Command::UdpAssociate],
+        )]);
+        assert!(with_udp.udp_associate_reachable(
+            "10.0.0.5".parse().unwrap(),
+            5000,
+            AuthKind::None
+        ));
+
+        // An "any command" rule (empty list) also permits UDP.
+        let any_cmd = RuleSet::new(vec![socks_rule(Verdict::Pass, "0.0.0.0/0", vec![])]);
+        assert!(any_cmd.udp_associate_reachable("10.0.0.5".parse().unwrap(), 5000, AuthKind::None));
+
+        // A `block` rule does not count as reachability.
+        let blocked = RuleSet::new(vec![socks_rule(
+            Verdict::Block,
+            "0.0.0.0/0",
+            vec![Command::UdpAssociate],
+        )]);
+        assert!(!blocked.udp_associate_reachable(
+            "10.0.0.5".parse().unwrap(),
+            5000,
+            AuthKind::None
+        ));
     }
 
     #[test]

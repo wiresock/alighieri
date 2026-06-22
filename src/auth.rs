@@ -100,6 +100,13 @@ impl UserDb {
             if let Some((user, credential)) = parse_argon2_directive(trimmed).map_err(|e| {
                 Error::Config(format!("userlist line {lineno}: invalid Argon2 entry: {e}"))
             })? {
+                if users.contains_key(&user) {
+                    tracing::warn!(
+                        line = lineno,
+                        user = %user,
+                        "duplicate userlist username; the later entry overrides the earlier one"
+                    );
+                }
                 users.insert(user, credential);
                 continue;
             }
@@ -116,6 +123,13 @@ impl UserDb {
                 return Err(Error::Config(format!(
                     "userlist line {lineno}: empty username"
                 )));
+            }
+            if users.contains_key(user) {
+                tracing::warn!(
+                    line = lineno,
+                    user = %user,
+                    "duplicate userlist username; the later entry overrides the earlier one"
+                );
             }
             users.insert(user.to_string(), StoredCredential::Plain(pass.to_string()));
         }
@@ -672,6 +686,17 @@ mod tests {
         assert_eq!(db.len(), 2);
         assert!(db.verify("alice", "s3cr3t"));
         assert!(db.verify("bob", "hunter2"));
+    }
+
+    #[test]
+    fn parse_duplicate_username_keeps_last_entry() {
+        // A duplicate username is not an error (a hard failure would break
+        // userlists that load today), but the later entry wins; the parser logs
+        // a warning so the shadowing is not silent.
+        let db = UserDb::parse("alice:first\nalice:second\n").unwrap();
+        assert_eq!(db.len(), 1);
+        assert!(db.verify("alice", "second"));
+        assert!(!db.verify("alice", "first"));
     }
 
     #[test]

@@ -6,6 +6,30 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- UDP ASSOCIATE is now authorised before any resources are allocated: if no
+  `socks` rule could permit UDP for the client (e.g. a `command: connect` only
+  policy), the request is rejected with "connection not allowed by ruleset"
+  instead of binding a relay socket and replying success only for the
+  per-datagram checks to drop every datagram while the association lingers until
+  the idle timeout. Per-datagram destination checks are unchanged for clients
+  that pass this gate.
+- RFC 1929 authentication now rejects a zero-length username before it reaches
+  an auth backend (notably `auth.command`, which would otherwise be handed a
+  blank credential). An empty password is still accepted, since the userlist
+  plaintext format permits one.
+- Duplicate usernames in a userlist now log a warning (with the line number)
+  identifying that a later entry overrides an earlier one, instead of silently
+  shadowing it. The last entry still wins, so existing userlists keep loading.
+
+### Documentation
+
+- The per-rule hit metrics (`alighieri_rule_hits_total`,
+  `alighieri_rule_named_hits_total`) are documented as best-effort: they may
+  undercount under heavy load/scrape contention because the hot path never
+  blocks on the metrics lock. Aggregate counters remain exact.
+
 ## [0.2.0] - 2026-06-21
 
 ### Changed

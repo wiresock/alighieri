@@ -516,6 +516,42 @@ async fn udp_associate_relays_datagrams() {
     assert_eq!(&buf[header.payload_offset..n], b"udp ping");
 }
 
+/// A `command: connect` only policy must reject UDP ASSOCIATE up front with
+/// "connection not allowed by ruleset" — not establish an association that
+/// lingers until the idle timeout while every datagram is dropped.
+#[tokio::test]
+async fn udp_associate_denied_by_connect_only_policy() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+
+    // UDP ASSOCIATE with the usual 0.0.0.0:0 placeholder destination.
+    let mut req = vec![0x05, 0x03, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    control.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x02,
+        "UDP ASSOCIATE should be denied by ruleset, got reply 0x{:02x}",
+        reply[1]
+    );
+}
+
 #[tokio::test]
 async fn udp_associate_rejects_second_client_port_from_same_ip() {
     let (_handle, proxy_addr) = start_proxy().await;
