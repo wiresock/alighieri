@@ -853,6 +853,7 @@ impl std::fmt::Display for UserNotFound {
 
 impl std::error::Error for UserNotFound {}
 
+#[derive(Debug)]
 struct UserlistLock {
     file: std::fs::File,
 }
