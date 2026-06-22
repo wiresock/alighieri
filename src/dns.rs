@@ -203,8 +203,11 @@ impl DnsResolver {
     }
 
     async fn store(&self, key: DnsCacheKey, addrs: Vec<SocketAddr>, ttl: Duration) {
-        let now = Instant::now();
         let mut cache = self.cache.lock().await;
+        // Capture the time after acquiring the lock so a contended await does
+        // not backdate the entry (which would make it expire and be evicted
+        // earlier than its TTL intends).
+        let now = Instant::now();
         // Sweeping the whole map costs O(capacity); do it only when the cache
         // is actually full rather than on every insert, and fall back to
         // evicting the oldest entry when the sweep frees nothing.
