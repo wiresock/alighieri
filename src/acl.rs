@@ -166,30 +166,52 @@ impl RuleSet {
         self.evaluate_socks_detail(ctx).verdict
     }
 
-    /// Whether any `pass` rule could authorise a `UdpAssociate` for this client,
-    /// ignoring the not-yet-known datagram destination.
+    /// Whether a `UdpAssociate` from this client could be authorised for some
+    /// destination, evaluated with the same first-match-wins ordering as
+    /// [`Self::evaluate_socks`] but ignoring the not-yet-known datagram
+    /// destination.
     ///
     /// Used to reject a UDP ASSOCIATE up front — before binding sockets and
     /// replying success — when the policy categorically forbids UDP for the
-    /// client (e.g. only `command: connect` rules), so such a client cannot hold
-    /// a relay socket open until the idle timeout. It is deliberately permissive
-    /// about the destination: a client with at least one UDP-permitting rule is
-    /// admitted and the per-datagram authoriser still filters the actual targets,
-    /// so destination-restricted UDP configs are never falsely rejected here.
+    /// client (e.g. only `command: connect` rules, or a wildcard `block`), so
+    /// such a client cannot hold a relay socket open until the idle timeout. The
+    /// per-datagram authoriser still filters the actual targets for clients that
+    /// pass this gate.
+    ///
+    /// Rules are walked in order; the first one that could apply to a UDP
+    /// ASSOCIATE from this client decides:
+    /// - a `pass` rule means UDP is reachable (to at least its destination
+    ///   range);
+    /// - a `block` rule with a [match-all](crate::net::AddrSpec::matches_all)
+    ///   `to:` denies the client categorically;
+    /// - a narrower `block` only rules out some destinations, so a later rule can
+    ///   still apply.
+    ///
+    /// The match-all check is conservative (single-family or port-restricted
+    /// blocks are not treated as categorical), so this never falsely rejects a
+    /// client that the per-datagram checks would have allowed.
     pub fn udp_associate_reachable(
         &self,
         client_ip: IpAddr,
         client_port: u16,
         method: AuthKind,
     ) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.scope == Scope::Socks
-                && rule.verdict == Verdict::Pass
+        for rule in &self.rules {
+            let applies = rule.scope == Scope::Socks
                 && rule.from.matches(client_ip, client_port)
                 && (rule.commands.is_empty() || rule.commands.contains(&Command::UdpAssociate))
                 && (rule.protocols.is_empty() || rule.protocols.contains(&Protocol::Udp))
-                && (rule.methods.is_empty() || rule.methods.contains(&method))
-        })
+                && (rule.methods.is_empty() || rule.methods.contains(&method));
+            if !applies {
+                continue;
+            }
+            match rule.verdict {
+                Verdict::Pass => return true,
+                Verdict::Block if rule.to.matches_all() => return false,
+                Verdict::Block => continue,
+            }
+        }
+        false
     }
 
     /// Evaluates request authorisation and includes the matching rule line.
@@ -329,6 +351,66 @@ mod tests {
             5000,
             AuthKind::None
         ));
+    }
+
+    #[test]
+    fn udp_associate_reachable_respects_first_match() {
+        let client: IpAddr = "10.0.0.5".parse().unwrap();
+        let mk = |verdict: Verdict, from: &str, to: AddrSpec, commands: Vec<Command>| Rule {
+            name: None,
+            verdict,
+            scope: Scope::Socks,
+            from: spec(from),
+            to,
+            commands,
+            protocols: vec![],
+            methods: vec![],
+            bandwidth: None,
+            source_line: 0,
+        };
+
+        // A categorical (match-all `to:`) block before a UDP-permitting pass:
+        // the client is blocked first, so UDP is unreachable.
+        let blocked_first = RuleSet::new(vec![
+            mk(Verdict::Block, "10.0.0.5/32", AddrSpec::any(), vec![]),
+            mk(
+                Verdict::Pass,
+                "10.0.0.0/8",
+                AddrSpec::any(),
+                vec![Command::UdpAssociate],
+            ),
+        ]);
+        assert!(!blocked_first.udp_associate_reachable(client, 5000, AuthKind::None));
+
+        // A narrow block (single family, not match-all) before a pass does not
+        // categorically block, so the later pass still makes UDP reachable.
+        let narrow_block_first = RuleSet::new(vec![
+            mk(
+                Verdict::Block,
+                "10.0.0.5/32",
+                spec("10.0.0.0/8"),
+                vec![Command::UdpAssociate],
+            ),
+            mk(
+                Verdict::Pass,
+                "10.0.0.0/8",
+                AddrSpec::any(),
+                vec![Command::UdpAssociate],
+            ),
+        ]);
+        assert!(narrow_block_first.udp_associate_reachable(client, 5000, AuthKind::None));
+
+        // A pass before a universal block wins (first match), so reachable.
+        let pass_first = RuleSet::new(vec![
+            mk(
+                Verdict::Pass,
+                "10.0.0.0/8",
+                spec("8.8.8.8/32"),
+                vec![Command::UdpAssociate],
+            ),
+            mk(Verdict::Block, "10.0.0.5/32", AddrSpec::any(), vec![]),
+        ]);
+        assert!(pass_first.udp_associate_reachable(client, 5000, AuthKind::None));
     }
 
     #[test]

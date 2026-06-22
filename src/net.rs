@@ -309,6 +309,18 @@ impl AddrSpec {
                 || host.is_some_and(|h| self.hosts.iter().any(|p| p.matches(h))))
     }
 
+    /// Whether this spec matches *every* possible destination — any port, and
+    /// every IPv4 and IPv6 address (a `/0` in each family). A `block` rule whose
+    /// `to:` matches all denies the client categorically. Deliberately
+    /// conservative: a spec covering only one family (a lone `0.0.0.0/0`) or a
+    /// restricted port range is not considered universal, so callers using this
+    /// to short-circuit never produce a false deny.
+    pub fn matches_all(&self) -> bool {
+        self.ports.is_none()
+            && self.cidrs.iter().any(|c| c.prefix() == 0 && !c.is_v6())
+            && self.cidrs.iter().any(|c| c.prefix() == 0 && c.is_v6())
+    }
+
     fn port_matches(&self, port: u16) -> bool {
         match self.ports {
             Some(range) => range.contains(port),
@@ -492,5 +504,22 @@ mod tests {
         let cidr = AddrSpec::new("10.0.0.0/8".parse().unwrap(), None);
         assert!(cidr.matches_dest(Some("anything"), "10.1.2.3".parse().unwrap(), 80));
         assert!(!cidr.matches_dest(Some("anything"), "192.0.2.1".parse().unwrap(), 80));
+    }
+
+    #[test]
+    fn matches_all_requires_both_families_and_any_port() {
+        // The omitted-`to:` selector (both families, any port) is universal.
+        assert!(AddrSpec::any().matches_all());
+        // A single family is not universal.
+        assert!(!AddrSpec::new("0.0.0.0/0".parse().unwrap(), None).matches_all());
+        assert!(!AddrSpec::new("::/0".parse().unwrap(), None).matches_all());
+        // A narrower network is not universal.
+        assert!(!AddrSpec::new("10.0.0.0/8".parse().unwrap(), None).matches_all());
+        // A port restriction makes it non-universal even with both families.
+        let both_families_one_port = AddrSpec {
+            ports: Some(PortRange { min: 80, max: 80 }),
+            ..AddrSpec::any()
+        };
+        assert!(!both_families_one_port.matches_all());
     }
 }

@@ -8,13 +8,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- UDP ASSOCIATE is now authorised before any resources are allocated: if no
-  `socks` rule could permit UDP for the client (e.g. a `command: connect` only
-  policy), the request is rejected with "connection not allowed by ruleset"
-  instead of binding a relay socket and replying success only for the
-  per-datagram checks to drop every datagram while the association lingers until
-  the idle timeout. Per-datagram destination checks are unchanged for clients
-  that pass this gate.
+- UDP ASSOCIATE is now authorised before any resources are allocated: if the
+  `socks` rules could not permit UDP for the client (a `command: connect` only
+  policy, or a wildcard `block` that matches first), the request is rejected with
+  "connection not allowed by ruleset" instead of binding a relay socket and
+  replying success only for the per-datagram checks to drop every datagram while
+  the association lingers until the idle timeout. The check honours first-match
+  ordering and is conservative about wildcard blocks, so destination-restricted
+  UDP policies are never falsely rejected; per-datagram destination checks are
+  unchanged for clients that pass this gate.
 - RFC 1929 authentication now rejects a zero-length username before it reaches
   an auth backend (notably `auth.command`, which would otherwise be handed a
   blank credential). An empty password is still accepted, since the userlist
