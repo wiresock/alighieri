@@ -134,8 +134,8 @@ impl DnsResolver {
     ) -> io::Result<Vec<SocketAddr>> {
         let key = DnsCacheKey::new(host, port);
         loop {
-            if ttl.is_some() {
-                if let Some(addrs) = self.cached(&key, Instant::now()).await {
+            if let Some(ttl) = ttl {
+                if let Some(addrs) = self.cached(&key, Instant::now(), ttl).await {
                     return Ok(addrs);
                 }
             }
@@ -144,12 +144,7 @@ impl DnsResolver {
                 Flight::Lead(mut lead) => {
                     let result = self.backend_lookup(host, port).await;
                     if let (Some(ttl), Ok(addrs)) = (ttl, &result) {
-                        self.store(
-                            key.clone(),
-                            addrs.clone(),
-                            cache_expiration(Instant::now(), ttl),
-                        )
-                        .await;
+                        self.store(key.clone(), addrs.clone(), ttl).await;
                     }
                     lead.publish(&result);
                     return result;
@@ -192,31 +187,42 @@ impl DnsResolver {
         })
     }
 
-    async fn cached(&self, key: &DnsCacheKey, now: Instant) -> Option<Vec<SocketAddr>> {
+    async fn cached(
+        &self,
+        key: &DnsCacheKey,
+        now: Instant,
+        ttl: Duration,
+    ) -> Option<Vec<SocketAddr>> {
         let mut cache = self.cache.lock().await;
         let entry = cache.get(key)?;
-        if cache_entry_live(entry, now) {
+        if cache_entry_live(entry, now, ttl) {
             return Some(entry.addrs.clone());
         }
         cache.remove(key);
         None
     }
 
-    async fn store(&self, key: DnsCacheKey, addrs: Vec<SocketAddr>, expires_at: Option<Instant>) {
+    async fn store(&self, key: DnsCacheKey, addrs: Vec<SocketAddr>, ttl: Duration) {
+        let now = Instant::now();
         let mut cache = self.cache.lock().await;
         // Sweeping the whole map costs O(capacity); do it only when the cache
         // is actually full rather than on every insert, and fall back to
-        // evicting the soonest-to-expire entry when the sweep frees nothing.
+        // evicting the oldest entry when the sweep frees nothing.
         if cache.len() >= MAX_DNS_CACHE_ENTRIES && !cache.contains_key(&key) {
-            let now = Instant::now();
-            cache.retain(|_, entry| cache_entry_live(entry, now));
+            cache.retain(|_, entry| cache_entry_live(entry, now, ttl));
             if cache.len() >= MAX_DNS_CACHE_ENTRIES {
                 if let Some(oldest_key) = oldest_cache_key(&cache) {
                     cache.remove(&oldest_key);
                 }
             }
         }
-        cache.insert(key, DnsCacheEntry { addrs, expires_at });
+        cache.insert(
+            key,
+            DnsCacheEntry {
+                addrs,
+                inserted_at: now,
+            },
+        );
     }
 }
 
@@ -291,38 +297,25 @@ impl DnsCacheKey {
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
     addrs: Vec<SocketAddr>,
-    /// `None` is used when a configured TTL is too large to represent as an
-    /// `Instant`; practically, that means the entry lives until eviction.
-    expires_at: Option<Instant>,
+    /// When the entry was stored. Liveness is judged at lookup against the
+    /// *current* `cache_ttl` (`now - inserted_at < ttl`), so a reload that lowers
+    /// the TTL shortens existing entries immediately instead of honouring the
+    /// TTL that was in force when they were cached. An over-large TTL simply
+    /// never elapses, so the entry lives until eviction.
+    inserted_at: Instant,
 }
 
-fn cache_expiration(now: Instant, ttl: Duration) -> Option<Instant> {
-    now.checked_add(ttl)
+fn cache_entry_live(entry: &DnsCacheEntry, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(entry.inserted_at) < ttl
 }
 
-fn cache_entry_live(entry: &DnsCacheEntry, now: Instant) -> bool {
-    entry.expires_at.is_none_or(|expires_at| expires_at > now)
-}
-
+/// The entry stored longest ago — the soonest to expire under a single shared
+/// TTL, evicted to make room when a sweep of expired entries frees nothing.
 fn oldest_cache_key(cache: &HashMap<DnsCacheKey, DnsCacheEntry>) -> Option<DnsCacheKey> {
-    let mut oldest: Option<(&DnsCacheKey, Option<Instant>)> = None;
-    for (key, entry) in cache {
-        if match oldest {
-            Some((_, oldest_expires)) => expires_before(entry.expires_at, oldest_expires),
-            None => true,
-        } {
-            oldest = Some((key, entry.expires_at));
-        }
-    }
-    oldest.map(|(key, _)| key.clone())
-}
-
-fn expires_before(candidate: Option<Instant>, current: Option<Instant>) -> bool {
-    match (candidate, current) {
-        (Some(candidate), Some(current)) => candidate < current,
-        (Some(_), None) => true,
-        (None, Some(_)) | (None, None) => false,
-    }
+    cache
+        .iter()
+        .min_by_key(|(_, entry)| entry.inserted_at)
+        .map(|(key, _)| key.clone())
 }
 
 async fn lookup_domain(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -578,21 +571,26 @@ mod tests {
     async fn store_purges_expired_entries_when_full() {
         let resolver = DnsResolver::new();
         let now = Instant::now();
-        for i in 0..MAX_DNS_CACHE_ENTRIES {
-            resolver
-                .store(
+        // Pre-age the entries past the TTL the store below will apply. `store`
+        // stamps `inserted_at` itself, so seed them directly to control it.
+        {
+            let mut cache = resolver.cache.lock().await;
+            for i in 0..MAX_DNS_CACHE_ENTRIES {
+                cache.insert(
                     DnsCacheKey::new(&format!("expired{i}.example"), 80),
-                    vec![answer(80)],
-                    Some(now - Duration::from_secs(1)),
-                )
-                .await;
+                    DnsCacheEntry {
+                        addrs: vec![answer(80)],
+                        inserted_at: now - Duration::from_secs(2),
+                    },
+                );
+            }
         }
 
         resolver
             .store(
                 DnsCacheKey::new("fresh.example", 80),
                 vec![answer(80)],
-                Some(now + Duration::from_secs(60)),
+                Duration::from_secs(1),
             )
             .await;
 
@@ -709,54 +707,102 @@ mod tests {
     async fn cached_entries_expire() {
         let resolver = DnsResolver::new();
         let key = DnsCacheKey::new("example.com", 80);
-        let addrs = vec!["203.0.113.10:80".parse().unwrap()];
+        let addrs: Vec<SocketAddr> = vec!["203.0.113.10:80".parse().unwrap()];
         let now = Instant::now();
+        let ttl = Duration::from_secs(10);
 
-        resolver
-            .store(
-                key.clone(),
-                addrs.clone(),
-                Some(now + Duration::from_secs(10)),
-            )
-            .await;
-        assert_eq!(resolver.cached(&key, now).await, Some(addrs));
+        // `store` stamps `inserted_at` itself, so seed entries directly to pin it
+        // and judge liveness against an explicit `now`.
+        let seed = |inserted_at: Instant| DnsCacheEntry {
+            addrs: addrs.clone(),
+            inserted_at,
+        };
+
+        resolver.cache.lock().await.insert(key.clone(), seed(now));
         assert_eq!(
-            resolver.cached(&key, now + Duration::from_secs(11)).await,
+            resolver
+                .cached(&key, now + Duration::from_secs(5), ttl)
+                .await,
+            Some(addrs.clone())
+        );
+        // Past the TTL: expired (and evicted on the miss).
+        assert_eq!(
+            resolver
+                .cached(&key, now + Duration::from_secs(11), ttl)
+                .await,
+            None
+        );
+        // The fix: liveness is judged against the *current* TTL, so a reload
+        // that lowered it expires an entry the original TTL would still keep.
+        resolver.cache.lock().await.insert(key.clone(), seed(now));
+        assert_eq!(
+            resolver
+                .cached(&key, now + Duration::from_secs(5), Duration::from_secs(3))
+                .await,
             None
         );
     }
 
     #[test]
-    fn oversized_cache_ttl_has_no_internal_expiration() {
+    fn oversized_ttl_never_expires() {
         let now = Instant::now();
-        assert_eq!(cache_expiration(now, Duration::MAX), None);
+        let entry = DnsCacheEntry {
+            addrs: vec![answer(80)],
+            inserted_at: now,
+        };
+        // A TTL larger than any realistic elapsed time keeps the entry live.
+        assert!(cache_entry_live(
+            &entry,
+            now + Duration::from_secs(86_400),
+            Duration::MAX
+        ));
+    }
+
+    #[test]
+    fn cache_liveness_uses_current_ttl() {
+        let now = Instant::now();
+        let entry = DnsCacheEntry {
+            addrs: vec![answer(80)],
+            inserted_at: now,
+        };
+        let later = now + Duration::from_secs(30);
+        // Within the current TTL: live. Past it: expired.
+        assert!(cache_entry_live(&entry, later, Duration::from_secs(60)));
+        assert!(!cache_entry_live(
+            &entry,
+            now + Duration::from_secs(61),
+            Duration::from_secs(60)
+        ));
+        // Same entry and instant, a shorter (reloaded) TTL: expired.
+        assert!(!cache_entry_live(&entry, later, Duration::from_secs(10)));
     }
 
     #[tokio::test]
     async fn cache_evicts_oldest_entry_when_full() {
         let resolver = DnsResolver::new();
-        let addrs = vec!["203.0.113.10:80".parse().unwrap()];
-        let now = Instant::now();
+        let addrs: Vec<SocketAddr> = vec!["203.0.113.10:80".parse().unwrap()];
+        // A long TTL: no entry is expired, so the full-cache path falls through
+        // to evicting the oldest. `store` stamps `inserted_at` in call order, so
+        // host0 (stored first) is the oldest.
+        let ttl = Duration::from_secs(3600);
 
         for i in 0..MAX_DNS_CACHE_ENTRIES {
             resolver
                 .store(
                     DnsCacheKey::new(&format!("host{i}.example"), 80),
                     addrs.clone(),
-                    Some(now + Duration::from_secs(60 + i as u64)),
+                    ttl,
                 )
                 .await;
         }
 
         let oldest = DnsCacheKey::new("host0.example", 80);
         resolver
-            .store(
-                DnsCacheKey::new("new.example", 80),
-                addrs,
-                Some(now + Duration::from_secs(120)),
-            )
+            .store(DnsCacheKey::new("new.example", 80), addrs, ttl)
             .await;
 
-        assert_eq!(resolver.cached(&oldest, now).await, None);
+        assert_eq!(resolver.cached(&oldest, Instant::now(), ttl).await, None);
+        let cache = resolver.cache.lock().await;
+        assert!(cache.contains_key(&DnsCacheKey::new("new.example", 80)));
     }
 }

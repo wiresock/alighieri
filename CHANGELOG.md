@@ -6,6 +6,16 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- A `dns.cachettl` change now takes effect immediately on hot reload. Cache
+  entries previously stored an absolute expiry computed from the TTL in force
+  when they were cached, so lowering `dns.cachettl` (e.g. 1h → 60s) left existing
+  entries alive for up to the old TTL — even though the resolver/cache is kept
+  across reloads. Entries now record their insertion time and liveness is judged
+  against the *current* TTL at lookup, so a reduced TTL shortens existing entries
+  at once (and a raised one extends them).
+
 ## [0.2.0] - 2026-06-21
 
 ### Changed
