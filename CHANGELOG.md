@@ -6,6 +6,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- The per-client abuse-control map is now bounded by a hard cap on tracked client
+  states. A connection spray from many distinct source IPs can no longer grow the
+  map — or the periodic prune scan that runs under the accept lock — without
+  bound; a new client over the cap evicts idle (non-active) entries to make room,
+  so memory and prune cost stay bounded regardless of source-IP diversity.
+- The userlist is now read and hash-parsed off the runtime worker threads
+  (`spawn_blocking`) during startup and reload, so a large userlist on slow
+  storage cannot stall a worker.
+
 ### Fixed
 
 - UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
