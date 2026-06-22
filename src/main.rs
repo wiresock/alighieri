@@ -864,12 +864,17 @@ impl Drop for UserlistLock {
     }
 }
 
-/// Rejects a userlist sidecar path that already exists as a symlink (Unix) or a
-/// reparse point (Windows). The `.lock` and `.bak` sidecars are created in the
-/// userlist's own directory; if an attacker can write there, a pre-placed
-/// symlink would otherwise be truncated (the lock's `set_len(0)`) or written
-/// through (the backup copy) when `alighieri user ...` runs with elevated
-/// privileges. The temporary file is already safe via `create_new` (`O_EXCL`).
+/// Rejects a userlist `.lock` path that already exists as a symlink. The lock is
+/// created in the userlist's own directory; if an attacker can write there, a
+/// pre-placed symlink would otherwise be truncated (the lock's `set_len(0)`)
+/// when `alighieri user ...` runs with elevated privileges. The lock open also
+/// passes `O_NOFOLLOW` on Unix to make this atomic. This catches the
+/// file-redirect vector on both platforms (`is_symlink` is true for Unix
+/// symlinks and Windows file symlinks); Windows junctions are directory-only
+/// reparse points and so cannot redirect a file sidecar. The temporary file and
+/// the backup are protected differently — the temp uses `create_new` (`O_EXCL`)
+/// and the backup is renamed into place (which replaces a link rather than
+/// following it).
 fn reject_symlink_sidecar(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
@@ -1037,16 +1042,23 @@ fn backup_userlist(userlist: &Path, existed: bool) -> std::io::Result<()> {
         return Ok(());
     }
     let backup = userlist_backup_path(userlist);
-    // Never copy credentials through a pre-placed symlink at the backup path.
-    // `fs::copy` replicates the source's permission bits onto the destination,
-    // so the backup is recreated with the userlist's own (restrictive) mode.
-    reject_symlink_sidecar(&backup)?;
-    std::fs::copy(userlist, &backup)?;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(backup)?
-        .sync_all()
+    // Write the backup to a fresh temp file (`create_new` / `O_EXCL`, so it
+    // cannot follow a pre-placed symlink) created with the userlist's own
+    // permissions, then atomically rename it over `.bak`. `rename` replaces the
+    // destination link itself rather than writing through it, closing the
+    // check-then-copy race a direct `fs::copy` to `.bak` would leave.
+    let (temp_path, mut temp_file) = create_userlist_temp(userlist, existed)?;
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        temp_file.write_all(&std::fs::read(userlist)?)?;
+        temp_file.sync_all()
+    })();
+    drop(temp_file);
+    if let Err(e) = write_result.and_then(|()| std::fs::rename(&temp_path, &backup)) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn userlist_backup_path(userlist: &Path) -> PathBuf {
@@ -1252,7 +1264,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn backup_userlist_rejects_symlink_sidecar() {
+    fn backup_userlist_replaces_symlink_without_following_it() {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1261,12 +1273,22 @@ mod tests {
         let target = dir.path().join("secret");
         std::fs::write(&target, b"secret-contents").unwrap();
         // Attacker pre-places the backup path as a symlink to a sensitive file.
-        symlink(&target, userlist_backup_path(&userlist)).unwrap();
+        let bak = userlist_backup_path(&userlist);
+        symlink(&target, &bak).unwrap();
 
-        let err = backup_userlist(&userlist, true).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        // Credentials must not have been written through the symlink.
+        // The backup is written to a temp file and renamed into place, so it
+        // succeeds while replacing the symlink rather than following it.
+        backup_userlist(&userlist, true).unwrap();
+
+        // The symlink target is untouched: credentials were not written through.
         assert_eq!(std::fs::read(&target).unwrap(), b"secret-contents");
+        // The backup is now a real file (the link was replaced) with the
+        // userlist content.
+        assert!(!std::fs::symlink_metadata(&bak)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&bak).unwrap(), b"user:$argon2id$hash");
     }
 
     #[test]
