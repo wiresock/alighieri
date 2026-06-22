@@ -377,6 +377,28 @@ impl Connection {
         request: Request,
         method: crate::config::AuthKind,
     ) -> Result<()> {
+        // Authorise the command before allocating any resources: if no socks
+        // rule could ever permit UDP for this client (e.g. a `command: connect`
+        // only policy), reject now rather than binding sockets and replying
+        // success only for the per-datagram checks to drop every datagram while
+        // the association lingers until the idle timeout. Per-datagram
+        // destination checks still run for clients that pass this gate.
+        if !self.config.rules.udp_associate_reachable(
+            self.peer.ip().to_canonical(),
+            self.peer.port(),
+            method,
+        ) {
+            self.metrics.socks_request_denied();
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::ConnectionNotAllowed,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            info!(peer = %self.peer, "udp associate denied by socks rules");
+            return Err(Error::AccessDenied);
+        }
+
         // The relay socket is bound on the same interface the client reached us
         // on, so the address we advertise is reachable by the client.
         let relay_socket =

@@ -339,6 +339,13 @@ scope, verdict, and config source line. Named ACL rule hits are also reported
 through `alighieri_rule_named_hits_total`, which adds the optional rule name as
 a label. It also reports rate-limit events.
 
+The per-rule hit counters (`alighieri_rule_hits_total` and
+`alighieri_rule_named_hits_total`) are **best-effort**: to keep the
+authorisation hot path non-blocking, an increment is dropped if it would
+contend with another update or an in-progress scrape, so these series can
+slightly undercount under heavy load. The aggregate counters (connections,
+allow/deny totals, bytes, rate-limit events) are exact.
+
 Optional per-client abuse controls are keyed by source IP. The connection and
 auth-failure rates use fixed windows; `byterate` is a token-bucket bandwidth
 throttle:

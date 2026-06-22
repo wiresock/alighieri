@@ -38,6 +38,8 @@ pub struct Metrics {
     udp_send_failures: AtomicU64,
     udp_relay_bytes_up: AtomicU64,
     udp_relay_bytes_down: AtomicU64,
+    /// Per-rule hit counts. Keyed by rule (not a fixed atomic set), so it sits
+    /// behind a mutex and is updated best-effort — see [`Metrics::rule_hit`].
     rule_hits: Mutex<BTreeMap<RuleHitKey, u64>>,
 }
 
@@ -282,6 +284,14 @@ impl Metrics {
         out
     }
 
+    /// Records a rule match. **Best-effort**: the per-rule counters live behind a
+    /// mutex (the map is keyed by rule, not a fixed set of atomics), and to keep
+    /// the hot authorisation path non-blocking this uses `try_lock` and *drops*
+    /// the increment when the lock is contended — including while a Prometheus
+    /// scrape is rendering the map. So `alighieri_rule_hits_total` /
+    /// `alighieri_rule_named_hits_total` may undercount under load; they are an
+    /// observability aid, not an exact ledger. The aggregate counters
+    /// (connections, denials, bytes) are exact atomics.
     pub fn rule_hit(
         &self,
         scope: Scope,
@@ -297,6 +307,8 @@ impl Metrics {
                 let mut rule_hits = poisoned.into_inner();
                 increment_rule_hit(&mut rule_hits, scope, verdict, source_line, rule_name);
             }
+            // Contended (e.g. a concurrent scrape render): drop this increment
+            // rather than block the authorisation path. See the doc comment.
             Err(TryLockError::WouldBlock) => {}
         }
     }

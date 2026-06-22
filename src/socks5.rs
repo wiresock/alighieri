@@ -313,6 +313,14 @@ pub async fn read_userpass<R: AsyncRead + Unpin>(r: &mut R) -> Result<UserPassCr
         String::from_utf8(ubuf).map_err(|_| Error::Protocol("username is not UTF-8".into()))?;
     let password =
         String::from_utf8(pbuf).map_err(|_| Error::Protocol("password is not UTF-8".into()))?;
+    // Reject a zero-length username before it reaches an auth backend: there is
+    // no valid empty username, and `auth.command` would otherwise be handed a
+    // blank credential to adjudicate. An empty password is left to the backend —
+    // the userlist plaintext format permits one (`user:`), so rejecting it here
+    // would change behaviour for that (discouraged) configuration.
+    if username.is_empty() {
+        return Err(Error::Protocol("empty username".into()));
+    }
     Ok(UserPassCredentials { username, password })
 }
 
@@ -581,6 +589,29 @@ mod tests {
         let creds = read_userpass(&mut cur).await.unwrap();
         assert_eq!(creds.username, "user");
         assert_eq!(creds.password, "pass");
+    }
+
+    #[tokio::test]
+    async fn read_userpass_rejects_empty_username() {
+        // ULEN = 0, then PLEN = 4 "pass": a blank username must be refused
+        // before it reaches an auth backend.
+        let mut bytes = vec![AUTH_VERSION, 0x00, 0x04];
+        bytes.extend_from_slice(b"pass");
+        let mut cur = Cursor::new(bytes);
+        assert!(read_userpass(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_userpass_allows_empty_password() {
+        // ULEN = 4 "user", PLEN = 0: the userlist plaintext format permits an
+        // empty password, so the parser must not reject it.
+        let mut bytes = vec![AUTH_VERSION, 0x04];
+        bytes.extend_from_slice(b"user");
+        bytes.push(0x00);
+        let mut cur = Cursor::new(bytes);
+        let creds = read_userpass(&mut cur).await.unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "");
     }
 
     #[tokio::test]
