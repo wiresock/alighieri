@@ -300,8 +300,10 @@ struct DnsCacheEntry {
     /// When the entry was stored. Liveness is judged at lookup against the
     /// *current* `cache_ttl` (`now - inserted_at < ttl`), so a reload that lowers
     /// the TTL shortens existing entries immediately instead of honouring the
-    /// TTL that was in force when they were cached. An over-large TTL simply
-    /// never elapses, so the entry lives until eviction.
+    /// TTL that was in force when they were cached. Comparing elapsed time
+    /// against the TTL (rather than storing an absolute expiry) also sidesteps
+    /// the `Instant`-overflow handling the previous `checked_add` needed: a very
+    /// large TTL is simply never reached within a process lifetime.
     inserted_at: Instant,
 }
 
