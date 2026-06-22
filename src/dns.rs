@@ -310,11 +310,14 @@ fn cache_entry_live(entry: &DnsCacheEntry, now: Instant, ttl: Duration) -> bool 
 }
 
 /// The entry stored longest ago — the soonest to expire under a single shared
-/// TTL, evicted to make room when a sweep of expired entries frees nothing.
+/// TTL, evicted to make room when a sweep of expired entries frees nothing. The
+/// key (port, host) breaks ties so eviction is deterministic when a coarse clock
+/// stamps several entries with the same `inserted_at`, rather than depending on
+/// the `HashMap`'s iteration order.
 fn oldest_cache_key(cache: &HashMap<DnsCacheKey, DnsCacheEntry>) -> Option<DnsCacheKey> {
     cache
         .iter()
-        .min_by_key(|(_, entry)| entry.inserted_at)
+        .min_by_key(|(key, entry)| (entry.inserted_at, key.port, key.host.as_str()))
         .map(|(key, _)| key.clone())
 }
 
@@ -782,18 +785,24 @@ mod tests {
         let resolver = DnsResolver::new();
         let addrs: Vec<SocketAddr> = vec!["203.0.113.10:80".parse().unwrap()];
         // A long TTL: no entry is expired, so the full-cache path falls through
-        // to evicting the oldest. `store` stamps `inserted_at` in call order, so
-        // host0 (stored first) is the oldest.
+        // to evicting the oldest.
         let ttl = Duration::from_secs(3600);
+        let now = Instant::now();
 
-        for i in 0..MAX_DNS_CACHE_ENTRIES {
-            resolver
-                .store(
+        // Seed a full cache with distinct, increasing insertion times so the
+        // oldest is unambiguous — a coarse clock (Windows, some VMs) could stamp
+        // several `store` calls with the same `Instant`. host0 is the oldest.
+        {
+            let mut cache = resolver.cache.lock().await;
+            for i in 0..MAX_DNS_CACHE_ENTRIES {
+                cache.insert(
                     DnsCacheKey::new(&format!("host{i}.example"), 80),
-                    addrs.clone(),
-                    ttl,
-                )
-                .await;
+                    DnsCacheEntry {
+                        addrs: addrs.clone(),
+                        inserted_at: now + Duration::from_millis(i as u64),
+                    },
+                );
+            }
         }
 
         let oldest = DnsCacheKey::new("host0.example", 80);
