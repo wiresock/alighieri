@@ -1349,6 +1349,12 @@ fn parse_addr_spec(vals: &[String], lineno: usize, allow_hosts: bool) -> Result<
 }
 
 fn parse_protocols(vals: &[String], lineno: usize) -> Result<Vec<Protocol>> {
+    if vals.is_empty() {
+        // A present-but-empty `protocol:` would parse to an empty set, which the
+        // matcher treats as "any" — silently broadening the rule. Omit the
+        // directive entirely to mean "any protocol".
+        return Err(cfg_err(lineno, "expected at least one protocol"));
+    }
     let mut out = Vec::new();
     for v in vals {
         let p = match v.to_ascii_lowercase().as_str() {
@@ -1369,6 +1375,12 @@ fn parse_protocols(vals: &[String], lineno: usize) -> Result<Vec<Protocol>> {
 }
 
 fn parse_commands(vals: &[String], lineno: usize) -> Result<Vec<Command>> {
+    if vals.is_empty() {
+        // A present-but-empty `command:` would parse to an empty set, which the
+        // matcher treats as "any" — silently broadening the rule. Omit the
+        // directive entirely to mean "any command".
+        return Err(cfg_err(lineno, "expected at least one command"));
+    }
     let mut out = Vec::new();
     for v in vals {
         let c = match v.to_ascii_lowercase().as_str() {
@@ -2528,6 +2540,51 @@ socks pass "" { command: connect }"#,
         let err = Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { protocol: sctp }")
             .unwrap_err();
         assert!(err.to_string().contains("unknown protocol"));
+    }
+
+    #[test]
+    fn empty_selector_directives_rejected() {
+        // A present-but-empty `protocol:`/`command:`/`method:` parses to an empty
+        // set, which the matcher treats as "any" — silently broadening the rule.
+        // The directive must carry at least one value; omit it to mean "any".
+        let head = "internal: 0.0.0.0 port = 1080\n";
+
+        let err = Config::parse(&format!("{head}socks pass {{ protocol: }}")).unwrap_err();
+        assert!(
+            err.to_string().contains("expected at least one protocol"),
+            "{err}"
+        );
+
+        let err = Config::parse(&format!("{head}socks pass {{ command: }}")).unwrap_err();
+        assert!(
+            err.to_string().contains("expected at least one command"),
+            "{err}"
+        );
+
+        let err = Config::parse(&format!("{head}socks pass {{ method: }}")).unwrap_err();
+        assert!(
+            err.to_string().contains("expected at least one method"),
+            "{err}"
+        );
+
+        // The sneaky case: an empty `protocol:` whose value is swallowed by the
+        // next selector keyword must still be rejected, not read as "any".
+        let err = Config::parse(&format!(
+            "{head}socks pass {{ protocol: command: connect }}"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected at least one protocol"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn omitted_selector_directives_are_wildcard() {
+        // Omitting a selector entirely keeps the rule a wildcard for that axis;
+        // only the present-but-empty form is an error.
+        Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { command: connect }")
+            .expect("a rule without protocol:/method: should parse (wildcard)");
     }
 
     #[test]
