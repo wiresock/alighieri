@@ -769,19 +769,18 @@ fn parse_endpoint(vals: &[String], lineno: usize) -> Result<SocketAddr> {
                 "expected 'IP port = N' (unexpected tokens before 'port')",
             ));
         }
-        // After `port`, only `= N` or a bare `N` is valid. Without this check,
-        // whitespace tokenization would let `port = 10 80` be joined into `1080`,
-        // and a lone `port =` would slip through as an empty port string.
-        let port_tokens = &vals[pos + 1..];
-        let valid = matches!(port_tokens, [eq, _] if eq == "=")
-            || matches!(port_tokens, [single] if single != "=");
-        if !valid {
+        // The keyword form is exactly `port = N` (the documented spelling), so
+        // the tokens after `port` must be `=` then the port. This rejects a
+        // missing value (`port =`), a `=`-less `port N`, and split/trailing
+        // tokens (`port = 10 80`) that whitespace tokenization would otherwise
+        // join into a single port string.
+        if !matches!(&vals[pos + 1..], [eq, _] if eq == "=") {
             return Err(cfg_err(lineno, "expected 'IP port = N'"));
         }
         let ip: IpAddr = vals[0]
             .parse()
             .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{}'", vals[0])))?;
-        let port_str = join_value_after(port_tokens);
+        let port_str = join_value_after(&vals[pos + 1..]);
         let port: u16 = port_str
             .parse()
             .map_err(|_| cfg_err(lineno, &format!("invalid port '{port_str}'")))?;
@@ -1887,12 +1886,15 @@ ratelimit.bytes: 64KiB/30
         assert!(Config::parse("internal: 127.0.0.1 port = 10 80").is_err());
         assert!(Config::parse("internal: 127.0.0.1 port = 1080 =").is_err());
         assert!(Config::parse("internal: 127.0.0.1 port =").is_err());
-        // The valid forms still parse (`= N` and a bare `N`).
+        // The keyword form is exactly `port = N`; a `=`-less `port N` is rejected.
+        assert!(Config::parse("internal: 127.0.0.1 port 1080").is_err());
+        // The documented `IP port = N` and bare `IP:PORT` forms still parse.
         assert!(Config::parse("internal: 127.0.0.1 port = 1080").is_ok());
-        assert!(Config::parse("internal: 127.0.0.1 port 1080").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080").is_ok());
         assert!(
             Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 100\ndns.tryall: yes").is_ok()
         );
+    }
 
     #[test]
     fn parses_disabled_auth_cache_ttl() {
