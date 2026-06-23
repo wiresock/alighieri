@@ -770,13 +770,13 @@ fn parse_endpoint(vals: &[String], lineno: usize) -> Result<SocketAddr> {
             ));
         }
         // After `port`, only `= N` or a bare `N` is valid. Without this check,
-        // whitespace tokenization would let `port = 10 80` be joined into `1080`.
+        // whitespace tokenization would let `port = 10 80` be joined into `1080`,
+        // and a lone `port =` would slip through as an empty port string.
         let port_tokens = &vals[pos + 1..];
-        if !matches!(port_tokens, [eq, _] if eq == "=") && port_tokens.len() != 1 {
-            return Err(cfg_err(
-                lineno,
-                "expected 'IP port = N' (unexpected tokens after 'port')",
-            ));
+        let valid = matches!(port_tokens, [eq, _] if eq == "=")
+            || matches!(port_tokens, [single] if single != "=");
+        if !valid {
+            return Err(cfg_err(lineno, "expected 'IP port = N'"));
         }
         let ip: IpAddr = vals[0]
             .parse()
@@ -1882,9 +1882,11 @@ ratelimit.bytes: 64KiB/30
         assert!(Config::parse("internal: 127.0.0.1 oops port = 1080").is_err());
         assert!(Config::parse("internal: 127.0.0.1:1080 oops").is_err());
         // Endpoint: split or trailing tokens after `port` must not be joined into
-        // a single port (e.g. `port = 10 80` -> 1080).
+        // a single port (e.g. `port = 10 80` -> 1080); a lone `port =` (no value)
+        // is rejected directly rather than as an empty port string.
         assert!(Config::parse("internal: 127.0.0.1 port = 10 80").is_err());
         assert!(Config::parse("internal: 127.0.0.1 port = 1080 =").is_err());
+        assert!(Config::parse("internal: 127.0.0.1 port =").is_err());
         // The valid forms still parse (`= N` and a bare `N`).
         assert!(Config::parse("internal: 127.0.0.1 port = 1080").is_ok());
         assert!(Config::parse("internal: 127.0.0.1 port 1080").is_ok());
