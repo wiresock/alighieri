@@ -24,6 +24,17 @@ const MAX_DNS_CACHE_ENTRIES: usize = 4096;
 /// headroom for other work even during an outage.
 const MAX_CONCURRENT_SYSTEM_LOOKUPS: usize = 128;
 
+/// How long a *timed-out* name is remembered so repeated requests fail fast
+/// instead of each starting (and waiting `dns.timeout` on) a fresh, uncancellable
+/// system lookup. This is a short backoff, not a definitive negative cache: a
+/// timeout is not proof a name is unresolvable, so the window is kept brief to
+/// limit how long a name that has since recovered keeps being failed fast.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Cap on remembered timed-out names, bounding the negative cache's memory the
+/// way [`MAX_DNS_CACHE_ENTRIES`] bounds the positive cache.
+const MAX_NEGATIVE_CACHE_ENTRIES: usize = 1024;
+
 /// The outcome a lookup leader publishes to coalesced followers. Errors are
 /// shared as kind + message because `io::Error` is not `Clone`, so followers
 /// observe the same `ErrorKind` the leader saw; they are never cached.
@@ -57,6 +68,9 @@ pub struct DnsResolver {
     backend: LookupBackend,
     /// Bounds concurrent system lookups; see [`MAX_CONCURRENT_SYSTEM_LOOKUPS`].
     lookup_slots: Arc<Semaphore>,
+    /// Names that recently timed out, mapped to when, so repeated requests back
+    /// off rather than each starting a fresh lookup. See [`NEGATIVE_CACHE_TTL`].
+    negative: std::sync::Mutex<HashMap<DnsCacheKey, Instant>>,
 }
 
 impl Default for DnsResolver {
@@ -66,6 +80,7 @@ impl Default for DnsResolver {
             inflight: std::sync::Mutex::new(HashMap::new()),
             backend: LookupBackend::default(),
             lookup_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SYSTEM_LOOKUPS)),
+            negative: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -186,6 +201,15 @@ impl DnsResolver {
                     return Ok(addrs);
                 }
             }
+            // Fail fast for a name that timed out within the last
+            // NEGATIVE_CACHE_TTL rather than starting another lookup that would
+            // (most likely) just time out again and tie up a lookup slot.
+            if self.negatively_cached(&key, Instant::now()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS resolution timed out",
+                ));
+            }
 
             match self.join_or_lead(&key) {
                 Flight::Lead(mut lead) => {
@@ -215,6 +239,11 @@ impl DnsResolver {
                     };
                     if let (Some(ttl), Ok(addrs)) = (ttl, &result) {
                         self.store(key.clone(), addrs.clone(), ttl).await;
+                    }
+                    // Remember a timeout so the next request for this name backs
+                    // off instead of starting another doomed lookup.
+                    if matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+                        self.store_negative(key.clone(), Instant::now());
                     }
                     lead.publish(&result);
                     return result;
@@ -296,6 +325,44 @@ impl DnsResolver {
                 inserted_at: now,
             },
         );
+    }
+
+    /// Whether `key` timed out within the last [`NEGATIVE_CACHE_TTL`] (as of
+    /// `now`), expiring a stale entry as a side effect.
+    fn negatively_cached(&self, key: &DnsCacheKey, now: Instant) -> bool {
+        let mut negative = self.negative.lock().unwrap_or_else(|e| e.into_inner());
+        match negative.get(key) {
+            Some(&failed_at) if now.saturating_duration_since(failed_at) < NEGATIVE_CACHE_TTL => {
+                true
+            }
+            Some(_) => {
+                negative.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Records that `key` timed out at `now` so later requests back off. Bounded
+    /// like the positive cache: a full map first drops expired entries, then the
+    /// oldest, before inserting.
+    fn store_negative(&self, key: DnsCacheKey, now: Instant) {
+        let mut negative = self.negative.lock().unwrap_or_else(|e| e.into_inner());
+        if negative.len() >= MAX_NEGATIVE_CACHE_ENTRIES && !negative.contains_key(&key) {
+            negative.retain(|_, failed_at| {
+                now.saturating_duration_since(*failed_at) < NEGATIVE_CACHE_TTL
+            });
+            if negative.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
+                if let Some(oldest) = negative
+                    .iter()
+                    .min_by_key(|(_, &failed_at)| failed_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    negative.remove(&oldest);
+                }
+            }
+        }
+        negative.insert(key, now);
     }
 }
 
@@ -662,6 +729,51 @@ mod tests {
             matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut),
             "expected a TimedOut error, got {result:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_name_is_negatively_cached() {
+        // After a name times out, a second request within the backoff window must
+        // fail fast without starting another (doomed) lookup.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let never_released = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver =
+            DnsResolver::with_lookup(parked_backend(calls.clone(), never_released, false));
+        let mut policy = policy(DnsPreference::System, Vec::new());
+        policy.timeout = Duration::from_secs(1);
+
+        let first = resolver
+            .resolve_all(&TargetAddr::Domain("wedged.example".into(), 443), &policy)
+            .await;
+        assert!(matches!(&first, Err(e) if e.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = resolver
+            .resolve_all(&TargetAddr::Domain("wedged.example".into(), 443), &policy)
+            .await;
+        assert!(matches!(&second, Err(e) if e.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the negative cache should suppress the second lookup"
+        );
+    }
+
+    #[test]
+    fn negative_cache_expires_after_ttl() {
+        let resolver = DnsResolver::new();
+        let key = DnsCacheKey::new("wedged.example", 443);
+        let t0 = Instant::now();
+        resolver.store_negative(key.clone(), t0);
+
+        assert!(resolver.negatively_cached(&key, t0));
+        assert!(
+            resolver.negatively_cached(&key, t0 + NEGATIVE_CACHE_TTL - Duration::from_millis(1))
+        );
+        // At the TTL boundary the entry is expired (and removed as a side effect).
+        assert!(!resolver.negatively_cached(&key, t0 + NEGATIVE_CACHE_TTL));
+        // A name that never failed is not cached.
+        assert!(!resolver.negatively_cached(&DnsCacheKey::new("other.example", 443), t0));
     }
 
     #[tokio::test(start_paused = true)]

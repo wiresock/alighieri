@@ -16,6 +16,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   (bounded by `dns.timeout`) rather than piling up, and the slot is held until the
   real OS lookup returns, not freed early when a caller times out. Coalesced
   lookups for the same name still share one slot, so normal traffic is unaffected.
+- A name whose DNS lookup times out is now briefly remembered (a ~2s backoff), so
+  a burst of requests for a wedged name fails fast instead of each starting — and
+  waiting `dns.timeout` on — its own uncancellable system lookup. The window is
+  short and applies only to timeouts (not to definitive "no such host" answers),
+  so a name that recovers is retried within a couple of seconds; it works
+  regardless of `dns.cachettl` (positive answer caching can be off).
 - The per-client abuse-control map is now capped. A connection spray from many
   distinct source IPs can no longer grow the map — or the periodic prune scan
   that runs under the accept lock — without bound: a new client at the cap evicts
