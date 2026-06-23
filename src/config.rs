@@ -381,6 +381,10 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_UDP_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_DNS_TIMEOUT_SECS: u64 = 5;
+/// Upper bound for `dns.timeout`. A resolution should never take an hour, and
+/// rejecting absurd values keeps the timer deadline (`Instant::now() + dur`)
+/// well clear of overflow.
+const MAX_DNS_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_LOG_ROTATE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
@@ -660,6 +664,12 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                 return Err(cfg_err(
                     lineno,
                     "dns.timeout must be at least 1 second (0 would fail every name resolution)",
+                ));
+            }
+            if secs > MAX_DNS_TIMEOUT_SECS {
+                return Err(cfg_err(
+                    lineno,
+                    &format!("dns.timeout cannot exceed {MAX_DNS_TIMEOUT_SECS} seconds"),
                 ));
             }
             b.dns_timeout = Some(Duration::from_secs(secs));
@@ -1778,6 +1788,13 @@ ratelimit.bytes: 64KiB/30
         // Zero is rejected — it would time out every name resolution.
         let err = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 0").unwrap_err();
         assert!(format!("{err}").contains("dns.timeout"), "{err}");
+
+        // An absurd value is rejected so it cannot overflow the timer deadline.
+        let err = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 100000").unwrap_err();
+        assert!(format!("{err}").contains("dns.timeout"), "{err}");
+        // The upper bound itself is accepted.
+        let cfg = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 3600").unwrap();
+        assert_eq!(cfg.dns.timeout, Duration::from_secs(3600));
     }
 
     #[test]
