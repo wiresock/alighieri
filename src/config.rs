@@ -403,8 +403,16 @@ const DEFAULT_DNS_TIMEOUT_SECS: u64 = 5;
 const MAX_DNS_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Upper bound on `maxconnections`: the value is passed to `Semaphore::new`,
+/// which panics above `Semaphore::MAX_PERMITS`, so reject an absurd value at
+/// parse time rather than crashing at startup.
+const MAX_CONNECTIONS_LIMIT: usize = tokio::sync::Semaphore::MAX_PERMITS;
 pub const DEFAULT_LOG_ROTATE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_LOG_ROTATE_KEEP: usize = 5;
+/// Upper bound on `logrotate.keep`: it drives an O(n) rename loop on each
+/// rotation, so an absurd value would stall logging. Far above any practical
+/// retention.
+const MAX_LOG_ROTATE_KEEP: usize = 10_000;
 
 #[derive(Default)]
 struct Builder {
@@ -650,7 +658,14 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.userlist = Some(PathBuf::from(vals.join(" ")));
         }
         "maxconnections" | "max.connections" => {
-            b.max_connections = Some(parse_usize_positive(vals, lineno, "maxconnections")?);
+            let value = parse_usize_positive(vals, lineno, "maxconnections")?;
+            if value > MAX_CONNECTIONS_LIMIT {
+                return Err(cfg_err(
+                    lineno,
+                    "maxconnections is too large for the connection limiter",
+                ));
+            }
+            b.max_connections = Some(value);
         }
         "logoutput" => b.log_outputs = Some(parse_log_outputs(vals, lineno)?),
         "logfile" | "log.file" => {
@@ -668,7 +683,14 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.log_rotate_size = Some(size);
         }
         "logrotatekeep" | "logrotate.keep" | "log.rotate.keep" => {
-            b.log_rotate_keep = Some(parse_usize(vals, lineno, "logrotate.keep")?);
+            let value = parse_usize(vals, lineno, "logrotate.keep")?;
+            if value > MAX_LOG_ROTATE_KEEP {
+                return Err(cfg_err(
+                    lineno,
+                    &format!("logrotate.keep must be at most {MAX_LOG_ROTATE_KEEP}"),
+                ));
+            }
+            b.log_rotate_keep = Some(value);
         }
         "dnsprefer" | "dns.prefer" => b.dns_preference = Some(parse_dns_preference(vals, lineno)?),
         "dnstryall" | "dns.tryall" | "dns.try_all" => {
@@ -1948,6 +1970,22 @@ ratelimit.bytes: 64KiB/30
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: off").is_ok());
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: 60").is_ok());
         assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 5").is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_numeric_limits() {
+        // maxconnections above the connection-limiter maximum is rejected — it
+        // would otherwise panic `Semaphore::new` at startup.
+        assert!(
+            Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 18446744073709551615")
+                .is_err()
+        );
+        // logrotate.keep above the practical maximum is rejected — it drives an
+        // O(n) rename loop on each rotation.
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 10001").is_err());
+        // Generous-but-bounded values still parse.
+        assert!(Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 1000000").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 10000").is_ok());
     }
 
     #[test]
