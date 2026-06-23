@@ -2581,10 +2581,23 @@ socks pass "" { command: connect }"#,
 
     #[test]
     fn omitted_selector_directives_are_wildcard() {
-        // Omitting a selector entirely keeps the rule a wildcard for that axis;
-        // only the present-but-empty form is an error.
-        Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { command: connect }")
+        // Omitting a selector entirely keeps the rule a wildcard for that axis
+        // (an empty set the matcher reads as "any"); only the present-but-empty
+        // form is an error.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass { command: connect }")
             .expect("a rule without protocol:/method: should parse (wildcard)");
+        let rule = &cfg.rules.rules[0];
+        assert!(
+            rule.protocols.is_empty(),
+            "omitted protocol: should stay wildcard"
+        );
+        assert!(
+            rule.methods.is_empty(),
+            "omitted method: should stay wildcard"
+        );
+        // The selector that *was* present is restricted — so the empty ones above
+        // are genuinely omitted, not a vacuous pass.
+        assert_eq!(rule.commands, vec![Command::Connect]);
     }
 
     #[test]
