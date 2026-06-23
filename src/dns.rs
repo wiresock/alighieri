@@ -105,21 +105,12 @@ impl DnsResolver {
     ) -> io::Result<Vec<SocketAddr>> {
         let mut addrs = match dest {
             TargetAddr::Ip(sa) => vec![*sa],
-            // Bound resolution by `policy.timeout` so a slow or wedged resolver
-            // cannot pin a CONNECT permit or stall the UDP relay loop. A timed-out
-            // leader's future is dropped here, which deregisters its singleflight
-            // entry and wakes any followers to retry.
+            // `policy.timeout` bounds resolution inside `resolve_domain` (around
+            // the singleflight leader's lookup), so a slow or wedged resolver
+            // cannot pin a CONNECT permit or stall the UDP relay loop.
             TargetAddr::Domain(host, port) => {
-                let resolve = self.resolve_domain(host, *port, policy.cache_ttl);
-                match tokio::time::timeout(policy.timeout, resolve).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "DNS resolution timed out",
-                        ))
-                    }
-                }
+                self.resolve_domain(host, *port, policy.cache_ttl, policy.timeout)
+                    .await?
             }
         };
         canonicalize_addrs(&mut addrs);
@@ -142,6 +133,7 @@ impl DnsResolver {
         host: &str,
         port: u16,
         ttl: Option<Duration>,
+        timeout: Duration,
     ) -> io::Result<Vec<SocketAddr>> {
         let key = DnsCacheKey::new(host, port);
         loop {
@@ -153,7 +145,27 @@ impl DnsResolver {
 
             match self.join_or_lead(&key) {
                 Flight::Lead(mut lead) => {
-                    let result = self.backend_lookup(host, port).await;
+                    // Bound the leader's lookup and publish the result — including
+                    // a timeout — to followers. Applying the deadline here (rather
+                    // than dropping the whole `resolve_domain` future) keeps the
+                    // singleflight intact: a timed-out leader publishes `TimedOut`
+                    // so followers fail fast instead of waking to retry, which
+                    // would each start a fresh OS lookup for the same name. The
+                    // underlying `getaddrinfo` is not cancellable, so its blocking
+                    // thread still runs to completion, but no more than one is
+                    // outstanding per name per timeout window.
+                    let result = match tokio::time::timeout(
+                        timeout,
+                        self.backend_lookup(host, port),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "DNS resolution timed out",
+                        )),
+                    };
                     if let (Some(ttl), Ok(addrs)) = (ttl, &result) {
                         self.store(key.clone(), addrs.clone(), ttl).await;
                     }
@@ -509,6 +521,35 @@ mod tests {
             matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut),
             "expected a TimedOut error, got {result:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_keeps_singleflight_coalesced() {
+        // A wedged resolver with several concurrent waiters for the same name:
+        // the leader times out and publishes `TimedOut` to its followers, so they
+        // fail fast rather than retrying — which would each start a fresh lookup.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let never_released = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver = Arc::new(DnsResolver::with_lookup(parked_backend(
+            calls.clone(),
+            never_released,
+            false,
+        )));
+
+        // The default policy deadline is 5s; one leader, the rest coalesced.
+        let tasks = spawn_resolvers(&resolver, 8).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Time advances to the leader's deadline; every waiter sees `TimedOut`.
+        for task in tasks {
+            let res = task.await.unwrap();
+            assert!(
+                matches!(&res, Err(e) if e.kind() == io::ErrorKind::TimedOut),
+                "expected TimedOut, got {res:?}"
+            );
+        }
+        // Still exactly one backend lookup despite the timeout — coalescing held.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     async fn spawn_resolvers(
