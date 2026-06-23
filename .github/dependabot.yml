@@ -30,7 +30,9 @@ updates:
     open-pull-requests-limit: 5
     ignore:
       # The `msrv` CI job pins dtolnay/rust-toolchain to the project's MSRV
-      # (1.85.0) on purpose — it must not track the latest toolchain, and the
+      # (1.88.0) on purpose — it must not track the latest toolchain, and the
       # action repo exposes phantom version branches (e.g. 1.100.0) with no
-      # matching Rust release. Other uses of this action are @stable.
+      # matching Rust release. Other uses of this action are @stable. Every use
+      # is pinned to a commit SHA (with a `# stable`/`# 1.88.0` comment); this
+      # entry opts the action out of Dependabot, so bump those SHAs manually.
       - dependency-name: "dtolnay/rust-toolchain"
