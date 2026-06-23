@@ -129,9 +129,13 @@ pub struct DnsPolicy {
     pub try_all: bool,
     pub deny: Vec<DnsDenyCategory>,
     pub cache_ttl: Option<Duration>,
-    /// Wall-clock deadline for resolving one destination name. Bounds how long a
-    /// CONNECT or a domain-target UDP datagram waits on a slow or wedged
-    /// resolver, so it cannot pin a connection permit or stall UDP forwarding.
+    /// Deadline for resolving one destination name, as monotonic elapsed time
+    /// (enforced with `tokio::time::timeout`). Bounds how long a CONNECT or a
+    /// domain-target UDP datagram *waits* on a slow or wedged resolver, so it
+    /// cannot pin a connection permit or stall UDP forwarding. It does not cancel
+    /// the underlying system `getaddrinfo`, which runs on a blocking thread and
+    /// keeps running until the OS resolver returns — this bounds the caller's
+    /// wait, not the resolver thread's lifetime.
     pub timeout: Duration,
 }
 
