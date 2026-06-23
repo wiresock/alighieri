@@ -1021,16 +1021,25 @@ fn write_config_atomically(path: &Path, contents: &[u8]) -> std::io::Result<Writ
 
 fn create_config_backup(path: &Path) -> std::io::Result<PathBuf> {
     let backup = backup_path(path);
-    // Stream the config into a fresh `create_new` temp file — which cannot follow
-    // a symlink — and atomically rename it over `.bak`. `rename` replaces
-    // whatever is at the path (a regular file, or a symlink an attacker planted)
-    // rather than following it, so the backup write is never redirected. The
-    // previous `remove` + `std::fs::copy` could follow a symlink raced onto the
-    // path between the remove and the copy; this mirrors the userlist backup
-    // hardening.
+    // Open the backup *source* first and no-follow (shared `open_no_follow`): a
+    // symlinked config path could otherwise redirect the copy to an arbitrary
+    // target file, streaming its contents into `.bak`. Back up only a regular
+    // file. (The `.bak` *destination* is separately protected by the temp +
+    // rename below.)
+    let mut source = crate::open_no_follow(path)?;
+    if !source.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to back up {}: not a regular file", path.display()),
+        ));
+    }
+    // Stream into a fresh `create_new` temp file — which cannot follow a symlink —
+    // and atomically rename it over `.bak`. `rename` replaces whatever is at the
+    // path (a regular file, or a symlink an attacker planted) rather than following
+    // it, so the backup write is never redirected. This mirrors the userlist
+    // backup hardening.
     let (temp_path, mut file) = create_config_temp(path, true)?;
     let write = (|| -> std::io::Result<()> {
-        let mut source = std::fs::File::open(path)?;
         std::io::copy(&mut source, &mut file)?;
         file.sync_all()
     })();
@@ -2399,6 +2408,24 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "new config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_backup_refuses_a_symlinked_source() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "secret-contents").unwrap();
+        // The config path itself is a symlink to a sensitive file.
+        let path = dir.path().join("alighieri.conf");
+        symlink(&secret, &path).unwrap();
+
+        // Backing up must refuse to follow the symlink to its target.
+        assert!(create_config_backup(&path).is_err());
+        // It fails before any temp/backup is created, so no `.bak` exists at all.
+        assert!(!backup_path(&path).exists());
     }
 
     #[cfg(unix)]
