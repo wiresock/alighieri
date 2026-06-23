@@ -54,6 +54,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The userlist and config-wizard backups now refuse a symlinked *source* path,
+  not just a symlinked `.bak` destination. The file being backed up was opened
+  with a plain `File::open`, which follows a symlink, so a symlink planted at the
+  userlist/config path could redirect the copy and stream an arbitrary target
+  file (e.g. credentials read out of another file) into `.bak` under a privileged
+  run. The source is now opened `O_NOFOLLOW` on Unix and must be a regular file;
+  the `.bak` destination was already protected by the temp-file + atomic rename.
 - A `socks`/`client` rule address selector now rejects stray or misspelled tokens
   instead of silently ignoring them. The parser recognised only an exact `port`
   token and dropped anything else, so a typo like `to: 0.0.0.0/0 ports = 443`

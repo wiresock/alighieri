@@ -1037,21 +1037,49 @@ fn write_userlist_atomically(
     result
 }
 
+/// Opens `path` read-only, refusing a final-component symlink on Unix
+/// (`O_NOFOLLOW`). Backup sources are opened this way so a symlinked target path
+/// cannot redirect the copy to an arbitrary file. On non-Unix this is a plain
+/// read-only open.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 fn backup_userlist(userlist: &Path, existed: bool) -> std::io::Result<()> {
     if !existed {
         return Ok(());
     }
     let backup = userlist_backup_path(userlist);
-    // Stream the backup into a fresh temp file (`create_new` / `O_EXCL`, so it
-    // cannot follow a pre-placed symlink), then atomically rename it over
-    // `.bak`. `rename` replaces the destination link itself rather than writing
-    // through it, closing the check-then-copy race a direct `fs::copy` to `.bak`
-    // would leave. The temp inherits the userlist's mode/uid/gid on Unix (via
+    // Open the backup *source* first and no-follow: a symlinked `userlist` path
+    // could otherwise redirect the copy to an arbitrary target file, streaming
+    // its contents (e.g. credentials) into `.bak` under a privileged run. Back up
+    // only a regular file. (The `.bak` *destination* is separately protected by
+    // the temp + rename below.)
+    let mut source = open_no_follow(userlist)?;
+    if !source.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {}: not a regular file",
+                userlist.display()
+            ),
+        ));
+    }
+    // Stream into a fresh temp file (`create_new` / `O_EXCL`, so it cannot follow
+    // a pre-placed symlink), then atomically rename it over `.bak`. `rename`
+    // replaces the destination link itself rather than writing through it. The
+    // temp inherits the userlist's mode/uid/gid on Unix (via
     // `create_userlist_temp`); on Windows it inherits the parent directory ACL,
     // as the previous `fs::copy` did.
     let (temp_path, mut temp_file) = create_userlist_temp(userlist, existed)?;
     let write_result = (|| -> std::io::Result<()> {
-        let mut source = std::fs::File::open(userlist)?;
         std::io::copy(&mut source, &mut temp_file)?;
         temp_file.sync_all()
     })();
@@ -1291,6 +1319,25 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&bak).unwrap(), b"user:$argon2id$hash");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_userlist_refuses_a_symlinked_source() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, b"secret-contents").unwrap();
+        // The userlist path itself is a symlink to a sensitive file.
+        let userlist = dir.path().join("users");
+        symlink(&secret, &userlist).unwrap();
+
+        // Backing up must refuse to follow the symlink to its target.
+        assert!(backup_userlist(&userlist, true).is_err());
+        // No backup carrying the secret contents was produced.
+        let bak = userlist_backup_path(&userlist);
+        assert!(std::fs::read(&bak).map_or(true, |c| c != b"secret-contents"));
     }
 
     #[test]
