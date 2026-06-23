@@ -775,6 +775,15 @@ mod tests {
         }
     }
 
+    // The three tests below drive the real recv/validate/mark path through real
+    // UDP sockets, so they use wall-clock time rather than a paused clock: real
+    // datagram readiness comes from the OS I/O driver, which does not advance with
+    // `tokio::time`, so there is no race-free way to interleave a delivered
+    // datagram with `tokio::time::advance`. Margins are wide (sends every 100ms vs
+    // a 500ms idle), and the two negative tests are robust to load besides — a
+    // delayed junk spray can only make the association idle out sooner, never keep
+    // it alive.
+
     // A stream of wrong-source datagrams must not keep a UDP association alive:
     // `activity.mark()` now runs only after the source/endpoint/header checks, so
     // spoofed or unrelated datagrams are dropped without refreshing the timer.
