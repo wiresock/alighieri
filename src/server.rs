@@ -49,7 +49,7 @@ impl Server {
     /// Emits warnings for configurations that would silently deny all traffic,
     /// since deny-by-default can otherwise be surprising.
     pub async fn bind(config: Config) -> Result<Server> {
-        let users = load_users(&config)?;
+        let users = load_users(&config).await?;
         warn_config_footguns(&config);
         // Build the acceptor and (for ACME) the renewal driver up front so config
         // errors surface before binding, but defer spawning the driver until the
@@ -141,7 +141,7 @@ impl Server {
     /// sinks, and the max-connection semaphore require a process restart.
     pub async fn reload(&self, mut config: Config) -> Result<()> {
         warn_restart_required_changes(&self.process_config, &config);
-        let users = load_users(&config)?;
+        let users = load_users(&config).await?;
         warn_config_footguns(&config);
         preserve_process_config(&mut config, &self.process_config);
         self.abuse.update_config(config.rate_limits.clone());
@@ -350,15 +350,26 @@ impl Server {
     }
 }
 
-fn load_users(config: &Config) -> Result<UserDb> {
-    match &config.userlist {
-        Some(path) => {
-            let db = UserDb::load(path)?;
-            info!(users = db.len(), path = %path.display(), "loaded userlist");
-            Ok(db)
-        }
-        None => Ok(UserDb::new()),
-    }
+async fn load_users(config: &Config) -> Result<UserDb> {
+    let Some(path) = config.userlist.clone() else {
+        return Ok(UserDb::new());
+    };
+    // Read and hash-parse the userlist off the runtime threads so a large file on
+    // slow storage cannot stall a worker during startup or reload. The outer `?`
+    // surfaces a join failure (only on a panic — `spawn_blocking` is never
+    // cancelled) with context; the inner `?` surfaces the load/parse error.
+    let db = tokio::task::spawn_blocking(move || -> Result<UserDb> {
+        let db = UserDb::load(&path)?;
+        info!(users = db.len(), path = %path.display(), "loaded userlist");
+        Ok(db)
+    })
+    .await
+    .map_err(|e| {
+        crate::errors::Error::Io(std::io::Error::other(format!(
+            "userlist load task failed: {e}"
+        )))
+    })??;
+    Ok(db)
 }
 
 /// Builds the external auth verifier when `auth.command` is configured. The

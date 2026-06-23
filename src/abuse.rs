@@ -19,6 +19,15 @@ use crate::throttle::TokenBucket;
 /// harmless in the meantime because windows reset on access.
 const PRUNE_EVERY_N_ADMISSIONS: u64 = 64;
 
+/// Soft cap on tracked client states. Without it, a spray from many distinct
+/// source IPs would grow the map (and the O(n) prune scan that runs under the
+/// global lock) unbounded. A new client at the cap evicts an idle entry to make
+/// room (see [`evict_idle_clients`]). Only *idle* states are evicted, so the map
+/// can still exceed the cap by the number of concurrently active clients — but
+/// that is bounded by `maxconnections`, so the map stays bounded overall (near
+/// 10 MB at ~150 bytes per entry, plus the active set).
+const MAX_TRACKED_CLIENTS: usize = 65_536;
+
 #[derive(Debug)]
 pub struct AbuseControls {
     config: RwLock<RateLimits>,
@@ -48,7 +57,6 @@ pub struct ClientPermit {
     controls: Arc<AbuseControls>,
     state: Arc<Mutex<ClientState>>,
     bandwidth: Option<Arc<Mutex<TokenBucket>>>,
-    active: bool,
 }
 
 impl AbuseControls {
@@ -72,17 +80,10 @@ impl AbuseControls {
             .clone();
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if self
-            .admissions
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS)
-        {
-            prune_expired_clients(&mut clients, &config, now);
-        }
-        let state = clients
-            .entry(ip)
-            .or_insert_with(|| Arc::new(Mutex::new(ClientState::new(now))))
-            .clone();
+        let state = checkout_state(&self.admissions, &mut clients, ip, &config, now);
+        // Hold the global `clients` lock until the permit is built: it keeps the
+        // freshly checked-out state in the map (so a concurrent prune/eviction
+        // cannot drop it) until `active_connections` is incremented below.
         let mut state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
 
         if is_limit_exceeded(
@@ -136,7 +137,6 @@ impl AbuseControls {
             controls: self.clone(),
             state,
             bandwidth,
-            active: true,
         })
     }
 
@@ -148,17 +148,7 @@ impl AbuseControls {
             .clone();
         let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        if self
-            .admissions
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS)
-        {
-            prune_expired_clients(&mut clients, &config, now);
-        }
-        let state = clients
-            .entry(ip)
-            .or_insert_with(|| Arc::new(Mutex::new(ClientState::new(now))))
-            .clone();
+        let state = checkout_state(&self.admissions, &mut clients, ip, &config, now);
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let _ = increment_window(
             &mut state.auth_failures,
@@ -180,17 +170,11 @@ impl ClientPermit {
     pub fn throttle_bucket(&self) -> Option<Arc<Mutex<TokenBucket>>> {
         self.bandwidth.clone()
     }
-
-    pub fn disarm(mut self) {
-        self.active = false;
-    }
 }
 
 impl Drop for ClientPermit {
     fn drop(&mut self) {
-        if self.active {
-            self.controls.release(&self.state);
-        }
+        self.controls.release(&self.state);
     }
 }
 
@@ -253,6 +237,40 @@ fn increment_window(window: &mut Window, limit: Option<&RateLimit>, now: Instant
     window.count > limit.limit
 }
 
+/// Looks up or creates the per-client state for `ip` under the already-held
+/// `clients` lock, running the amortized prune and — at the cap — evicting an
+/// idle entry, so the map and its prune scan stay bounded. Shared by `admit`
+/// and `record_auth_failure`.
+fn checkout_state(
+    admissions: &AtomicU64,
+    clients: &mut HashMap<IpAddr, Arc<Mutex<ClientState>>>,
+    ip: IpAddr,
+    config: &RateLimits,
+    now: Instant,
+) -> Arc<Mutex<ClientState>> {
+    let due = admissions
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(PRUNE_EVERY_N_ADMISSIONS);
+    // Prune only on the amortized schedule. At the cap, `clients.len() >= cap`
+    // holds on every new-IP connection, so forcing a full O(n) prune there would
+    // run it on *every* connection instead of every Nth — worse than the
+    // unbounded version. The eviction below already keeps the map bounded.
+    if due {
+        prune_expired_clients(clients, config, now);
+    }
+    // A brand-new client at the cap: evict an idle entry to make room so a spray
+    // from many distinct source IPs cannot grow the map without bound. With
+    // `target = cap - 1` only one victim is needed, so this stops at the first
+    // idle (non-active) entry rather than scanning the whole map.
+    if clients.len() >= MAX_TRACKED_CLIENTS && !clients.contains_key(&ip) {
+        evict_idle_clients(clients, MAX_TRACKED_CLIENTS - 1);
+    }
+    clients
+        .entry(ip)
+        .or_insert_with(|| Arc::new(Mutex::new(ClientState::new(now))))
+        .clone()
+}
+
 fn prune_expired_clients(
     clients: &mut HashMap<IpAddr, Arc<Mutex<ClientState>>>,
     config: &RateLimits,
@@ -262,6 +280,30 @@ fn prune_expired_clients(
         Ok(state) => !state.is_expired(config, now),
         Err(_) => true,
     });
+}
+
+/// Evicts idle (no active connections) client states until the map holds at most
+/// `target` entries. Active states are never evicted — a live `ClientPermit`
+/// references them for connection accounting, and dropping one would split a
+/// client's concurrent-connection count across two states. Best-effort: if too
+/// few states are idle the map may briefly exceed `target` (bounded by the live
+/// connection count), and evicting an idle debt-owing state yields its
+/// burst-evasion protection to the hard memory bound.
+fn evict_idle_clients(clients: &mut HashMap<IpAddr, Arc<Mutex<ClientState>>>, target: usize) {
+    if clients.len() <= target {
+        return;
+    }
+    let excess = clients.len() - target;
+    let victims: Vec<IpAddr> = clients
+        .iter()
+        // A state we cannot lock is in active use, so treat it as not idle.
+        .filter(|(_, state)| state.try_lock().is_ok_and(|g| g.active_connections == 0))
+        .take(excess)
+        .map(|(ip, _)| *ip)
+        .collect();
+    for ip in victims {
+        clients.remove(&ip);
+    }
 }
 
 impl ClientState {
@@ -451,5 +493,44 @@ mod tests {
         let clients = controls.clients.lock().unwrap();
         assert_eq!(clients.len(), 1);
         assert!(clients.contains_key(&second));
+    }
+
+    #[test]
+    fn evict_idle_clients_drops_idle_but_keeps_active() {
+        let now = Instant::now();
+        let mut clients: HashMap<IpAddr, Arc<Mutex<ClientState>>> = HashMap::new();
+        for i in 0..5u8 {
+            clients.insert(
+                IpAddr::from([10, 0, 0, i]),
+                Arc::new(Mutex::new(ClientState::new(now))),
+            );
+        }
+        let active_ip = IpAddr::from([10, 0, 0, 100]);
+        let active = Arc::new(Mutex::new(ClientState::new(now)));
+        active.lock().unwrap().active_connections = 1;
+        clients.insert(active_ip, active);
+        assert_eq!(clients.len(), 6);
+
+        // Evict down to two: idle states are dropped, the active one survives.
+        evict_idle_clients(&mut clients, 2);
+        assert_eq!(clients.len(), 2);
+        assert!(
+            clients.contains_key(&active_ip),
+            "an active state must never be evicted"
+        );
+    }
+
+    #[test]
+    fn evict_idle_clients_never_drops_active_even_over_target() {
+        let now = Instant::now();
+        let mut clients: HashMap<IpAddr, Arc<Mutex<ClientState>>> = HashMap::new();
+        for i in 0..3u8 {
+            let state = Arc::new(Mutex::new(ClientState::new(now)));
+            state.lock().unwrap().active_connections = 1;
+            clients.insert(IpAddr::from([10, 0, 0, i]), state);
+        }
+        // Nothing is idle, so the map stays put even though it exceeds the target.
+        evict_idle_clients(&mut clients, 1);
+        assert_eq!(clients.len(), 3);
     }
 }
