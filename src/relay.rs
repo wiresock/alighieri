@@ -4,11 +4,12 @@
 //! caller (the [`crate::connection`] state machine) and, for UDP, supplied as
 //! an `authorize` closure invoked per destination.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -330,6 +331,9 @@ where
         let _ = client_endpoint.set(endpoint);
     }
     let activity = Arc::new(ActivityClock::new());
+    // Remote IPs the client has sent to; replies from any other source are
+    // dropped as unsolicited injection.
+    let contacted = Arc::new(Mutex::new(ContactedRemotes::default()));
 
     let mut client_to_remote = tokio::spawn(relay_client_to_remote(
         relay_socket.clone(),
@@ -341,6 +345,7 @@ where
         options.throttle.clone(),
         client_endpoint.clone(),
         activity.clone(),
+        contacted.clone(),
         options.outbound_dual,
         authorize,
     ));
@@ -351,6 +356,7 @@ where
         options.throttle,
         client_endpoint,
         activity.clone(),
+        contacted,
     ));
 
     // Idleness is enforced with a coarse periodic check rather than a timer
@@ -400,6 +406,47 @@ fn flatten_direction(
     }
 }
 
+/// Cap on remembered remote destinations per UDP association. The set is
+/// consulted on every reply, and the least-recently-recorded IP is evicted at
+/// the cap, which only a client contacting a very large number of distinct
+/// destinations could reach. 256 covers ordinary UDP use comfortably.
+const MAX_CONTACTED_REMOTES: usize = 256;
+
+/// The remote IPs a client has sent to on one UDP association, shared between the
+/// two relay tasks. A reply is forwarded to the client only from a recorded IP,
+/// so an off-path host cannot inject unsolicited datagrams. Matching is on the
+/// canonical IP (port-agnostic), tolerating a server that answers from a
+/// different port. Bounded (the least-recently-recorded IP is evicted at the cap)
+/// so it cannot grow without limit.
+#[derive(Default)]
+struct ContactedRemotes {
+    seen: HashMap<IpAddr, u64>,
+    ticks: u64,
+}
+
+impl ContactedRemotes {
+    /// Records that the client sent to `ip` (pass the canonical form).
+    fn record(&mut self, ip: IpAddr) {
+        self.ticks += 1;
+        if self.seen.len() >= MAX_CONTACTED_REMOTES && !self.seen.contains_key(&ip) {
+            if let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, &tick)| tick)
+                .map(|(ip, _)| *ip)
+            {
+                self.seen.remove(&oldest);
+            }
+        }
+        self.seen.insert(ip, self.ticks);
+    }
+
+    /// Whether the client has sent to `ip` (pass the canonical form).
+    fn contains(&self, ip: &IpAddr) -> bool {
+        self.seen.contains_key(ip)
+    }
+}
+
 /// Coarse last-activity tracking shared across a relay's tasks. Uses the
 /// tokio clock so idle behaviour is testable under paused time.
 struct ActivityClock {
@@ -446,6 +493,7 @@ async fn relay_client_to_remote<F>(
     throttle: Option<Throttle>,
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
+    contacted: Arc<Mutex<ContactedRemotes>>,
     outbound_dual: bool,
     authorize: F,
 ) -> Result<()>
@@ -502,6 +550,16 @@ where
             continue;
         }
         let _ = client_endpoint.set(src);
+        // Remember the destination before sending, so a fast reply is already
+        // recognised by relay_remote_to_client; replies from any other remote are
+        // dropped there as unsolicited injection. Store the canonical IP so an
+        // IPv4 reply on a dual-stack socket (`::ffff:`) still matches; compute it
+        // before locking to keep the critical section minimal.
+        let dest_ip = dest.ip().to_canonical();
+        contacted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(dest_ip);
         // A fully validated, authorized datagram from the locked client endpoint
         // is genuine client use of the association, so it refreshes the idle
         // timer here — even if the token bucket below then polices it or the send
@@ -547,6 +605,7 @@ async fn relay_remote_to_client(
     throttle: Option<Throttle>,
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
+    contacted: Arc<Mutex<ContactedRemotes>>,
 ) -> Result<()> {
     // Headroom in front of the receive area lets the relay prepend the SOCKS
     // header in place instead of allocating per packet.
@@ -562,6 +621,19 @@ async fn relay_remote_to_client(
         let Some(caddr) = client_endpoint.get().copied() else {
             continue; // no client endpoint locked yet — do not refresh idle
         };
+        // Forward only replies from a remote the client has actually sent to;
+        // drop the rest so an off-path host cannot inject unsolicited UDP to the
+        // client. Match on the canonical IP (an IPv4 reply on a dual-stack socket
+        // arrives `::ffff:`-mapped), computed before locking to keep the critical
+        // section minimal. Dropped injections do not refresh idle.
+        let remote_ip = remote_src.ip().to_canonical();
+        if !contacted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&remote_ip)
+        {
+            continue;
+        }
         // A reply for an established association counts as activity; packets that
         // arrive before the client's endpoint is locked do not keep it alive.
         activity.mark();
@@ -895,6 +967,121 @@ mod tests {
             "validated traffic must keep the association alive"
         );
         keepalive.abort();
+        assoc.abort();
+    }
+
+    #[test]
+    fn contacted_remotes_records_and_evicts_oldest() {
+        let mut contacted = ContactedRemotes::default();
+        let ip = |i: usize| IpAddr::from([10, 0, (i >> 8) as u8, i as u8]);
+
+        contacted.record(ip(0));
+        assert!(contacted.contains(&ip(0)));
+        assert!(!contacted.contains(&ip(1)));
+
+        // Fill to the cap with distinct IPs; ip(0) was recorded first (oldest).
+        for i in 1..MAX_CONTACTED_REMOTES {
+            contacted.record(ip(i));
+        }
+        assert!(contacted.contains(&ip(0)));
+
+        // One more distinct IP evicts the oldest.
+        contacted.record(ip(MAX_CONTACTED_REMOTES));
+        assert!(
+            !contacted.contains(&ip(0)),
+            "the oldest contacted IP should be evicted at the cap"
+        );
+        assert!(contacted.contains(&ip(MAX_CONTACTED_REMOTES)));
+        assert!(contacted.contains(&ip(MAX_CONTACTED_REMOTES - 1)));
+    }
+
+    // Split into two tests so neither depends on processing order: in the drop
+    // test the client never contacts anything, so the set stays empty and the
+    // reply is unsolicited whenever it is processed (no shared loopback-IP race).
+    #[tokio::test]
+    async fn udp_drops_replies_from_uncontacted_remotes() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound_addr = outbound.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        // The client never sends, so the contacted set stays empty: a reply to the
+        // outbound socket is always unsolicited and dropped.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unsolicited", outbound_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "an unsolicited reply must not reach the client"
+        );
+
+        assoc.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_forwards_replies_from_contacted_remotes() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound_addr = outbound.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let dest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        // The client contacts `dest`, recording its IP.
+        let IpAddr::V4(dest_ip) = dest_addr.ip() else {
+            unreachable!()
+        };
+        let mut datagram = vec![0u8, 0, 0, 1]; // RSV RSV FRAG ATYP=IPv4
+        datagram.extend_from_slice(&dest_ip.octets());
+        datagram.extend_from_slice(&dest_addr.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        client.send_to(&datagram, relay_addr).await.unwrap();
+        let mut dbuf = [0u8; 64];
+        let (dn, _) = tokio::time::timeout(Duration::from_secs(1), dest.recv_from(&mut dbuf))
+            .await
+            .expect("dest should receive the forwarded datagram")
+            .unwrap();
+        assert_eq!(&dbuf[..dn], b"ping");
+
+        // A reply from the now-contacted remote is forwarded to the client.
+        dest.send_to(b"pong", outbound_addr).await.unwrap();
+        let mut buf = [0u8; 256];
+        let (cn, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("a reply from a contacted remote must reach the client")
+            .unwrap();
+        assert!(buf[..cn].ends_with(b"pong"));
+
         assoc.abort();
     }
 }
