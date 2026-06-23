@@ -638,11 +638,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.userlist = Some(PathBuf::from(vals.join(" ")));
         }
         "maxconnections" | "max.connections" => {
-            let n = parse_u64(vals, lineno)? as usize;
-            if n == 0 {
-                return Err(cfg_err(lineno, "maxconnections must be > 0"));
-            }
-            b.max_connections = Some(n);
+            b.max_connections = Some(parse_usize_positive(vals, lineno, "maxconnections")?);
         }
         "logoutput" => b.log_outputs = Some(parse_log_outputs(vals, lineno)?),
         "logfile" | "log.file" => {
@@ -660,7 +656,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.log_rotate_size = Some(size);
         }
         "logrotatekeep" | "logrotate.keep" | "log.rotate.keep" => {
-            b.log_rotate_keep = Some(parse_u64(vals, lineno)? as usize);
+            b.log_rotate_keep = Some(parse_usize(vals, lineno, "logrotate.keep")?);
         }
         "dnsprefer" | "dns.prefer" => b.dns_preference = Some(parse_dns_preference(vals, lineno)?),
         "dnstryall" | "dns.tryall" | "dns.try_all" => {
@@ -804,12 +800,20 @@ fn parse_path(vals: &[String], lineno: usize, setting: &str) -> Result<PathBuf> 
     Ok(PathBuf::from(vals.join(" ")))
 }
 
-fn parse_usize_positive(vals: &[String], lineno: usize, setting: &str) -> Result<usize> {
+/// Parses a `usize` setting (zero allowed), rejecting a value too large for the
+/// target's pointer width rather than silently truncating it — `as usize` would
+/// wrap a `u64` above `usize::MAX` on a 32-bit target.
+fn parse_usize(vals: &[String], lineno: usize, setting: &str) -> Result<usize> {
     let n = parse_u64(vals, lineno)?;
+    usize::try_from(n).map_err(|_| cfg_err(lineno, &format!("{setting} is too large")))
+}
+
+fn parse_usize_positive(vals: &[String], lineno: usize, setting: &str) -> Result<usize> {
+    let n = parse_usize(vals, lineno, setting)?;
     if n == 0 {
         return Err(cfg_err(lineno, &format!("{setting} must be > 0")));
     }
-    usize::try_from(n).map_err(|_| cfg_err(lineno, &format!("{setting} is too large")))
+    Ok(n)
 }
 
 fn parse_rate_limit(vals: &[String], lineno: usize, setting: &str) -> Result<RateLimit> {
@@ -872,12 +876,9 @@ fn parse_byte_rate_limit(vals: &[String], lineno: usize, setting: &str) -> Resul
 }
 
 fn parse_ip(vals: &[String], lineno: usize) -> Result<IpAddr> {
-    if vals.is_empty() {
-        return Err(cfg_err(lineno, "expected an IP address"));
-    }
-    vals[0]
-        .parse()
-        .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{}'", vals[0])))
+    let val = expect_single(vals, lineno, "IP address")?;
+    val.parse()
+        .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{val}'")))
 }
 
 /// Returns the single value of a scalar setting, rejecting trailing tokens that
@@ -978,10 +979,10 @@ fn parse_log_outputs(vals: &[String], lineno: usize) -> Result<Vec<LogOutput>> {
 }
 
 fn parse_log_format(vals: &[String], lineno: usize) -> Result<LogFormat> {
-    if vals.is_empty() {
-        return Err(cfg_err(lineno, "expected a log format"));
-    }
-    match vals[0].to_ascii_lowercase().as_str() {
+    match expect_single(vals, lineno, "log format")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "text" => Ok(LogFormat::Text),
         "json" => Ok(LogFormat::Json),
         other => Err(cfg_err(
@@ -1035,10 +1036,10 @@ fn parse_byte_size(vals: &[String], lineno: usize) -> Result<u64> {
 }
 
 fn parse_dns_preference(vals: &[String], lineno: usize) -> Result<DnsPreference> {
-    if vals.is_empty() {
-        return Err(cfg_err(lineno, "expected a DNS preference"));
-    }
-    match vals[0].to_ascii_lowercase().as_str() {
+    match expect_single(vals, lineno, "DNS preference")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "system" | "default" => Ok(DnsPreference::System),
         "ipv4" | "v4" => Ok(DnsPreference::Ipv4),
         "ipv6" | "v6" => Ok(DnsPreference::Ipv6),
@@ -1050,13 +1051,11 @@ fn parse_dns_preference(vals: &[String], lineno: usize) -> Result<DnsPreference>
 }
 
 fn parse_cache_ttl(vals: &[String], lineno: usize, setting: &str) -> Result<Option<Duration>> {
-    if vals.is_empty() {
-        return Err(cfg_err(
-            lineno,
-            &format!("{setting} requires seconds, 0, off, none, or disabled"),
-        ));
-    }
-    match vals[0].to_ascii_lowercase().as_str() {
+    let what = format!("{setting} value (seconds, 0, off, none, or disabled)");
+    match expect_single(vals, lineno, &what)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "off" | "none" | "disabled" => Ok(None),
         _ => {
             let secs = parse_u64(vals, lineno)?;
@@ -1894,6 +1893,25 @@ ratelimit.bytes: 64KiB/30
         assert!(
             Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 100\ndns.tryall: yes").is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_trailing_tokens_on_value_settings() {
+        // Scalar value parsers (IP, enum keywords, the cache-ttl keyword, usize)
+        // reject extra tokens instead of silently using only the first.
+        assert!(Config::parse("internal: 127.0.0.1:1080\nexternal: 0.0.0.0 oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogformat: json text").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.prefer: ipv4 oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: off oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nauth.cachettl: none oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 5 oops").is_err());
+        // The valid single-value forms still parse.
+        assert!(Config::parse("internal: 127.0.0.1:1080\nexternal: 0.0.0.0").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogformat: json").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.prefer: ipv4").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: off").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: 60").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 5").is_ok());
     }
 
     #[test]

@@ -23,11 +23,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   connection — so it is refused at parse time instead of silently breaking the
   proxy. (`iotimeout`/`udptimeout` still accept `0` to mean a disabled idle
   timeout.)
-- Numeric and boolean settings (e.g. `maxconnections`, `dns.tryall`) and endpoint
-  addresses (`internal:`, `metrics.listen:`) now reject trailing tokens instead
-  of silently ignoring them, so a typo like `dns.tryall: yes maybe` or
-  `internal: 127.0.0.1 port = 10 80` fails to parse rather than quietly using
-  only the first value.
+- Configuration settings now reject trailing tokens instead of silently ignoring
+  them: numeric and boolean settings (e.g. `maxconnections`, `dns.tryall`), the
+  `internal:`/`metrics.listen:`/`external:` addresses, and single-keyword settings
+  (`logformat`, `dns.prefer`, and the `dns.cachettl`/`auth.cachettl`
+  `off`/`none`/`disabled` keyword). A typo like `dns.tryall: yes maybe`,
+  `logformat: json text`, or `internal: 127.0.0.1 port = 10 80` now fails to parse
+  rather than quietly using only the first value.
 
 ### Fixed
 
@@ -42,6 +44,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   direction); control-channel data never refreshes it (only its close tears the
   association down). A validated, authorized datagram still counts as activity
   even if the token bucket then polices it, since the client is genuinely active.
+- `maxconnections` and `logrotate.keep` no longer truncate a value too large for
+  the platform's pointer width. They were cast with `u64 as usize`, which wraps a
+  value above `usize::MAX` on a 32-bit target; the value is now rejected at parse
+  time instead.
 - DNS resolution is now bounded by a deadline (`dns.timeout`, default 5s). The
   CONNECT path awaited resolution with no timeout (only the *connect* had one),
   and the UDP relay resolved domain targets inside its single client→remote loop,
