@@ -1,6 +1,6 @@
 //! The listener and accept loop.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,6 +20,7 @@ use crate::connection::{Connection, ConnectionResources};
 use crate::dns::DnsResolver;
 use crate::errors::Result;
 use crate::metrics::{self, Metrics};
+use crate::net::Cidr;
 use crate::tls;
 
 /// A bound SOCKS5 server ready to accept connections.
@@ -245,11 +246,7 @@ impl Server {
             // listener, or it could forge its advertised source address.
             let expect_proxy = if config.proxy_protocol.is_empty() {
                 false
-            } else if config
-                .proxy_protocol
-                .iter()
-                .any(|cidr| cidr.contains(peer.ip()))
-            {
+            } else if is_trusted_proxy_upstream(&config.proxy_protocol, peer.ip()) {
                 true
             } else {
                 warn!(peer = %peer, "rejecting connection: proxyprotocol is enabled and the source is not a trusted upstream");
@@ -394,6 +391,18 @@ fn build_command_auth(config: &Config) -> Option<Arc<CommandAuth>> {
     }
 }
 
+/// Returns `true` if `peer` falls within one of the trusted PROXY-protocol
+/// upstream networks.
+///
+/// The peer address is canonicalized first so an IPv4 trust CIDR still matches
+/// an upstream that arrives IPv4-mapped (`::ffff:a.b.c.d`) on a dual-stack
+/// listener — `Cidr::contains` itself treats a mapped address as IPv6 and would
+/// otherwise reject a legitimately trusted IPv4 upstream.
+fn is_trusted_proxy_upstream(trusted: &[Cidr], peer: IpAddr) -> bool {
+    let canonical = peer.to_canonical();
+    trusted.iter().any(|cidr| cidr.contains(canonical))
+}
+
 fn warn_config_footguns(config: &Config) {
     if !config.rules.has_scope(Scope::Client) {
         warn!("no 'client' rules defined — all incoming connections will be denied");
@@ -477,6 +486,47 @@ impl<T> Drop for AbortOnDrop<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_trust_matches_ipv4_mapped_upstream() {
+        let trusted: Vec<Cidr> = vec!["10.0.0.0/8".parse().unwrap()];
+
+        // A plain IPv4 trusted upstream matches.
+        assert!(is_trusted_proxy_upstream(
+            &trusted,
+            "10.1.2.3".parse().unwrap()
+        ));
+        // The same upstream arriving IPv4-mapped on a dual-stack listener must
+        // also match the IPv4 trust CIDR — the regression this fixes.
+        assert!(is_trusted_proxy_upstream(
+            &trusted,
+            "::ffff:10.1.2.3".parse().unwrap()
+        ));
+
+        // An untrusted source is rejected whether it arrives plain or mapped.
+        assert!(!is_trusted_proxy_upstream(
+            &trusted,
+            "203.0.113.7".parse().unwrap()
+        ));
+        assert!(!is_trusted_proxy_upstream(
+            &trusted,
+            "::ffff:203.0.113.7".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn proxy_trust_matches_native_ipv6_upstream() {
+        // A native (non-mapped) IPv6 upstream still matches an IPv6 trust CIDR.
+        let trusted: Vec<Cidr> = vec!["2001:db8::/32".parse().unwrap()];
+        assert!(is_trusted_proxy_upstream(
+            &trusted,
+            "2001:db8::1".parse().unwrap()
+        ));
+        assert!(!is_trusted_proxy_upstream(
+            &trusted,
+            "2001:dead::1".parse().unwrap()
+        ));
+    }
 
     #[tokio::test]
     async fn bind_reports_local_addr() {
