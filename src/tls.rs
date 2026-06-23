@@ -245,14 +245,25 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
 /// deliberately managed elsewhere.
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    // mkdir with a mode is atomic, so a freshly created directory is private from
+    // the start (no window where it exists with looser bits).
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    // Tighten an already-existing directory through a descriptor, not the path:
+    // open it with O_NOFOLLOW|O_DIRECTORY so a symlink swapped in after the
+    // earlier check/create fails the open (closing the TOCTOU window the
+    // `symlink_metadata` check leaves), then fstat/fchmod the descriptor, which
+    // refers to the real directory regardless of any later path swap.
+    let dir_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)?;
+    let mode = dir_file.metadata()?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        if let Err(e) = dir_file.set_permissions(std::fs::Permissions::from_mode(0o700)) {
             tracing::warn!(
                 dir = %dir.display(),
                 error = %e,
@@ -509,6 +520,27 @@ TJmcpHqqAD9nQAqB4GvHPA==
         assert_eq!(
             mode, 0o700,
             "an existing loose cache dir must be tightened, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_does_not_chmod_through_a_symlink() {
+        // A symlink raced onto the cache path after the earlier check must not let
+        // the chmod follow it to the target: O_NOFOLLOW fails the open instead.
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("cache");
+        symlink(&target, &link).unwrap();
+
+        assert!(create_private_dir(&link).is_err());
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            target_mode, 0o755,
+            "the symlink target must not be chmod'd, got {target_mode:o}"
         );
     }
 }
