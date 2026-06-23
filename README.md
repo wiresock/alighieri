@@ -269,6 +269,7 @@ socks pass "allow-default" {
 | `dns.tryall`       | `false`         | Try every resolved address for TCP CONNECT           |
 | `dns.deny`         | —               | Deny resolved IP categories after DNS lookup         |
 | `dns.cachettl`     | `0`             | Cache domain lookup answers for this many seconds    |
+| `dns.timeout`      | `5`             | Deadline (seconds) for resolving one destination name |
 | `metrics.listen`   | —               | Optional HTTP metrics endpoint address               |
 | `tls.certfile`     | —               | PEM certificate chain for TLS-wrapped client traffic |
 | `tls.keyfile`      | —               | PEM private key for TLS-wrapped client traffic       |

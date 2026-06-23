@@ -21,6 +21,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- DNS resolution is now bounded by a deadline (`dns.timeout`, default 5s). The
+  CONNECT path awaited resolution with no timeout (only the *connect* had one),
+  and the UDP relay resolved domain targets inside its single client→remote loop,
+  so a slow or wedged resolver could pin a connection permit or stall UDP
+  forwarding. Resolution now fails with a timeout at the deadline (the CONNECT
+  path replies host-unreachable; UDP drops the datagram). `dns.timeout: 0` is
+  rejected, since it would time out every lookup.
 - UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
   socket was bound to `external` (default `0.0.0.0`, IPv4-only), so datagrams to
   an IPv6 target failed to send — and the error was discarded — while the TCP

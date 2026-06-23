@@ -28,6 +28,7 @@
 //! dns.prefer: system
 //! dns.tryall: false
 //! dns.cachettl: 0
+//! dns.timeout: 5
 //! # metrics.listen: 127.0.0.1:9090
 //! # tls.certfile: /etc/alighieri/tls/server.crt
 //! # tls.keyfile: /etc/alighieri/tls/server.key
@@ -128,6 +129,14 @@ pub struct DnsPolicy {
     pub try_all: bool,
     pub deny: Vec<DnsDenyCategory>,
     pub cache_ttl: Option<Duration>,
+    /// Deadline for resolving one destination name, as monotonic elapsed time
+    /// (enforced with `tokio::time::timeout`). Bounds how long a CONNECT or a
+    /// domain-target UDP datagram *waits* on a slow or wedged resolver, so it
+    /// cannot pin a connection permit or stall UDP forwarding. It does not cancel
+    /// the underlying system `getaddrinfo`, which runs on a blocking thread and
+    /// keeps running until the OS resolver returns — this bounds the caller's
+    /// wait, not the resolver thread's lifetime.
+    pub timeout: Duration,
 }
 
 /// TLS listener settings. When present, accepted client TCP connections are
@@ -375,6 +384,11 @@ fn parse_config_text(
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_UDP_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_DNS_TIMEOUT_SECS: u64 = 5;
+/// Upper bound for `dns.timeout`. A resolution should never take an hour, and
+/// rejecting absurd values keeps the timer deadline (`Instant::now() + dur`)
+/// well clear of overflow.
+const MAX_DNS_TIMEOUT_SECS: u64 = 3600;
 const DEFAULT_AUTH_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_LOG_ROTATE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
@@ -404,6 +418,7 @@ struct Builder {
     dns_try_all: Option<bool>,
     dns_deny: Option<Vec<DnsDenyCategory>>,
     dns_cache_ttl: Option<Option<Duration>>,
+    dns_timeout: Option<Duration>,
     metrics_listen: Option<SocketAddr>,
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
@@ -533,6 +548,9 @@ impl Builder {
                 try_all: self.dns_try_all.unwrap_or(false),
                 deny: self.dns_deny.unwrap_or_default(),
                 cache_ttl: self.dns_cache_ttl.unwrap_or(None),
+                timeout: self
+                    .dns_timeout
+                    .unwrap_or(Duration::from_secs(DEFAULT_DNS_TIMEOUT_SECS)),
             },
             metrics_listen: self.metrics_listen,
             tls,
@@ -643,6 +661,22 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         "dnsdeny" | "dns.deny" => b.dns_deny = Some(parse_dns_deny(vals, lineno)?),
         "dnscachettl" | "dns.cachettl" | "dns.cache.ttl" => {
             b.dns_cache_ttl = Some(parse_cache_ttl(vals, lineno, "dns.cachettl")?);
+        }
+        "dnstimeout" | "dns.timeout" => {
+            let secs = parse_u64(vals, lineno)?;
+            if secs == 0 {
+                return Err(cfg_err(
+                    lineno,
+                    "dns.timeout must be at least 1 second (0 would fail every name resolution)",
+                ));
+            }
+            if secs > MAX_DNS_TIMEOUT_SECS {
+                return Err(cfg_err(
+                    lineno,
+                    &format!("dns.timeout cannot exceed {MAX_DNS_TIMEOUT_SECS} seconds"),
+                ));
+            }
+            b.dns_timeout = Some(Duration::from_secs(secs));
         }
         "authcachettl" | "auth.cachettl" | "auth.cache.ttl" => {
             b.auth_cache_ttl = Some(parse_cache_ttl(vals, lineno, "auth.cachettl")?);
@@ -1744,6 +1778,27 @@ ratelimit.bytes: 64KiB/30
 
         let cfg = Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: 0").unwrap();
         assert_eq!(cfg.dns.cache_ttl, None);
+    }
+
+    #[test]
+    fn parses_dns_timeout_and_rejects_zero() {
+        let cfg = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 3").unwrap();
+        assert_eq!(cfg.dns.timeout, Duration::from_secs(3));
+
+        // Unset falls back to the default.
+        let cfg = Config::parse("internal: 127.0.0.1:1080").unwrap();
+        assert_eq!(cfg.dns.timeout, Duration::from_secs(5));
+
+        // Zero is rejected — it would time out every name resolution.
+        let err = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 0").unwrap_err();
+        assert!(format!("{err}").contains("dns.timeout"), "{err}");
+
+        // An absurd value is rejected so it cannot overflow the timer deadline.
+        let err = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 100000").unwrap_err();
+        assert!(format!("{err}").contains("dns.timeout"), "{err}");
+        // The upper bound itself is accepted.
+        let cfg = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 3600").unwrap();
+        assert_eq!(cfg.dns.timeout, Duration::from_secs(3600));
     }
 
     #[test]
