@@ -1019,27 +1019,14 @@ fn write_config_atomically(path: &Path, contents: &[u8]) -> std::io::Result<Writ
     })
 }
 
-/// Opens `path` read-only, refusing a final-component symlink on Unix
-/// (`O_NOFOLLOW`), so a symlinked backup source cannot redirect the copy to an
-/// arbitrary file. On non-Unix this is a plain read-only open.
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options.open(path)
-}
-
 fn create_config_backup(path: &Path) -> std::io::Result<PathBuf> {
     let backup = backup_path(path);
-    // Open the backup *source* first and no-follow: a symlinked config path could
-    // otherwise redirect the copy to an arbitrary target file, streaming its
-    // contents into `.bak`. Back up only a regular file. (The `.bak` *destination*
-    // is separately protected by the temp + rename below.)
-    let mut source = open_no_follow(path)?;
+    // Open the backup *source* first and no-follow (shared `open_no_follow`): a
+    // symlinked config path could otherwise redirect the copy to an arbitrary
+    // target file, streaming its contents into `.bak`. Back up only a regular
+    // file. (The `.bak` *destination* is separately protected by the temp +
+    // rename below.)
+    let mut source = crate::open_no_follow(path)?;
     if !source.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2437,9 +2424,8 @@ mod tests {
 
         // Backing up must refuse to follow the symlink to its target.
         assert!(create_config_backup(&path).is_err());
-        // No backup carrying the secret contents was produced.
-        let backup = backup_path(&path);
-        assert!(std::fs::read_to_string(&backup).map_or(true, |c| c != "secret-contents"));
+        // It fails before any temp/backup is created, so no `.bak` exists at all.
+        assert!(!backup_path(&path).exists());
     }
 
     #[cfg(unix)]

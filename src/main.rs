@@ -1037,17 +1037,25 @@ fn write_userlist_atomically(
     result
 }
 
-/// Opens `path` read-only, refusing a final-component symlink on Unix
-/// (`O_NOFOLLOW`). Backup sources are opened this way so a symlinked target path
-/// cannot redirect the copy to an arbitrary file. On non-Unix this is a plain
-/// read-only open.
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens `path` read-only, refusing a final-component symlink: `O_NOFOLLOW` on
+/// Unix, and `FILE_FLAG_OPEN_REPARSE_POINT` on Windows (which opens a
+/// symlink/reparse point itself instead of following it, so the caller's
+/// `is_file()` check then rejects it). Backup sources are opened this way so a
+/// symlinked target path cannot redirect the copy to an arbitrary file. Shared
+/// by the userlist and config-wizard backups.
+pub(crate) fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options.open(path)
 }
@@ -1335,9 +1343,8 @@ mod tests {
 
         // Backing up must refuse to follow the symlink to its target.
         assert!(backup_userlist(&userlist, true).is_err());
-        // No backup carrying the secret contents was produced.
-        let bak = userlist_backup_path(&userlist);
-        assert!(std::fs::read(&bak).map_or(true, |c| c != b"secret-contents"));
+        // It fails before any temp/backup is created, so no `.bak` exists at all.
+        assert!(!userlist_backup_path(&userlist).exists());
     }
 
     #[test]
