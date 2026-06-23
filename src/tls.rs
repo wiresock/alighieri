@@ -174,7 +174,26 @@ fn acme_setup(acme: &AcmeConfig, prepare_cache: bool) -> Result<TlsSetup> {
 /// `create_dir_all` alone is not enough: it succeeds on an existing directory
 /// even when it is not writable, so probe by writing and removing a temp file.
 fn ensure_writable_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).map_err(|e| {
+    // Reject a pre-placed symlink (or non-directory) at the cache path: an
+    // attacker who can write the parent could otherwise redirect the ACME account
+    // key and issued certificates elsewhere, since `create_dir_all` silently
+    // follows a symlink to a directory.
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::Config(format!(
+                "ACME cache directory {} is a symlink; refusing to use it",
+                dir.display()
+            )));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Error::Config(format!(
+                "ACME cache path {} exists but is not a directory",
+                dir.display()
+            )));
+        }
+        _ => {} // does not exist yet, or is a real directory
+    }
+    create_private_dir(dir).map_err(|e| {
         Error::Config(format!(
             "failed to create ACME cache directory {}: {e}",
             dir.display()
@@ -216,6 +235,37 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
             dir.display()
         ))),
     }
+}
+
+/// Creates `dir` (and any missing parents) owner-only (mode `0700`) on Unix, so
+/// the ACME account key and certificates it will hold are not group/other
+/// readable. An already-existing directory is tightened to `0700` best-effort:
+/// `DirBuilder`'s mode applies only to directories it creates, and a cache owned
+/// by another user cannot be chmod'd by us, which only warns since it may be
+/// deliberately managed elsewhere.
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "ACME cache directory is group/other-accessible (mode {mode:o}) and could not be tightened to 0700; it holds the ACME account key and issued certificates"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -412,5 +462,53 @@ TJmcpHqqAD9nQAqB4GvHPA==
             Err(err) => err,
         };
         assert!(err.to_string().contains("did not contain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_writable_dir_rejects_a_symlinked_cache_dir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("cache");
+        symlink(&real, &link).unwrap();
+
+        let err = ensure_writable_dir(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_writable_dir_creates_a_private_cache_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("acme");
+
+        ensure_writable_dir(&cache).unwrap();
+
+        let mode = fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a fresh cache dir must be owner-only, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_writable_dir_tightens_an_existing_loose_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("acme");
+        fs::create_dir(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_writable_dir(&cache).unwrap();
+
+        let mode = fs::metadata(&cache).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "an existing loose cache dir must be tightened, got {mode:o}"
+        );
     }
 }
