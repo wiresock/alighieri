@@ -33,6 +33,12 @@ pub struct Server {
     metrics_addr: Option<SocketAddr>,
     metrics_listener: Mutex<Option<TcpListener>>,
     tls_listener: Option<tls::TlsListener>,
+    /// Background ACME renewal task, aborted when the `Server` is dropped (the
+    /// same `AbortOnDrop` guard used for the metrics task). Held only for that
+    /// drop side effect, so a `Server` bound and dropped without running to
+    /// process exit does not leak it.
+    #[allow(dead_code)]
+    acme_driver: Option<AbortOnDrop<()>>,
     has_run: AtomicBool,
 }
 
@@ -90,14 +96,15 @@ impl Server {
         // Now the listener is bound, spawn the ACME renewal driver (if any): a
         // failed bind above cannot leak it, and validation cannot start before
         // the listener can answer the TLS-ALPN-01 challenge.
-        let tls_listener = match tls_setup {
+        let (tls_listener, acme_driver) = match tls_setup {
             Some(setup) => {
-                if let Some(driver) = setup.acme_driver {
-                    tokio::spawn(driver);
-                }
-                Some(setup.listener)
+                // Hold the renewal task as an abort-on-drop handle so a `Server`
+                // bound and dropped without running to process exit (e.g. in
+                // tests) does not leak it.
+                let driver = setup.acme_driver.map(|d| AbortOnDrop(tokio::spawn(d)));
+                (Some(setup.listener), driver)
             }
-            None => None,
+            None => (None, None),
         };
         let max_connections = config.max_connections;
         let abuse = AbuseControls::new(config.rate_limits.clone());
@@ -121,6 +128,7 @@ impl Server {
             metrics_addr,
             metrics_listener: Mutex::new(metrics_listener),
             tls_listener,
+            acme_driver,
             has_run: AtomicBool::new(false),
         })
     }
