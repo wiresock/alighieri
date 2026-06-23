@@ -1244,27 +1244,40 @@ fn is_known_body_key(tok: &str) -> bool {
 }
 
 fn parse_addr_spec(vals: &[String], lineno: usize, allow_hosts: bool) -> Result<AddrSpec> {
-    if vals.is_empty() {
+    let Some((addr, rest)) = vals.split_first() else {
         return Err(cfg_err(lineno, "address selector requires a value"));
-    }
+    };
 
-    let ports = if let Some(pos) = vals.iter().position(|v| v.eq_ignore_ascii_case("port")) {
-        let spec = join_value_after(&vals[pos + 1..]);
-        if spec.is_empty() {
-            return Err(cfg_err(lineno, "'port' requires a value"));
+    // After the address, the only accepted continuation is `port = RANGE` (the
+    // `=` is optional). Any other trailing tokens — a `ports`/typo, a word before
+    // `port`, or garbage after the range — are rejected rather than silently
+    // dropped: dropping the port spec would broaden the rule to match *all* ports
+    // (e.g. `to: 0.0.0.0/0 ports = 443` would otherwise allow every port).
+    let ports = match rest {
+        [] => None,
+        [kw, spec @ ..] if kw.eq_ignore_ascii_case("port") => {
+            let spec = join_value_after(spec);
+            if spec.is_empty() {
+                return Err(cfg_err(lineno, "'port' requires a range value"));
+            }
+            let range: PortRange = spec
+                .parse()
+                .map_err(|e| cfg_err(lineno, &format!("invalid port spec '{spec}': {e}")))?;
+            Some(range)
         }
-        let range: PortRange = spec
-            .parse()
-            .map_err(|e| cfg_err(lineno, &format!("invalid port spec '{spec}': {e}")))?;
-        Some(range)
-    } else {
-        None
+        _ => {
+            return Err(cfg_err(
+                lineno,
+                &format!(
+                    "expected 'ADDR' or 'ADDR port = RANGE', got unexpected tokens after '{addr}'"
+                ),
+            ));
+        }
     };
 
     // The selector address is the first token: a network (CIDR or bare IP), or
     // — only for a `socks` rule `to:` — a hostname pattern such as
     // `.example.com` (domain and subdomains) or `example.com` (exact).
-    let addr = &vals[0];
     match addr.parse::<Cidr>() {
         Ok(cidr) => Ok(AddrSpec::new(cidr, ports)),
         Err(cidr_err) if allow_hosts => match HostPattern::parse(addr) {
@@ -2055,6 +2068,25 @@ socks pass {
         let to = &cfg.rules.rules[0].to;
         assert_eq!(to.hosts, vec![HostPattern::Exact("api.example.com".into())]);
         assert_eq!(to.ports, Some(PortRange { min: 443, max: 443 }));
+    }
+
+    #[test]
+    fn address_selectors_reject_stray_tokens() {
+        let base = "internal: 0.0.0.0 port = 1080\n";
+        let parse = |rule: &str| Config::parse(&format!("{base}{rule}"));
+
+        // A `port` typo or stray token must not be silently dropped: dropping the
+        // port spec would broaden the rule to match *all* ports.
+        assert!(parse("socks pass { to: 0.0.0.0/0 ports = 443 }").is_err());
+        assert!(parse("socks pass { to: 0.0.0.0/0 oops port = 443 }").is_err());
+        assert!(parse("socks pass { to: 0.0.0.0/0 port = 443 oops }").is_err());
+        assert!(parse("socks pass { to: 0.0.0.0/0 oops }").is_err());
+        assert!(parse("socks pass { from: 10.0.0.0/8 oops }").is_err());
+        // The documented forms still parse (the `=` is optional; ranges allowed).
+        assert!(parse("socks pass { to: 0.0.0.0/0 port = 443 }").is_ok());
+        assert!(parse("socks pass { to: 0.0.0.0/0 port 443 }").is_ok());
+        assert!(parse("socks pass { to: 0.0.0.0/0 port = 1024 - 2000 }").is_ok());
+        assert!(parse("socks pass { to: 0.0.0.0/0 }").is_ok());
     }
 
     #[test]

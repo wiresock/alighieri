@@ -47,6 +47,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A `socks`/`client` rule address selector now rejects stray or misspelled tokens
+  instead of silently ignoring them. The parser recognised only an exact `port`
+  token and dropped anything else, so a typo like `to: 0.0.0.0/0 ports = 443`
+  (note the trailing `s`) parsed as *no port restriction* — i.e. **all ports** —
+  silently broadening an allow rule. A token after the address that is not `port`,
+  an extra word before `port`, or garbage after the range is now a parse error.
+  The documented `ADDR port = RANGE` form still parses (the `=` stays optional,
+  e.g. `port 443`, and ranges like `port = 1024 - 2000` are unchanged).
 - The UDP ASSOCIATE idle timeout is no longer refreshed by traffic the relay
   rejects. Activity was marked *before* a datagram was validated, so a spoofed or
   unrelated source datagram, a malformed header, a fragment, or even bytes on the
