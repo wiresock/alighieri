@@ -776,6 +776,34 @@ mod tests {
         assert!(!resolver.negatively_cached(&DnsCacheKey::new("other.example", 443), t0));
     }
 
+    #[test]
+    fn negative_cache_evicts_oldest_when_full() {
+        let resolver = DnsResolver::new();
+        let now = Instant::now();
+        // Seed a full negative cache with distinct, increasing timestamps so the
+        // oldest is unambiguous (`host0`). Seed directly because `store_negative`
+        // would otherwise stamp its own time.
+        {
+            let mut negative = resolver.negative.lock().unwrap();
+            for i in 0..MAX_NEGATIVE_CACHE_ENTRIES {
+                negative.insert(
+                    DnsCacheKey::new(&format!("host{i}.example"), 80),
+                    now + Duration::from_millis(i as u64),
+                );
+            }
+        }
+
+        // Every seeded entry is still within the TTL, so the expired-sweep frees
+        // nothing and the oldest entry must be evicted to make room.
+        let insert_time = now + Duration::from_millis(MAX_NEGATIVE_CACHE_ENTRIES as u64);
+        resolver.store_negative(DnsCacheKey::new("new.example", 80), insert_time);
+
+        let negative = resolver.negative.lock().unwrap();
+        assert_eq!(negative.len(), MAX_NEGATIVE_CACHE_ENTRIES, "the cap holds");
+        assert!(!negative.contains_key(&DnsCacheKey::new("host0.example", 80)));
+        assert!(negative.contains_key(&DnsCacheKey::new("new.example", 80)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_keeps_singleflight_coalesced() {
         // A wedged resolver with several concurrent waiters for the same name:
