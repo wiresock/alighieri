@@ -370,7 +370,7 @@ where
         tokio::select! {
             // The control connection is only a teardown signal: its closing ends
             // the association, but data on it (unexpected) must not refresh the
-            // UDP idle timer — only validated, forwarded datagrams do.
+            // UDP idle timer — only an accepted datagram does.
             res = control.read(&mut ctrl_buf) => {
                 match res {
                     Ok(0) | Err(_) => break Ok(()),
@@ -502,10 +502,13 @@ where
             continue;
         }
         let _ = client_endpoint.set(src);
-        // Only a fully validated, authorized datagram from the locked client
-        // endpoint counts as activity. Spoofed/unrelated sources, malformed
-        // headers, fragments, and denied/unauthorized destinations were all
-        // dropped above without refreshing the idle timer.
+        // A fully validated, authorized datagram from the locked client endpoint
+        // is genuine client use of the association, so it refreshes the idle
+        // timer here — even if the token bucket below then polices it or the send
+        // fails (both are our delivery concerns, not the client's liveness).
+        // Spoofed/unrelated sources, malformed headers, fragments, and
+        // denied/unauthorized destinations were all dropped above without ever
+        // reaching this point.
         activity.mark();
         let payload = &buf[header.payload_offset..n];
         // Police the datagram against the token bucket: drop it when the bucket
