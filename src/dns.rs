@@ -17,9 +17,12 @@ const MAX_DNS_CACHE_ENTRIES: usize = 4096;
 /// observe the same `ErrorKind` the leader saw; they are never cached.
 type SharedLookup = Option<std::result::Result<Vec<SocketAddr>, (io::ErrorKind, String)>>;
 
-/// Resolves a SOCKS target into policy-ordered, policy-allowed socket
-/// addresses. IP literals are still passed through the same policy filter.
-pub async fn resolve_all(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Vec<SocketAddr>> {
+/// Cache-bypassing one-shot resolution, for tests only. Production resolves
+/// through [`DnsResolver`] (cache + request coalescing); keeping this
+/// test-scoped avoids a second public path that could drift from the ordering
+/// and policy `DnsResolver::resolve_all` applies.
+#[cfg(test)]
+async fn resolve_all(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = match dest {
         TargetAddr::Ip(sa) => vec![*sa],
         TargetAddr::Domain(host, port) => lookup_domain(host, *port).await?,
@@ -28,11 +31,6 @@ pub async fn resolve_all(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Ve
     order_addresses(&mut addrs, policy.preference);
     addrs.retain(|addr| address_allowed(addr.ip(), policy));
     Ok(addrs)
-}
-
-/// Returns the first policy-allowed address for UDP-style forwarding.
-pub async fn resolve_one(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Option<SocketAddr>> {
-    Ok(resolve_all(dest, policy).await?.into_iter().next())
 }
 
 /// Shared DNS resolver with an optional in-memory TTL cache for domain
