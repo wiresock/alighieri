@@ -69,6 +69,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   an extra word before `port`, or garbage after the range is now a parse error.
   The documented `ADDR port = RANGE` form still parses (the `=` stays optional,
   e.g. `port 443`, and ranges like `port = 1024 - 2000` are unchanged).
+- A present-but-empty `protocol:` or `command:` selector in a `socks`/`client`
+  rule is now a parse error instead of silently meaning *any*. An empty selector
+  parsed to an empty set, which the matcher treats as a wildcard, so a directive
+  left without a value (e.g. `protocol:` with the intended values dropped, or
+  `protocol: command: connect` where the next keyword swallows `protocol`'s value)
+  broadened the rule rather than restricting it. Each present selector must now
+  carry at least one value; omitting the directive entirely still means "any" for
+  that axis. (`method:` already required a value; this extends the same rule to
+  `protocol:` and `command:`.)
 - The UDP ASSOCIATE idle timeout is no longer refreshed by traffic the relay
   rejects. Activity was marked *before* a datagram was validated, so a spoofed or
   unrelated source datagram, a malformed header, a fragment, or even bytes on the
