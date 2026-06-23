@@ -8,11 +8,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
-- Alighieri now warns at startup and on reload when no-authentication
-  (`socksmethod: none`, the default) is offered on a non-loopback `internal`
-  listener. Combined with permissive `socks`/`client` rules that is an open proxy;
-  the warning points to requiring `socksmethod: username`, tightening the rules,
-  or binding `internal` to loopback. A loopback listener is not flagged.
+- Alighieri now warns at startup and on reload when the no-authentication
+  (`none`) SOCKS method is offered on a non-loopback `internal` listener. `none`
+  is offered by default and whenever `socksmethod` lists it (e.g. `username
+  none`); combined with permissive `socks`/`client` rules that is an open proxy.
+  The warning points to dropping `none` from `socksmethod`, tightening the rules,
+  or binding `internal` to loopback. Loopback listeners (including IPv4-mapped)
+  are not flagged.
 - Concurrent system DNS lookups are now capped (128 per resolver). `getaddrinfo`
   runs on a blocking thread that a timeout cannot cancel, so a DNS outage with
   many unique names could otherwise leave an unbounded number of orphaned blocking

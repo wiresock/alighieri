@@ -254,12 +254,16 @@ impl Config {
         self.log_outputs.contains(&LogOutput::File)
     }
 
-    /// True when no-authentication (`socksmethod: none`, the default) is offered
-    /// on a non-loopback `internal` listener. Combined with permissive
-    /// `socks`/`client` rules that is an open proxy, so the server warns about it
-    /// at startup and on reload.
-    pub fn noauth_on_public_listener(&self) -> bool {
-        self.socks_methods.contains(&AuthKind::None) && !self.internal.ip().is_loopback()
+    /// True when the no-authentication (`none`) SOCKS method is offered on a
+    /// non-loopback `internal` listener. `none` is offered by default, and also
+    /// whenever `socksmethod` lists it (e.g. `username none`). Combined with
+    /// permissive `socks`/`client` rules that is an open proxy, so the server
+    /// warns about it at startup and on reload. An IPv4-mapped loopback address
+    /// (`::ffff:127.0.0.1`) is canonicalised first so it is recognised as
+    /// loopback.
+    pub fn noauth_on_non_loopback_listener(&self) -> bool {
+        self.socks_methods.contains(&AuthKind::None)
+            && !self.internal.ip().to_canonical().is_loopback()
     }
 
     /// Loads and validates configuration from a file on disk.
@@ -2004,20 +2008,26 @@ ratelimit.bytes: 64KiB/30
     }
 
     #[test]
-    fn flags_noauth_on_a_public_listener() {
-        let public_noauth = |cfg: &str| Config::parse(cfg).unwrap().noauth_on_public_listener();
+    fn flags_noauth_on_a_non_loopback_listener() {
+        let flagged = |cfg: &str| {
+            Config::parse(cfg)
+                .unwrap()
+                .noauth_on_non_loopback_listener()
+        };
 
         // No-auth (the default) on a non-loopback listener is flagged.
-        assert!(public_noauth("internal: 0.0.0.0 port = 1080"));
-        assert!(public_noauth("internal: 192.168.1.5 port = 1080"));
-        // A loopback listener is fine with the default no-auth.
-        assert!(!public_noauth("internal: 127.0.0.1 port = 1080"));
-        // Username-only auth on a public listener is not flagged.
-        assert!(!public_noauth(
+        assert!(flagged("internal: 0.0.0.0 port = 1080"));
+        assert!(flagged("internal: 192.168.1.5 port = 1080"));
+        // Loopback listeners — including IPv6 and IPv4-mapped — are not flagged.
+        assert!(!flagged("internal: 127.0.0.1 port = 1080"));
+        assert!(!flagged("internal: ::1 port = 1080"));
+        assert!(!flagged("internal: ::ffff:127.0.0.1 port = 1080"));
+        // Username-only auth on a non-loopback listener is not flagged.
+        assert!(!flagged(
             "internal: 0.0.0.0 port = 1080\nsocksmethod: username\nuserlist: /tmp/users"
         ));
         // Offering 'none' alongside 'username' still flags it: a client can pick none.
-        assert!(public_noauth(
+        assert!(flagged(
             "internal: 0.0.0.0 port = 1080\nsocksmethod: username none\nuserlist: /tmp/users"
         ));
     }
