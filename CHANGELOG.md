@@ -54,6 +54,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The `proxyprotocol` trust gate now canonicalizes the peer address before
+  matching it against the trusted-upstream CIDRs, so a trusted IPv4 upstream that
+  reaches a dual-stack (`::`) listener as an IPv4-mapped address (`::ffff:a.b.c.d`)
+  is recognised instead of being rejected. The raw address was passed to
+  `Cidr::contains`, which treats a mapped address as IPv6 and never matches an
+  IPv4 CIDR — so enabling `proxyprotocol` with IPv4 trust entries on a dual-stack
+  listener dropped every connection from the legitimate upstream. Other rule
+  paths already canonicalize; this brings the trust check in line.
 - The userlist and config-wizard backups now refuse a symlinked *source* path,
   not just a symlinked `.bak` destination. The file being backed up was opened
   with a plain `File::open`, which follows a symlink, so a symlink planted at the
