@@ -23,10 +23,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   connection — so it is refused at parse time instead of silently breaking the
   proxy. (`iotimeout`/`udptimeout` still accept `0` to mean a disabled idle
   timeout.)
-- Scalar configuration settings now reject trailing tokens instead of silently
-  ignoring them. A typo like `dns.tryall: yes maybe`, `maxconnections: 100 oops`,
-  or extra tokens in an `internal:`/`metrics.listen:` address now fails to parse
-  rather than quietly using only the first value.
+- Numeric and boolean settings (e.g. `maxconnections`, `dns.tryall`) and endpoint
+  addresses (`internal:`, `metrics.listen:`) now reject trailing tokens instead
+  of silently ignoring them, so a typo like `dns.tryall: yes maybe` or
+  `internal: 127.0.0.1 port = 10 80` fails to parse rather than quietly using
+  only the first value.
 
 ### Fixed
 
