@@ -991,8 +991,48 @@ mod tests {
         assert!(contacted.contains(&ip(MAX_CONTACTED_REMOTES - 1)));
     }
 
+    // Split into two tests so neither depends on processing order: in the drop
+    // test the client never contacts anything, so the set stays empty and the
+    // reply is unsolicited whenever it is processed (no shared loopback-IP race).
     #[tokio::test]
-    async fn udp_replies_require_a_contacted_remote() {
+    async fn udp_drops_replies_from_uncontacted_remotes() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound_addr = outbound.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        // The client never sends, so the contacted set stays empty: a reply to the
+        // outbound socket is always unsolicited and dropped.
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger
+            .send_to(b"unsolicited", outbound_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "an unsolicited reply must not reach the client"
+        );
+
+        assoc.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_forwards_replies_from_contacted_remotes() {
         let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_socket.local_addr().unwrap();
         let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1013,21 +1053,6 @@ mod tests {
             |_, _, _| true,
         ));
 
-        // Before the client has contacted anything, a reply to `outbound` is
-        // dropped — nothing has been recorded, so it is unsolicited.
-        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        stranger
-            .send_to(b"unsolicited", outbound_addr)
-            .await
-            .unwrap();
-        let mut buf = [0u8; 256];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf))
-                .await
-                .is_err(),
-            "an unsolicited reply must not reach the client"
-        );
-
         // The client contacts `dest`, recording its IP.
         let IpAddr::V4(dest_ip) = dest_addr.ip() else {
             unreachable!()
@@ -1046,6 +1071,7 @@ mod tests {
 
         // A reply from the now-contacted remote is forwarded to the client.
         dest.send_to(b"pong", outbound_addr).await.unwrap();
+        let mut buf = [0u8; 256];
         let (cn, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
             .await
             .expect("a reply from a contacted remote must reach the client")
