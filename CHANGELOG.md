@@ -18,6 +18,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - The userlist is now read and hash-parsed off the runtime worker threads
   (`spawn_blocking`) during startup and reload, so a large userlist on slow
   storage cannot stall a worker.
+- `connecttimeout` and `handshaketimeout` now reject `0`. Zero is not "disabled"
+  for these — it makes `tokio::time::timeout` expire immediately and fail every
+  connection — so it is refused at parse time instead of silently breaking the
+  proxy. (`iotimeout`/`udptimeout` still accept `0` to mean a disabled idle
+  timeout.)
 
 ### Fixed
 
@@ -28,6 +33,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   forwarding. Resolution now fails with a timeout at the deadline (the CONNECT
   path replies host-unreachable; UDP drops the datagram). `dns.timeout: 0` is
   rejected, since it would time out every lookup.
+- The config wizard's backup is now written to a fresh `create_new` temp file and
+  atomically renamed over `<name>.bak`, instead of `std::fs::copy` after removing
+  the old backup. A wizard run in an attacker-writable directory could otherwise
+  have the backup write redirected through a symlink raced onto the backup path
+  (the same hardening already applied to the userlist backup).
 - UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
   socket was bound to `external` (default `0.0.0.0`, IPv4-only), so datagrams to
   an IPv6 target failed to send — and the error was discarded — while the TCP
