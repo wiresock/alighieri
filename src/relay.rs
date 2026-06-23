@@ -553,11 +553,13 @@ where
         // Remember the destination before sending, so a fast reply is already
         // recognised by relay_remote_to_client; replies from any other remote are
         // dropped there as unsolicited injection. Store the canonical IP so an
-        // IPv4 reply on a dual-stack socket (`::ffff:`) still matches.
+        // IPv4 reply on a dual-stack socket (`::ffff:`) still matches; compute it
+        // before locking to keep the critical section minimal.
+        let dest_ip = dest.ip().to_canonical();
         contacted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .record(dest.ip().to_canonical());
+            .record(dest_ip);
         // A fully validated, authorized datagram from the locked client endpoint
         // is genuine client use of the association, so it refreshes the idle
         // timer here — even if the token bucket below then polices it or the send
@@ -622,11 +624,13 @@ async fn relay_remote_to_client(
         // Forward only replies from a remote the client has actually sent to;
         // drop the rest so an off-path host cannot inject unsolicited UDP to the
         // client. Match on the canonical IP (an IPv4 reply on a dual-stack socket
-        // arrives `::ffff:`-mapped). Dropped injections do not refresh idle.
+        // arrives `::ffff:`-mapped), computed before locking to keep the critical
+        // section minimal. Dropped injections do not refresh idle.
+        let remote_ip = remote_src.ip().to_canonical();
         if !contacted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&remote_src.ip().to_canonical())
+            .contains(&remote_ip)
         {
             continue;
         }
