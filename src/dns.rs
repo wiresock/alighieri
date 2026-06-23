@@ -124,12 +124,11 @@ impl DnsResolver {
         // stay bounded (only the singleflight leader reaches here per name, so
         // coalesced callers share one slot). Waiting for a slot happens inside the
         // caller's `tokio::time::timeout`, so it cannot block past the deadline.
-        let permit = self
-            .lookup_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the DNS lookup semaphore is never closed");
+        let Ok(permit) = self.lookup_slots.clone().acquire_owned().await else {
+            // The semaphore is never closed; if it ever were, fail this lookup
+            // gracefully rather than panicking the whole process.
+            return Err(io::Error::other("DNS lookup semaphore closed"));
+        };
         match &self.backend {
             LookupBackend::System => system_lookup(host.to_owned(), port, permit).await,
             #[cfg(test)]
@@ -592,7 +591,7 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn caps_concurrent_system_lookups() {
         // With two slots and five *distinct* names (distinct so the singleflight
         // does not coalesce them into one lookup), at most two may resolve at once.
