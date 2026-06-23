@@ -596,10 +596,18 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.socks_methods = Some(parse_methods(vals, lineno)?);
         }
         "connecttimeout" | "connect.timeout" => {
-            b.connect_timeout = Some(Duration::from_secs(parse_u64(vals, lineno)?));
+            b.connect_timeout = Some(Duration::from_secs(parse_nonzero_secs(
+                vals,
+                lineno,
+                "connecttimeout",
+            )?));
         }
         "handshaketimeout" | "handshake.timeout" => {
-            b.handshake_timeout = Some(Duration::from_secs(parse_u64(vals, lineno)?));
+            b.handshake_timeout = Some(Duration::from_secs(parse_nonzero_secs(
+                vals,
+                lineno,
+                "handshaketimeout",
+            )?));
         }
         "iotimeout" | "io.timeout" => {
             b.io_timeout = Some(Duration::from_secs(parse_u64(vals, lineno)?));
@@ -861,6 +869,22 @@ fn parse_u64(vals: &[String], lineno: usize) -> Result<u64> {
     vals[0]
         .parse()
         .map_err(|_| cfg_err(lineno, &format!("invalid number '{}'", vals[0])))
+}
+
+/// Parses a positive (non-zero) number of seconds. For `connecttimeout` and
+/// `handshaketimeout`, `0` is not "disabled" — it would make `tokio::time::timeout`
+/// expire immediately and fail every connection — so it is rejected.
+fn parse_nonzero_secs(vals: &[String], lineno: usize, name: &str) -> Result<u64> {
+    let secs = parse_u64(vals, lineno)?;
+    if secs == 0 {
+        return Err(cfg_err(
+            lineno,
+            &format!(
+                "{name} must be at least 1 second (0 would fail every connection immediately)"
+            ),
+        ));
+    }
+    Ok(secs)
 }
 
 fn parse_bool(vals: &[String], lineno: usize) -> Result<bool> {
@@ -1799,6 +1823,26 @@ ratelimit.bytes: 64KiB/30
         // The upper bound itself is accepted.
         let cfg = Config::parse("internal: 127.0.0.1:1080\ndns.timeout: 3600").unwrap();
         assert_eq!(cfg.dns.timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn rejects_zero_connect_and_handshake_timeout() {
+        // Zero would make tokio::time::timeout expire immediately and fail every
+        // connection, so it is rejected rather than silently accepted.
+        let err = Config::parse("internal: 127.0.0.1:1080\nconnecttimeout: 0").unwrap_err();
+        assert!(format!("{err}").contains("connecttimeout"), "{err}");
+        let err = Config::parse("internal: 127.0.0.1:1080\nhandshaketimeout: 0").unwrap_err();
+        assert!(format!("{err}").contains("handshaketimeout"), "{err}");
+
+        // Positive values parse, and `iotimeout: 0` (a genuine "disabled" idle
+        // timeout) is still accepted.
+        let cfg = Config::parse(
+            "internal: 127.0.0.1:1080\nconnecttimeout: 5\nhandshaketimeout: 3\niotimeout: 0",
+        )
+        .unwrap();
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.handshake_timeout, Duration::from_secs(3));
+        assert_eq!(cfg.io_timeout, Duration::ZERO);
     }
 
     #[test]

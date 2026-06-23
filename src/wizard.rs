@@ -1021,19 +1021,24 @@ fn write_config_atomically(path: &Path, contents: &[u8]) -> std::io::Result<Writ
 
 fn create_config_backup(path: &Path) -> std::io::Result<PathBuf> {
     let backup = backup_path(path);
+    // Remove any existing `.bak` first (which also clears a read-only attribute
+    // on Windows so the rename below can replace it). The backup is then streamed
+    // into a fresh `create_new` temp file — which cannot follow a pre-placed
+    // symlink — and atomically renamed over the `.bak`: `rename` replaces
+    // whatever is at that path, including a symlink planted in the gap, rather
+    // than writing through it. This mirrors the userlist backup hardening; the
+    // previous `remove` + `std::fs::copy` could be redirected through a symlink.
     remove_stale_backup(&backup)?;
-    std::fs::copy(path, &backup)?;
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&backup)
-    {
-        Ok(file) => file.sync_all()?,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let file = std::fs::OpenOptions::new().read(true).open(&backup)?;
-            let _ = file.sync_all();
-        }
-        Err(e) => return Err(e),
+    let (temp_path, mut file) = create_config_temp(path, true)?;
+    let write = (|| -> std::io::Result<()> {
+        let mut source = std::fs::File::open(path)?;
+        std::io::copy(&mut source, &mut file)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(e) = write.and_then(|()| std::fs::rename(&temp_path, &backup)) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
     }
     Ok(backup)
 }
@@ -2374,6 +2379,31 @@ mod tests {
         let err = create_config_backup(&path).unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_backup_does_not_write_through_a_symlinked_bak() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(&path, "new config").unwrap();
+        let target = dir.path().join("secret");
+        std::fs::write(&target, "secret-contents").unwrap();
+        // A symlink planted at the backup path must not redirect the backup
+        // write; the temp+rename replaces the link rather than following it.
+        symlink(&target, backup_path(&path)).unwrap();
+
+        let backup = create_config_backup(&path).unwrap();
+
+        // The symlink target is untouched, and the `.bak` is a real file.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "secret-contents");
+        assert!(!std::fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "new config");
     }
 
     #[cfg(unix)]
