@@ -84,6 +84,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the platform's pointer width. They were cast with `u64 as usize`, which wraps a
   value above `usize::MAX` on a 32-bit target; the value is now rejected at parse
   time instead.
+- `maxconnections` and `logrotate.keep` are now also bounded at the top.
+  `maxconnections` is passed to `Semaphore::new`, which panics above
+  `Semaphore::MAX_PERMITS`, so an absurd value crashed the server at startup;
+  `logrotate.keep` drives an O(n) rename loop on each rotation, so an absurd value
+  stalled logging. Both are now rejected during configuration validation.
 - DNS resolution is now bounded by a deadline (`dns.timeout`, default 5s). The
   CONNECT path awaited resolution with no timeout (only the *connect* had one),
   and the UDP relay resolved domain targets inside its single client→remote loop,
