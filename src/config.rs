@@ -1256,7 +1256,18 @@ fn parse_addr_spec(vals: &[String], lineno: usize, allow_hosts: bool) -> Result<
     let ports = match rest {
         [] => None,
         [kw, spec @ ..] if kw.eq_ignore_ascii_case("port") => {
-            let spec = join_value_after(spec);
+            // The `=` is optional but, if present, appears exactly once right
+            // after `port`. Strip that single leading `=`; any further `=` is a
+            // stray token and rejected rather than silently dropped. The range
+            // itself may still be split across tokens (`1024 - 2000`).
+            let range_tokens = match spec {
+                [eq, rest @ ..] if eq == "=" => rest,
+                _ => spec,
+            };
+            if range_tokens.iter().any(|tok| tok == "=") {
+                return Err(cfg_err(lineno, "unexpected '=' in port spec"));
+            }
+            let spec = range_tokens.concat();
             if spec.is_empty() {
                 return Err(cfg_err(lineno, "'port' requires a range value"));
             }
@@ -2082,6 +2093,9 @@ socks pass {
         assert!(parse("socks pass { to: 0.0.0.0/0 port = 443 oops }").is_err());
         assert!(parse("socks pass { to: 0.0.0.0/0 oops }").is_err());
         assert!(parse("socks pass { from: 10.0.0.0/8 oops }").is_err());
+        // A stray `=` is a token too: it is not silently filtered out.
+        assert!(parse("socks pass { to: 0.0.0.0/0 port = 443 = }").is_err());
+        assert!(parse("socks pass { to: 0.0.0.0/0 port = = 443 }").is_err());
         // The documented forms still parse (the `=` is optional; ranges allowed).
         assert!(parse("socks pass { to: 0.0.0.0/0 port = 443 }").is_ok());
         assert!(parse("socks pass { to: 0.0.0.0/0 port 443 }").is_ok());
