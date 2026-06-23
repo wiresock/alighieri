@@ -19,11 +19,13 @@ use crate::throttle::TokenBucket;
 /// harmless in the meantime because windows reset on access.
 const PRUNE_EVERY_N_ADMISSIONS: u64 = 64;
 
-/// Hard cap on tracked client states. Without it, a spray from many distinct
+/// Soft cap on tracked client states. Without it, a spray from many distinct
 /// source IPs would grow the map (and the O(n) prune scan that runs under the
-/// global lock) unbounded. At roughly 150 bytes per entry this caps the map near
-/// 10 MB and the prune scan at a bounded size. A new client over the cap evicts
-/// idle entries to make room (see [`evict_idle_clients`]).
+/// global lock) unbounded. A new client at the cap evicts an idle entry to make
+/// room (see [`evict_idle_clients`]). Only *idle* states are evicted, so the map
+/// can still exceed the cap by the number of concurrently active clients — but
+/// that is bounded by `maxconnections`, so the map stays bounded overall (near
+/// 10 MB at ~150 bytes per entry, plus the active set).
 const MAX_TRACKED_CLIENTS: usize = 65_536;
 
 #[derive(Debug)]

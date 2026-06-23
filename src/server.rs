@@ -355,14 +355,21 @@ async fn load_users(config: &Config) -> Result<UserDb> {
         return Ok(UserDb::new());
     };
     // Read and hash-parse the userlist off the runtime threads so a large file on
-    // slow storage cannot stall a worker during startup or reload.
-    tokio::task::spawn_blocking(move || {
+    // slow storage cannot stall a worker during startup or reload. The outer `?`
+    // surfaces a join failure (only on a panic — `spawn_blocking` is never
+    // cancelled) with context; the inner `?` surfaces the load/parse error.
+    let db = tokio::task::spawn_blocking(move || -> Result<UserDb> {
         let db = UserDb::load(&path)?;
         info!(users = db.len(), path = %path.display(), "loaded userlist");
         Ok(db)
     })
     .await
-    .map_err(|e| crate::errors::Error::Io(std::io::Error::other(e)))?
+    .map_err(|e| {
+        crate::errors::Error::Io(std::io::Error::other(format!(
+            "userlist load task failed: {e}"
+        )))
+    })??;
+    Ok(db)
 }
 
 /// Builds the external auth verifier when `auth.command` is configured. The
