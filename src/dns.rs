@@ -149,11 +149,14 @@ impl DnsResolver {
                     // a timeout — to followers. Applying the deadline here (rather
                     // than dropping the whole `resolve_domain` future) keeps the
                     // singleflight intact: a timed-out leader publishes `TimedOut`
-                    // so followers fail fast instead of waking to retry, which
-                    // would each start a fresh OS lookup for the same name. The
-                    // underlying `getaddrinfo` is not cancellable, so its blocking
-                    // thread still runs to completion, but no more than one is
-                    // outstanding per name per timeout window.
+                    // so the followers it coalesced fail fast instead of waking to
+                    // retry, which would each start a fresh OS lookup for the same
+                    // name. The underlying `getaddrinfo` is not cancellable, so its
+                    // blocking thread still runs to completion. This does not cap
+                    // how many lookups for a name are outstanding (a later request,
+                    // after the in-flight entry clears, can start another while an
+                    // orphaned one runs) — it only stops one coalesced batch from
+                    // fanning back out into a lookup per follower.
                     let result = match tokio::time::timeout(
                         timeout,
                         self.backend_lookup(host, port),
