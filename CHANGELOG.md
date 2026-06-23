@@ -77,6 +77,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - The background ACME certificate-renewal task is now aborted when the `Server`
   is dropped, instead of being left running detached. This prevents a leaked
   task when a server is bound and dropped without running to process exit.
+- The ACME certificate cache directory is now created owner-only (mode `0700` on
+  Unix), and a pre-placed symlink (or non-directory) at its path is rejected.
+  `ensure_writable_dir` used `create_dir_all`, which silently follows a symlink,
+  so on a console/custom deployment without the systemd unit's
+  `StateDirectoryMode=0750` an attacker who could write the parent could redirect
+  the ACME account key and issued certificates, and the directory could be
+  group/other-readable. An existing directory is tightened to `0700` best-effort
+  (a cache owned by another user only warns). The write-probe was already
+  symlink-safe (`create_new`).
 - UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
   socket was bound to `external` (default `0.0.0.0`, IPv4-only), so datagrams to
   an IPv6 target failed to send — and the error was discarded — while the TCP
