@@ -2,15 +2,27 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{DnsDenyCategory, DnsPolicy, DnsPreference};
 use crate::socks5::TargetAddr;
 
 const MAX_DNS_CACHE_ENTRIES: usize = 4096;
+
+/// Cap on concurrent system DNS lookups in flight. `getaddrinfo` runs on a
+/// blocking thread that cannot be cancelled, so a timed-out lookup keeps
+/// occupying one until the OS resolver gives up. Bounding the count stops a DNS
+/// outage with many unique names from spawning an unbounded number of orphaned
+/// blocking tasks and starving Tokio's blocking pool (default 512 threads),
+/// which also serves userlist reads and other `spawn_blocking` work. Coalesced
+/// lookups for the same name share one slot (only the singleflight leader
+/// resolves), so this bounds distinct concurrent names; 128 leaves ample pool
+/// headroom for other work even during an outage.
+const MAX_CONCURRENT_SYSTEM_LOOKUPS: usize = 128;
 
 /// The outcome a lookup leader publishes to coalesced followers. Errors are
 /// shared as kind + message because `io::Error` is not `Clone`, so followers
@@ -38,11 +50,24 @@ async fn resolve_all(dest: &TargetAddr, policy: &DnsPolicy) -> io::Result<Vec<So
 /// resolve the same cold name at once, one of them performs the system
 /// lookup and the rest wait for its result instead of stampeding the
 /// blocking resolver pool.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DnsResolver {
     cache: Mutex<HashMap<DnsCacheKey, DnsCacheEntry>>,
     inflight: std::sync::Mutex<HashMap<DnsCacheKey, watch::Receiver<SharedLookup>>>,
     backend: LookupBackend,
+    /// Bounds concurrent system lookups; see [`MAX_CONCURRENT_SYSTEM_LOOKUPS`].
+    lookup_slots: Arc<Semaphore>,
+}
+
+impl Default for DnsResolver {
+    fn default() -> Self {
+        DnsResolver {
+            cache: Mutex::new(HashMap::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
+            backend: LookupBackend::default(),
+            lookup_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_SYSTEM_LOOKUPS)),
+        }
+    }
 }
 
 /// How `lookup_domain` reaches name resolution; tests substitute a custom
@@ -82,17 +107,36 @@ impl DnsResolver {
 
     #[cfg(test)]
     fn with_lookup(lookup: std::sync::Arc<TestLookupFn>) -> Self {
+        Self::with_lookup_and_slots(lookup, MAX_CONCURRENT_SYSTEM_LOOKUPS)
+    }
+
+    #[cfg(test)]
+    fn with_lookup_and_slots(lookup: std::sync::Arc<TestLookupFn>, slots: usize) -> Self {
         DnsResolver {
             backend: LookupBackend::Custom(TestLookup(lookup)),
+            lookup_slots: Arc::new(Semaphore::new(slots)),
             ..DnsResolver::default()
         }
     }
 
     async fn backend_lookup(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        // Take a lookup slot before resolving so concurrent distinct-name lookups
+        // stay bounded (only the singleflight leader reaches here per name, so
+        // coalesced callers share one slot). Waiting for a slot happens inside the
+        // caller's `tokio::time::timeout`, so it cannot block past the deadline.
+        let Ok(permit) = self.lookup_slots.clone().acquire_owned().await else {
+            // The semaphore is never closed; if it ever were, fail this lookup
+            // gracefully rather than panicking the whole process.
+            return Err(io::Error::other("DNS lookup semaphore closed"));
+        };
         match &self.backend {
-            LookupBackend::System => lookup_domain(host, port).await,
+            LookupBackend::System => system_lookup(host.to_owned(), port, permit).await,
             #[cfg(test)]
-            LookupBackend::Custom(lookup) => (lookup.0)(host, port).await,
+            LookupBackend::Custom(lookup) => {
+                // Hold the slot across the mock so tests exercise the same bound.
+                let _permit = permit;
+                (lookup.0)(host, port).await
+            }
         }
     }
 
@@ -352,6 +396,26 @@ fn oldest_cache_key(cache: &HashMap<DnsCacheKey, DnsCacheEntry>) -> Option<DnsCa
         .map(|(key, _)| key.clone())
 }
 
+/// Runs the blocking system resolver (`getaddrinfo`) on the blocking pool,
+/// holding `permit` for the call's full duration. The permit is moved into the
+/// blocking closure rather than held in this future, so a caller that times out
+/// and drops this future does not free the slot early: it stays held until the
+/// real, uncancellable OS lookup on its blocking thread actually returns.
+async fn system_lookup(
+    host: String,
+    port: u16,
+    permit: OwnedSemaphorePermit,
+) -> io::Result<Vec<SocketAddr>> {
+    tokio::task::spawn_blocking(move || -> io::Result<Vec<SocketAddr>> {
+        let _permit = permit;
+        Ok((host.as_str(), port).to_socket_addrs()?.collect())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Cache-bypassing one-shot resolution used only by the test helper above.
+#[cfg(test)]
 async fn lookup_domain(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     tokio::net::lookup_host((host, port))
         .await
@@ -504,6 +568,80 @@ mod tests {
                 }
             })
         })
+    }
+
+    /// A backend that records peak/in-flight concurrency and blocks each lookup
+    /// until `release` is posted, so the lookup-slot bound is observable.
+    fn counting_backend(
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<TestLookupFn> {
+        Arc::new(move |_host, port| {
+            let in_flight = in_flight.clone();
+            let peak = peak.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let _permit = release.acquire().await.expect("semaphore closed");
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![answer(port)])
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caps_concurrent_system_lookups() {
+        // With two slots and five *distinct* names (distinct so the singleflight
+        // does not coalesce them into one lookup), at most two may resolve at once.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver = Arc::new(DnsResolver::with_lookup_and_slots(
+            counting_backend(in_flight.clone(), peak.clone(), release.clone()),
+            2,
+        ));
+
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let resolver = resolver.clone();
+            handles.push(tokio::spawn(async move {
+                let dns_policy = policy(DnsPreference::System, Vec::new());
+                resolver
+                    .resolve_all(
+                        &TargetAddr::Domain(format!("name{i}.example"), 443),
+                        &dns_policy,
+                    )
+                    .await
+            }));
+        }
+        // Drive every task to its await point: two inside the backend, three
+        // parked on the lookup semaphore.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            2,
+            "exactly the slot count should be resolving at once"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "the cap must never be exceeded"
+        );
+
+        // Release the blocked lookups; the parked ones then proceed and finish.
+        release.add_permits(5);
+        for handle in handles {
+            assert_eq!(handle.await.unwrap().unwrap(), vec![answer(443)]);
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "the cap held for the whole run"
+        );
     }
 
     #[tokio::test(start_paused = true)]

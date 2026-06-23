@@ -8,6 +8,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Changed
 
+- Concurrent system DNS lookups are now capped (128 per resolver). `getaddrinfo`
+  runs on a blocking thread that a timeout cannot cancel, so a DNS outage with
+  many unique names could otherwise leave an unbounded number of orphaned blocking
+  lookups running and starve Tokio's blocking pool — which also serves userlist
+  reads and other blocking work. Lookups beyond the cap now wait for a slot
+  (bounded by `dns.timeout`) rather than piling up, and the slot is held until the
+  real OS lookup returns, not freed early when a caller times out. Coalesced
+  lookups for the same name still share one slot, so normal traffic is unaffected.
 - The per-client abuse-control map is now capped. A connection spray from many
   distinct source IPs can no longer grow the map — or the periodic prune scan
   that runs under the accept lock — without bound: a new client at the cap evicts
