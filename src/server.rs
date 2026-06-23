@@ -401,6 +401,12 @@ fn warn_config_footguns(config: &Config) {
     if !config.rules.has_scope(Scope::Socks) {
         warn!("no 'socks' rules defined — all requests will be denied");
     }
+    if config.noauth_on_public_listener() {
+        warn!(
+            listen = %config.internal,
+            "no-authentication ('socksmethod: none') is offered on a non-loopback listener; combined with permissive 'socks'/'client' rules this is an open proxy — require 'socksmethod: username', tighten the rules, or bind 'internal' to loopback"
+        );
+    }
     // Checked here (rather than only at bind) so it also fires on reload, where
     // `proxyprotocol` can be enabled while ACME stays active.
     if matches!(config.tls.as_ref(), Some(crate::config::TlsConfig::Acme(_)))

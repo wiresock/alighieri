@@ -254,6 +254,14 @@ impl Config {
         self.log_outputs.contains(&LogOutput::File)
     }
 
+    /// True when no-authentication (`socksmethod: none`, the default) is offered
+    /// on a non-loopback `internal` listener. Combined with permissive
+    /// `socks`/`client` rules that is an open proxy, so the server warns about it
+    /// at startup and on reload.
+    pub fn noauth_on_public_listener(&self) -> bool {
+        self.socks_methods.contains(&AuthKind::None) && !self.internal.ip().is_loopback()
+    }
+
     /// Loads and validates configuration from a file on disk.
     pub fn load(path: &Path) -> Result<Config> {
         let mut builder = Builder::default();
@@ -1993,6 +2001,25 @@ ratelimit.bytes: 64KiB/30
         .unwrap();
         assert_eq!(cfg.socks_methods, vec![AuthKind::Username, AuthKind::None]);
         assert_eq!(cfg.userlist, Some(PathBuf::from("/tmp/users")));
+    }
+
+    #[test]
+    fn flags_noauth_on_a_public_listener() {
+        let public_noauth = |cfg: &str| Config::parse(cfg).unwrap().noauth_on_public_listener();
+
+        // No-auth (the default) on a non-loopback listener is flagged.
+        assert!(public_noauth("internal: 0.0.0.0 port = 1080"));
+        assert!(public_noauth("internal: 192.168.1.5 port = 1080"));
+        // A loopback listener is fine with the default no-auth.
+        assert!(!public_noauth("internal: 127.0.0.1 port = 1080"));
+        // Username-only auth on a public listener is not flagged.
+        assert!(!public_noauth(
+            "internal: 0.0.0.0 port = 1080\nsocksmethod: username\nuserlist: /tmp/users"
+        ));
+        // Offering 'none' alongside 'username' still flags it: a client can pick none.
+        assert!(public_noauth(
+            "internal: 0.0.0.0 port = 1080\nsocksmethod: username none\nuserlist: /tmp/users"
+        ));
     }
 
     #[test]
