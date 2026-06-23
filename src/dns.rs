@@ -107,8 +107,21 @@ impl DnsResolver {
     ) -> io::Result<Vec<SocketAddr>> {
         let mut addrs = match dest {
             TargetAddr::Ip(sa) => vec![*sa],
+            // Bound resolution by `policy.timeout` so a slow or wedged resolver
+            // cannot pin a CONNECT permit or stall the UDP relay loop. A timed-out
+            // leader's future is dropped here, which deregisters its singleflight
+            // entry and wakes any followers to retry.
             TargetAddr::Domain(host, port) => {
-                self.resolve_domain(host, *port, policy.cache_ttl).await?
+                let resolve = self.resolve_domain(host, *port, policy.cache_ttl);
+                match tokio::time::timeout(policy.timeout, resolve).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "DNS resolution timed out",
+                        ))
+                    }
+                }
             }
         };
         canonicalize_addrs(&mut addrs);
@@ -447,6 +460,7 @@ mod tests {
             try_all: false,
             deny,
             cache_ttl: None,
+            timeout: Duration::from_secs(5),
         }
     }
 
@@ -477,6 +491,26 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolution_times_out_on_a_wedged_resolver() {
+        // A backend that blocks forever (a semaphore that is never released)
+        // stands in for a wedged resolver; resolution must give up at the
+        // policy deadline rather than hang.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let never_released = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver = DnsResolver::with_lookup(parked_backend(calls, never_released, false));
+        let mut policy = policy(DnsPreference::System, Vec::new());
+        policy.timeout = Duration::from_secs(2);
+
+        let result = resolver
+            .resolve_all(&TargetAddr::Domain("wedged.example".into(), 443), &policy)
+            .await;
+        assert!(
+            matches!(&result, Err(e) if e.kind() == io::ErrorKind::TimedOut),
+            "expected a TimedOut error, got {result:?}"
+        );
     }
 
     async fn spawn_resolvers(
