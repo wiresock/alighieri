@@ -1021,14 +1021,13 @@ fn write_config_atomically(path: &Path, contents: &[u8]) -> std::io::Result<Writ
 
 fn create_config_backup(path: &Path) -> std::io::Result<PathBuf> {
     let backup = backup_path(path);
-    // Remove any existing `.bak` first (which also clears a read-only attribute
-    // on Windows so the rename below can replace it). The backup is then streamed
-    // into a fresh `create_new` temp file — which cannot follow a pre-placed
-    // symlink — and atomically renamed over the `.bak`: `rename` replaces
-    // whatever is at that path, including a symlink planted in the gap, rather
-    // than writing through it. This mirrors the userlist backup hardening; the
-    // previous `remove` + `std::fs::copy` could be redirected through a symlink.
-    remove_stale_backup(&backup)?;
+    // Stream the config into a fresh `create_new` temp file — which cannot follow
+    // a symlink — and atomically rename it over `.bak`. `rename` replaces
+    // whatever is at the path (a regular file, or a symlink an attacker planted)
+    // rather than following it, so the backup write is never redirected. The
+    // previous `remove` + `std::fs::copy` could follow a symlink raced onto the
+    // path between the remove and the copy; this mirrors the userlist backup
+    // hardening.
     let (temp_path, mut file) = create_config_temp(path, true)?;
     let write = (|| -> std::io::Result<()> {
         let mut source = std::fs::File::open(path)?;
@@ -1036,46 +1035,42 @@ fn create_config_backup(path: &Path) -> std::io::Result<PathBuf> {
         file.sync_all()
     })();
     drop(file);
-    if let Err(e) = write.and_then(|()| std::fs::rename(&temp_path, &backup)) {
+    if let Err(e) = write.and_then(|()| replace_backup(&temp_path, &backup)) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(e);
     }
     Ok(backup)
 }
 
-fn remove_stale_backup(backup: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(backup) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => retry_remove_read_only(backup, e),
-    }
+// Unix `rename` replaces a regular file, a symlink, or a read-only entry (the
+// directory permission governs, not the file's), so it never follows a symlink
+// at the backup path and needs no read-only handling.
+#[cfg(not(windows))]
+fn replace_backup(temp: &Path, backup: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, backup)
 }
 
-// Windows refuses to delete read-only files (a read-only config propagates the
-// attribute to its backup via fs::copy); the lint's Unix world-writable concern
-// does not apply because the file is removed immediately afterwards.
+// Windows `rename` (MoveFileEx with REPLACE_EXISTING) fails on a read-only
+// destination — a read-only config propagates the attribute to its backup — so
+// clear the attribute on a regular-file backup and retry. A symlink destination
+// is replaced by the rename, not followed.
 #[cfg(windows)]
 #[allow(clippy::permissions_set_readonly_false)]
-fn retry_remove_read_only(backup: &Path, remove_error: std::io::Error) -> std::io::Result<()> {
-    let Ok(metadata) = std::fs::metadata(backup) else {
-        return Err(remove_error);
-    };
-    let mut permissions = metadata.permissions();
-    if !permissions.readonly() {
-        return Err(remove_error);
+fn replace_backup(temp: &Path, backup: &Path) -> std::io::Result<()> {
+    match std::fs::rename(temp, backup) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            if let Ok(metadata) = std::fs::symlink_metadata(backup) {
+                if metadata.file_type().is_file() {
+                    let mut permissions = metadata.permissions();
+                    permissions.set_readonly(false);
+                    let _ = std::fs::set_permissions(backup, permissions);
+                }
+            }
+            std::fs::rename(temp, backup)
+        }
+        Err(e) => Err(e),
     }
-    permissions.set_readonly(false);
-    if std::fs::set_permissions(backup, permissions).is_err() {
-        return Err(remove_error);
-    }
-    std::fs::remove_file(backup)
-}
-
-// Unix unlink ignores file permissions (the directory governs), so a failed
-// removal is not a read-only problem worth retrying.
-#[cfg(not(windows))]
-fn retry_remove_read_only(_backup: &Path, remove_error: std::io::Error) -> std::io::Result<()> {
-    Err(remove_error)
 }
 
 fn create_config_temp(path: &Path, _existed: bool) -> std::io::Result<(PathBuf, std::fs::File)> {
