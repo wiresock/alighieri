@@ -662,7 +662,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             if value > MAX_CONNECTIONS_LIMIT {
                 return Err(cfg_err(
                     lineno,
-                    "maxconnections is too large for the connection limiter",
+                    &format!("maxconnections must be at most {MAX_CONNECTIONS_LIMIT}"),
                 ));
             }
             b.max_connections = Some(value);
