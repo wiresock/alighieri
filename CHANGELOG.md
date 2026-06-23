@@ -31,6 +31,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The UDP ASSOCIATE idle timeout is no longer refreshed by traffic the relay
+  rejects. Activity was marked *before* a datagram was validated, so a spoofed or
+  unrelated source datagram, a malformed header, a fragment, or even bytes on the
+  TCP control channel could keep an association — and its relay socket and port —
+  alive past `udptimeout`. An off-path host that learned the relay port could
+  pin associations open and, with a configured `udp.portrange`, exhaust it. The
+  idle timer is now refreshed only once a datagram is fully validated and
+  authorized (client direction) or matched to a locked client endpoint (remote
+  direction); control-channel data never refreshes it (only its close tears the
+  association down). A validated, authorized datagram still counts as activity
+  even if the token bucket then polices it, since the client is genuinely active.
 - DNS resolution is now bounded by a deadline (`dns.timeout`, default 5s). The
   CONNECT path awaited resolution with no timeout (only the *connect* had one),
   and the UDP relay resolved domain targets inside its single client→remote loop,

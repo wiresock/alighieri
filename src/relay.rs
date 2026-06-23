@@ -368,9 +368,10 @@ where
 
     let result = loop {
         tokio::select! {
-            // The TCP control connection closing tears down the association.
+            // The control connection is only a teardown signal: its closing ends
+            // the association, but data on it (unexpected) must not refresh the
+            // UDP idle timer — only an accepted datagram does.
             res = control.read(&mut ctrl_buf) => {
-                activity.mark();
                 match res {
                     Ok(0) | Err(_) => break Ok(()),
                     Ok(_) => continue, // unexpected data — ignore, keep relaying
@@ -455,7 +456,6 @@ where
     let mut recv_errors = 0u32;
     loop {
         let (n, src) = recv_resilient(&relay_socket, &mut buf, &mut recv_errors).await?;
-        activity.mark();
         if src.ip() != client_ip {
             continue; // reject spoofed / unrelated source
         }
@@ -502,6 +502,14 @@ where
             continue;
         }
         let _ = client_endpoint.set(src);
+        // A fully validated, authorized datagram from the locked client endpoint
+        // is genuine client use of the association, so it refreshes the idle
+        // timer here — even if the token bucket below then polices it or the send
+        // fails (both are our delivery concerns, not the client's liveness).
+        // Spoofed/unrelated sources, malformed headers, fragments, and
+        // denied/unauthorized destinations were all dropped above without ever
+        // reaching this point.
+        activity.mark();
         let payload = &buf[header.payload_offset..n];
         // Police the datagram against the token bucket: drop it when the bucket
         // is short rather than delaying real-time traffic.
@@ -551,10 +559,12 @@ async fn relay_remote_to_client(
             &mut recv_errors,
         )
         .await?;
-        activity.mark();
         let Some(caddr) = client_endpoint.get().copied() else {
-            continue;
+            continue; // no client endpoint locked yet — do not refresh idle
         };
+        // A reply for an established association counts as activity; packets that
+        // arrive before the client's endpoint is locked do not keep it alive.
+        activity.mark();
         let prefix: &mut [u8; socks5::UDP_IP_HEADER_MAX] = (&mut buf[..socks5::UDP_IP_HEADER_MAX])
             .try_into()
             .expect("prefix slice is UDP_IP_HEADER_MAX bytes");
@@ -744,5 +754,147 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn udp_options(client_ip: IpAddr, idle: Duration) -> UdpAssociateOptions {
+        UdpAssociateOptions {
+            client_ip,
+            client_endpoint: None,
+            idle,
+            dns_policy: DnsPolicy {
+                preference: crate::config::DnsPreference::System,
+                try_all: false,
+                deny: Vec::new(),
+                cache_ttl: None,
+                timeout: Duration::from_secs(5),
+            },
+            dns_resolver: Arc::new(DnsResolver::new()),
+            metrics: Metrics::new(),
+            throttle: None,
+            outbound_dual: false,
+        }
+    }
+
+    // The three tests below drive the real recv/validate/mark path through real
+    // UDP sockets, so they use wall-clock time rather than a paused clock: real
+    // datagram readiness comes from the OS I/O driver, which does not advance with
+    // `tokio::time`, so there is no race-free way to interleave a delivered
+    // datagram with `tokio::time::advance`. Margins are wide (sends every 100ms vs
+    // a 500ms idle), and the two negative tests are robust to load besides — a
+    // delayed junk spray can only make the association idle out sooner, never keep
+    // it alive.
+
+    // A stream of wrong-source datagrams must not keep a UDP association alive:
+    // `activity.mark()` now runs only after the source/endpoint/header checks, so
+    // spoofed or unrelated datagrams are dropped without refreshing the timer.
+    #[tokio::test]
+    async fn spoofed_source_datagrams_do_not_refresh_udp_idle() {
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // The association expects a client at 10.0.0.1, so the loopback datagrams
+        // sprayed below are all wrong-source and must be ignored.
+        let options = udp_options(IpAddr::from([10, 0, 0, 1]), Duration::from_millis(500));
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let spray = tokio::spawn(async move {
+            for _ in 0..40 {
+                let _ = sender.send_to(b"junk", relay_addr).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        // The spray runs for ~4s, but the association must idle out at its 500ms
+        // deadline regardless — so it finishes well within 2s.
+        let result = tokio::time::timeout(Duration::from_secs(2), assoc)
+            .await
+            .expect("association should idle out despite spoofed traffic");
+        assert!(result.unwrap().is_ok());
+        spray.abort();
+    }
+
+    // Bytes on the TCP control channel must not refresh the UDP idle timer; only
+    // its *closing* tears the association down.
+    #[tokio::test]
+    async fn control_channel_data_does_not_refresh_udp_idle() {
+        let (control, mut control_peer) = tokio::io::duplex(1024);
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let options = udp_options(IpAddr::from([127, 0, 0, 1]), Duration::from_millis(500));
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        let junk = tokio::spawn(async move {
+            for _ in 0..40 {
+                if control_peer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), assoc)
+            .await
+            .expect("association should idle out despite control-channel data");
+        assert!(result.unwrap().is_ok());
+        junk.abort();
+    }
+
+    // Validated datagrams from the locked client endpoint DO keep the association
+    // alive — the regression guard that the mark still fires for real traffic.
+    #[tokio::test]
+    async fn validated_datagrams_keep_udp_association_alive() {
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let options = udp_options(IpAddr::from([127, 0, 0, 1]), Duration::from_millis(500));
+        let mut assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,
+        ));
+
+        // A well-formed SOCKS UDP datagram to an allowed IPv4 destination:
+        // RSV(2) FRAG(1) ATYP=IPv4(1) DST.ADDR(4) DST.PORT(2) DATA.
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut datagram = vec![0u8, 0, 0, 1];
+        datagram.extend_from_slice(&[127, 0, 0, 1]);
+        datagram.extend_from_slice(&9u16.to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        let keepalive = tokio::spawn(async move {
+            for _ in 0..20 {
+                let _ = sender.send_to(&datagram, relay_addr).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+
+        // Datagrams every 100ms are well inside the 500ms idle window, so the
+        // association must still be running after 1.5s (3x the idle timeout).
+        let still_running = tokio::time::timeout(Duration::from_millis(1500), &mut assoc).await;
+        assert!(
+            still_running.is_err(),
+            "validated traffic must keep the association alive"
+        );
+        keepalive.abort();
+        assoc.abort();
     }
 }
