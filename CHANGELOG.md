@@ -80,6 +80,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   direction); control-channel data never refreshes it (only its close tears the
   association down). A validated, authorized datagram still counts as activity
   even if the token bucket then polices it, since the client is genuinely active.
+- UDP ASSOCIATE replies are now accepted only from a remote the client has
+  actually sent to. The relay forwarded any datagram arriving on the outbound
+  socket once the client endpoint was locked, so an off-path host that learned
+  the socket's port could inject unsolicited UDP to the client. Each association
+  now records the destination IPs the client sends to (bounded, with the
+  least-recently-recorded evicted at the cap) and drops a reply whose source IP
+  is not among them. Matching is on the canonical IP (port-agnostic), so a server
+  that answers from a different port still works.
 - `maxconnections` and `logrotate.keep` no longer truncate a value too large for
   the platform's pointer width. They were cast with `u64 as usize`, which wraps a
   value above `usize::MAX` on a 32-bit target; the value is now rejected at parse
