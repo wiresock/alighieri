@@ -23,6 +23,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   connection — so it is refused at parse time instead of silently breaking the
   proxy. (`iotimeout`/`udptimeout` still accept `0` to mean a disabled idle
   timeout.)
+- Numeric and boolean settings (e.g. `maxconnections`, `dns.tryall`) and endpoint
+  addresses (`internal:`, `metrics.listen:`) now reject trailing tokens instead
+  of silently ignoring them, so a typo like `dns.tryall: yes maybe` or
+  `internal: 127.0.0.1 port = 10 80` fails to parse rather than quietly using
+  only the first value.
 
 ### Fixed
 
@@ -38,6 +43,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the old backup. A wizard run in an attacker-writable directory could otherwise
   have the backup write redirected through a symlink raced onto the backup path
   (the same hardening already applied to the userlist backup).
+- The background ACME certificate-renewal task is now aborted when the `Server`
+  is dropped, instead of being left running detached. This prevents a leaked
+  task when a server is bound and dropped without running to process exit.
 - UDP ASSOCIATE no longer silently drops IPv6 destinations. The single outbound
   socket was bound to `external` (default `0.0.0.0`, IPv4-only), so datagrams to
   an IPv6 target failed to send — and the error was discarded — while the TCP

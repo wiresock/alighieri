@@ -761,6 +761,22 @@ fn parse_endpoint(vals: &[String], lineno: usize) -> Result<SocketAddr> {
         return Err(cfg_err(lineno, "expected an address"));
     }
     if let Some(pos) = vals.iter().position(|v| v.eq_ignore_ascii_case("port")) {
+        // The only valid form is `IP port = N`, so `port` must follow the IP
+        // directly; anything between them is a typo to reject rather than ignore.
+        if pos != 1 {
+            return Err(cfg_err(
+                lineno,
+                "expected 'IP port = N' (unexpected tokens before 'port')",
+            ));
+        }
+        // The keyword form is exactly `port = N` (the documented spelling), so
+        // the tokens after `port` must be `=` then the port. This rejects a
+        // missing value (`port =`), a `=`-less `port N`, and split/trailing
+        // tokens (`port = 10 80`) that whitespace tokenization would otherwise
+        // join into a single port string.
+        if !matches!(&vals[pos + 1..], [eq, _] if eq == "=") {
+            return Err(cfg_err(lineno, "expected 'IP port = N'"));
+        }
         let ip: IpAddr = vals[0]
             .parse()
             .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{}'", vals[0])))?;
@@ -770,10 +786,12 @@ fn parse_endpoint(vals: &[String], lineno: usize) -> Result<SocketAddr> {
             .map_err(|_| cfg_err(lineno, &format!("invalid port '{port_str}'")))?;
         Ok(SocketAddr::new(ip, port))
     } else {
-        vals[0].parse::<SocketAddr>().map_err(|_| {
+        // A bare `IP:PORT` is a single token; reject trailing tokens.
+        let val = expect_single(vals, lineno, "'IP:PORT' or 'IP port = N' address")?;
+        val.parse::<SocketAddr>().map_err(|_| {
             cfg_err(
                 lineno,
-                &format!("expected 'IP port = N' or 'IP:PORT', got '{}'", vals[0]),
+                &format!("expected 'IP port = N' or 'IP:PORT', got '{val}'"),
             )
         })
     }
@@ -862,13 +880,24 @@ fn parse_ip(vals: &[String], lineno: usize) -> Result<IpAddr> {
         .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{}'", vals[0])))
 }
 
-fn parse_u64(vals: &[String], lineno: usize) -> Result<u64> {
-    if vals.is_empty() {
-        return Err(cfg_err(lineno, "expected a number"));
+/// Returns the single value of a scalar setting, rejecting trailing tokens that
+/// would otherwise be silently ignored (e.g. `dns.tryall: yes maybe` or
+/// `connecttimeout: 5 oops`).
+fn expect_single<'a>(vals: &'a [String], lineno: usize, what: &str) -> Result<&'a String> {
+    match vals {
+        [single] => Ok(single),
+        [] => Err(cfg_err(lineno, &format!("expected a {what}"))),
+        _ => Err(cfg_err(
+            lineno,
+            &format!("expected a single {what}, got {} values", vals.len()),
+        )),
     }
-    vals[0]
-        .parse()
-        .map_err(|_| cfg_err(lineno, &format!("invalid number '{}'", vals[0])))
+}
+
+fn parse_u64(vals: &[String], lineno: usize) -> Result<u64> {
+    let val = expect_single(vals, lineno, "number")?;
+    val.parse()
+        .map_err(|_| cfg_err(lineno, &format!("invalid number '{val}'")))
 }
 
 /// Parses a positive (non-zero) number of seconds. For `connecttimeout` and
@@ -888,10 +917,8 @@ fn parse_nonzero_secs(vals: &[String], lineno: usize, name: &str) -> Result<u64>
 }
 
 fn parse_bool(vals: &[String], lineno: usize) -> Result<bool> {
-    if vals.is_empty() {
-        return Err(cfg_err(lineno, "expected a boolean"));
-    }
-    match vals[0].to_ascii_lowercase().as_str() {
+    let val = expect_single(vals, lineno, "boolean")?;
+    match val.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Ok(true),
         "false" | "no" | "off" | "0" => Ok(false),
         other => Err(cfg_err(
@@ -1843,6 +1870,30 @@ ratelimit.bytes: 64KiB/30
         assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
         assert_eq!(cfg.handshake_timeout, Duration::from_secs(3));
         assert_eq!(cfg.io_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn rejects_trailing_tokens_on_scalar_settings() {
+        // A trailing token on a scalar setting is a typo, not silently ignored.
+        assert!(Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 100 oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\ndns.tryall: yes maybe").is_err());
+        // Endpoint: tokens before `port`, or after a bare `IP:PORT`.
+        assert!(Config::parse("internal: 127.0.0.1 oops port = 1080").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080 oops").is_err());
+        // Endpoint: split or trailing tokens after `port` must not be joined into
+        // a single port (e.g. `port = 10 80` -> 1080); a lone `port =` (no value)
+        // is rejected directly rather than as an empty port string.
+        assert!(Config::parse("internal: 127.0.0.1 port = 10 80").is_err());
+        assert!(Config::parse("internal: 127.0.0.1 port = 1080 =").is_err());
+        assert!(Config::parse("internal: 127.0.0.1 port =").is_err());
+        // The keyword form is exactly `port = N`; a `=`-less `port N` is rejected.
+        assert!(Config::parse("internal: 127.0.0.1 port 1080").is_err());
+        // The documented `IP port = N` and bare `IP:PORT` forms still parse.
+        assert!(Config::parse("internal: 127.0.0.1 port = 1080").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080").is_ok());
+        assert!(
+            Config::parse("internal: 127.0.0.1:1080\nmaxconnections: 100\ndns.tryall: yes").is_ok()
+        );
     }
 
     #[test]
