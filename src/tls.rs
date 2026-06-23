@@ -191,7 +191,16 @@ fn ensure_writable_dir(dir: &Path) -> Result<()> {
                 dir.display()
             )));
         }
-        _ => {} // does not exist yet, or is a real directory
+        Ok(_) => {}                                              // a real directory: fine
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // create it below
+        // Surface an unexpected inspection failure (e.g. permission denied)
+        // directly, rather than masking it as a later "create failed".
+        Err(e) => {
+            return Err(Error::Config(format!(
+                "cannot inspect ACME cache directory {}: {e}",
+                dir.display()
+            )));
+        }
     }
     create_private_dir(dir).map_err(|e| {
         Error::Config(format!(
@@ -527,7 +536,9 @@ TJmcpHqqAD9nQAqB4GvHPA==
     #[test]
     fn create_private_dir_does_not_chmod_through_a_symlink() {
         // A symlink raced onto the cache path after the earlier check must not let
-        // the chmod follow it to the target: O_NOFOLLOW fails the open instead.
+        // the chmod follow it to the target. `DirBuilder` no-ops (the link's target
+        // dir already exists, so the recursive create returns Ok), then the
+        // `O_NOFOLLOW` open refuses the symlink — so the target is never chmod'd.
         use std::os::unix::fs::{symlink, PermissionsExt};
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target");
