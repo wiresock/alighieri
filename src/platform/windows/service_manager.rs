@@ -218,6 +218,11 @@ fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
 fn validate_config(config_path: &Path) -> ServiceCliResult<()> {
     Config::load(config_path)
         .and_then(|config| {
+            // Mirror the checks `Server::bind` runs at startup (same order as the
+            // `check` command) so `service install`/`start`/`reload` reject a
+            // config that would otherwise fail the moment the service binds —
+            // e.g. an unauthenticated public metrics endpoint.
+            config.validate_startup()?;
             tls::validate_config(&config)?;
             Ok(())
         })
@@ -498,6 +503,26 @@ mod tests {
             parse_service_command(vec!["status".into()]).unwrap(),
             ServiceCommand::Status
         );
+    }
+
+    #[test]
+    fn validate_config_rejects_public_metrics_without_allowpublic() {
+        // The service validation path must enforce the same startup checks as
+        // `Server::bind`, so installing/starting a config that binds public
+        // metrics without `metrics.allowpublic` fails up front rather than only
+        // when the service later tries to bind.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &path,
+            "internal: 127.0.0.1 port = 1080\nmetrics.listen: 0.0.0.0:9090\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+
+        let Err(err) = validate_config(&path) else {
+            panic!("service validation should refuse public metrics without metrics.allowpublic");
+        };
+        assert!(err.to_string().contains("metrics.allowpublic"), "{err}");
     }
 
     #[test]

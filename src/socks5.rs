@@ -447,6 +447,11 @@ pub fn parse_udp_header(buf: &[u8]) -> Result<UdpHeader> {
             }
             let len = buf[pos] as usize;
             pos += 1;
+            if len == 0 {
+                // Reject zero-length domains to match the TCP request parser
+                // (`read_target_addr`); an empty host is invalid protocol input.
+                return Err(Error::Protocol("UDP empty domain name".into()));
+            }
             if buf.len() < pos + len + 2 {
                 return Err(Error::Protocol("UDP header truncated (domain)".into()));
             }
@@ -731,6 +736,16 @@ mod tests {
     #[test]
     fn udp_header_rejects_nonzero_reserved_bytes() {
         let datagram = [0x00, 0x01, 0x00, ATYP_V4, 1, 2, 3, 4, 0x00, 0x35];
+        assert!(parse_udp_header(&datagram).is_err());
+    }
+
+    #[test]
+    fn udp_header_rejects_empty_domain() {
+        // A zero-length ATYP_DOMAIN host (len byte 0x00) is otherwise
+        // well-formed here, so this exercises the empty-name check rather than
+        // the truncation guard — matching how the TCP parser rejects it.
+        let mut datagram = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, 0x00];
+        datagram.extend_from_slice(&53u16.to_be_bytes());
         assert!(parse_udp_header(&datagram).is_err());
     }
 }

@@ -102,6 +102,23 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `metrics.allowpublic` no longer drifts on reload. The flag is restart-only, but
+  reload neither preserved its startup value nor warned when it changed, so
+  reloading a config that flipped it left `state.config` claiming a different
+  exposure than the still-bound listener — and an operator who set
+  `metrics.allowpublic: false` and reloaded got no hint that the public endpoint
+  stays up until restart. Reload now preserves the startup value (like
+  `metrics.listen`) and warns that a change requires a restart.
+- The Windows service manager now runs the same startup validation as
+  `Server::bind` and `alighieri check`. `service install`/`start`/`reload`
+  previously validated only TLS, so they accepted a config that the service would
+  reject the instant it tried to bind (for example public metrics without
+  `metrics.allowpublic`); the validation now also calls `validate_startup`, so the
+  failure is reported up front.
+- UDP request headers now reject a zero-length domain name, matching the TCP
+  request parser. `parse_udp_header` accepted `ATYP=DOMAIN` with length 0 and
+  produced an empty host that only failed later at DNS resolution; the two parsers
+  now treat an empty host as the invalid protocol input it is.
 - `config metadata --json` now lists every configuration setting. The table had
   drifted from the parser and omitted `proxyprotocol`, `udp.portrange`,
   `udp.strictreply`, `shutdown.draintimeout`, `dns.timeout`, `auth.command`,
