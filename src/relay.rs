@@ -428,6 +428,12 @@ const MAX_CONTACTED_REMOTES: usize = 256;
 /// that answers from a different port (e.g. TFTP). Bounded (the
 /// least-recently-recorded entry is evicted at the cap) so it cannot grow
 /// without limit.
+///
+/// Keys are rebuilt from the canonical IP and port via `SocketAddr::new`, which
+/// deliberately drops IPv6 `scope_id`/`flowinfo`: a reply's `recvfrom` zone can
+/// differ from the zone-less address in the SOCKS request, so folding it into
+/// the key would drop legitimate replies for no security gain (the prior
+/// `IpAddr`-only match excluded it too).
 struct ContactedRemotes {
     seen: HashMap<SocketAddr, u64>,
     ticks: u64,
