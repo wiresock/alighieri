@@ -68,6 +68,9 @@ impl Server {
     /// Emits warnings for configurations that would silently deny all traffic,
     /// since deny-by-default can otherwise be surprising.
     pub async fn bind(config: Config) -> Result<Server> {
+        // Reject startup-only footguns (e.g. an unauthenticated metrics endpoint
+        // exposed off loopback) before binding anything.
+        config.validate_startup()?;
         let users = load_users(&config).await?;
         warn_config_footguns(&config);
         // Build the acceptor and (for ACME) the renewal driver up front so config
@@ -82,7 +85,9 @@ impl Server {
                 // A non-loopback bind is only reachable here because the config
                 // set `metrics.allowpublic` (it is refused otherwise), so this is
                 // a reminder the operator opted into an unauthenticated endpoint.
-                if listen.ip().is_unspecified() || !listen.ip().is_loopback() {
+                // Canonicalize so an IPv4-mapped loopback matches `validate_startup`.
+                let canonical = listen.ip().to_canonical();
+                if canonical.is_unspecified() || !canonical.is_loopback() {
                     warn!(
                         listen = %listen,
                         "metrics endpoint is exposed off loopback (metrics.allowpublic is set) and is unauthenticated; protect it with network access controls"
@@ -651,6 +656,20 @@ mod tests {
         let addr = server.local_addr().unwrap();
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_public_metrics_without_allowpublic() {
+        // `bind` runs the startup validation, so an unauthenticated metrics
+        // endpoint on a non-loopback address is refused before anything binds.
+        let cfg = Config::parse(
+            "internal: 127.0.0.1 port = 0\nmetrics.listen: 0.0.0.0:0\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+        let Err(err) = Server::bind(cfg).await else {
+            panic!("bind should refuse a public metrics endpoint without metrics.allowpublic");
+        };
+        assert!(err.to_string().contains("metrics.allowpublic"), "{err}");
     }
 
     #[tokio::test]

@@ -246,8 +246,9 @@ pub struct Config {
     pub dns: DnsPolicy,
     /// Optional local metrics endpoint listen address.
     pub metrics_listen: Option<SocketAddr>,
-    /// Whether a non-loopback `metrics.listen` is allowed. The metrics endpoint
-    /// is unauthenticated, so binding it off loopback is refused unless this is
+    /// Whether a `metrics.listen` that is not loopback — including an unspecified
+    /// address such as `0.0.0.0`/`[::]` — is allowed. The metrics endpoint is
+    /// unauthenticated, so binding it off loopback is refused unless this is
     /// explicitly set (`metrics.allowpublic: true`).
     pub metrics_allow_public: bool,
     /// Optional TLS wrapper for the client listener.
@@ -273,6 +274,27 @@ impl Config {
     pub fn noauth_on_non_loopback_listener(&self) -> bool {
         self.socks_methods.contains(&AuthKind::None)
             && !self.internal.ip().to_canonical().is_loopback()
+    }
+
+    /// Validates settings that only take effect when the process starts (so this
+    /// is run at startup and by `config check`, but not on reload, where these
+    /// settings are not applied anyway).
+    ///
+    /// The metrics endpoint is unauthenticated and exposes operational counters
+    /// and rule labels, so a non-loopback (or unspecified) `metrics.listen` is
+    /// refused unless the operator explicitly opts in with `metrics.allowpublic`.
+    /// An IPv4-mapped loopback address is canonicalised first.
+    pub fn validate_startup(&self) -> Result<()> {
+        if let Some(addr) = self.metrics_listen {
+            let ip = addr.ip().to_canonical();
+            if (ip.is_unspecified() || !ip.is_loopback()) && !self.metrics_allow_public {
+                return Err(Error::Config(format!(
+                    "metrics.listen {addr} is not loopback; the metrics endpoint is unauthenticated, \
+                     so set 'metrics.allowpublic: true' to expose it or bind it to 127.0.0.1/[::1]"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Loads and validates configuration from a file on disk.
@@ -483,22 +505,6 @@ impl Builder {
             return Err(Error::Config(
                 "socksmethod 'username' requires a 'userlist' or 'auth.command' setting".into(),
             ));
-        }
-
-        // The metrics endpoint is unauthenticated and exposes operational
-        // counters and rule labels, so a non-loopback bind is refused unless the
-        // operator explicitly opts in. `to_canonical` so an IPv4-mapped loopback
-        // still counts as loopback.
-        if let Some(addr) = self.metrics_listen {
-            let ip = addr.ip().to_canonical();
-            if (ip.is_unspecified() || !ip.is_loopback())
-                && !self.metrics_allow_public.unwrap_or(false)
-            {
-                return Err(Error::Config(format!(
-                    "metrics.listen {addr} is not loopback; the metrics endpoint is unauthenticated, \
-                     so set 'metrics.allowpublic: true' to expose it or bind it to 127.0.0.1/[::1]"
-                )));
-            }
         }
 
         let mut log_outputs = self.log_outputs.unwrap_or_else(|| vec![LogOutput::Stdout]);
@@ -2105,26 +2111,35 @@ ratelimit.bytes: 64KiB/30
     fn metrics_public_bind_requires_allowpublic() {
         let head = "internal: 127.0.0.1 port = 1080\n";
 
-        // Loopback is always allowed, and defaults to not-public.
-        let cfg = Config::parse(&format!("{head}metrics.listen: 127.0.0.1:9090")).unwrap();
-        assert!(!cfg.metrics_allow_public);
+        // The rule is a startup-only validation, not a parse error (so a reload
+        // that touches the non-reloadable metrics settings does not fail).
+        // Loopback — including IPv4-mapped — is always allowed.
+        for addr in ["127.0.0.1:9090", "[::1]:9090", "[::ffff:127.0.0.1]:9090"] {
+            let cfg = Config::parse(&format!("{head}metrics.listen: {addr}")).unwrap();
+            assert!(!cfg.metrics_allow_public);
+            cfg.validate_startup()
+                .unwrap_or_else(|e| panic!("{addr} should be allowed: {e}"));
+        }
 
-        // A non-loopback (or unspecified) bind is refused without the opt-in.
+        // A non-loopback or unspecified bind parses but is refused at startup
+        // without the opt-in.
         for addr in ["0.0.0.0:9090", "192.168.1.5:9090", "[::]:9090"] {
-            let err = Config::parse(&format!("{head}metrics.listen: {addr}")).unwrap_err();
+            let cfg = Config::parse(&format!("{head}metrics.listen: {addr}")).unwrap();
+            let err = cfg.validate_startup().unwrap_err();
             assert!(
                 err.to_string().contains("metrics.allowpublic"),
                 "{addr}: {err}"
             );
         }
 
-        // With the explicit opt-in it is accepted.
+        // With the explicit opt-in it passes startup validation.
         let cfg = Config::parse(&format!(
             "{head}metrics.listen: 0.0.0.0:9090\nmetrics.allowpublic: true"
         ))
         .unwrap();
         assert!(cfg.metrics_allow_public);
         assert_eq!(cfg.metrics_listen, Some("0.0.0.0:9090".parse().unwrap()));
+        cfg.validate_startup().unwrap();
 
         // The concatenated alias parses too (set to the non-default value).
         let cfg = Config::parse(&format!(
