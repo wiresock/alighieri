@@ -59,6 +59,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   client that did not reconnect kept its old rate until it did. Enabling or
   disabling `byterate` continues to take effect per connection: an in-flight flow
   keeps the bucket (or lack of one) it was admitted with.
+- The `Dockerfile` now pins its base images — the `rust:1.88-bookworm` builder and
+  the distroless `cc-debian12:nonroot` runtime — by digest rather than by mutable
+  tag, so a release rebuild resolves the exact same layers and a moved tag cannot
+  swap the base image under a build. A new Dependabot `docker` ecosystem bumps the
+  digests (and tags) as the upstreams publish updates.
 
 ### Fixed
 

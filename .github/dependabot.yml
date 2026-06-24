@@ -36,3 +36,11 @@ updates:
       # is pinned to a commit SHA (with a `# stable`/`# 1.88.0` comment); this
       # entry opts the action out of Dependabot, so bump those SHAs manually.
       - dependency-name: "dtolnay/rust-toolchain"
+
+  # Base images in the Dockerfile. They are pinned by digest (`image:tag@sha256`)
+  # so the mutable tag cannot drift; Dependabot bumps the digest (and tag) here.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
