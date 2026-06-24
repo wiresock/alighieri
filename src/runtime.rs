@@ -78,15 +78,36 @@ where
             event = reloads.recv(), if !reloads_closed => {
                 match event {
                     Some(()) => {
-                        match Config::load(&config_path) {
-                            Ok(config) => {
-                                if let Err(e) = server.reload(config).await {
+                        // Apply the reload as a future raced against shutdown, so a
+                        // stop signal is never delayed behind slow config/userlist
+                        // I/O or a wedged filesystem. `Config::load` is synchronous,
+                        // so run it on a blocking thread rather than on this task;
+                        // `server.reload` already does its own blocking reads. With
+                        // `biased`, shutdown wins over an in-progress reload.
+                        let reload = async {
+                            let path = config_path.clone();
+                            match tokio::task::spawn_blocking(move || Config::load(&path)).await {
+                                Ok(Ok(config)) => {
+                                    if let Err(e) = server.reload(config).await {
+                                        error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
+                                    }
+                                }
+                                Ok(Err(e)) => {
                                     error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
                                 }
+                                Err(e) => {
+                                    error!(error = %e, "configuration reload task failed; keeping active configuration");
+                                }
                             }
-                            Err(e) => {
-                                error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown => {
+                                info!("shutdown signal received; draining in-flight connections");
+                                server.begin_shutdown();
+                                return server_join_result((&mut run_task).await);
                             }
+                            () = reload => {}
                         }
                     }
                     None => reloads_closed = true,
@@ -831,6 +852,143 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_loop_applies_valid_reload_then_shuts_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &config_path,
+            "internal: 127.0.0.1 port = 0\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n",
+        )
+        .unwrap();
+        let server = Server::bind(Config::load(&config_path).unwrap())
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn({
+            let config_path = config_path.clone();
+            async move {
+                run_bound_server_reloading_until_shutdown(
+                    server,
+                    config_path,
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    reload_rx,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // A valid reload exercises the success branch of the reload arm; the loop
+        // must keep running.
+        std::fs::write(
+            &config_path,
+            "internal: 127.0.0.1 port = 0\nhandshaketimeout: 9\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n",
+        )
+        .unwrap();
+        reload_tx.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!run.is_finished(), "loop exited after a valid reload");
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .expect("driver did not stop after shutdown")
+            .expect("driver task panicked")
+            .expect("driver returned an error");
+    }
+
+    // A reload reads the config (and userlist) with blocking I/O. A wedged read
+    // must not delay a stop: the config read is raced against shutdown, with
+    // shutdown taking priority. Uses a reader-blocking FIFO as the config path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_is_not_delayed_by_a_wedged_reload() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &config_path,
+            "internal: 127.0.0.1 port = 0\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n",
+        )
+        .unwrap();
+        let server = Server::bind(Config::load(&config_path).unwrap())
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn({
+            let config_path = config_path.clone();
+            async move {
+                run_bound_server_reloading_until_shutdown(
+                    server,
+                    config_path,
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                    reload_rx,
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Replace the config with a FIFO that has no writer, so the reload's
+        // config read blocks at open, then trigger the reload.
+        std::fs::remove_file(&config_path).unwrap();
+        let c_path = std::ffi::CString::new(config_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        reload_tx.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Shutdown must still return promptly despite the wedged reload.
+        let _ = shutdown_tx.send(());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+
+        // Unblock the wedged read by opening a writer so the detached blocking
+        // task can finish and not hang runtime teardown. `O_NONBLOCK` keeps this
+        // from blocking if (by some timing) no reader is waiting. Done regardless
+        // of the assertion below so a failure does not leave a stuck thread.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&config_path);
+
+        result
+            .expect("shutdown was delayed behind the wedged reload")
+            .expect("driver task panicked")
+            .expect("driver returned an error");
     }
 
     #[test]
