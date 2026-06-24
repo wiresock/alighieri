@@ -381,15 +381,46 @@ async fn handle_metrics_connection(mut stream: TcpStream, metrics: Arc<Metrics>)
         return Ok(());
     };
     with_request_timeout(read_request_headers(&mut stream), "metrics request headers").await?;
-    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("/");
+
+    // A metrics scrape is a read; only GET (and HEAD) are meaningful. Reject any
+    // other method with 405 and the `Allow` header RFC 7231 requires, so the
+    // endpoint cannot be driven with write-style verbs.
+    if method != "GET" && method != "HEAD" {
+        write_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "method not allowed\n",
+            "allow: GET, HEAD\r\n",
+            true,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // HEAD carries no message body on any status, so decide this before
+    // branching on the path — otherwise a `HEAD /invalid` would return a 404
+    // with a body, which RFC 7231 forbids.
+    let include_body = method == "GET";
 
     if path != "/metrics" {
-        write_response(&mut stream, 404, "Not Found", "not found\n").await?;
+        write_response(
+            &mut stream,
+            404,
+            "Not Found",
+            "not found\n",
+            "",
+            include_body,
+        )
+        .await?;
         return Ok(());
     }
 
     let body = metrics.render_prometheus();
-    write_response(&mut stream, 200, "OK", &body).await
+    write_response(&mut stream, 200, "OK", &body, "", include_body).await
 }
 
 async fn with_request_timeout<T>(
@@ -450,11 +481,25 @@ async fn write_response(
     status: u16,
     reason: &str,
     body: &str,
+    extra_headers: &str,
+    include_body: bool,
 ) -> io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    // `content-length` always advertises the body length — a HEAD reports the
+    // size a GET would return without sending the bytes. `extra_headers`, when
+    // non-empty, must be CRLF-terminated header lines placed before the blank
+    // line (e.g. `allow: GET, HEAD\r\n`); otherwise the following `connection`
+    // header would be folded onto the same line and the response malformed.
+    debug_assert!(
+        extra_headers.is_empty() || extra_headers.ends_with("\r\n"),
+        "extra_headers must be empty or CRLF-terminated, got: {extra_headers:?}"
+    );
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n",
         body.len()
     );
+    if include_body {
+        response.push_str(body);
+    }
     stream.write_all(response.as_bytes()).await
 }
 
@@ -622,6 +667,80 @@ mod tests {
         task.abort();
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_non_get_method() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_metrics(listener, Metrics::new()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /metrics HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        task.abort();
+
+        assert!(
+            response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "{response}"
+        );
+        assert!(response.contains("allow: GET, HEAD\r\n"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_head_returns_headers_without_body() {
+        let metrics = Metrics::new();
+        metrics.accepted_connection();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_metrics(listener, metrics));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"HEAD /metrics HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        // The content-length advertises the body a GET would return, but a HEAD
+        // carries no body of its own.
+        assert!(response.contains("content-length: "), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(
+            body.is_empty(),
+            "HEAD must not return a body, got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_head_on_unknown_path_has_no_body() {
+        // A HEAD must carry no body on any status, including the 404 path.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_metrics(listener, Metrics::new()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"HEAD /nope HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(
+            body.is_empty(),
+            "HEAD must not return a body, got: {body:?}"
+        );
     }
 
     #[tokio::test]
