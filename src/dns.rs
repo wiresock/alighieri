@@ -574,21 +574,23 @@ fn is_documentation(ip: IpAddr) -> bool {
     }
 }
 
-/// IANA special-purpose ranges that should never name a real service and are
-/// not already owned by a more specific deny category (private, link-local,
-/// loopback, multicast, unspecified, documentation):
+/// IANA special-purpose ranges that should never name a real service.
 ///
-/// - IPv4 `0.0.0.0/8` ("this network"), `100.64.0.0/10` (CGNAT, RFC 6598),
-///   `192.0.0.0/24` (IETF protocol assignments), `192.88.99.0/24` (6to4 relay
-///   anycast, RFC 7526), `198.18.0.0/15` (benchmarking, RFC 2544), and
-///   `240.0.0.0/4` (reserved for future use, including the `255.255.255.255`
-///   limited broadcast).
-/// - IPv6 `::` (unspecified), `::1` (loopback), and `2001:db8::/32`
-///   (documentation).
+/// The IPv4 entries are special-purpose ranges the other deny categories
+/// (private, link-local, loopback, multicast, unspecified, documentation) do not
+/// otherwise cover: `0.0.0.0/8` ("this network"; overlaps `unspecified` only at
+/// `0.0.0.0`), `100.64.0.0/10` (CGNAT, RFC 6598), `192.0.0.0/24` (IETF protocol
+/// assignments), `192.88.99.0/24` (6to4 relay anycast, RFC 7526),
+/// `198.18.0.0/15` (benchmarking, RFC 2544), and `240.0.0.0/4` (reserved for
+/// future use, including the `255.255.255.255` limited broadcast).
+///
+/// The IPv6 entries instead *overlap* more specific categories — `::` (also
+/// `unspecified`), `::1` (also `loopback`), and `2001:db8::/32` (also
+/// `documentation`) — so denying `reserved` alone still blocks those.
 ///
 /// Private (`10/8`, `172.16/12`, `192.168/16`), link-local, multicast, and the
-/// `TEST-NET` documentation ranges are intentionally left to their own
-/// categories, so `reserved` can be combined with them as needed.
+/// IPv4 `TEST-NET` documentation ranges have their own categories, so combine
+/// `reserved` with them for broader coverage.
 fn is_reserved(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
