@@ -311,7 +311,15 @@ Included files are processed in sorted path order. Include cycles are rejected
 and configuration errors report file and line context.
 
 `dns.deny` accepts `private`, `linklocal`, `loopback`, `multicast`,
-`unspecified`, `documentation`, and `reserved`. For example:
+`unspecified`, `documentation`, and `reserved`. For IPv4, `reserved` covers the
+IANA special-purpose ranges the other categories do not — `0.0.0.0/8`,
+`100.64.0.0/10` (CGNAT), `192.0.0.0/24`, `192.88.99.0/24` (6to4), `198.18.0.0/15`
+(benchmarking), and `240.0.0.0/4` (including the broadcast address). For IPv6 it
+instead overlaps the specific categories, matching `::` (unspecified), `::1`
+(loopback), and `2001:db8::/32` (documentation). Private, link-local, multicast,
+and the `TEST-NET` documentation ranges have their own categories, so combine
+`reserved` with them (e.g. `private linklocal loopback reserved`) for broader
+coverage. For example:
 
 ```conf
 dns.prefer: ipv4
