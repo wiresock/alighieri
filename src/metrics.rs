@@ -401,13 +401,24 @@ async fn handle_metrics_connection(mut stream: TcpStream, metrics: Arc<Metrics>)
         return Ok(());
     }
 
+    // HEAD carries no message body on any status, so decide this before
+    // branching on the path — otherwise a `HEAD /invalid` would return a 404
+    // with a body, which RFC 7231 forbids.
+    let include_body = method == "GET";
+
     if path != "/metrics" {
-        write_response(&mut stream, 404, "Not Found", "not found\n", "", true).await?;
+        write_response(
+            &mut stream,
+            404,
+            "Not Found",
+            "not found\n",
+            "",
+            include_body,
+        )
+        .await?;
         return Ok(());
     }
 
-    // HEAD gets the same status and headers as GET but no message body.
-    let include_body = method == "GET";
     let body = metrics.render_prometheus();
     write_response(&mut stream, 200, "OK", &body, "", include_body).await
 }
@@ -696,6 +707,30 @@ mod tests {
         // The content-length advertises the body a GET would return, but a HEAD
         // carries no body of its own.
         assert!(response.contains("content-length: "), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(
+            body.is_empty(),
+            "HEAD must not return a body, got: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_head_on_unknown_path_has_no_body() {
+        // A HEAD must carry no body on any status, including the 404 path.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_metrics(listener, Metrics::new()));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"HEAD /nope HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
         let (_, body) = response.split_once("\r\n\r\n").unwrap();
         assert!(
             body.is_empty(),
