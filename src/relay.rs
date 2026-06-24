@@ -114,8 +114,8 @@ pub struct UdpAssociateOptions {
     /// The outbound socket is a dual-stack IPv6 socket: IPv4 destinations are
     /// sent in `::ffff:` mapped form. See `connection::bind_outbound_udp`.
     pub outbound_dual: bool,
-    /// When set (the default; `udp.strictreply`), a reply must come from the
-    /// exact remote `host:port` the client sent to, not merely the same host.
+    /// When `true` (the default; `udp.strictreply: true`), a reply must come from
+    /// the exact remote `host:port` the client sent to, not merely the same host.
     /// `udp.strictreply: false` relaxes it to host-only for servers that answer
     /// from a different port.
     pub strict_reply: bool,
