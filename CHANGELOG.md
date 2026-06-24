@@ -102,6 +102,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `config metadata --json` now lists every configuration setting. The table had
+  drifted from the parser and omitted `proxyprotocol`, `udp.portrange`,
+  `udp.strictreply`, `shutdown.draintimeout`, `dns.timeout`, `auth.command`,
+  `metrics.allowpublic`, and the `tls.acme.*` settings, so tools and installers
+  reasoning about live-vs-restart settings could be misled. A regression test now
+  asserts the metadata covers every parser setting (and that each listed name is
+  a real one), so it cannot silently drift again.
 - A stop signal is no longer delayed behind an in-progress configuration reload.
   The reload handler read the config and applied it inline in the select loop, so
   while a reload was running — including a slow or wedged config/userlist read —
