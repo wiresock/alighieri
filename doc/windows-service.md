@@ -94,9 +94,10 @@ service restart.
 
 When the Service Control Manager sends a stop request, Alighieri signals the
 same async server runtime used in console mode. The listener is dropped and the
-process exits after the runtime observes the shutdown signal. The service
-advertises both `STOP` and `SHUTDOWN`, so an operating-system shutdown or restart
-runs the same graceful stop (final log flush, clean `Stopped` status) rather than
+process exits once the runtime observes the shutdown signal; connections still
+in flight are cut at exit rather than drained. The service advertises both
+`STOP` and `SHUTDOWN`, so an operating-system shutdown or restart runs the same
+orderly stop — a final log flush and a clean `Stopped` status — rather than
 terminating the process abruptly.
 
 ## Crash Recovery
