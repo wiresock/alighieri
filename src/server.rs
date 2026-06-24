@@ -4,7 +4,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -24,12 +23,6 @@ use crate::errors::Result;
 use crate::metrics::{self, Metrics};
 use crate::net::Cidr;
 use crate::tls;
-
-/// How long [`Server::run`] waits for in-flight connections to finish after a
-/// shutdown signal before aborting whatever remains. Kept well under typical
-/// service-manager stop windows (e.g. systemd's 90s `TimeoutStopSec`) so the
-/// process drains and exits on its own rather than being killed.
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A bound SOCKS5 server ready to accept connections.
 pub struct Server {
@@ -428,12 +421,13 @@ impl Server {
         // Dropping `conns` would abort everything immediately, so drain first.
         let active = conns.len();
         if active > 0 {
+            let drain_timeout = self.process_config.shutdown_drain_timeout;
             info!(
                 active,
-                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                drain_timeout_secs = drain_timeout.as_secs(),
                 "shutdown: draining in-flight connections"
             );
-            let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+            let drained = tokio::time::timeout(drain_timeout, async {
                 while let Some(outcome) = conns.join_next().await {
                     note_task_outcome(outcome);
                 }
@@ -569,6 +563,13 @@ fn warn_restart_required_changes(old: &Config, new: &Config) {
             current = old.max_connections,
             requested = new.max_connections,
             "maxconnections changes require a restart"
+        );
+    }
+    if old.shutdown_drain_timeout != new.shutdown_drain_timeout {
+        warn!(
+            current_secs = old.shutdown_drain_timeout.as_secs(),
+            requested_secs = new.shutdown_drain_timeout.as_secs(),
+            "shutdown.draintimeout changes require a restart"
         );
     }
     if old.log_outputs != new.log_outputs
