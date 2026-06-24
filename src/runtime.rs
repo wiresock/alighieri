@@ -90,9 +90,18 @@ where
                         let reload = async {
                             let path = config_path.clone();
                             let (tx, rx) = tokio::sync::oneshot::channel();
-                            std::thread::spawn(move || {
-                                let _ = tx.send(Config::load(&path));
-                            });
+                            // `Builder::spawn` so a transient thread-creation
+                            // failure (e.g. resource exhaustion) fails the reload
+                            // gracefully instead of panicking the service.
+                            if let Err(e) = std::thread::Builder::new()
+                                .name("config-reload".into())
+                                .spawn(move || {
+                                    let _ = tx.send(Config::load(&path));
+                                })
+                            {
+                                error!(config = %config_path.display(), error = %e, "configuration reload failed: could not spawn config-reader thread; keeping active configuration");
+                                return;
+                            }
                             match rx.await {
                                 Ok(Ok(config)) => {
                                     if let Err(e) = server.reload(config).await {
