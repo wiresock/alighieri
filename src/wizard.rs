@@ -972,6 +972,10 @@ fn rulesets_equivalent(a: &RuleSet, b: &RuleSet) -> bool {
                 && x.commands == y.commands
                 && x.protocols == y.protocols
                 && x.methods == y.methods
+                // Per-rule `bandwidth:` is policy too. The wizard does not model
+                // it, so it is dropped on regeneration; comparing it here lets the
+                // import-loss check warn instead of silently discarding throttles.
+                && x.bandwidth == y.bandwidth
         })
 }
 
@@ -2020,6 +2024,45 @@ mod tests {
         let warnings = import_loss_warnings(&config, &form).unwrap();
         assert!(
             warnings.iter().any(|w| w.contains("userlist")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn rulesets_equivalent_distinguishes_bandwidth() {
+        // Two rule sets that differ only in a rule's `bandwidth:` are not
+        // equivalent — otherwise the wizard would drop throttling on import
+        // without warning.
+        let with_bw = Config::parse(
+            "internal: 127.0.0.1 port = 1080\n\
+             socks pass { to: 0.0.0.0/0 command: connect bandwidth: 1MiB/1 }\n",
+        )
+        .unwrap();
+        let without_bw = Config::parse(
+            "internal: 127.0.0.1 port = 1080\n\
+             socks pass { to: 0.0.0.0/0 command: connect }\n",
+        )
+        .unwrap();
+        assert!(rulesets_equivalent(&with_bw.rules, &with_bw.rules));
+        assert!(!rulesets_equivalent(&with_bw.rules, &without_bw.rules));
+    }
+
+    #[test]
+    fn import_flags_dropped_per_rule_bandwidth() {
+        // The wizard does not model per-rule `bandwidth:`, so regeneration drops
+        // it; the loss must be reported rather than silently discarded. The rule
+        // shape otherwise round-trips, so `bandwidth` is the only difference.
+        let config = Config::parse(
+            "internal: 127.0.0.1 port = 1080\n\
+             external: 0.0.0.0\n\
+             client pass { from: 192.168.0.0/16 to: 0.0.0.0/0 }\n\
+             socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect bandwidth: 1MiB/1 }\n",
+        )
+        .unwrap();
+        let form = wizard_form_from_config(&config, Path::new("out.conf"));
+        let warnings = import_loss_warnings(&config, &form).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("access-control rules")),
             "{warnings:?}"
         );
     }
