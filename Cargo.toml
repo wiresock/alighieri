@@ -1,6 +1,6 @@
 [package]
 name = "alighieri"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009
 # patched `time` (>=0.3.47) requires rustc 1.88.
