@@ -859,7 +859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_loop_applies_valid_reload_then_shuts_down() {
+    async fn reload_loop_keeps_running_after_valid_reload() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("alighieri.conf");
         std::fs::write(
@@ -974,20 +974,36 @@ mod tests {
         let c_path = std::ffi::CString::new(config_path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         reload_tx.send(()).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Synchronize rather than sleep: a non-blocking writer-open of the FIFO
+        // succeeds only once the reload's `Config::load` is waiting at the open,
+        // which deterministically confirms the wedged path is exercised before we
+        // signal shutdown. Hold the writer open without writing, so the reader now
+        // blocks at read and the reload stays wedged.
+        let writer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&config_path)
+                {
+                    Ok(writer) => break writer,
+                    // `ENXIO`: no reader yet — the reload has not reached the open.
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("reload never reached the wedged config read");
 
         // Shutdown must still return promptly despite the wedged reload.
         let _ = shutdown_tx.send(());
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
 
-        // Unblock the wedged read by opening a writer so the detached blocking
-        // task can finish and not hang runtime teardown. `O_NONBLOCK` keeps this
-        // from blocking if (by some timing) no reader is waiting. Done regardless
+        // Closing the writer lets the wedged read see EOF and finish, so the
+        // detached blocking task does not hang runtime teardown. Done regardless
         // of the assertion below so a failure does not leave a stuck thread.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&config_path);
+        drop(writer);
 
         result
             .expect("shutdown was delayed behind the wedged reload")

@@ -174,23 +174,29 @@ impl Server {
         warn_config_footguns(&config);
         preserve_process_config(&mut config, &self.process_config);
         let command_auth = build_command_auth(&config);
+        let rate_limits = config.rate_limits.clone();
 
-        // Apply everything under the state write lock with no `.await` in between,
-        // so the reload is atomic even if the caller cancels it (the driver races
-        // reload against shutdown). Otherwise a cancellation after the abuse
-        // update but before the state swap would leave the abuse limits on the new
-        // config while the rest stayed on the old one. Acquiring the lock is the
-        // last await; everything below is synchronous.
-        let mut state = self.state.write().await;
-        self.abuse.update_config(config.rate_limits.clone());
-        state.config = Arc::new(config);
-        state.users = Arc::new(users);
-        state.command_auth = command_auth;
-        // The DNS resolver (and its TTL cache) is intentionally preserved across
-        // reloads: the resolution *policy* lives in the config and is read per
-        // lookup, so a reload takes effect on the next resolve without discarding
-        // the cache and triggering a re-resolve storm. The deny policy is also
-        // applied per call, so newly denied categories take effect immediately.
+        // Acquiring the state write lock is the last `.await`; everything below it
+        // is synchronous, so the reload is atomic — a cancellation (the driver
+        // races reload against shutdown) can only happen above, before anything is
+        // applied. Swap the runtime state under the lock, release it, then retune
+        // the abuse controls: that step is O(tracked clients), so keeping it out
+        // of the state lock avoids stalling the accept loop's `state.read()`, and
+        // because no `.await` separates the two, nothing can observe only one
+        // half applied.
+        {
+            let mut state = self.state.write().await;
+            state.config = Arc::new(config);
+            state.users = Arc::new(users);
+            state.command_auth = command_auth;
+            // The DNS resolver (and its TTL cache) is intentionally preserved
+            // across reloads: the resolution *policy* lives in the config and is
+            // read per lookup, so a reload takes effect on the next resolve
+            // without discarding the cache and triggering a re-resolve storm. The
+            // deny policy is also applied per call, so newly denied categories
+            // take effect immediately.
+        }
+        self.abuse.update_config(rate_limits);
         info!("configuration reloaded");
         Ok(())
     }
