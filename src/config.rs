@@ -2126,10 +2126,11 @@ ratelimit.bytes: 64KiB/30
         for addr in ["0.0.0.0:9090", "192.168.1.5:9090", "[::]:9090"] {
             let cfg = Config::parse(&format!("{head}metrics.listen: {addr}")).unwrap();
             let err = cfg.validate_startup().unwrap_err();
-            assert!(
-                err.to_string().contains("metrics.allowpublic"),
-                "{addr}: {err}"
-            );
+            let msg = err.to_string();
+            assert!(msg.contains("metrics.allowpublic"), "{addr}: {err}");
+            // The message uses a `\` line continuation, which strips the next
+            // line's indentation — guard against it leaking a run of spaces.
+            assert!(!msg.contains("  "), "message has stray spacing: {msg}");
         }
 
         // With the explicit opt-in it passes startup validation.
