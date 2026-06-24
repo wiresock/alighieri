@@ -96,7 +96,7 @@ where
                                     error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
                                 }
                                 Err(e) => {
-                                    error!(error = %e, "configuration reload task failed; keeping active configuration");
+                                    error!(config = %config_path.display(), error = %e, "configuration reload task failed; keeping active configuration");
                                 }
                             }
                         };
@@ -107,6 +107,10 @@ where
                                 server.begin_shutdown();
                                 return server_join_result((&mut run_task).await);
                             }
+                            // Still observe a fatal server exit during a slow reload
+                            // so the driver returns promptly rather than after the
+                            // reload finishes.
+                            res = &mut run_task => return server_join_result(res),
                             () = reload => {}
                         }
                     }

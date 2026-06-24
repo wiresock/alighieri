@@ -173,10 +173,16 @@ impl Server {
         let users = load_users(&config).await?;
         warn_config_footguns(&config);
         preserve_process_config(&mut config, &self.process_config);
-        self.abuse.update_config(config.rate_limits.clone());
-
         let command_auth = build_command_auth(&config);
+
+        // Apply everything under the state write lock with no `.await` in between,
+        // so the reload is atomic even if the caller cancels it (the driver races
+        // reload against shutdown). Otherwise a cancellation after the abuse
+        // update but before the state swap would leave the abuse limits on the new
+        // config while the rest stayed on the old one. Acquiring the lock is the
+        // last await; everything below is synchronous.
         let mut state = self.state.write().await;
+        self.abuse.update_config(config.rate_limits.clone());
         state.config = Arc::new(config);
         state.users = Arc::new(users);
         state.command_auth = command_auth;
