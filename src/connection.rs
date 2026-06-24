@@ -511,6 +511,7 @@ impl Connection {
                 metrics: self.metrics.clone(),
                 throttle,
                 outbound_dual,
+                strict_reply: self.config.udp_strict_reply,
             },
             authorize,
         )

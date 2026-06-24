@@ -259,6 +259,7 @@ socks pass "allow-default" {
 | `iotimeout`        | `0` (disabled)  | Idle timeout for established TCP relays (seconds)    |
 | `udptimeout`       | `60`            | Idle timeout for UDP associations (seconds)          |
 | `udp.portrange`    | —               | Bind the client-facing UDP relay port (`BND.PORT`) within a fixed `MIN-MAX` range for firewalling; unset uses an ephemeral port |
+| `udp.strictreply`  | `false`         | Require UDP replies to come from the exact remote `host:port` contacted, not just the same host (see below) |
 | `maxconnections`   | `1024`          | Maximum concurrent client TCP connections            |
 | `logoutput`        | `stdout`        | One or more of `stdout`, `stderr`, `file`            |
 | `logfile`          | —               | File path used when `logoutput` includes `file`      |
@@ -333,6 +334,15 @@ evaluation. TCP CONNECT can try later DNS answers when `dns.tryall` is enabled;
 UDP ASSOCIATE uses the first allowed answer. `dns.cachettl` is disabled by
 default; set it to a positive number of seconds to cache domain lookups, or to
 `0`/`off` to keep every lookup live.
+
+For UDP ASSOCIATE, the relay forwards a reply to the client only from a remote
+the client has actually sent to, so an off-path host cannot inject unsolicited
+datagrams. By default this match is by host (any source port on a contacted
+host is accepted), which tolerates servers that legitimately answer from a
+different port. Setting `udp.strictreply: true` tightens the match to the exact
+`host:port` the client contacted — stronger against a co-located attacker on the
+same host but a different port (notably on shared hosts or loopback) at the cost
+of breaking protocols whose servers reply from another port (e.g. TFTP).
 
 When `metrics.listen` is set, Alighieri serves Prometheus-style text metrics at
 `/metrics`. Bind this to loopback unless you intentionally place it behind other

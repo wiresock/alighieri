@@ -114,6 +114,10 @@ pub struct UdpAssociateOptions {
     /// The outbound socket is a dual-stack IPv6 socket: IPv4 destinations are
     /// sent in `::ffff:` mapped form. See `connection::bind_outbound_udp`.
     pub outbound_dual: bool,
+    /// When set (`udp.strictreply`), a reply must come from the exact remote
+    /// `host:port` the client sent to, not merely the same host. Defaults off to
+    /// tolerate servers that answer from a different port.
+    pub strict_reply: bool,
 }
 
 /// Relays data in both directions between `client` and `remote` until both
@@ -331,9 +335,10 @@ where
         let _ = client_endpoint.set(endpoint);
     }
     let activity = Arc::new(ActivityClock::new());
-    // Remote IPs the client has sent to; replies from any other source are
-    // dropped as unsolicited injection.
-    let contacted = Arc::new(Mutex::new(ContactedRemotes::default()));
+    // Remote endpoints the client has sent to; replies from any other source are
+    // dropped as unsolicited injection (see `ContactedRemotes` for the IP-only
+    // vs strict `host:port` match modes).
+    let contacted = Arc::new(Mutex::new(ContactedRemotes::new(options.strict_reply)));
 
     let mut client_to_remote = tokio::spawn(relay_client_to_remote(
         relay_socket.clone(),
@@ -412,38 +417,64 @@ fn flatten_direction(
 /// destinations could reach. 256 covers ordinary UDP use comfortably.
 const MAX_CONTACTED_REMOTES: usize = 256;
 
-/// The remote IPs a client has sent to on one UDP association, shared between the
-/// two relay tasks. A reply is forwarded to the client only from a recorded IP,
-/// so an off-path host cannot inject unsolicited datagrams. Matching is on the
-/// canonical IP (port-agnostic), tolerating a server that answers from a
-/// different port. Bounded (the least-recently-recorded IP is evicted at the cap)
-/// so it cannot grow without limit.
-#[derive(Default)]
+/// The remote endpoints a client has sent to on one UDP association, shared
+/// between the two relay tasks. A reply is forwarded to the client only from a
+/// recorded remote, so an off-path host cannot inject unsolicited datagrams.
+///
+/// Matching is always on the canonical IP (so an IPv4 reply on a dual-stack
+/// socket, arriving `::ffff:`-mapped, still matches). When `match_port` is set
+/// (the `udp.strictreply` option) the reply's source *port* must match too;
+/// otherwise any port on a contacted host is accepted, which tolerates a server
+/// that answers from a different port (e.g. TFTP). Bounded (the
+/// least-recently-recorded entry is evicted at the cap) so it cannot grow
+/// without limit.
 struct ContactedRemotes {
-    seen: HashMap<IpAddr, u64>,
+    seen: HashMap<SocketAddr, u64>,
     ticks: u64,
+    /// When set, the source port is part of the key (strict matching); otherwise
+    /// it is ignored so every port on a contacted host shares one entry.
+    match_port: bool,
 }
 
 impl ContactedRemotes {
-    /// Records that the client sent to `ip` (pass the canonical form).
-    fn record(&mut self, ip: IpAddr) {
+    fn new(match_port: bool) -> Self {
+        ContactedRemotes {
+            seen: HashMap::new(),
+            ticks: 0,
+            match_port,
+        }
+    }
+
+    /// The lookup key for an already-canonical `addr`: the port is kept only in
+    /// strict mode, otherwise zeroed so all ports on a host collapse to one key.
+    fn key(&self, addr: SocketAddr) -> SocketAddr {
+        if self.match_port {
+            addr
+        } else {
+            SocketAddr::new(addr.ip(), 0)
+        }
+    }
+
+    /// Records that the client sent to `addr` (pass the canonical form).
+    fn record(&mut self, addr: SocketAddr) {
+        let key = self.key(addr);
         self.ticks += 1;
-        if self.seen.len() >= MAX_CONTACTED_REMOTES && !self.seen.contains_key(&ip) {
+        if self.seen.len() >= MAX_CONTACTED_REMOTES && !self.seen.contains_key(&key) {
             if let Some(oldest) = self
                 .seen
                 .iter()
                 .min_by_key(|(_, &tick)| tick)
-                .map(|(ip, _)| *ip)
+                .map(|(addr, _)| *addr)
             {
                 self.seen.remove(&oldest);
             }
         }
-        self.seen.insert(ip, self.ticks);
+        self.seen.insert(key, self.ticks);
     }
 
-    /// Whether the client has sent to `ip` (pass the canonical form).
-    fn contains(&self, ip: &IpAddr) -> bool {
-        self.seen.contains_key(ip)
+    /// Whether the client has sent to `addr` (pass the canonical form).
+    fn contains(&self, addr: SocketAddr) -> bool {
+        self.seen.contains_key(&self.key(addr))
     }
 }
 
@@ -552,14 +583,16 @@ where
         let _ = client_endpoint.set(src);
         // Remember the destination before sending, so a fast reply is already
         // recognised by relay_remote_to_client; replies from any other remote are
-        // dropped there as unsolicited injection. Store the canonical IP so an
-        // IPv4 reply on a dual-stack socket (`::ffff:`) still matches; compute it
-        // before locking to keep the critical section minimal.
-        let dest_ip = dest.ip().to_canonical();
+        // dropped there as unsolicited injection. Store the canonical endpoint so
+        // an IPv4 reply on a dual-stack socket (`::ffff:`) still matches; whether
+        // the port is part of the match is decided inside `ContactedRemotes` by
+        // `udp.strictreply`. Canonicalize before locking to keep the critical
+        // section minimal.
+        let dest_canon = SocketAddr::new(dest.ip().to_canonical(), dest.port());
         contacted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .record(dest_ip);
+            .record(dest_canon);
         // A fully validated, authorized datagram from the locked client endpoint
         // is genuine client use of the association, so it refreshes the idle
         // timer here — even if the token bucket below then polices it or the send
@@ -623,14 +656,15 @@ async fn relay_remote_to_client(
         };
         // Forward only replies from a remote the client has actually sent to;
         // drop the rest so an off-path host cannot inject unsolicited UDP to the
-        // client. Match on the canonical IP (an IPv4 reply on a dual-stack socket
-        // arrives `::ffff:`-mapped), computed before locking to keep the critical
-        // section minimal. Dropped injections do not refresh idle.
-        let remote_ip = remote_src.ip().to_canonical();
+        // client. Match on the canonical endpoint (an IPv4 reply on a dual-stack
+        // socket arrives `::ffff:`-mapped); `ContactedRemotes` decides whether the
+        // port must match (`udp.strictreply`). Canonicalize before locking to keep
+        // the critical section minimal. Dropped injections do not refresh idle.
+        let remote_canon = SocketAddr::new(remote_src.ip().to_canonical(), remote_src.port());
         if !contacted
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&remote_ip)
+            .contains(remote_canon)
         {
             continue;
         }
@@ -844,6 +878,7 @@ mod tests {
             metrics: Metrics::new(),
             throttle: None,
             outbound_dual: false,
+            strict_reply: false,
         }
     }
 
@@ -972,27 +1007,49 @@ mod tests {
 
     #[test]
     fn contacted_remotes_records_and_evicts_oldest() {
-        let mut contacted = ContactedRemotes::default();
-        let ip = |i: usize| IpAddr::from([10, 0, (i >> 8) as u8, i as u8]);
+        let mut contacted = ContactedRemotes::new(false);
+        let addr = |i: usize| SocketAddr::new(IpAddr::from([10, 0, (i >> 8) as u8, i as u8]), 9);
 
-        contacted.record(ip(0));
-        assert!(contacted.contains(&ip(0)));
-        assert!(!contacted.contains(&ip(1)));
+        contacted.record(addr(0));
+        assert!(contacted.contains(addr(0)));
+        assert!(!contacted.contains(addr(1)));
 
-        // Fill to the cap with distinct IPs; ip(0) was recorded first (oldest).
+        // Fill to the cap with distinct IPs; addr(0) was recorded first (oldest).
         for i in 1..MAX_CONTACTED_REMOTES {
-            contacted.record(ip(i));
+            contacted.record(addr(i));
         }
-        assert!(contacted.contains(&ip(0)));
+        assert!(contacted.contains(addr(0)));
 
         // One more distinct IP evicts the oldest.
-        contacted.record(ip(MAX_CONTACTED_REMOTES));
+        contacted.record(addr(MAX_CONTACTED_REMOTES));
         assert!(
-            !contacted.contains(&ip(0)),
-            "the oldest contacted IP should be evicted at the cap"
+            !contacted.contains(addr(0)),
+            "the oldest contacted remote should be evicted at the cap"
         );
-        assert!(contacted.contains(&ip(MAX_CONTACTED_REMOTES)));
-        assert!(contacted.contains(&ip(MAX_CONTACTED_REMOTES - 1)));
+        assert!(contacted.contains(addr(MAX_CONTACTED_REMOTES)));
+        assert!(contacted.contains(addr(MAX_CONTACTED_REMOTES - 1)));
+    }
+
+    #[test]
+    fn contacted_remotes_port_matching_modes() {
+        let dest = SocketAddr::from(([10, 0, 0, 1], 53));
+        let same_ip_other_port = SocketAddr::from(([10, 0, 0, 1], 9999));
+        let other_ip = SocketAddr::from(([10, 0, 0, 2], 53));
+
+        // Default (port-agnostic): any port on a contacted host is accepted, but
+        // a different host is not.
+        let mut loose = ContactedRemotes::new(false);
+        loose.record(dest);
+        assert!(loose.contains(dest));
+        assert!(loose.contains(same_ip_other_port));
+        assert!(!loose.contains(other_ip));
+
+        // Strict (`udp.strictreply`): only the exact host:port matches.
+        let mut strict = ContactedRemotes::new(true);
+        strict.record(dest);
+        assert!(strict.contains(dest));
+        assert!(!strict.contains(same_ip_other_port));
+        assert!(!strict.contains(other_ip));
     }
 
     // Split into two tests so neither depends on processing order: in the drop
