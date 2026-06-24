@@ -206,7 +206,7 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   undercount under heavy load/scrape contention because the hot path never
   blocks on the metrics lock. Aggregate counters remain exact.
 - The stop/shutdown docs no longer describe the stop as a "graceful stop", which
-  could imply in-flight connections are drained. On stop (or OS SHUTDOWN) the
+  could imply in-flight connections are drained. On stop (or OS `SHUTDOWN`) the
   listener is dropped and the process exits promptly — logs are flushed and the
   Windows service reports a clean `Stopped` status, but connections still in
   flight are cut at exit, not drained. Wording in the README and the Windows
