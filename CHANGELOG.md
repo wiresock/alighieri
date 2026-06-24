@@ -69,6 +69,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   served the counters. `HEAD` returns the response headers (including the
   `content-length` a `GET` would produce) without a body. Previously every method
   was served `/metrics` regardless of verb.
+- The `dns.deny: reserved` category now also covers `192.88.99.0/24` (6to4 relay
+  anycast) and `198.18.0.0/15` (benchmarking), IANA special-purpose ranges that
+  no other category owns, so a deny meant to block non-routable answers no longer
+  lets them through. The exact set `reserved` matches (and which ranges belong to
+  the sibling categories instead) is now documented in the README and the code.
 
 ### Fixed
 

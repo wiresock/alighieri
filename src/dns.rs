@@ -574,6 +574,21 @@ fn is_documentation(ip: IpAddr) -> bool {
     }
 }
 
+/// IANA special-purpose ranges that should never name a real service and are
+/// not already owned by a more specific deny category (private, link-local,
+/// loopback, multicast, unspecified, documentation):
+///
+/// - IPv4 `0.0.0.0/8` ("this network"), `100.64.0.0/10` (CGNAT, RFC 6598),
+///   `192.0.0.0/24` (IETF protocol assignments), `192.88.99.0/24` (6to4 relay
+///   anycast, RFC 7526), `198.18.0.0/15` (benchmarking, RFC 2544), and
+///   `240.0.0.0/4` (reserved for future use, including the `255.255.255.255`
+///   limited broadcast).
+/// - IPv6 `::` (unspecified), `::1` (loopback), and `2001:db8::/32`
+///   (documentation).
+///
+/// Private (`10/8`, `172.16/12`, `192.168/16`), link-local, multicast, and the
+/// `TEST-NET` documentation ranges are intentionally left to their own
+/// categories, so `reserved` can be combined with them as needed.
 fn is_reserved(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -582,6 +597,8 @@ fn is_reserved(ip: IpAddr) -> bool {
                 || a >= 240
                 || (a == 100 && (64..=127).contains(&b))
                 || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19))
         }
         IpAddr::V6(ip) => {
             ip == Ipv6Addr::UNSPECIFIED
@@ -994,6 +1011,48 @@ mod tests {
         assert!(!address_allowed("127.0.0.1".parse().unwrap(), &deny));
         // A genuine public address (mapped or not) still passes.
         assert!(address_allowed("::ffff:8.8.8.8".parse().unwrap(), &deny));
+    }
+
+    #[test]
+    fn reserved_covers_iana_special_ranges() {
+        let deny = policy(DnsPreference::System, vec![DnsDenyCategory::Reserved]);
+        // One representative (and a boundary) per reserved range.
+        for ip in [
+            "0.0.0.0",
+            "0.255.255.255", // 0.0.0.0/8
+            "100.64.0.1",
+            "100.127.255.255", // 100.64.0.0/10 (CGNAT)
+            "192.0.0.7",       // 192.0.0.0/24
+            "192.88.99.1",     // 192.88.99.0/24 (6to4 relay anycast)
+            "198.18.0.1",
+            "198.19.255.255", // 198.18.0.0/15 (benchmarking)
+            "240.0.0.1",
+            "255.255.255.255", // 240.0.0.0/4 + limited broadcast
+            "::",
+            "::1",
+            "2001:db8::1",       // IPv6 reserved
+            "::ffff:198.18.0.1", // mapped form still caught
+        ] {
+            assert!(
+                !address_allowed(ip.parse().unwrap(), &deny),
+                "{ip} should be denied as reserved"
+            );
+        }
+        // Public addresses just outside the reserved ranges still pass.
+        for ip in [
+            "8.8.8.8",
+            "100.63.255.255", // just below 100.64.0.0/10
+            "100.128.0.0",    // just above 100.64.0.0/10
+            "198.17.255.255", // just below 198.18.0.0/15
+            "198.20.0.0",     // just above 198.18.0.0/15
+            "192.88.98.255",  // adjacent to 192.88.99.0/24
+            "2001:4860:4860::8888",
+        ] {
+            assert!(
+                address_allowed(ip.parse().unwrap(), &deny),
+                "{ip} should be allowed"
+            );
+        }
     }
 
     #[tokio::test]
