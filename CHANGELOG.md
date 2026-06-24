@@ -86,6 +86,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   carry at least one value; omitting the directive entirely still means "any" for
   that axis. (`method:` already required a value; this extends the same rule to
   `protocol:` and `command:`.)
+- Tokens after a rule's closing `}` are now a parse error instead of being
+  silently discarded. The block reader stopped at the closing brace, so a
+  selector typed *outside* the braces was dropped, leaving the rule broader than
+  written. For example, `socks pass { to: 0.0.0.0/0 } command: connect` kept any
+  command rather than just `connect`, because the trailing selector was ignored.
+  A second rule crammed onto the same line is likewise rejected now; comments
+  after `}` are still fine.
 - The UDP ASSOCIATE idle timeout is no longer refreshed by traffic the relay
   rejects. Activity was marked *before* a datagram was validated, so a spoofed or
   unrelated source datagram, a malformed header, a fragment, or even bytes on the

@@ -1141,8 +1141,9 @@ fn gather_block(lines: &[&str], start: usize) -> Result<(Vec<String>, usize)> {
     while i < lines.len() {
         let stripped = strip_comment(lines[i]);
         let spaced = stripped.replace('{', " { ").replace('}', " } ");
-        for tok in spaced.split_whitespace() {
-            match tok {
+        let line_tokens: Vec<&str> = spaced.split_whitespace().collect();
+        for (j, tok) in line_tokens.iter().enumerate() {
+            match *tok {
                 "{" => {
                     depth += 1;
                     opened = true;
@@ -1155,7 +1156,15 @@ fn gather_block(lines: &[&str], start: usize) -> Result<(Vec<String>, usize)> {
                 }
                 _ => {}
             }
-            tokens.push(tok.to_string());
+            tokens.push((*tok).to_string());
+            // The brace that closes the block must be the last token on its
+            // line. Anything after it — a selector typed outside the braces, or
+            // a second rule crammed onto the line — would be silently dropped by
+            // the body parser (which only sees tokens up to '}'), broadening the
+            // rule. Reject it instead.
+            if opened && depth == 0 && j + 1 < line_tokens.len() {
+                return Err(cfg_err(i + 1, "unexpected tokens after '}'"));
+            }
         }
         i += 1;
         if opened && depth == 0 {
@@ -2355,6 +2364,45 @@ socks pass "" { command: connect }"#,
         let err = Config::parse("internal: 0.0.0.0 port = 1080\nsocks pass {\n from: 0.0.0.0/0")
             .unwrap_err();
         assert!(err.to_string().contains("unterminated"));
+    }
+
+    #[test]
+    fn rejects_tokens_after_closing_brace() {
+        let head = "internal: 0.0.0.0 port = 1080\n";
+
+        // A selector typed outside the braces is dropped by the body parser
+        // (which only sees tokens up to '}'), silently widening the rule — so it
+        // must be a parse error.
+        let err = Config::parse(&format!(
+            "{head}socks pass {{ command: connect }} protocol: tcp"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected tokens after '}'"),
+            "{err}"
+        );
+
+        // A second rule crammed onto the same line as the first's '}' is also
+        // rejected rather than silently mangled.
+        let err = Config::parse(&format!(
+            "{head}socks pass {{ command: connect }} socks block {{ }}"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected tokens after '}'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn comment_after_closing_brace_is_ok() {
+        // A comment is stripped before tokenizing, so it is not mistaken for
+        // stray tokens after the closing brace.
+        let cfg = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nsocks pass { command: connect } # trailing comment",
+        )
+        .expect("a comment after '}' should parse");
+        assert_eq!(cfg.rules.rules.len(), 1);
     }
 
     #[test]
