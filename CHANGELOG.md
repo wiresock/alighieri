@@ -102,6 +102,21 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Reload footgun warnings now reflect the configuration that is actually in
+  effect, not the requested one. The open-proxy (`none` on a non-loopback
+  listener) and ACME-vs-`proxyprotocol` warnings were evaluated before the
+  restart-only fields (`internal`, `tls`) were restored to their live values, so
+  a reload that merely *requested* a loopback `internal` could suppress the
+  open-proxy warning even though the public listener stays up until restart. The
+  warnings are now evaluated after those fields are preserved, so they describe
+  the live listener while still honoring reloadable fields (rules, `socksmethod`,
+  `proxyprotocol`).
+- The Windows service install is now transactional around its config marker.
+  The marker (which `start`/`reload` read to know which config to validate) was
+  written after the SCM service was created, so a failed marker write left an
+  installed service whose baked-in launch arguments pointed at one config while
+  the CLI fell back to validating the default — silently validating a different
+  file than the service runs. A failed marker write now rolls the install back.
 - `metrics.allowpublic` no longer drifts on reload. The flag is restart-only, but
   reload neither preserved its startup value nor warned when it changed, so
   reloading a config that flipped it left `state.config` claiming a different
