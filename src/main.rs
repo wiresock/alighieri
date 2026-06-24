@@ -337,9 +337,11 @@ fn config_usage() -> String {
 }
 
 /// Reload metadata for every config setting, surfaced by `config metadata
-/// --json`. Keep in sync with the parser in `config.rs`; the
-/// `config_metadata_covers_every_setting` test enforces that every documented
-/// setting is listed here and that each name is a real one.
+/// --json`. Lists the canonical (documented) name of each setting; the parser
+/// also accepts aliases (e.g. `proxy.protocol`, `dns.try_all`, `tls.cert`),
+/// which are intentionally not repeated here. Keep in sync with the parser in
+/// `config.rs`; the `config_metadata_covers_every_setting` test enforces that
+/// every setting is listed and that each name is a real one.
 const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
     ConfigSettingMetadata {
         name: "internal",
@@ -1531,9 +1533,18 @@ mod tests {
         let scopes_and_directives: BTreeSet<&str> =
             ["client", "socks", "include"].into_iter().collect();
 
-        let metadata_settings: BTreeSet<&str> = CONFIG_SETTINGS_METADATA
-            .iter()
-            .map(|s| s.name)
+        // Collect names as a list first so a duplicate entry is caught here rather
+        // than silently deduplicated (it would still emit duplicate JSON keys).
+        let all_names: Vec<&str> = CONFIG_SETTINGS_METADATA.iter().map(|s| s.name).collect();
+        let unique_names: BTreeSet<&str> = all_names.iter().copied().collect();
+        assert_eq!(
+            all_names.len(),
+            unique_names.len(),
+            "config metadata contains duplicate entries"
+        );
+
+        let metadata_settings: BTreeSet<&str> = unique_names
+            .into_iter()
             .filter(|name| !scopes_and_directives.contains(name))
             .collect();
 
@@ -1548,9 +1559,11 @@ mod tests {
             }
         }
 
-        // The complete set of `key: value` settings the parser accepts. When a new
-        // setting is added to the parser it must be added here and to
-        // CONFIG_SETTINGS_METADATA, so `config metadata --json` stays complete.
+        // The canonical name of every `key: value` setting the parser accepts;
+        // aliases (e.g. `proxy.protocol`, `dns.try_all`, `tls.cert`) are
+        // intentionally not listed. When a new setting is added to the parser it
+        // must be added here and to CONFIG_SETTINGS_METADATA, so
+        // `config metadata --json` stays complete.
         let expected: BTreeSet<&str> = [
             "internal",
             "external",
