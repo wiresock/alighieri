@@ -172,8 +172,14 @@ impl Server {
     pub async fn reload(&self, mut config: Config) -> Result<()> {
         warn_restart_required_changes(&self.process_config, &config);
         let users = load_users(&config).await?;
-        warn_config_footguns(&config);
         preserve_process_config(&mut config, &self.process_config);
+        // Warn on the *effective* config: `preserve_process_config` has just
+        // restored the restart-only fields (`internal`, `tls`) to their live
+        // values, so e.g. a reload requesting a loopback `internal` no longer
+        // suppresses the open-proxy warning while the public listener stays live
+        // until restart. Reloadable fields (rules, socksmethod, proxyprotocol)
+        // already hold their new values here, so those footguns stay accurate.
+        warn_config_footguns(&config);
         let command_auth = build_command_auth(&config);
         let rate_limits = config.rate_limits.clone();
 
@@ -526,28 +532,69 @@ fn reap_finished(conns: &mut JoinSet<()>) {
     }
 }
 
-fn warn_config_footguns(config: &Config) {
+/// A valid-but-very-likely-a-mistake configuration combination, surfaced as a
+/// startup/reload warning. Kept as a pure enumeration (evaluated by
+/// [`config_footguns`]) so the decision logic can be unit-tested without
+/// capturing log output, and so callers can warn on the *effective* config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Footgun {
+    NoClientRules,
+    NoSocksRules,
+    OpenProxyNoAuth,
+    AcmeWithProxyProtocol,
+}
+
+/// Returns the [`Footgun`]s the given config trips, in warning order.
+///
+/// This must be evaluated on the config that is actually in effect. On reload
+/// that means *after* `preserve_process_config` restores the restart-only fields
+/// (`internal`, `tls`) to their live values: a reload that merely *requests* a
+/// loopback `internal` must not suppress [`Footgun::OpenProxyNoAuth`] while the
+/// public listener is still live until restart.
+fn config_footguns(config: &Config) -> Vec<Footgun> {
+    let mut footguns = Vec::new();
     if !config.rules.has_scope(Scope::Client) {
-        warn!("no 'client' rules defined — all incoming connections will be denied");
+        footguns.push(Footgun::NoClientRules);
     }
     if !config.rules.has_scope(Scope::Socks) {
-        warn!("no 'socks' rules defined — all requests will be denied");
+        footguns.push(Footgun::NoSocksRules);
     }
     if config.noauth_on_non_loopback_listener() {
-        warn!(
-            listen = %config.internal,
-            "the SOCKS 'none' (no-authentication) method is offered on a non-loopback listener; combined with permissive 'socks'/'client' rules this is an open proxy — drop 'none' from 'socksmethod' (require 'username'), tighten the rules, or bind 'internal' to loopback"
-        );
+        footguns.push(Footgun::OpenProxyNoAuth);
     }
-    // Checked here (rather than only at bind) so it also fires on reload, where
-    // `proxyprotocol` can be enabled while ACME stays active.
+    // Evaluated here (rather than only at bind) so it also fires on reload, where
+    // `proxyprotocol` is live and can be enabled while ACME (restart-only) stays
+    // active.
     if matches!(config.tls.as_ref(), Some(crate::config::TlsConfig::Acme(_)))
         && !config.proxy_protocol.is_empty()
     {
-        warn!(
-            listen = %config.internal,
-            "ACME and proxyprotocol are both configured: TLS-ALPN-01 validation connections that reach this listener without a trusted PROXY header (for example Let's Encrypt connecting directly) are rejected by the proxy-protocol admission gate, so certificate issuance/renewal fails unless every validation connection is proxied through a trusted PROXY-protocol upstream (TCP passthrough)"
-        );
+        footguns.push(Footgun::AcmeWithProxyProtocol);
+    }
+    footguns
+}
+
+fn warn_config_footguns(config: &Config) {
+    for footgun in config_footguns(config) {
+        match footgun {
+            Footgun::NoClientRules => {
+                warn!("no 'client' rules defined — all incoming connections will be denied");
+            }
+            Footgun::NoSocksRules => {
+                warn!("no 'socks' rules defined — all requests will be denied");
+            }
+            Footgun::OpenProxyNoAuth => {
+                warn!(
+                    listen = %config.internal,
+                    "the SOCKS 'none' (no-authentication) method is offered on a non-loopback listener; combined with permissive 'socks'/'client' rules this is an open proxy — drop 'none' from 'socksmethod' (require 'username'), tighten the rules, or bind 'internal' to loopback"
+                );
+            }
+            Footgun::AcmeWithProxyProtocol => {
+                warn!(
+                    listen = %config.internal,
+                    "ACME and proxyprotocol are both configured: TLS-ALPN-01 validation connections that reach this listener without a trusted PROXY header (for example Let's Encrypt connecting directly) are rejected by the proxy-protocol admission gate, so certificate issuance/renewal fails unless every validation connection is proxied through a trusted PROXY-protocol upstream (TCP passthrough)"
+                );
+            }
+        }
     }
 }
 
@@ -763,6 +810,74 @@ mod tests {
         assert!(
             state.config.metrics_allow_public,
             "metrics.allowpublic must keep its startup value across reload"
+        );
+    }
+
+    #[test]
+    fn config_footguns_flags_open_proxy_and_missing_rules() {
+        // Loopback, fully ruled, no TLS: nothing to warn about.
+        let clean = Config::parse(
+            "internal: 127.0.0.1 port = 1080\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+        assert!(config_footguns(&clean).is_empty());
+
+        // Public listener offering the default `none` method: an open proxy.
+        let open = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+        assert_eq!(config_footguns(&open), vec![Footgun::OpenProxyNoAuth]);
+
+        // No rule scopes at all: both deny-everything footguns trip.
+        let no_rules = Config::parse("internal: 127.0.0.1 port = 1080").unwrap();
+        let footguns = config_footguns(&no_rules);
+        assert!(footguns.contains(&Footgun::NoClientRules));
+        assert!(footguns.contains(&Footgun::NoSocksRules));
+        assert!(!footguns.contains(&Footgun::OpenProxyNoAuth));
+    }
+
+    #[test]
+    fn config_footguns_flags_acme_with_proxyprotocol() {
+        // ACME validates via TLS-ALPN-01, which the proxyprotocol admission gate
+        // would reject for direct (un-PROXY-headed) Let's Encrypt connections.
+        let cfg = Config::parse(
+            "internal: 127.0.0.1 port = 1080\ntls.acme.domains: proxy.example.com\ntls.acme.cache: /var/lib/alighieri/acme\nproxyprotocol: 10.0.0.0/8\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+        assert_eq!(config_footguns(&cfg), vec![Footgun::AcmeWithProxyProtocol]);
+    }
+
+    #[tokio::test]
+    async fn reload_footgun_warnings_reflect_effective_listener() {
+        // Bind a public, no-auth listener — an open proxy that trips the footgun.
+        let server = Server::bind(
+            Config::parse(
+                "internal: 0.0.0.0 port = 0\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(config_footguns(&server.process_config).contains(&Footgun::OpenProxyNoAuth));
+
+        // A reload that *requests* a loopback `internal` must not make the
+        // warning disappear: `internal` is restart-only, so the public listener
+        // is still live and the effective config still trips the footgun.
+        server
+            .reload(
+                Config::parse(
+                    "internal: 127.0.0.1 port = 0\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let state = server.state.read().await;
+        assert!(
+            config_footguns(&state.config).contains(&Footgun::OpenProxyNoAuth),
+            "open-proxy footgun must reflect the still-live public listener, not the requested loopback"
         );
     }
 

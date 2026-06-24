@@ -59,6 +59,10 @@ pub trait ServiceController {
     fn stop(&self) -> ServiceCliResult<()>;
     fn reload(&self) -> ServiceCliResult<()>;
     fn status(&self) -> ServiceCliResult<String>;
+    /// Records which config the service was installed with, so the CLI's
+    /// `start`/`reload` validate the same file the service runs. Kept on the
+    /// controller (rather than inlined) so install can roll back when it fails.
+    fn persist_config_marker(&self, config_path: &Path) -> ServiceCliResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +124,7 @@ pub fn execute_service_command<C: ServiceController>(
                 account_name: OsString::from(LOCAL_SERVICE_ACCOUNT),
             };
             controller.install(&options)?;
-            write_config_marker(&config_path)?;
+            finalize_install(controller, &config_path)?;
             Ok(format!(
                 "installed {SERVICE_NAME} using config '{}'",
                 config_path.display()
@@ -213,6 +217,35 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
 fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
     std::fs::write(config_marker_path(), config_path.display().to_string())?;
     Ok(())
+}
+
+/// Records the installed config marker after the service is created, rolling the
+/// install back if it cannot be written.
+///
+/// The service's config path is baked into its SCM launch arguments, and the
+/// marker mirrors it for the CLI's `start`/`reload`. If the two disagreed the CLI
+/// would validate a different config than the service actually runs (a missing
+/// marker falls back to the default path), so a failed marker write must not
+/// leave an installed service behind. A successful rollback returns the original
+/// marker error (net state: not installed); if the rollback *also* fails the
+/// service is still installed, so both failures are surfaced and the operator is
+/// pointed at a manual uninstall rather than the leftover service being hidden
+/// behind the marker error alone.
+fn finalize_install<C: ServiceController>(
+    controller: &C,
+    config_path: &Path,
+) -> ServiceCliResult<()> {
+    let Err(persist_err) = controller.persist_config_marker(config_path) else {
+        return Ok(());
+    };
+    match controller.uninstall() {
+        Ok(()) => Err(persist_err),
+        Err(uninstall_err) => Err(ServiceCliError::Service(format!(
+            "failed to record the installed config ({persist_err}); rolling the install back \
+             also failed ({uninstall_err}), so the {SERVICE_NAME} service may still be installed \
+             - run 'alighieri service uninstall' to remove it"
+        ))),
+    }
 }
 
 fn validate_config(config_path: &Path) -> ServiceCliResult<()> {
@@ -387,11 +420,10 @@ impl ServiceController for WindowsServiceController {
             let _ = event_log::unregister_source();
             return Err(err);
         }
-        event_log::report(
-            event_log::EventLevel::Info,
-            event_log::EVENT_SERVICE_INSTALLED,
-            format!("{SERVICE_DISPLAY_NAME} was installed"),
-        );
+        // The "was installed" Event Log entry is reported from
+        // `persist_config_marker` (the final install step), not here: a failed
+        // marker write rolls the install back, so reporting here would leave a
+        // misleading "was installed" record with no service behind it.
         Ok(())
     }
 
@@ -458,6 +490,21 @@ impl ServiceController for WindowsServiceController {
             .query_status()
             .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
         Ok(format!("{SERVICE_NAME}: {:?}", status.current_state))
+    }
+
+    fn persist_config_marker(&self, config_path: &Path) -> ServiceCliResult<()> {
+        write_config_marker(config_path)?;
+        // Reported here rather than in `install` so the "was installed" entry is
+        // logged only once the whole install has succeeded (service created and
+        // marker persisted). A marker-write failure rolls the install back, so
+        // emitting this from `install` would misreport an install the command
+        // ultimately failed and removed.
+        event_log::report(
+            event_log::EventLevel::Info,
+            event_log::EVENT_SERVICE_INSTALLED,
+            format!("{SERVICE_DISPLAY_NAME} was installed"),
+        );
+        Ok(())
     }
 }
 
@@ -576,7 +623,12 @@ mod tests {
         ));
     }
 
-    struct FakeController;
+    #[derive(Default)]
+    struct FakeController {
+        persist_should_fail: bool,
+        uninstall_should_fail: bool,
+        uninstalled: std::cell::Cell<bool>,
+    }
 
     impl ServiceController for FakeController {
         fn install(&self, _options: &InstallOptions) -> ServiceCliResult<()> {
@@ -584,7 +636,14 @@ mod tests {
         }
 
         fn uninstall(&self) -> ServiceCliResult<()> {
-            Ok(())
+            self.uninstalled.set(true);
+            if self.uninstall_should_fail {
+                Err(ServiceCliError::Service(
+                    "simulated uninstall failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
 
         fn start(&self) -> ServiceCliResult<()> {
@@ -602,11 +661,82 @@ mod tests {
         fn status(&self) -> ServiceCliResult<String> {
             Ok("Alighieri: Running".into())
         }
+
+        fn persist_config_marker(&self, _config_path: &Path) -> ServiceCliResult<()> {
+            if self.persist_should_fail {
+                Err(ServiceCliError::Io(std::io::Error::other(
+                    "simulated marker write failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
     fn command_layer_dispatches_status() {
-        let message = execute_service_command(&FakeController, ServiceCommand::Status).unwrap();
+        let message =
+            execute_service_command(&FakeController::default(), ServiceCommand::Status).unwrap();
         assert_eq!(message, "Alighieri: Running");
+    }
+
+    #[test]
+    fn finalize_install_rolls_back_when_config_marker_write_fails() {
+        // If the marker cannot be written after the service is created, the
+        // freshly installed service must be rolled back so the SCM launch
+        // arguments and the CLI's marker can never point at different configs.
+        let controller = FakeController {
+            persist_should_fail: true,
+            ..FakeController::default()
+        };
+        let err = finalize_install(
+            &controller,
+            Path::new(r"C:\ProgramData\Alighieri\alighieri.conf"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServiceCliError::Io(_)), "{err}");
+        assert!(
+            controller.uninstalled.get(),
+            "a failed marker write must roll back (uninstall) the service"
+        );
+    }
+
+    #[test]
+    fn finalize_install_surfaces_a_failed_rollback() {
+        // Marker write fails AND the rollback uninstall fails: the service may
+        // still be installed, so the error must say so (and name both failures)
+        // instead of returning only the marker error.
+        let controller = FakeController {
+            persist_should_fail: true,
+            uninstall_should_fail: true,
+            ..FakeController::default()
+        };
+        let err = finalize_install(
+            &controller,
+            Path::new(r"C:\ProgramData\Alighieri\alighieri.conf"),
+        )
+        .unwrap_err();
+        assert!(
+            controller.uninstalled.get(),
+            "rollback uninstall must be attempted"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("may still be installed"), "{msg}");
+        assert!(msg.contains("simulated marker write failure"), "{msg}");
+        assert!(msg.contains("simulated uninstall failure"), "{msg}");
+    }
+
+    #[test]
+    fn finalize_install_succeeds_and_keeps_the_service_when_marker_writes() {
+        let controller = FakeController::default();
+        finalize_install(
+            &controller,
+            Path::new(r"C:\ProgramData\Alighieri\alighieri.conf"),
+        )
+        .unwrap();
+        assert!(
+            !controller.uninstalled.get(),
+            "a successful install must not be rolled back"
+        );
     }
 }
