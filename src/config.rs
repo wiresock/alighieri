@@ -246,6 +246,10 @@ pub struct Config {
     pub dns: DnsPolicy,
     /// Optional local metrics endpoint listen address.
     pub metrics_listen: Option<SocketAddr>,
+    /// Whether a non-loopback `metrics.listen` is allowed. The metrics endpoint
+    /// is unauthenticated, so binding it off loopback is refused unless this is
+    /// explicitly set (`metrics.allowpublic: true`).
+    pub metrics_allow_public: bool,
     /// Optional TLS wrapper for the client listener.
     pub tls: Option<TlsConfig>,
     /// Optional per-client rate limits and abuse controls.
@@ -446,6 +450,7 @@ struct Builder {
     dns_cache_ttl: Option<Option<Duration>>,
     dns_timeout: Option<Duration>,
     metrics_listen: Option<SocketAddr>,
+    metrics_allow_public: Option<bool>,
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
     tls_acme_domains: Vec<String>,
@@ -478,6 +483,22 @@ impl Builder {
             return Err(Error::Config(
                 "socksmethod 'username' requires a 'userlist' or 'auth.command' setting".into(),
             ));
+        }
+
+        // The metrics endpoint is unauthenticated and exposes operational
+        // counters and rule labels, so a non-loopback bind is refused unless the
+        // operator explicitly opts in. `to_canonical` so an IPv4-mapped loopback
+        // still counts as loopback.
+        if let Some(addr) = self.metrics_listen {
+            let ip = addr.ip().to_canonical();
+            if (ip.is_unspecified() || !ip.is_loopback())
+                && !self.metrics_allow_public.unwrap_or(false)
+            {
+                return Err(Error::Config(format!(
+                    "metrics.listen {addr} is not loopback; the metrics endpoint is unauthenticated, \
+                     so set 'metrics.allowpublic: true' to expose it or bind it to 127.0.0.1/[::1]"
+                )));
+            }
         }
 
         let mut log_outputs = self.log_outputs.unwrap_or_else(|| vec![LogOutput::Stdout]);
@@ -580,6 +601,7 @@ impl Builder {
                     .unwrap_or(Duration::from_secs(DEFAULT_DNS_TIMEOUT_SECS)),
             },
             metrics_listen: self.metrics_listen,
+            metrics_allow_public: self.metrics_allow_public.unwrap_or(false),
             tls,
             rate_limits: RateLimits {
                 connection_rate: self.rate_connection,
@@ -737,6 +759,9 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "metricslisten" | "metrics.listen" => {
             b.metrics_listen = Some(parse_endpoint(vals, lineno)?)
+        }
+        "metricsallowpublic" | "metrics.allowpublic" => {
+            b.metrics_allow_public = Some(parse_bool(vals, lineno)?)
         }
         "tlscertfile" | "tls.certfile" | "tls.cert" => {
             b.tls_cert_file = Some(parse_path(vals, lineno, "tls.certfile")?);
@@ -2074,6 +2099,39 @@ ratelimit.bytes: 64KiB/30
         .unwrap();
         assert_eq!(cfg.socks_methods, vec![AuthKind::Username, AuthKind::None]);
         assert_eq!(cfg.userlist, Some(PathBuf::from("/tmp/users")));
+    }
+
+    #[test]
+    fn metrics_public_bind_requires_allowpublic() {
+        let head = "internal: 127.0.0.1 port = 1080\n";
+
+        // Loopback is always allowed, and defaults to not-public.
+        let cfg = Config::parse(&format!("{head}metrics.listen: 127.0.0.1:9090")).unwrap();
+        assert!(!cfg.metrics_allow_public);
+
+        // A non-loopback (or unspecified) bind is refused without the opt-in.
+        for addr in ["0.0.0.0:9090", "192.168.1.5:9090", "[::]:9090"] {
+            let err = Config::parse(&format!("{head}metrics.listen: {addr}")).unwrap_err();
+            assert!(
+                err.to_string().contains("metrics.allowpublic"),
+                "{addr}: {err}"
+            );
+        }
+
+        // With the explicit opt-in it is accepted.
+        let cfg = Config::parse(&format!(
+            "{head}metrics.listen: 0.0.0.0:9090\nmetrics.allowpublic: true"
+        ))
+        .unwrap();
+        assert!(cfg.metrics_allow_public);
+        assert_eq!(cfg.metrics_listen, Some("0.0.0.0:9090".parse().unwrap()));
+
+        // The concatenated alias parses too (set to the non-default value).
+        let cfg = Config::parse(&format!(
+            "{head}metrics.listen: 127.0.0.1:9090\nmetricsallowpublic: true"
+        ))
+        .unwrap();
+        assert!(cfg.metrics_allow_public);
     }
 
     #[test]

@@ -79,10 +79,13 @@ impl Server {
             Some(addr) => {
                 let listener = TcpListener::bind(addr).await?;
                 let listen = listener.local_addr()?;
+                // A non-loopback bind is only reachable here because the config
+                // set `metrics.allowpublic` (it is refused otherwise), so this is
+                // a reminder the operator opted into an unauthenticated endpoint.
                 if listen.ip().is_unspecified() || !listen.ip().is_loopback() {
                     warn!(
                         listen = %listen,
-                        "metrics endpoint is not bound to loopback; protect it with network access controls"
+                        "metrics endpoint is exposed off loopback (metrics.allowpublic is set) and is unauthenticated; protect it with network access controls"
                     );
                 }
                 (Some(listen), Some(listener))
