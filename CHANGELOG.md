@@ -64,6 +64,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   tag, so a release rebuild resolves the exact same layers and a moved tag cannot
   swap the base image under a build. A new Dependabot `docker` ecosystem bumps the
   digests (and tags) as the upstreams publish updates.
+- The metrics endpoint now answers only `GET` and `HEAD`; any other method gets
+  `405 Method Not Allowed` with an `Allow: GET, HEAD` header instead of being
+  served the counters. `HEAD` returns the response headers (including the
+  `content-length` a `GET` would produce) without a body. Previously every method
+  was served `/metrics` regardless of verb.
 
 ### Fixed
 
