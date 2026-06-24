@@ -412,11 +412,10 @@ impl ServiceController for WindowsServiceController {
             let _ = event_log::unregister_source();
             return Err(err);
         }
-        event_log::report(
-            event_log::EventLevel::Info,
-            event_log::EVENT_SERVICE_INSTALLED,
-            format!("{SERVICE_DISPLAY_NAME} was installed"),
-        );
+        // The "was installed" Event Log entry is reported from
+        // `persist_config_marker` (the final install step), not here: a failed
+        // marker write rolls the install back, so reporting here would leave a
+        // misleading "was installed" record with no service behind it.
         Ok(())
     }
 
@@ -486,7 +485,18 @@ impl ServiceController for WindowsServiceController {
     }
 
     fn persist_config_marker(&self, config_path: &Path) -> ServiceCliResult<()> {
-        write_config_marker(config_path)
+        write_config_marker(config_path)?;
+        // Reported here rather than in `install` so the "was installed" entry is
+        // logged only once the whole install has succeeded (service created and
+        // marker persisted). A marker-write failure rolls the install back, so
+        // emitting this from `install` would misreport an install the command
+        // ultimately failed and removed.
+        event_log::report(
+            event_log::EventLevel::Info,
+            event_log::EVENT_SERVICE_INSTALLED,
+            format!("{SERVICE_DISPLAY_NAME} was installed"),
+        );
+        Ok(())
     }
 }
 
