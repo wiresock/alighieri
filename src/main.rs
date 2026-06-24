@@ -1534,7 +1534,8 @@ mod tests {
             ["client", "socks", "include"].into_iter().collect();
 
         // Collect names as a list first so a duplicate entry is caught here rather
-        // than silently deduplicated (it would still emit duplicate JSON keys).
+        // than silently deduplicated (it would still emit a duplicate object in
+        // the `config metadata --json` settings array).
         let all_names: Vec<&str> = CONFIG_SETTINGS_METADATA.iter().map(|s| s.name).collect();
         let unique_names: BTreeSet<&str> = all_names.iter().copied().collect();
         assert_eq!(
