@@ -70,11 +70,12 @@ impl AbuseControls {
 
     pub fn update_config(&self, config: RateLimits) {
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = config.clone();
-        // Apply the new `byterate` to live per-client buckets immediately so a
-        // client's ongoing flows pick up the change at once, rather than only
-        // when it next reconnects (which is when `admit` would otherwise
-        // reconcile). Snapshot the states under a brief lock, then retune each
-        // without holding the global `clients` lock across every bucket update.
+        // Apply a new `byterate` rate to live per-client buckets immediately so a
+        // client's ongoing flows pick up the change at once (the bucket is shared
+        // with its connections), rather than only when it next reconnects — which
+        // is when `admit` would otherwise reconcile. Snapshot the states under a
+        // brief lock, then retune each without holding the global `clients` lock
+        // across every bucket update.
         let now = Instant::now();
         let states: Vec<Arc<Mutex<ClientState>>> = {
             let clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,12 +88,18 @@ impl AbuseControls {
     }
 
     pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<ClientPermit, DenialReason> {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        // Read the config *after* taking the clients lock. We hold this lock
+        // across the bandwidth reconcile below, and `update_config` retunes live
+        // buckets only after taking the same lock — so a reload that lands while
+        // we are admitting is forced to apply its (newer) rate after ours, never
+        // letting a stale snapshot revert it. (No deadlock: `update_config`
+        // releases the config write lock before it takes the clients lock.)
         let config = self
             .config
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let state = checkout_state(&self.admissions, &mut clients, ip, &config, now);
         // Hold the global `clients` lock until the permit is built: it keeps the
@@ -236,9 +243,15 @@ fn increment_window(window: &mut Window, limit: Option<&RateLimit>, now: Instant
 
 /// Reconciles a client's shared bandwidth bucket with the current `byterate`
 /// config: create it when newly enabled, drop it when disabled, or re-tune the
-/// existing shared bucket in place when the rate changed so the change reaches
-/// the client's ongoing flows. Called both when admitting a connection and, on
-/// reload, for every live client so existing flows pick up the new rate at once.
+/// existing shared bucket in place when the rate changed.
+///
+/// Only the in-place retune reaches the client's *ongoing* flows: they hold a
+/// clone of the same `Arc<Mutex<TokenBucket>>`, so mutating it is visible to
+/// them at once. Create/drop only change the tracked state, so enabling or
+/// disabling `byterate` takes effect on the client's next connection — an
+/// in-flight flow keeps the bucket (or lack of one) it was admitted with.
+///
+/// Called when admitting a connection and, on reload, for every live client.
 fn reconcile_bandwidth(state: &mut ClientState, config: &RateLimits, now: Instant) {
     match (&config.byte_rate, &state.bandwidth) {
         (Some(limit), None) => {

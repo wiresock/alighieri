@@ -51,13 +51,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `off`/`none`/`disabled` keyword). A typo like `dns.tryall: yes maybe`,
   `logformat: json text`, or `internal: 127.0.0.1 port = 10 80` now fails to parse
   rather than quietly using only the first value.
-- A `ratelimit.byterate` change now retunes every live per-client throttle bucket
-  the moment the config reloads, so a client's in-flight flows pick up the new
-  rate immediately — matching the documented "existing flows pick up a new rate."
-  The retune previously ran only when a client was next admitted, so a long-lived
-  client that did not reconnect kept its old rate until it did. Disabling
-  `byterate` likewise drops live buckets at reload now, rather than on the next
-  connection.
+- A `ratelimit.byterate` rate change now retunes every live per-client throttle
+  bucket in place the moment the config reloads, so a client's in-flight flows
+  pick up the new rate immediately — the bucket is shared with the client's
+  connections, matching the documented "existing flows pick up a new rate." The
+  retune previously ran only when a client was next admitted, so a long-lived
+  client that did not reconnect kept its old rate until it did. Enabling or
+  disabling `byterate` continues to take effect per connection: an in-flight flow
+  keeps the bucket (or lack of one) it was admitted with.
 
 ### Fixed
 
