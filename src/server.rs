@@ -177,13 +177,15 @@ impl Server {
         let rate_limits = config.rate_limits.clone();
 
         // Acquiring the state write lock is the last `.await`; everything below it
-        // is synchronous, so the reload is atomic — a cancellation (the driver
-        // races reload against shutdown) can only happen above, before anything is
-        // applied. Swap the runtime state under the lock, release it, then retune
-        // the abuse controls: that step is O(tracked clients), so keeping it out
-        // of the state lock avoids stalling the accept loop's `state.read()`, and
-        // because no `.await` separates the two, nothing can observe only one
-        // half applied.
+        // is synchronous, so the reload is *cancellation*-atomic — the driver
+        // races reload against shutdown, and a cancellation can only land above,
+        // before anything is applied (never with one half done). Swap the runtime
+        // state under the lock, release it, then retune the abuse controls: that
+        // step is O(tracked clients), so keeping it out of the state lock avoids
+        // stalling the accept loop's `state.read()`. A concurrent task on another
+        // worker may briefly see the new state before the abuse retune lands, but
+        // that window is tiny and the rate limits are approximate, so it is benign
+        // (and shorter than the old order, which updated abuse first).
         {
             let mut state = self.state.write().await;
             state.config = Arc::new(config);

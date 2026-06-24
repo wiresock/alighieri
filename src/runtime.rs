@@ -81,12 +81,19 @@ where
                         // Apply the reload as a future raced against shutdown, so a
                         // stop signal is never delayed behind slow config/userlist
                         // I/O or a wedged filesystem. `Config::load` is synchronous,
-                        // so run it on a blocking thread rather than on this task;
-                        // `server.reload` already does its own blocking reads. With
-                        // `biased`, shutdown wins over an in-progress reload.
+                        // so read it on a detached OS thread — not `spawn_blocking`:
+                        // if shutdown preempts the reload, a wedged read keeps
+                        // running, and a detached thread (unlike a blocking-pool
+                        // task) does not hold up the runtime's shutdown, so the
+                        // process still exits promptly. `server.reload` does its own
+                        // blocking reads off-task. With `biased`, shutdown wins.
                         let reload = async {
                             let path = config_path.clone();
-                            match tokio::task::spawn_blocking(move || Config::load(&path)).await {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Config::load(&path));
+                            });
+                            match rx.await {
                                 Ok(Ok(config)) => {
                                     if let Err(e) = server.reload(config).await {
                                         error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
@@ -95,8 +102,8 @@ where
                                 Ok(Err(e)) => {
                                     error!(config = %config_path.display(), error = %e, "configuration reload failed; keeping active configuration");
                                 }
-                                Err(e) => {
-                                    error!(config = %config_path.display(), error = %e, "configuration reload task failed; keeping active configuration");
+                                Err(_) => {
+                                    error!(config = %config_path.display(), "configuration reload thread panicked; keeping active configuration");
                                 }
                             }
                         };
@@ -988,8 +995,13 @@ mod tests {
                     .open(&config_path)
                 {
                     Ok(writer) => break writer,
-                    // `ENXIO`: no reader yet — the reload has not reached the open.
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    // `ENXIO` means no reader yet — the reload has not reached the
+                    // open. Any other error is unexpected (missing path, perms),
+                    // so fail fast rather than spinning to the timeout.
+                    Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    Err(e) => panic!("unexpected error opening FIFO writer: {e}"),
                 }
             }
         })
