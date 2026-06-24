@@ -173,18 +173,32 @@ impl Server {
         let users = load_users(&config).await?;
         warn_config_footguns(&config);
         preserve_process_config(&mut config, &self.process_config);
-        self.abuse.update_config(config.rate_limits.clone());
-
         let command_auth = build_command_auth(&config);
-        let mut state = self.state.write().await;
-        state.config = Arc::new(config);
-        state.users = Arc::new(users);
-        state.command_auth = command_auth;
-        // The DNS resolver (and its TTL cache) is intentionally preserved across
-        // reloads: the resolution *policy* lives in the config and is read per
-        // lookup, so a reload takes effect on the next resolve without discarding
-        // the cache and triggering a re-resolve storm. The deny policy is also
-        // applied per call, so newly denied categories take effect immediately.
+        let rate_limits = config.rate_limits.clone();
+
+        // Acquiring the state write lock is the last `.await`; everything below it
+        // is synchronous, so the reload is *cancellation*-atomic — the driver
+        // races reload against shutdown, and a cancellation can only land above,
+        // before anything is applied (never with one half done). Swap the runtime
+        // state under the lock, release it, then retune the abuse controls: that
+        // step is O(tracked clients), so keeping it out of the state lock avoids
+        // stalling the accept loop's `state.read()`. A concurrent task on another
+        // worker may briefly see the new state before the abuse retune lands, but
+        // that window is tiny and the rate limits are approximate, so it is benign
+        // (and shorter than the old order, which updated abuse first).
+        {
+            let mut state = self.state.write().await;
+            state.config = Arc::new(config);
+            state.users = Arc::new(users);
+            state.command_auth = command_auth;
+            // The DNS resolver (and its TTL cache) is intentionally preserved
+            // across reloads: the resolution *policy* lives in the config and is
+            // read per lookup, so a reload takes effect on the next resolve
+            // without discarding the cache and triggering a re-resolve storm. The
+            // deny policy is also applied per call, so newly denied categories
+            // take effect immediately.
+        }
+        self.abuse.update_config(rate_limits);
         info!("configuration reloaded");
         Ok(())
     }

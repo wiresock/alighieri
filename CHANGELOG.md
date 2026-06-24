@@ -93,6 +93,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A stop signal is no longer delayed behind an in-progress configuration reload.
+  The reload handler read the config and applied it inline in the select loop, so
+  while a reload was running — including a slow or wedged config/userlist read —
+  the shutdown signal was not observed. The reload now runs as a future raced
+  against shutdown (with the synchronous config read moved to a blocking thread),
+  and shutdown takes priority, so stopping the service stays prompt regardless of
+  reload I/O.
 - The config wizard's import-loss check now also compares each rule's
   `bandwidth:`, so importing a config whose `socks` rules carry a per-rule
   throttle warns that the policy will be dropped instead of discarding it
