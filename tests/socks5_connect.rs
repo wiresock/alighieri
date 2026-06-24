@@ -5,6 +5,7 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1350,4 +1351,63 @@ socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }}
     // Wrong credentials are rejected.
     let mut bad = TcpStream::connect(addr).await.unwrap();
     assert!(!handshake_username(&mut bad, "alice", "wrong").await);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_inflight_connection() {
+    let echo = start_echo_server().await;
+
+    // Keep an Arc so the test can trigger shutdown while `run` executes.
+    let server = Arc::new(Server::bind(permissive_config()).await.unwrap());
+    let proxy_addr = server.local_addr().unwrap();
+    let run = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await.ok() })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Establish a tunnel through the proxy to the echo server.
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+    let _bound = request_connect(&mut client, echo).await;
+
+    // Signal shutdown while the tunnel is open.
+    server.begin_shutdown();
+
+    // The in-flight tunnel must still carry data: it is drained, not cut.
+    client.write_all(b"after shutdown").await.unwrap();
+    let mut buf = [0u8; 14];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+        .await
+        .expect("in-flight tunnel was cut on shutdown instead of draining")
+        .unwrap();
+    assert_eq!(&buf, b"after shutdown");
+
+    // Closing the client lets the connection finish; `run` then drains and exits
+    // (proving it also stopped accepting — the loop returned).
+    client.shutdown().await.ok();
+    drop(client);
+    let exited = tokio::time::timeout(Duration::from_secs(5), run).await;
+    assert!(
+        exited.is_ok(),
+        "run() did not return after the connection drained"
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_returns_promptly_when_idle() {
+    let server = Arc::new(Server::bind(permissive_config()).await.unwrap());
+    let run = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await.ok() })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // With no in-flight connections the drain is empty, so `run` returns at once.
+    server.begin_shutdown();
+    let exited = tokio::time::timeout(Duration::from_secs(2), run).await;
+    assert!(
+        exited.is_ok(),
+        "idle server did not exit promptly on shutdown"
+    );
 }

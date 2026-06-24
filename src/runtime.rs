@@ -66,16 +66,14 @@ where
     loop {
         tokio::select! {
             res = &mut run_task => {
-                return match res {
-                    Ok(res) => res,
-                    Err(e) if e.is_cancelled() => Ok(()),
-                    Err(e) => Err(Error::Io(io::Error::other(format!("server task failed: {e}")))),
-                };
+                return server_join_result(res);
             }
             _ = &mut shutdown => {
-                info!("shutdown signal received; exiting");
-                run_task.abort();
-                return Ok(());
+                // Stop accepting and drain in-flight connections (bounded inside
+                // `run`), then wait for the loop to finish rather than aborting it.
+                info!("shutdown signal received; draining in-flight connections");
+                server.begin_shutdown();
+                return server_join_result((&mut run_task).await);
             }
             event = reloads.recv(), if !reloads_closed => {
                 match event {
@@ -98,17 +96,38 @@ where
     }
 }
 
+/// Maps a joined `run` task result to the driver's return value. A cancelled
+/// (aborted) task counts as a clean stop.
+fn server_join_result(
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match joined {
+        Ok(res) => res,
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => Err(Error::Io(io::Error::other(format!(
+            "server task failed: {e}"
+        )))),
+    }
+}
+
 /// Runs an already-bound SOCKS server until it exits or the supplied shutdown
-/// future resolves.
+/// future resolves. On shutdown the accept loop stops and in-flight connections
+/// are drained (bounded inside `run`) before the process returns.
 pub async fn run_bound_server_until_shutdown<F>(server: Server, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()>,
 {
+    let server = Arc::new(server);
+    let run_server = server.clone();
+    let mut run_task = tokio::spawn(async move { run_server.run().await });
+    tokio::pin!(shutdown);
+
     tokio::select! {
-        res = server.run() => res,
-        _ = shutdown => {
-            info!("shutdown signal received; exiting");
-            Ok(())
+        res = &mut run_task => server_join_result(res),
+        _ = &mut shutdown => {
+            info!("shutdown signal received; draining in-flight connections");
+            server.begin_shutdown();
+            server_join_result((&mut run_task).await)
         }
     }
 }
