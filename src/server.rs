@@ -837,6 +837,17 @@ mod tests {
         assert!(!footguns.contains(&Footgun::OpenProxyNoAuth));
     }
 
+    #[test]
+    fn config_footguns_flags_acme_with_proxyprotocol() {
+        // ACME validates via TLS-ALPN-01, which the proxyprotocol admission gate
+        // would reject for direct (un-PROXY-headed) Let's Encrypt connections.
+        let cfg = Config::parse(
+            "internal: 127.0.0.1 port = 1080\ntls.acme.domains: proxy.example.com\ntls.acme.cache: /var/lib/alighieri/acme\nproxyprotocol: 10.0.0.0/8\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+        )
+        .unwrap();
+        assert_eq!(config_footguns(&cfg), vec![Footgun::AcmeWithProxyProtocol]);
+    }
+
     #[tokio::test]
     async fn reload_footgun_warnings_reflect_effective_listener() {
         // Bind a public, no-auth listener — an open proxy that trips the footgun.
