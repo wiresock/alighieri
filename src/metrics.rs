@@ -487,7 +487,12 @@ async fn write_response(
     // `content-length` always advertises the body length — a HEAD reports the
     // size a GET would return without sending the bytes. `extra_headers`, when
     // non-empty, must be CRLF-terminated header lines placed before the blank
-    // line (e.g. `allow: GET, HEAD\r\n`).
+    // line (e.g. `allow: GET, HEAD\r\n`); otherwise the following `connection`
+    // header would be folded onto the same line and the response malformed.
+    debug_assert!(
+        extra_headers.is_empty() || extra_headers.ends_with("\r\n"),
+        "extra_headers must be empty or CRLF-terminated, got: {extra_headers:?}"
+    );
     let mut response = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n",
         body.len()
