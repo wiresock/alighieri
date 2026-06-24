@@ -67,6 +67,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The config wizard's import-loss check now also compares each rule's
+  `bandwidth:`, so importing a config whose `socks` rules carry a per-rule
+  throttle warns that the policy will be dropped instead of discarding it
+  silently. The wizard does not model per-rule bandwidth, so regeneration
+  removes it; the rule comparison previously ignored `bandwidth`, so the loss was
+  not reported. (The global `ratelimit.*` limits were already checked.)
 - The `proxyprotocol` trust gate now canonicalizes the peer address before
   matching it against the trusted-upstream CIDRs, so a trusted IPv4 upstream that
   reaches a dual-stack (`::`) listener as an IPv4-mapped address (`::ffff:a.b.c.d`)
