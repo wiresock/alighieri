@@ -74,6 +74,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   no other category owns, so a deny meant to block non-routable answers no longer
   lets them through. The exact set `reserved` matches (and which ranges belong to
   the sibling categories instead) is now documented in the README and the code.
+- A new `udp.strictreply` option tightens UDP ASSOCIATE reply validation to the
+  exact remote `host:port` the client contacted, instead of the default
+  host-only (port-agnostic) match. It defaults off to keep tolerating servers
+  that answer from a different port (e.g. TFTP); enabling it is stronger against
+  a co-located attacker on the same host but a different port, which matters most
+  on shared hosts or loopback. Replies are still matched on the canonical IP, so
+  IPv4-mapped answers on a dual-stack socket are unaffected.
 
 ### Fixed
 
