@@ -336,187 +336,261 @@ fn config_usage() -> String {
     "usage: alighieri config metadata --json | alighieri config wizard [--listen 127.0.0.1:PORT] [--output PATH]".into()
 }
 
-fn config_metadata_json() -> String {
-    let settings = [
-        ConfigSettingMetadata {
-            name: "internal",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "listener address is bound when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "external",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "outbound bind address is used by newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "socksmethod",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "offered authentication methods are used by new SOCKS handshakes",
-        },
-        ConfigSettingMetadata {
-            name: "userlist",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "user database is reloaded before accepting new authenticated sessions",
-        },
-        ConfigSettingMetadata {
-            name: "connecttimeout",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "timeout applies to newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "handshaketimeout",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "timeout applies to newly accepted client connections",
-        },
-        ConfigSettingMetadata {
-            name: "iotimeout",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "timeout applies to newly accepted relays",
-        },
-        ConfigSettingMetadata {
-            name: "udptimeout",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "timeout applies to newly accepted UDP associations",
-        },
-        ConfigSettingMetadata {
-            name: "maxconnections",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "connection semaphore is created when the listener starts",
-        },
-        ConfigSettingMetadata {
-            name: "logoutput",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "logging sinks are initialised when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "logfile",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "file logging is initialised when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "logformat",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "subscriber formatting is initialised when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "logrotate.size",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "rotating file writer is initialised when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "logrotate.keep",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "rotating file writer is initialised when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "dns.prefer",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "DNS policy is used by newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "dns.tryall",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "DNS policy is used by newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "dns.deny",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "DNS policy is used by newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "dns.cachettl",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "DNS cache settings are applied to newly accepted requests",
-        },
-        ConfigSettingMetadata {
-            name: "auth.cachettl",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note:
-                "verified-credential cache TTL; reloads also clear the cache with the user database",
-        },
-        ConfigSettingMetadata {
-            name: "metrics.listen",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "metrics listener is bound when the process starts",
-        },
-        ConfigSettingMetadata {
-            name: "tls.certfile",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "TLS acceptor is initialised when the listener starts",
-        },
-        ConfigSettingMetadata {
-            name: "tls.keyfile",
-            reload: ReloadBehavior::Restart,
-            applies_to: "process",
-            note: "TLS acceptor is initialised when the listener starts",
-        },
-        ConfigSettingMetadata {
-            name: "ratelimit.connectionrate",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "rate limit config is swapped during reload",
-        },
-        ConfigSettingMetadata {
-            name: "ratelimit.authfailurerate",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "rate limit config is swapped during reload",
-        },
-        ConfigSettingMetadata {
-            name: "ratelimit.concurrentconnections",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "rate limit config is swapped during reload",
-        },
-        ConfigSettingMetadata {
-            name: "ratelimit.byterate",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "rate limit config is swapped during reload",
-        },
-        ConfigSettingMetadata {
-            name: "client",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "client ACL rules are used for new client connections",
-        },
-        ConfigSettingMetadata {
-            name: "socks",
-            reload: ReloadBehavior::Live,
-            applies_to: "new_connections",
-            note: "SOCKS ACL rules are used for new SOCKS requests",
-        },
-        ConfigSettingMetadata {
-            name: "include",
-            reload: ReloadBehavior::Live,
-            applies_to: "next_reload",
-            note: "included files are re-read when the configuration is loaded",
-        },
-    ];
+/// Reload metadata for every config setting, surfaced by
+/// `config metadata --json`. Lists the canonical (documented) name of each
+/// setting; the parser also accepts aliases (e.g. `proxy.protocol`,
+/// `dns.try_all`, `tls.cert`), which are intentionally not repeated here. **When
+/// you add a setting to the parser in `config.rs`, add it here too** (and to the
+/// `expected` list in the `config_metadata_covers_every_setting` test). That
+/// test checks every name here is a real setting key, matches the canonical list
+/// it maintains, and has no duplicates — it cannot, however, notice a parser
+/// setting that is left out of both, so the manual step matters.
+const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
+    ConfigSettingMetadata {
+        name: "internal",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "listener address is bound when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "external",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "outbound bind address is used by newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "proxyprotocol",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "trusted PROXY-protocol upstreams are consulted on new connections",
+    },
+    ConfigSettingMetadata {
+        name: "socksmethod",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "offered authentication methods are used by new SOCKS handshakes",
+    },
+    ConfigSettingMetadata {
+        name: "userlist",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "user database is reloaded before accepting new authenticated sessions",
+    },
+    ConfigSettingMetadata {
+        name: "connecttimeout",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "timeout applies to newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "handshaketimeout",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "timeout applies to newly accepted client connections",
+    },
+    ConfigSettingMetadata {
+        name: "iotimeout",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "timeout applies to newly accepted relays",
+    },
+    ConfigSettingMetadata {
+        name: "udptimeout",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "timeout applies to newly accepted UDP associations",
+    },
+    ConfigSettingMetadata {
+        name: "udp.portrange",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "client-facing UDP relay port range is applied to new UDP associations",
+    },
+    ConfigSettingMetadata {
+        name: "udp.strictreply",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "UDP reply matching mode is applied to new UDP associations",
+    },
+    ConfigSettingMetadata {
+        name: "shutdown.draintimeout",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "drain timeout is read from the startup configuration at shutdown",
+    },
+    ConfigSettingMetadata {
+        name: "maxconnections",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "connection semaphore is created when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "logoutput",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "logging sinks are initialised when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "logfile",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "file logging is initialised when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "logformat",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "subscriber formatting is initialised when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "logrotate.size",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "rotating file writer is initialised when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "logrotate.keep",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "rotating file writer is initialised when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "dns.prefer",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "DNS policy is used by newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "dns.tryall",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "DNS policy is used by newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "dns.deny",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "DNS policy is used by newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "dns.cachettl",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "DNS cache settings are applied to newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "dns.timeout",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "DNS lookup timeout is used by newly accepted requests",
+    },
+    ConfigSettingMetadata {
+        name: "auth.cachettl",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "verified-credential cache TTL; reloads also clear the cache with the user database",
+    },
+    ConfigSettingMetadata {
+        name: "auth.command",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "external auth command is used by newly authenticated sessions",
+    },
+    ConfigSettingMetadata {
+        name: "metrics.listen",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "metrics listener is bound when the process starts",
+    },
+    ConfigSettingMetadata {
+        name: "metrics.allowpublic",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "checked at startup when the metrics listener is bound",
+    },
+    ConfigSettingMetadata {
+        name: "tls.certfile",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "TLS acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "tls.keyfile",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "TLS acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "tls.acme.domains",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "ACME acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "tls.acme.email",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "ACME acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "tls.acme.cache",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "ACME acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "tls.acme.staging",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "ACME acceptor is initialised when the listener starts",
+    },
+    ConfigSettingMetadata {
+        name: "ratelimit.connectionrate",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "rate limit config is swapped during reload",
+    },
+    ConfigSettingMetadata {
+        name: "ratelimit.authfailurerate",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "rate limit config is swapped during reload",
+    },
+    ConfigSettingMetadata {
+        name: "ratelimit.concurrentconnections",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "rate limit config is swapped during reload",
+    },
+    ConfigSettingMetadata {
+        name: "ratelimit.byterate",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "rate limit config is swapped during reload",
+    },
+    ConfigSettingMetadata {
+        name: "client",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "client ACL rules are used for new client connections",
+    },
+    ConfigSettingMetadata {
+        name: "socks",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "SOCKS ACL rules are used for new SOCKS requests",
+    },
+    ConfigSettingMetadata {
+        name: "include",
+        reload: ReloadBehavior::Live,
+        applies_to: "next_reload",
+        note: "included files are re-read when the configuration is loaded",
+    },
+];
 
+fn config_metadata_json() -> String {
     let mut json = String::from("{\"version\":1,\"settings\":[");
-    for (index, setting) in settings.iter().enumerate() {
+    for (index, setting) in CONFIG_SETTINGS_METADATA.iter().enumerate() {
         if index > 0 {
             json.push(',');
         }
@@ -1450,6 +1524,104 @@ mod tests {
         assert!(metadata.contains("\"name\":\"internal\",\"reload\":\"restart\""));
         assert!(metadata.contains("\"name\":\"dns.prefer\",\"reload\":\"live\""));
         assert!(metadata.contains("\"name\":\"include\",\"reload\":\"live\""));
+    }
+
+    #[test]
+    fn config_metadata_covers_every_setting() {
+        use std::collections::BTreeSet;
+
+        // Rule scopes and the `include` directive are listed in the metadata but
+        // are not `key: value` settings, so they are checked separately from the
+        // parser keys below.
+        let scopes_and_directives: BTreeSet<&str> =
+            ["client", "socks", "include"].into_iter().collect();
+
+        // Collect names as a list first so a duplicate entry is caught here rather
+        // than silently deduplicated (it would still emit a duplicate object in
+        // the `config metadata --json` settings array).
+        let all_names: Vec<&str> = CONFIG_SETTINGS_METADATA.iter().map(|s| s.name).collect();
+        let unique_names: BTreeSet<&str> = all_names.iter().copied().collect();
+        assert_eq!(
+            all_names.len(),
+            unique_names.len(),
+            "config metadata contains duplicate entries"
+        );
+
+        let metadata_settings: BTreeSet<&str> = unique_names
+            .into_iter()
+            .filter(|name| !scopes_and_directives.contains(name))
+            .collect();
+
+        // Every name the metadata lists must be a real setting key: assigning it a
+        // value yields some result, but never the parser's "unknown keyword".
+        for name in &metadata_settings {
+            if let Err(e) = Config::parse(&format!("internal: 127.0.0.1:1080\n{name}: x")) {
+                assert!(
+                    !e.to_string().contains("unknown keyword"),
+                    "metadata lists '{name}', which the parser does not recognise"
+                );
+            }
+        }
+
+        // The canonical name of every `key: value` setting the parser accepts;
+        // aliases (e.g. `proxy.protocol`, `dns.try_all`, `tls.cert`) are
+        // intentionally not listed. When a new setting is added to the parser it
+        // must be added here and to CONFIG_SETTINGS_METADATA, so
+        // `config metadata --json` stays complete.
+        let expected: BTreeSet<&str> = [
+            "internal",
+            "external",
+            "proxyprotocol",
+            "socksmethod",
+            "connecttimeout",
+            "handshaketimeout",
+            "iotimeout",
+            "udptimeout",
+            "udp.portrange",
+            "udp.strictreply",
+            "shutdown.draintimeout",
+            "userlist",
+            "maxconnections",
+            "logoutput",
+            "logfile",
+            "logformat",
+            "logrotate.size",
+            "logrotate.keep",
+            "dns.prefer",
+            "dns.tryall",
+            "dns.deny",
+            "dns.cachettl",
+            "dns.timeout",
+            "auth.cachettl",
+            "auth.command",
+            "metrics.listen",
+            "metrics.allowpublic",
+            "tls.certfile",
+            "tls.keyfile",
+            "tls.acme.domains",
+            "tls.acme.email",
+            "tls.acme.cache",
+            "tls.acme.staging",
+            "ratelimit.connectionrate",
+            "ratelimit.authfailurerate",
+            "ratelimit.concurrentconnections",
+            "ratelimit.byterate",
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            metadata_settings, expected,
+            "config metadata drifted from the parser's settings (missing or extra entries)"
+        );
+
+        // The rule scopes and directive are represented too.
+        for name in &scopes_and_directives {
+            assert!(
+                CONFIG_SETTINGS_METADATA.iter().any(|s| s.name == *name),
+                "config metadata is missing rule scope/directive '{name}'"
+            );
+        }
     }
 
     #[test]
