@@ -215,9 +215,10 @@ pub struct Config {
     /// datagrams). `None` lets the OS pick an ephemeral port. Useful for
     /// firewalling: open exactly this range to the proxy for inbound UDP.
     pub udp_port_range: Option<PortRange>,
-    /// When set (`udp.strictreply`), a UDP ASSOCIATE reply must come from the
-    /// exact remote `host:port` the client sent to, not merely the same host.
-    /// Defaults off, which tolerates servers that answer from a different port.
+    /// Whether a UDP ASSOCIATE reply must come from the exact remote `host:port`
+    /// the client sent to, rather than merely the same host. Defaults on (`true`);
+    /// set `udp.strictreply: false` to relax to host-only matching for servers
+    /// that legitimately answer from a different port (e.g. TFTP).
     pub udp_strict_reply: bool,
     /// Path to the username/password database (required if `username` is
     /// offered as a method).
@@ -555,7 +556,7 @@ impl Builder {
                 .udp_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_UDP_TIMEOUT_SECS)),
             udp_port_range: self.udp_port_range,
-            udp_strict_reply: self.udp_strict_reply.unwrap_or(false),
+            udp_strict_reply: self.udp_strict_reply.unwrap_or(true),
             userlist: self.userlist,
             auth_cache_ttl: self
                 .auth_cache_ttl
@@ -2308,16 +2309,19 @@ socks pass "" { command: connect }"#,
     }
 
     #[test]
-    fn udp_strict_reply_parses_and_defaults_off() {
+    fn udp_strict_reply_parses_and_defaults_on() {
         let cfg = Config::parse("internal: 0.0.0.0 port = 1080").unwrap();
-        assert!(!cfg.udp_strict_reply, "defaults to port-agnostic matching");
+        assert!(
+            cfg.udp_strict_reply,
+            "defaults to strict host:port matching"
+        );
 
-        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: true").unwrap();
-        assert!(cfg.udp_strict_reply);
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: false").unwrap();
+        assert!(!cfg.udp_strict_reply);
 
         // The concatenated alias works too.
-        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudpstrictreply: false").unwrap();
-        assert!(!cfg.udp_strict_reply);
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudpstrictreply: true").unwrap();
+        assert!(cfg.udp_strict_reply);
 
         // A non-boolean value is rejected like other booleans.
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: maybe").is_err());

@@ -1411,3 +1411,101 @@ async fn graceful_shutdown_returns_promptly_when_idle() {
         .expect("run task panicked")
         .expect("run() returned an error");
 }
+
+#[tokio::test]
+async fn udp_strict_reply_default_rejects_same_ip_different_port() {
+    // `permissive_config` uses the default `udp.strictreply` (now strict).
+    let (_handle, proxy_addr) = start_proxy().await;
+
+    // The contacted target; the proxy's outbound address is learned from the
+    // datagram it forwards here.
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    // Client sends a datagram destined for `target` through the proxy.
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(target_addr));
+    datagram.extend_from_slice(b"ping");
+    client.send_to(&datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (_, proxy_outbound) =
+        tokio::time::timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .expect("proxy did not forward the datagram to the target")
+            .unwrap();
+
+    // Inject a reply to the proxy's outbound socket from the same IP but a
+    // different port. Under strict matching it must be dropped.
+    let injector = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_ne!(injector.local_addr().unwrap().port(), target_addr.port());
+    injector.send_to(b"inject", proxy_outbound).await.unwrap();
+    let leaked = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf)).await;
+    assert!(
+        leaked.is_err(),
+        "strict mode forwarded an injected reply from a different port"
+    );
+
+    // A reply from the contacted endpoint itself is still delivered.
+    target.send_to(b"legit", proxy_outbound).await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("a legitimate reply from the contacted endpoint was dropped")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"legit");
+}
+
+#[tokio::test]
+async fn udp_loose_reply_accepts_same_ip_different_port() {
+    // Opt out of strict matching: any port on a contacted host is accepted.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+udp.strictreply: false
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp command: connect udpassociate }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(target_addr));
+    datagram.extend_from_slice(b"ping");
+    client.send_to(&datagram, relay_addr).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (_, proxy_outbound) =
+        tokio::time::timeout(Duration::from_secs(2), target.recv_from(&mut buf))
+            .await
+            .expect("proxy did not forward the datagram to the target")
+            .unwrap();
+
+    // A same-IP, different-port reply is accepted under loose matching.
+    let injector = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_ne!(injector.local_addr().unwrap().port(), target_addr.port());
+    injector
+        .send_to(b"from-other-port", proxy_outbound)
+        .await
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("loose mode dropped a reply from a different port on the contacted host")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"from-other-port");
+}
