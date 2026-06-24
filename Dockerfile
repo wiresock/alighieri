@@ -3,8 +3,9 @@
 # Multi-arch image. The builder runs on the native build platform and, when the
 # build host arch differs from the target, cross-compiles to it (no QEMU of the
 # Rust build), then the binary ships in a minimal distroless runtime. Pinned to
-# the project MSRV so rebuilding a release tag stays reproducible.
-FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+# the project MSRV — and by digest, kept current by Dependabot — so rebuilding a
+# release tag stays reproducible and the mutable tag cannot drift under us.
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 ARG TARGETARCH
 WORKDIR /src
 
@@ -48,8 +49,8 @@ RUN set -eux; \
 
 # Distroless runtime (glibc, matches the bookworm builder ABI): no shell or
 # package manager, runs as a non-root user. Use the :debug-nonroot tag if you
-# need a busybox shell to poke around.
-FROM gcr.io/distroless/cc-debian12:nonroot
+# need a busybox shell to poke around. Pinned by digest (Dependabot-maintained).
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985
 COPY --from=builder /alighieri /usr/local/bin/alighieri
 EXPOSE 1080
 ENTRYPOINT ["/usr/local/bin/alighieri"]
