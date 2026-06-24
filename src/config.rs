@@ -2316,12 +2316,14 @@ socks pass "" { command: connect }"#,
             "defaults to strict host:port matching"
         );
 
+        // Set `false` (not the default) so the assertion actually proves the key
+        // was parsed rather than falling back to the default.
         let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: false").unwrap();
         assert!(!cfg.udp_strict_reply);
 
-        // The concatenated alias works too.
-        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudpstrictreply: true").unwrap();
-        assert!(cfg.udp_strict_reply);
+        // The concatenated alias works too — again with the non-default value.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudpstrictreply: false").unwrap();
+        assert!(!cfg.udp_strict_reply);
 
         // A non-boolean value is rejected like other booleans.
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: maybe").is_err());
