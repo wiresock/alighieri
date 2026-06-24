@@ -336,15 +336,15 @@ fn config_usage() -> String {
     "usage: alighieri config metadata --json | alighieri config wizard [--listen 127.0.0.1:PORT] [--output PATH]".into()
 }
 
-/// Reload metadata for every config setting, surfaced by `config metadata
-/// --json`. Lists the canonical (documented) name of each setting; the parser
-/// also accepts aliases (e.g. `proxy.protocol`, `dns.try_all`, `tls.cert`),
-/// which are intentionally not repeated here. **When you add a setting to the
-/// parser in `config.rs`, add it here too** (and to the `expected` list in the
-/// `config_metadata_covers_every_setting` test). That test checks every name
-/// here is a real setting key, matches the canonical list it maintains, and has
-/// no duplicates — it cannot, however, notice a parser setting that is left out
-/// of both, so the manual step matters.
+/// Reload metadata for every config setting, surfaced by
+/// `config metadata --json`. Lists the canonical (documented) name of each
+/// setting; the parser also accepts aliases (e.g. `proxy.protocol`,
+/// `dns.try_all`, `tls.cert`), which are intentionally not repeated here. **When
+/// you add a setting to the parser in `config.rs`, add it here too** (and to the
+/// `expected` list in the `config_metadata_covers_every_setting` test). That
+/// test checks every name here is a real setting key, matches the canonical list
+/// it maintains, and has no duplicates — it cannot, however, notice a parser
+/// setting that is left out of both, so the manual step matters.
 const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
     ConfigSettingMetadata {
         name: "internal",
