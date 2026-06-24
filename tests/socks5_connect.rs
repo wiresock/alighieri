@@ -1413,6 +1413,56 @@ async fn graceful_shutdown_returns_promptly_when_idle() {
 }
 
 #[tokio::test]
+async fn shutdown_aborts_inflight_after_drain_timeout() {
+    let echo = start_echo_server().await;
+    // A short, configured drain window so the abort path runs quickly.
+    let cfg = Config::parse(
+        "internal: 127.0.0.1:0\nexternal: 127.0.0.1\nsocksmethod: none\n\
+         shutdown.draintimeout: 1\n\
+         client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n\
+         socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }\n",
+    )
+    .unwrap();
+    let server = Arc::new(Server::bind(cfg).await.unwrap());
+    let proxy_addr = server.local_addr().unwrap();
+    let run = {
+        let server = server.clone();
+        tokio::spawn(async move { server.run().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Establish a tunnel and leave it open and idle — neither side closes, so it
+    // does not drain on its own and must be aborted at the timeout.
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+    let _bound = request_connect(&mut client, echo).await;
+
+    let started = std::time::Instant::now();
+    server.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run() hung past the drain timeout")
+        .expect("run task panicked")
+        .expect("run() returned an error");
+    let elapsed = started.elapsed();
+    // It waited out the ~1s drain rather than cutting instantly. The surrounding
+    // 5s timeout already fails the test if shutdown hangs, so no upper bound here
+    // (which would only add CI flakiness).
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "returned before the drain window elapsed: {elapsed:?}"
+    );
+
+    // The aborted connection cut the tunnel: the client now reads EOF or errors.
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("expected the tunnel to be cut, read {n} bytes"),
+        Err(_) => panic!("tunnel was not cut after the drain timeout"),
+    }
+}
+
+#[tokio::test]
 async fn udp_strict_reply_default_rejects_same_ip_different_port() {
     // `permissive_config` uses the default `udp.strictreply` (now strict).
     let (_handle, proxy_addr) = start_proxy().await;

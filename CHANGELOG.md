@@ -10,12 +10,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Shutdown now drains in-flight connections instead of cutting them. On a stop
   signal (Ctrl-C, SIGTERM, or a Windows service `STOP`/`SHUTDOWN`) the accept
-  loop stops taking new connections and waits up to 10 seconds for the
-  established ones to finish on their own, then aborts whatever remains so the
-  process still exits promptly. Connection tasks are tracked in a `JoinSet` and
-  the accept loop observes a latched shutdown signal, so an idle server exits at
-  once and a busy one is not severed mid-transfer. (The Windows service guide and
-  README, which previously documented the cut-at-exit behavior, are updated.)
+  loop stops taking new connections and waits up to `shutdown.draintimeout`
+  seconds (default 10, `0` to cut immediately) for the established ones to finish
+  on their own, then aborts whatever remains so the process still exits promptly.
+  Connection tasks are tracked in a `JoinSet` and the accept loop observes a
+  latched shutdown signal, so an idle server exits at once and a busy one is not
+  severed mid-transfer. (The Windows service guide and README, which previously
+  documented the cut-at-exit behavior, are updated.)
 - Alighieri now warns at startup and on reload when the no-authentication
   (`none`) SOCKS method is offered on a non-loopback `internal` listener. `none`
   is offered by default and whenever `socksmethod` lists it (e.g. `username

@@ -261,6 +261,7 @@ socks pass "allow-default" {
 | `udp.portrange`    | —               | Bind the client-facing UDP relay port (`BND.PORT`) within a fixed `MIN-MAX` range for firewalling; unset uses an ephemeral port |
 | `udp.strictreply`  | `true`          | Require UDP replies from the exact remote `host:port` contacted; set `false` to relax to host-only for compatibility (see below) |
 | `maxconnections`   | `1024`          | Maximum concurrent client TCP connections            |
+| `shutdown.draintimeout` | `10`       | Seconds shutdown waits for in-flight connections before aborting the rest (`0` cuts immediately) |
 | `logoutput`        | `stdout`        | One or more of `stdout`, `stderr`, `file`            |
 | `logfile`          | —               | File path used when `logoutput` includes `file`      |
 | `logformat`        | `text`          | Log encoding: `text` or `json`                       |
@@ -734,8 +735,9 @@ The installed service uses:
 - recovery: restart on crash (after 5s, then 30s, then 60s; failure count resets
   after an hour), the Windows equivalent of systemd's `Restart=on-failure`
 - accepts `STOP` and system `SHUTDOWN`, so an OS restart stops it cleanly: it
-  stops accepting, drains in-flight connections for up to 10 seconds (cutting any
-  that remain), then flushes logs and reports a clean `Stopped` status
+  stops accepting, drains in-flight connections for up to `shutdown.draintimeout`
+  seconds (default 10; cutting any that remain), then flushes logs and reports a
+  clean `Stopped` status
 
 The installer validates the configuration before creating the service and the
 start and reload commands validate the installed configuration before asking

@@ -220,6 +220,10 @@ pub struct Config {
     /// set `udp.strictreply: false` to relax to host-only matching for servers
     /// that legitimately answer from a different port (e.g. TFTP).
     pub udp_strict_reply: bool,
+    /// How long shutdown waits for in-flight connections to finish before
+    /// aborting the rest (`shutdown.draintimeout`, seconds). `0` cuts them
+    /// immediately. Read at process start; a reload does not change it.
+    pub shutdown_drain_timeout: Duration,
     /// Path to the username/password database (required if `username` is
     /// offered as a method).
     pub userlist: Option<PathBuf>,
@@ -428,6 +432,13 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_UDP_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_DNS_TIMEOUT_SECS: u64 = 5;
+/// How long shutdown waits for in-flight connections to drain before aborting
+/// the rest. Kept under typical service-manager stop windows (systemd's 90s) so
+/// the process exits on its own first.
+const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Upper bound for `shutdown.draintimeout`. A drain should never take an hour,
+/// and bounding it avoids an overflow panic when the timer deadline is computed.
+const MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 3600;
 /// Upper bound for `dns.timeout`. A resolution should never take an hour, and
 /// rejecting absurd values keeps the timer deadline (`Instant::now() + dur`)
 /// well clear of overflow.
@@ -457,6 +468,7 @@ struct Builder {
     udp_timeout: Option<Duration>,
     udp_port_range: Option<PortRange>,
     udp_strict_reply: Option<bool>,
+    shutdown_drain_timeout: Option<Duration>,
     userlist: Option<PathBuf>,
     auth_cache_ttl: Option<Option<Duration>>,
     auth_command: Option<Vec<String>>,
@@ -584,6 +596,9 @@ impl Builder {
                 .unwrap_or(Duration::from_secs(DEFAULT_UDP_TIMEOUT_SECS)),
             udp_port_range: self.udp_port_range,
             udp_strict_reply: self.udp_strict_reply.unwrap_or(true),
+            shutdown_drain_timeout: self
+                .shutdown_drain_timeout
+                .unwrap_or(Duration::from_secs(DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECS)),
             userlist: self.userlist,
             auth_cache_ttl: self
                 .auth_cache_ttl
@@ -688,6 +703,18 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "udpstrictreply" | "udp.strictreply" => {
             b.udp_strict_reply = Some(parse_bool(vals, lineno)?);
+        }
+        "shutdowndraintimeout" | "shutdown.draintimeout" => {
+            let secs = parse_u64(vals, lineno)?;
+            if secs > MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS {
+                return Err(cfg_err(
+                    lineno,
+                    &format!(
+                        "shutdown.draintimeout cannot exceed {MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS} seconds"
+                    ),
+                ));
+            }
+            b.shutdown_drain_timeout = Some(Duration::from_secs(secs));
         }
         "userlist" => {
             if vals.is_empty() {
@@ -2401,6 +2428,30 @@ socks pass "" { command: connect }"#,
 
         // A non-boolean value is rejected like other booleans.
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: maybe").is_err());
+    }
+
+    #[test]
+    fn shutdown_drain_timeout_parses_and_defaults() {
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080").unwrap();
+        assert_eq!(cfg.shutdown_drain_timeout, Duration::from_secs(10));
+
+        let cfg =
+            Config::parse("internal: 0.0.0.0 port = 1080\nshutdown.draintimeout: 30").unwrap();
+        assert_eq!(cfg.shutdown_drain_timeout, Duration::from_secs(30));
+
+        // `0` is allowed (cut in-flight connections immediately); alias parses.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nshutdowndraintimeout: 0").unwrap();
+        assert_eq!(cfg.shutdown_drain_timeout, Duration::ZERO);
+
+        // A non-numeric value is rejected.
+        assert!(
+            Config::parse("internal: 0.0.0.0 port = 1080\nshutdown.draintimeout: soon").is_err()
+        );
+
+        // A value over the cap is rejected (it would overflow the timer deadline).
+        let err = Config::parse("internal: 0.0.0.0 port = 1080\nshutdown.draintimeout: 3601")
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot exceed"), "{err}");
     }
 
     #[test]
