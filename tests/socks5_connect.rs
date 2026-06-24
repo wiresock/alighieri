@@ -1445,14 +1445,12 @@ async fn shutdown_aborts_inflight_after_drain_timeout() {
         .expect("run task panicked")
         .expect("run() returned an error");
     let elapsed = started.elapsed();
-    // It waited out the ~1s drain (did not cut instantly) but did not hang.
+    // It waited out the ~1s drain rather than cutting instantly. The surrounding
+    // 5s timeout already fails the test if shutdown hangs, so no upper bound here
+    // (which would only add CI flakiness).
     assert!(
         elapsed >= Duration::from_millis(500),
         "returned before the drain window elapsed: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "drain took too long: {elapsed:?}"
     );
 
     // The aborted connection cut the tunnel: the client now reads EOF or errors.
