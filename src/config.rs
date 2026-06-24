@@ -436,6 +436,9 @@ const DEFAULT_DNS_TIMEOUT_SECS: u64 = 5;
 /// the rest. Kept under typical service-manager stop windows (systemd's 90s) so
 /// the process exits on its own first.
 const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Upper bound for `shutdown.draintimeout`. A drain should never take an hour,
+/// and bounding it avoids an overflow panic when the timer deadline is computed.
+const MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS: u64 = 3600;
 /// Upper bound for `dns.timeout`. A resolution should never take an hour, and
 /// rejecting absurd values keeps the timer deadline (`Instant::now() + dur`)
 /// well clear of overflow.
@@ -702,7 +705,16 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.udp_strict_reply = Some(parse_bool(vals, lineno)?);
         }
         "shutdowndraintimeout" | "shutdown.draintimeout" => {
-            b.shutdown_drain_timeout = Some(Duration::from_secs(parse_u64(vals, lineno)?));
+            let secs = parse_u64(vals, lineno)?;
+            if secs > MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS {
+                return Err(cfg_err(
+                    lineno,
+                    &format!(
+                        "shutdown.draintimeout cannot exceed {MAX_SHUTDOWN_DRAIN_TIMEOUT_SECS} seconds"
+                    ),
+                ));
+            }
+            b.shutdown_drain_timeout = Some(Duration::from_secs(secs));
         }
         "userlist" => {
             if vals.is_empty() {
@@ -2435,6 +2447,11 @@ socks pass "" { command: connect }"#,
         assert!(
             Config::parse("internal: 0.0.0.0 port = 1080\nshutdown.draintimeout: soon").is_err()
         );
+
+        // A value over the cap is rejected (it would overflow the timer deadline).
+        let err = Config::parse("internal: 0.0.0.0 port = 1080\nshutdown.draintimeout: 3601")
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot exceed"), "{err}");
     }
 
     #[test]

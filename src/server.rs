@@ -422,25 +422,36 @@ impl Server {
         let active = conns.len();
         if active > 0 {
             let drain_timeout = self.process_config.shutdown_drain_timeout;
-            info!(
-                active,
-                drain_timeout_secs = drain_timeout.as_secs(),
-                "shutdown: draining in-flight connections"
-            );
-            let drained = tokio::time::timeout(drain_timeout, async {
-                while let Some(outcome) = conns.join_next().await {
-                    note_task_outcome(outcome);
-                }
-            })
-            .await;
-            if drained.is_err() {
-                warn!(
-                    remaining = conns.len(),
-                    "shutdown drain timed out; aborting remaining connections"
+            if drain_timeout.is_zero() {
+                // `shutdown.draintimeout: 0` — cut in-flight connections at once,
+                // skipping the (immediately-elapsing) timeout and its misleading
+                // "drain timed out" warning.
+                info!(
+                    active,
+                    "shutdown: cutting in-flight connections immediately"
                 );
                 conns.shutdown().await;
             } else {
-                info!("shutdown: all in-flight connections drained");
+                info!(
+                    active,
+                    drain_timeout_secs = drain_timeout.as_secs(),
+                    "shutdown: draining in-flight connections"
+                );
+                let drained = tokio::time::timeout(drain_timeout, async {
+                    while let Some(outcome) = conns.join_next().await {
+                        note_task_outcome(outcome);
+                    }
+                })
+                .await;
+                if drained.is_err() {
+                    warn!(
+                        remaining = conns.len(),
+                        "shutdown drain timed out; aborting remaining connections"
+                    );
+                    conns.shutdown().await;
+                } else {
+                    info!("shutdown: all in-flight connections drained");
+                }
             }
         }
 
@@ -587,6 +598,7 @@ fn preserve_process_config(config: &mut Config, process_config: &Config) {
     config.metrics_listen = process_config.metrics_listen;
     config.tls = process_config.tls.clone();
     config.max_connections = process_config.max_connections;
+    config.shutdown_drain_timeout = process_config.shutdown_drain_timeout;
     config.log_outputs = process_config.log_outputs.clone();
     config.log_file = process_config.log_file.clone();
     config.log_format = process_config.log_format;
@@ -677,7 +689,7 @@ mod tests {
     async fn reload_updates_runtime_config_for_new_connections() {
         let server = Server::bind(
             Config::parse(
-                "internal: 127.0.0.1 port = 0\nhandshaketimeout: 7\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+                "internal: 127.0.0.1 port = 0\nhandshaketimeout: 7\nshutdown.draintimeout: 5\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
             )
             .unwrap(),
         )
@@ -688,7 +700,7 @@ mod tests {
         server
             .reload(
                 Config::parse(
-                    "internal: 127.0.0.1 port = 1\nhandshaketimeout: 11\nmaxconnections: 7\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks block { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+                    "internal: 127.0.0.1 port = 1\nhandshaketimeout: 11\nmaxconnections: 7\nshutdown.draintimeout: 20\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks block { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
                 )
                 .unwrap(),
             )
@@ -702,6 +714,12 @@ mod tests {
         );
         assert_eq!(state.config.internal, listen);
         assert_eq!(state.config.max_connections, 1024);
+        // Non-reloadable process-level settings keep their startup values rather
+        // than the reloaded ones.
+        assert_eq!(
+            state.config.shutdown_drain_timeout,
+            std::time::Duration::from_secs(5)
+        );
         assert_eq!(state.config.rules.rules.len(), 2);
     }
 
