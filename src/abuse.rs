@@ -69,16 +69,37 @@ impl AbuseControls {
     }
 
     pub fn update_config(&self, config: RateLimits) {
-        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config.clone();
+        // Apply a new `byterate` rate to live per-client buckets immediately so a
+        // client's ongoing flows pick up the change at once (the bucket is shared
+        // with its connections), rather than only when it next reconnects — which
+        // is when `admit` would otherwise reconcile. Snapshot the states under a
+        // brief lock, then retune each without holding the global `clients` lock
+        // across every bucket update.
+        let now = Instant::now();
+        let states: Vec<Arc<Mutex<ClientState>>> = {
+            let clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+            clients.values().cloned().collect()
+        };
+        for state in states {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            reconcile_bandwidth(&mut state, &config, now);
+        }
     }
 
     pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<ClientPermit, DenialReason> {
+        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        // Read the config *after* taking the clients lock. We hold this lock
+        // across the bandwidth reconcile below, and `update_config` retunes live
+        // buckets only after taking the same lock — so a reload that lands while
+        // we are admitting is forced to apply its (newer) rate after ours, never
+        // letting a stale snapshot revert it. (No deadlock: `update_config`
+        // releases the config write lock before it takes the clients lock.)
         let config = self
             .config
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut clients = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let state = checkout_state(&self.admissions, &mut clients, ip, &config, now);
         // Hold the global `clients` lock until the permit is built: it keeps the
@@ -110,27 +131,10 @@ impl AbuseControls {
         }
 
         state_guard.active_connections += 1;
-        // Reconcile the per-client bandwidth bucket with the current config so a
-        // reload takes effect: add or drop the bucket when `byterate` is enabled
-        // or disabled, and re-tune the existing shared bucket in place when the
-        // rate changes, applying to the client's ongoing flows at once.
-        match (&config.byte_rate, &state_guard.bandwidth) {
-            (Some(limit), None) => {
-                state_guard.bandwidth =
-                    TokenBucket::from_rate_window(limit.limit, limit.window, now)
-                        .map(|b| Arc::new(Mutex::new(b)));
-            }
-            (Some(limit), Some(bucket)) => {
-                // Re-tune the existing shared bucket in place so a reloaded rate
-                // applies to this client's ongoing flows, not just new clients.
-                bucket
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .update_rate_window(limit.limit, limit.window, now);
-            }
-            (None, Some(_)) => state_guard.bandwidth = None,
-            (None, None) => {}
-        }
+        // Reconcile the bandwidth bucket with the current config so a reload that
+        // arrived since this client was last admitted takes effect for it now.
+        // (Reloads also retune every live bucket eagerly; see `update_config`.)
+        reconcile_bandwidth(&mut state_guard, &config, now);
         let bandwidth = state_guard.bandwidth.clone();
         drop(state_guard);
         Ok(ClientPermit {
@@ -235,6 +239,34 @@ fn increment_window(window: &mut Window, limit: Option<&RateLimit>, now: Instant
     reset_if_expired(window, limit, now);
     window.count = window.count.saturating_add(1);
     window.count > limit.limit
+}
+
+/// Reconciles a client's shared bandwidth bucket with the current `byterate`
+/// config: create it when newly enabled, drop it when disabled, or re-tune the
+/// existing shared bucket in place when the rate changed.
+///
+/// Only the in-place retune reaches the client's *ongoing* flows: they hold a
+/// clone of the same `Arc<Mutex<TokenBucket>>`, so mutating it is visible to
+/// them at once. Create/drop only change the tracked state, so enabling or
+/// disabling `byterate` takes effect on the client's next connection — an
+/// in-flight flow keeps the bucket (or lack of one) it was admitted with.
+///
+/// Called when admitting a connection and, on reload, for every live client.
+fn reconcile_bandwidth(state: &mut ClientState, config: &RateLimits, now: Instant) {
+    match (&config.byte_rate, &state.bandwidth) {
+        (Some(limit), None) => {
+            state.bandwidth = TokenBucket::from_rate_window(limit.limit, limit.window, now)
+                .map(|b| Arc::new(Mutex::new(b)));
+        }
+        (Some(limit), Some(bucket)) => {
+            bucket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .update_rate_window(limit.limit, limit.window, now);
+        }
+        (None, Some(_)) => state.bandwidth = None,
+        (None, None) => {}
+    }
 }
 
 /// Looks up or creates the per-client state for `ip` under the already-held
@@ -439,6 +471,37 @@ mod tests {
         // The bucket is re-tuned in place (the same instance), not recreated, so
         // the new rate applies to the client's ongoing flows immediately.
         assert!(Arc::ptr_eq(&bucket, &second.throttle_bucket().unwrap()));
+    }
+
+    #[test]
+    fn reload_retunes_live_bucket_without_readmission() {
+        // A reload must reach a client's *existing* flows even if the client does
+        // not reconnect — `admit` is not the only thing that applies a new rate.
+        let controls = AbuseControls::new(RateLimits {
+            byte_rate: Some(RateLimit {
+                limit: 100,
+                window: Duration::from_secs(60),
+            }),
+            ..RateLimits::default()
+        });
+        let permit = controls.admit(ip()).unwrap();
+        let bucket = permit.throttle_bucket().unwrap();
+        // A fresh bucket starts full (tokens == capacity).
+        assert!(bucket.lock().unwrap().is_full(Instant::now()));
+
+        // Reload to a far larger rate, but do NOT admit the client again.
+        controls.update_config(RateLimits {
+            byte_rate: Some(RateLimit {
+                limit: 1_000_000,
+                window: Duration::from_secs(60),
+            }),
+            ..RateLimits::default()
+        });
+
+        // The live bucket was retuned at reload: its capacity grew well past the
+        // ~100 tokens it carried, so it is no longer full. Without the eager
+        // retune the capacity would still be 100 and the bucket would read full.
+        assert!(!bucket.lock().unwrap().is_full(Instant::now()));
     }
 
     #[test]
