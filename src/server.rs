@@ -4,11 +4,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 use crate::abuse::AbuseControls;
@@ -22,6 +24,12 @@ use crate::errors::Result;
 use crate::metrics::{self, Metrics};
 use crate::net::Cidr;
 use crate::tls;
+
+/// How long [`Server::run`] waits for in-flight connections to finish after a
+/// shutdown signal before aborting whatever remains. Kept well under typical
+/// service-manager stop windows (e.g. systemd's 90s `TimeoutStopSec`) so the
+/// process drains and exits on its own rather than being killed.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A bound SOCKS5 server ready to accept connections.
 pub struct Server {
@@ -41,6 +49,10 @@ pub struct Server {
     #[allow(dead_code)]
     acme_driver: Option<AbortOnDrop<()>>,
     has_run: AtomicBool,
+    /// Set to `true` by [`Server::begin_shutdown`] to tell the accept loop to
+    /// stop accepting and drain in-flight connections. `send_replace` latches the
+    /// value, so a signal that arrives before `run` subscribes is not missed.
+    shutdown: watch::Sender<bool>,
 }
 
 struct ServerState {
@@ -131,6 +143,7 @@ impl Server {
             tls_listener,
             acme_driver,
             has_run: AtomicBool::new(false),
+            shutdown: watch::channel(false).0,
         })
     }
 
@@ -143,6 +156,13 @@ impl Server {
     /// Returns the metrics endpoint address when metrics are enabled.
     pub fn metrics_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         Ok(self.metrics_addr)
+    }
+
+    /// Signals the accept loop to stop accepting new connections and drain the
+    /// in-flight ones (see [`Server::run`]). Idempotent, and safe to call before
+    /// `run` starts — the signal latches, so it is observed once `run` begins.
+    pub fn begin_shutdown(&self) {
+        let _ = self.shutdown.send_replace(true);
     }
 
     /// Replaces the runtime configuration used for newly accepted
@@ -196,26 +216,48 @@ impl Server {
             .map(|listener| tokio::spawn(metrics::serve_metrics(listener, self.metrics.clone())))
             .map(AbortOnDrop);
 
+        // In-flight connection tasks, tracked so a shutdown can drain them rather
+        // than cut them. Finished tasks are reaped after each accept, so the set
+        // stays bounded (by `max_connections` plus whatever finished while idle).
+        let mut conns: JoinSet<()> = JoinSet::new();
+        // Latched shutdown flag. `wait_for` also observes a signal that arrived
+        // before this subscribe, so an early `begin_shutdown` is not missed.
+        let mut shutdown_rx = self.shutdown.subscribe();
+
         loop {
             // Acquire a slot before accepting so we apply backpressure rather
-            // than unboundedly spawning tasks under load.
-            let permit = match limiter.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    error!("connection limiter closed unexpectedly");
-                    break;
-                }
+            // than unboundedly spawning tasks under load; a shutdown signal stops
+            // the wait instead.
+            let permit = tokio::select! {
+                biased;
+                _ = shutdown_rx.wait_for(|&stop| stop) => break,
+                slot = limiter.clone().acquire_owned() => match slot {
+                    Ok(p) => p,
+                    Err(_) => {
+                        error!("connection limiter closed unexpectedly");
+                        break;
+                    }
+                },
             };
 
-            let (mut stream, peer) = match self.listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    // Transient accept errors (e.g. EMFILE) should not kill the
-                    // server; log and continue after dropping the permit.
-                    warn!(error = %e, "accept failed");
+            // Accept the next connection, letting a shutdown signal interrupt the
+            // wait so an idle server stops promptly rather than after one more.
+            let (mut stream, peer) = tokio::select! {
+                biased;
+                _ = shutdown_rx.wait_for(|&stop| stop) => {
                     drop(permit);
-                    continue;
+                    break;
                 }
+                accepted = self.listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Transient accept errors (e.g. EMFILE) should not kill
+                        // the server; log and continue after dropping the permit.
+                        warn!(error = %e, "accept failed");
+                        drop(permit);
+                        continue;
+                    }
+                },
             };
 
             let local = match stream.local_addr() {
@@ -264,7 +306,7 @@ impl Server {
             let tls_listener = self.tls_listener.clone();
             let abuse = self.abuse.clone();
             let handshake_timeout = config.handshake_timeout;
-            tokio::spawn(async move {
+            conns.spawn(async move {
                 // Resolve the real client address from a trusted upstream's
                 // PROXY header before admitting and handling the connection.
                 let peer = if expect_proxy {
@@ -349,6 +391,41 @@ impl Server {
                 drop(client_permit);
                 drop(permit); // release the slot when the connection finishes
             });
+
+            // Reap finished connection tasks so the set cannot grow without
+            // bound (non-blocking; drains all that are already done).
+            reap_finished(&mut conns);
+        }
+
+        // Shutdown was signalled: the accept loop has stopped. Reap anything that
+        // finished since the last sweep so `active` counts only still-running
+        // connections (and we skip the drain entirely if none remain).
+        reap_finished(&mut conns);
+        // Let the in-flight connections finish on their own, up to a bounded
+        // window, then abort whatever is left so the process exits promptly.
+        // Dropping `conns` would abort everything immediately, so drain first.
+        let active = conns.len();
+        if active > 0 {
+            info!(
+                active,
+                drain_timeout_secs = SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "shutdown: draining in-flight connections"
+            );
+            let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+                while let Some(outcome) = conns.join_next().await {
+                    note_task_outcome(outcome);
+                }
+            })
+            .await;
+            if drained.is_err() {
+                warn!(
+                    remaining = conns.len(),
+                    "shutdown drain timed out; aborting remaining connections"
+                );
+                conns.shutdown().await;
+            } else {
+                info!("shutdown: all in-flight connections drained");
+            }
         }
 
         Ok(())
@@ -401,6 +478,25 @@ fn build_command_auth(config: &Config) -> Option<Arc<CommandAuth>> {
 fn is_trusted_proxy_upstream(trusted: &[Cidr], peer: IpAddr) -> bool {
     let canonical = peer.to_canonical();
     trusted.iter().any(|cidr| cidr.contains(canonical))
+}
+
+/// Logs a connection task that ended abnormally. The connection body itself
+/// logs ordinary errors, so a failure surfaced here means the task panicked;
+/// `JoinError::is_cancelled` only arises from `JoinSet::shutdown` (the drain's
+/// abort path), which joins those tasks itself and never routes them here.
+fn note_task_outcome(outcome: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(e) = outcome {
+        warn!(error = %e, "connection task terminated abnormally");
+    }
+}
+
+/// Reaps every connection task that has already finished (non-blocking), keeping
+/// the tracking set bounded during normal operation and giving an accurate
+/// active count at shutdown. Panicking tasks are logged via [`note_task_outcome`].
+fn reap_finished(conns: &mut JoinSet<()>) {
+    while let Some(outcome) = conns.try_join_next() {
+        note_task_outcome(outcome);
+    }
 }
 
 fn warn_config_footguns(config: &Config) {
