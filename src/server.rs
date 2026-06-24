@@ -566,6 +566,13 @@ fn warn_restart_required_changes(old: &Config, new: &Config) {
             "metrics listener changes require a restart"
         );
     }
+    if old.metrics_allow_public != new.metrics_allow_public {
+        warn!(
+            current = old.metrics_allow_public,
+            requested = new.metrics_allow_public,
+            "metrics.allowpublic changes require a restart"
+        );
+    }
     if old.tls != new.tls {
         warn!("TLS listener changes require a restart");
     }
@@ -596,6 +603,7 @@ fn warn_restart_required_changes(old: &Config, new: &Config) {
 fn preserve_process_config(config: &mut Config, process_config: &Config) {
     config.internal = process_config.internal;
     config.metrics_listen = process_config.metrics_listen;
+    config.metrics_allow_public = process_config.metrics_allow_public;
     config.tls = process_config.tls.clone();
     config.max_connections = process_config.max_connections;
     config.shutdown_drain_timeout = process_config.shutdown_drain_timeout;
@@ -721,6 +729,41 @@ mod tests {
             std::time::Duration::from_secs(5)
         );
         assert_eq!(state.config.rules.rules.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_preserves_metrics_allowpublic() {
+        // Start with a public metrics endpoint that was explicitly allowed at
+        // bind time.
+        let server = Server::bind(
+            Config::parse(
+                "internal: 127.0.0.1 port = 0\nmetrics.listen: 0.0.0.0:0\nmetrics.allowpublic: true\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // A reload that turns `metrics.allowpublic` off must NOT drift the
+        // runtime state: the flag is restart-only, the listener stays bound, and
+        // `state.config` keeps the startup value so it never claims the live
+        // public endpoint is disallowed. (Toggling it actually takes effect only
+        // on restart, which `warn_restart_required_changes` surfaces.)
+        server
+            .reload(
+                Config::parse(
+                    "internal: 127.0.0.1 port = 0\nmetrics.listen: 0.0.0.0:0\nmetrics.allowpublic: false\nclient pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\nsocks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let state = server.state.read().await;
+        assert!(
+            state.config.metrics_allow_public,
+            "metrics.allowpublic must keep its startup value across reload"
+        );
     }
 
     #[tokio::test]
