@@ -107,8 +107,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `udp.strictreply`, `shutdown.draintimeout`, `dns.timeout`, `auth.command`,
   `metrics.allowpublic`, and the `tls.acme.*` settings, so tools and installers
   reasoning about live-vs-restart settings could be misled. A regression test now
-  asserts the metadata covers every parser setting (and that each listed name is
-  a real one), so it cannot silently drift again.
+  asserts every name in the table is a real setting key, matches a canonical
+  list, and is not duplicated, so the table can no longer drop, mistype, or
+  duplicate an entry.
 - A stop signal is no longer delayed behind an in-progress configuration reload.
   The reload handler read the config and applied it inline in the select loop, so
   while a reload was running — including a slow or wedged config/userlist read —
