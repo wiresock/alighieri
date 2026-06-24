@@ -1362,7 +1362,7 @@ async fn graceful_shutdown_drains_inflight_connection() {
     let proxy_addr = server.local_addr().unwrap();
     let run = {
         let server = server.clone();
-        tokio::spawn(async move { server.run().await.ok() })
+        tokio::spawn(async move { server.run().await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1387,11 +1387,11 @@ async fn graceful_shutdown_drains_inflight_connection() {
     // (proving it also stopped accepting — the loop returned).
     client.shutdown().await.ok();
     drop(client);
-    let exited = tokio::time::timeout(Duration::from_secs(5), run).await;
-    assert!(
-        exited.is_ok(),
-        "run() did not return after the connection drained"
-    );
+    tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("run() did not return after the connection drained")
+        .expect("run task panicked")
+        .expect("run() returned an error");
 }
 
 #[tokio::test]
@@ -1399,15 +1399,15 @@ async fn graceful_shutdown_returns_promptly_when_idle() {
     let server = Arc::new(Server::bind(permissive_config()).await.unwrap());
     let run = {
         let server = server.clone();
-        tokio::spawn(async move { server.run().await.ok() })
+        tokio::spawn(async move { server.run().await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // With no in-flight connections the drain is empty, so `run` returns at once.
     server.begin_shutdown();
-    let exited = tokio::time::timeout(Duration::from_secs(2), run).await;
-    assert!(
-        exited.is_ok(),
-        "idle server did not exit promptly on shutdown"
-    );
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("idle server did not exit promptly on shutdown")
+        .expect("run task panicked")
+        .expect("run() returned an error");
 }

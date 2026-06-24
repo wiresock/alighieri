@@ -393,15 +393,17 @@ impl Server {
             });
 
             // Reap finished connection tasks so the set cannot grow without
-            // bound; `try_join_next` is non-blocking and drains all that are
-            // already done.
-            while conns.try_join_next().is_some() {}
+            // bound (non-blocking; drains all that are already done).
+            reap_finished(&mut conns);
         }
 
-        // Shutdown was signalled: the accept loop has stopped. Let the in-flight
-        // connections finish on their own, up to a bounded window, then abort
-        // whatever is left so the process exits promptly. Dropping `conns` would
-        // abort everything immediately, so drain first.
+        // Shutdown was signalled: the accept loop has stopped. Reap anything that
+        // finished since the last sweep so `active` counts only still-running
+        // connections (and we skip the drain entirely if none remain).
+        reap_finished(&mut conns);
+        // Let the in-flight connections finish on their own, up to a bounded
+        // window, then abort whatever is left so the process exits promptly.
+        // Dropping `conns` would abort everything immediately, so drain first.
         let active = conns.len();
         if active > 0 {
             info!(
@@ -410,7 +412,9 @@ impl Server {
                 "shutdown: draining in-flight connections"
             );
             let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
-                while conns.join_next().await.is_some() {}
+                while let Some(outcome) = conns.join_next().await {
+                    note_task_outcome(outcome);
+                }
             })
             .await;
             if drained.is_err() {
@@ -474,6 +478,25 @@ fn build_command_auth(config: &Config) -> Option<Arc<CommandAuth>> {
 fn is_trusted_proxy_upstream(trusted: &[Cidr], peer: IpAddr) -> bool {
     let canonical = peer.to_canonical();
     trusted.iter().any(|cidr| cidr.contains(canonical))
+}
+
+/// Logs a connection task that ended abnormally. The connection body itself
+/// logs ordinary errors, so a failure surfaced here means the task panicked;
+/// `JoinError::is_cancelled` only arises from `JoinSet::shutdown` (the drain's
+/// abort path), which joins those tasks itself and never routes them here.
+fn note_task_outcome(outcome: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(e) = outcome {
+        warn!(error = %e, "connection task terminated abnormally");
+    }
+}
+
+/// Reaps every connection task that has already finished (non-blocking), keeping
+/// the tracking set bounded during normal operation and giving an accurate
+/// active count at shutdown. Panicking tasks are logged via [`note_task_outcome`].
+fn reap_finished(conns: &mut JoinSet<()>) {
+    while let Some(outcome) = conns.try_join_next() {
+        note_task_outcome(outcome);
+    }
 }
 
 fn warn_config_footguns(config: &Config) {
