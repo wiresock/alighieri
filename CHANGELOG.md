@@ -72,6 +72,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   tag, so a release rebuild resolves the exact same layers and a moved tag cannot
   swap the base image under a build. A new Dependabot `docker` ecosystem bumps the
   digests (and tags) as the upstreams publish updates.
+- A non-loopback `metrics.listen` is now refused at startup unless the new
+  `metrics.allowpublic: true` is also set. The metrics endpoint is unauthenticated
+  and exposes operational counters and rule labels, so exposing it off loopback
+  now requires an explicit opt-in rather than only emitting a warning. Loopback
+  binds are unaffected; an unspecified address (e.g. `0.0.0.0`) counts as
+  non-loopback. **Breaking** for any deployment that binds metrics to a routable
+  address — add `metrics.allowpublic: true` (and keep it behind your own access
+  controls).
 - The metrics endpoint now answers only `GET` and `HEAD`; any other method gets
   `405 Method Not Allowed` with an `Allow: GET, HEAD` header instead of being
   served the counters. `HEAD` returns the response headers (including the

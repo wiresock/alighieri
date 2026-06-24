@@ -271,7 +271,8 @@ socks pass "allow-default" {
 | `dns.deny`         | —               | Deny resolved IP categories after DNS lookup         |
 | `dns.cachettl`     | `0`             | Cache domain lookup answers for this many seconds    |
 | `dns.timeout`      | `5`             | Deadline (seconds) for resolving one destination name |
-| `metrics.listen`   | —               | Optional HTTP metrics endpoint address               |
+| `metrics.listen`   | —               | Optional HTTP metrics endpoint address (loopback unless `metrics.allowpublic`) |
+| `metrics.allowpublic` | `false`      | Allow a non-loopback `metrics.listen`; required because the endpoint is unauthenticated |
 | `tls.certfile`     | —               | PEM certificate chain for TLS-wrapped client traffic |
 | `tls.keyfile`      | —               | PEM private key for TLS-wrapped client traffic       |
 | `tls.acme.domains` | —               | Domains for automatic Let's Encrypt certs (TLS-ALPN-01, needs port 443) |
@@ -344,11 +345,21 @@ host-only (any source port on a contacted host) for servers that legitimately
 answer from a different port (e.g. TFTP) — at the cost of that protection.
 
 When `metrics.listen` is set, Alighieri serves Prometheus-style text metrics at
-`/metrics`. Bind this to loopback unless you intentionally place it behind other
-access controls:
+`/metrics`. The endpoint is unauthenticated and exposes operational counters and
+rule labels, so it must be bound to loopback:
 
 ```conf
 metrics.listen: 127.0.0.1:9090
+```
+
+Binding it to a non-loopback (or unspecified, e.g. `0.0.0.0`) address is refused
+at startup unless you explicitly opt in — only do so behind your own network
+access controls (a firewall, private network, or an authenticating reverse
+proxy):
+
+```conf
+metrics.listen: 0.0.0.0:9090
+metrics.allowpublic: true
 ```
 
 The endpoint reports connection counts, auth failures, SOCKS allow/deny counts,

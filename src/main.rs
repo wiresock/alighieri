@@ -235,6 +235,7 @@ fn check_ok_json(config_path: &Path, config: &Config) -> String {
 
 fn validate_config(config_path: &Path, format: CheckOutputFormat) -> ExitCode {
     match Config::load(config_path).and_then(|config| {
+        config.validate_startup()?;
         tls::validate_config(&config)?;
         Ok(config)
     }) {
