@@ -369,16 +369,16 @@ ensure_user() {
     fi
 }
 
-# Whether the service needs CAP_NET_BIND_SERVICE to start. Rather than reparse
-# the config here — its keywords are case-insensitive, `include:` files expand
-# inline, and `internal:` is last-wins — we ask the binary: `--check --json`
-# loads it with the real parser and reports the effective `listen` address and
-# whether `acme` is enabled. ACME forces the TLS-ALPN-01 challenge onto :443; a
-# listener port in 1..1023 is privileged. A binary too old to emit those fields
-# (or an invalid config) yields neither match, so the capability stays unset.
+# Whether the service needs CAP_NET_BIND_SERVICE to start, decided from a
+# `--check --json` summary (the caller runs it once and passes it in). Rather than
+# reparse the config — its keywords are case-insensitive, `include:` files expand
+# inline, and `internal:` is last-wins — the binary loads it with the real parser
+# and reports the effective `listen` address and whether `acme` is enabled. ACME
+# forces the TLS-ALPN-01 challenge onto :443; a listener port in 1..1023 is
+# privileged. A binary too old to emit those fields yields neither match, so the
+# capability stays unset.
 needs_net_bind_capability() {
-    local install_bin="$1" config_file="$2" summary port
-    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 1
+    local summary="$1" port
     case "$summary" in
         *'"acme":true'*) return 0 ;;
     esac
@@ -405,12 +405,11 @@ needs_net_bind_capability() {
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
-# written, so certificate issuance/renewal fails at runtime. As with the
-# capability check, ask the binary for the resolved cache path rather than
-# reparsing the config (case-insensitive keywords, include: files).
+# written, so certificate issuance/renewal fails at runtime. Reads the resolved
+# cache path from the caller's `--check --json` summary rather than reparsing the
+# config (case-insensitive keywords, include: files).
 warn_acme_cache_outside_state_dir() {
-    local install_bin="$1" config_file="$2" summary cache
-    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 0
+    local summary="$1" cache
     # Only relevant when ACME is enabled.
     case "$summary" in
         *'"acme":true'*) : ;;
@@ -439,11 +438,10 @@ warn_acme_cache_outside_state_dir() {
 # Warn when the configured logfile is outside the unit's writable log directory.
 # Same hardening trap as the ACME cache: ProtectSystem=strict leaves the
 # filesystem read-only except ReadWritePaths=$LOG_DIR, so a logfile elsewhere
-# cannot be written and file logging fails at runtime. Ask the binary for the
-# resolved path rather than reparsing the config.
+# cannot be written and file logging fails at runtime. Reads the resolved path
+# from the caller's `--check --json` summary rather than reparsing the config.
 warn_logfile_outside_log_dir() {
-    local install_bin="$1" config_file="$2" summary logfile
-    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 0
+    local summary="$1" logfile
     logfile="$(printf '%s\n' "$summary" | sed -n 's/.*"log_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     [ -n "$logfile" ] || return 0   # file logging not configured (or older binary)
     case "$logfile" in
@@ -455,11 +453,11 @@ warn_logfile_outside_log_dir() {
 }
 
 write_unit() {
-    local install_bin="$1" config_file="$2"
+    local install_bin="$1" config_file="$2" summary="$3"
     # Grant the minimal capability to bind a privileged port only when the
     # config actually needs one; otherwise keep all capabilities dropped.
     local caps=""
-    if needs_net_bind_capability "$install_bin" "$config_file"; then
+    if needs_net_bind_capability "$summary"; then
         caps="CAP_NET_BIND_SERVICE"
     fi
     cat >"$UNIT_FILE" <<UNIT
@@ -610,17 +608,20 @@ do_install() {
     chown "root:$SERVICE_USER" "$config_file"
     chmod 640 "$config_file"
 
-    # Validate the config before writing the unit and restarting. write_unit
-    # decides CAP_NET_BIND_SERVICE from `--check --json`, which yields no
-    # capability for a config that fails to parse — so installing over a broken
-    # config (meant to bind :443 or use ACME) would emit a unit that lacks the
-    # capability, and a plain restart after fixing the config would still fail.
-    # Abort the install instead, mirroring the upgrade path's pre-swap check.
-    if ! "$install_bin" --check "$config_file"; then
+    # Validate the config and capture the resolved facts in one `--check --json`,
+    # reused below for the warnings and write_unit's CAP_NET_BIND_SERVICE decision
+    # rather than each re-running it (which also re-resolves a udp.advertise
+    # hostname). A config that fails to parse must abort the install — otherwise
+    # write_unit, deriving the capability from a failed check, would emit a unit
+    # that may lack the capability the config needs once fixed. On failure, re-run
+    # in text mode to surface the human-readable error before aborting.
+    local check_summary
+    if ! check_summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)"; then
+        "$install_bin" --check "$config_file" || true
         die "config $config_file failed validation; fix the errors above, then re-run install"
     fi
-    warn_acme_cache_outside_state_dir "$install_bin" "$config_file"
-    warn_logfile_outside_log_dir "$install_bin" "$config_file"
+    warn_acme_cache_outside_state_dir "$check_summary"
+    warn_logfile_outside_log_dir "$check_summary"
 
     # Log directory for optional file logging. The default config logs to
     # stdout, which systemd captures into the journal. As with the config dir,
@@ -633,7 +634,7 @@ do_install() {
     chmod 750 "$LOG_DIR"
 
     info "writing systemd unit $UNIT_FILE"
-    write_unit "$install_bin" "$config_file"
+    write_unit "$install_bin" "$config_file" "$check_summary"
 
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}.service"
