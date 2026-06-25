@@ -520,7 +520,8 @@ fn configure_rollback_error(configure_err: &str, delete: ServiceCliResult<()>) -
 
 /// `create_service` failed because the service is already installed. Sourced
 /// from `windows_sys` (a `WIN32_ERROR`, i.e. `u32`) rather than hardcoding the
-/// numeric code, and narrowed to the `i32` that `io::Error::raw_os_error` yields.
+/// numeric code, and narrowed to `i32` to match the `Option<i32>` that
+/// `io::Error::raw_os_error` returns.
 const ERROR_SERVICE_EXISTS: i32 = windows_sys::Win32::Foundation::ERROR_SERVICE_EXISTS as i32;
 
 /// Classifies a `create_service` failure. `ERROR_SERVICE_EXISTS` means an
