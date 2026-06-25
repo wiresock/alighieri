@@ -1079,10 +1079,7 @@ where
         Err(RecvTimeoutError::Timeout) => {
             return Err(cfg_err(
                 lineno,
-                &format!(
-                    "udp.advertise: timed out resolving '{spec}' after {}s",
-                    timeout.as_secs()
-                ),
+                &format!("udp.advertise: timed out resolving '{spec}' after {timeout:?}"),
             ))
         }
         Err(RecvTimeoutError::Disconnected) => {
