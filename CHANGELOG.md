@@ -19,6 +19,21 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `udp.advertise` hostname resolution no longer risks hanging config load on a
+  wedged resolver. It used the blocking system resolver during config load
+  (`--check`, install validation, startup, reload), so a slow or unresponsive DNS
+  server could stall those for the resolver's full timeout. Resolution now runs on
+  a detached thread bounded by a 5s timeout, failing the load with a clear error
+  instead of blocking.
+- A UDP ASSOCIATE from a client whose address family `udp.advertise` does not
+  cover now logs a warning. With an A-only (or AAAA-only) `udp.advertise`
+  hostname, a client of the other family fell back to the bound (possibly private)
+  relay address with only an info log; the mismatch is now surfaced.
+- The Linux installer now warns when `logfile` points outside the writable log
+  directory (`/var/log/alighieri`), mirroring the ACME-cache check. The hardened
+  unit's `ProtectSystem=strict` makes other paths read-only, so file logging to a
+  custom path fails at runtime; `alighieri --check --json` now also reports the
+  resolved `log_file` path so the installer can check it.
 - The Linux installer now warns when `tls.acme.cache` points outside the service
   StateDirectory (`/var/lib/alighieri`). The hardened unit runs with
   `ProtectSystem=strict`, so a cache elsewhere is read-only and ACME certificate

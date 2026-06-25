@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use alighieri::auth::UserDb;
-use alighieri::config::{Config, TlsConfig};
+use alighieri::config::{Config, LogOutput, TlsConfig};
 use alighieri::runtime::{
     init_console_logging, reload_signal_channel, run_server_reloading_until_shutdown,
     shutdown_signal,
@@ -231,12 +231,22 @@ fn check_ok_json(config_path: &Path, config: &Config) -> String {
         Some(TlsConfig::Acme(cfg)) => cfg.cache_dir.display().to_string(),
         _ => String::new(),
     };
+    // The file-logging path (empty unless `logoutput` includes `file`), so the
+    // installer can check it against the unit's writable log directory.
+    let log_file = match (
+        config.log_outputs.contains(&LogOutput::File),
+        &config.log_file,
+    ) {
+        (true, Some(path)) => path.display().to_string(),
+        _ => String::new(),
+    };
     format!(
-        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\"}}",
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\"}}",
         json_escape(&config_path.display().to_string()),
         json_escape(&config.internal.to_string()),
         acme,
-        json_escape(&acme_cache)
+        json_escape(&acme_cache),
+        json_escape(&log_file)
     )
 }
 
@@ -1648,12 +1658,25 @@ mod tests {
         assert!(json.contains("\"listen\":\"0.0.0.0:443\""), "{json}");
         assert!(json.contains("\"acme\":true"), "{json}");
         assert!(json.contains("\"acme_cache\":\"/tmp/acme\""), "{json}");
+        assert!(json.contains("\"log_file\":\"\""), "{json}");
 
         let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
         assert!(json.contains("\"listen\":\"127.0.0.1:1080\""), "{json}");
         assert!(json.contains("\"acme\":false"), "{json}");
         assert!(json.contains("\"acme_cache\":\"\""), "{json}");
+        assert!(json.contains("\"log_file\":\"\""), "{json}");
+
+        // File logging reports the configured logfile path.
+        let config = Config::parse(
+            "internal: 127.0.0.1:1080\nlogoutput: file\nlogfile: /var/log/alighieri/app.log",
+        )
+        .unwrap();
+        let json = check_ok_json(Path::new("test.conf"), &config);
+        assert!(
+            json.contains("\"log_file\":\"/var/log/alighieri/app.log\""),
+            "{json}"
+        );
     }
 
     #[test]
