@@ -285,7 +285,7 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
         // service's — exactly the mismatch the install-side fix removed — so
         // refuse it rather than silently validating the wrong file.
         return Err(ServiceCliError::Service(format!(
-            "the service config marker {} contains a relative path ('{trimmed}'); reinstall \
+            "the service config marker {} contains a relative path ({trimmed:?}); reinstall \
              the service with 'alighieri service install --config <absolute path>'",
             marker.display()
         )));
