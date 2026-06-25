@@ -13,8 +13,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   reaches the proxy through NAT (or via a different public address than it binds
   on locally) is told an address it can actually send datagrams to. The real
   bound relay port is kept; an IP is advertised directly and a hostname is
-  resolved per association through the async resolver (bounded, cached, and
-  coalesced — config load does no DNS). The advertised address matches the
+  resolved per association through the async resolver (bounded by `dns.timeout`
+  and coalesced, and cached when `dns.cachettl` is set — config load does no
+  DNS). The advertised address matches the
   client's connection family (IPv4/IPv6), falling back to the bound address (with
   a warning) when the hostname cannot be resolved or has no address for the
   family. Pairs with `udp.portrange` for a stable NAT port-forward.

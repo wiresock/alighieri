@@ -188,11 +188,11 @@ impl DnsResolver {
     }
 
     /// Resolves `host` to all of its addresses (both families, canonicalised),
-    /// bounded by `timeout` and using the shared cache + singleflight — but
-    /// without the connection deny/preference policy. The caller is choosing an
-    /// address to *advertise* (`udp.advertise`), not a destination to connect to,
-    /// so the deny categories and v4/v6 preference (which exist to shape outbound
-    /// connections) must not filter it.
+    /// bounded by `timeout` and using the shared singleflight (and positive cache
+    /// when `ttl` is set) — but without the connection deny/preference policy. The
+    /// caller is choosing an address to *advertise* (`udp.advertise`), not a
+    /// destination to connect to, so the deny categories and v4/v6 preference
+    /// (which exist to shape outbound connections) must not filter it.
     pub async fn resolve_host(
         &self,
         host: &str,

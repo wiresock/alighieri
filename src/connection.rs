@@ -375,8 +375,9 @@ impl Connection {
     /// `udp.advertise` host matching this client's address family (keeping the
     /// real bound relay port), or the bound relay address when nothing applies
     /// (unset, a hostname that can't be resolved, or no address for the family). A
-    /// hostname is resolved here through the async resolver — bounded, cached, and
-    /// coalesced — so config load never does DNS.
+    /// hostname is resolved here through the async resolver — bounded by
+    /// `dns.timeout` and singleflight-coalesced (and cached when `dns.cachettl` is
+    /// set) — so config load never does DNS.
     async fn advertised_reply_addr(&self, relay_addr: SocketAddr) -> SocketAddr {
         let Some(advertise) = &self.config.udp_advertise else {
             return relay_addr;
