@@ -8,6 +8,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The Windows service CLI now rejects a config marker that holds a relative path
+  instead of resolving it against the caller's working directory. New installs
+  write an absolute path, but a marker from an older install (before the path was
+  absolutised) or a tampered one could make `service start`/`reload` validate a
+  different file than the service runs; a relative marker is now an explicit error
+  pointing to a reinstall, completing the absolute-path guarantee on the read side.
 - A failed Windows service reinstall no longer removes the Event Log source the
   existing installation uses. `install` registers the source before creating the
   service, and a create failure unregistered it on the way out; when the failure
