@@ -50,7 +50,7 @@
 //! ```
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,9 +222,9 @@ pub struct Config {
     pub udp_strict_reply: bool,
     /// Public host advertised as the `BND.ADDR` in the UDP ASSOCIATE reply (the
     /// real bound relay port is kept), for a proxy reached via NAT or a different
-    /// public address than it binds on locally. Resolved from `udp.advertise` at
-    /// config load — an IP is used directly, a hostname is resolved (and
-    /// re-resolved on reload). `None` advertises the locally-bound relay address.
+    /// public address than it binds on locally. An IP is advertised directly; a
+    /// hostname is resolved per UDP association through the async resolver (so
+    /// config load does no DNS). `None` advertises the locally-bound relay address.
     pub udp_advertise: Option<UdpAdvertise>,
     /// How long shutdown waits for in-flight connections to finish before
     /// aborting the rest (`shutdown.draintimeout`, seconds). `0` cuts them
@@ -714,7 +714,10 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "udpadvertise" | "udp.advertise" => {
             let spec = expect_single(vals, lineno, "udp.advertise host")?;
-            b.udp_advertise = Some(resolve_udp_advertise(spec, lineno)?);
+            b.udp_advertise = Some(match spec.parse::<IpAddr>() {
+                Ok(ip) => UdpAdvertise::Ip(ip),
+                Err(_) => UdpAdvertise::Host(spec.clone()),
+            });
         }
         "shutdowndraintimeout" | "shutdown.draintimeout" => {
             let secs = parse_u64(vals, lineno)?;
@@ -995,125 +998,17 @@ fn parse_ip(vals: &[String], lineno: usize) -> Result<IpAddr> {
         .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{val}'")))
 }
 
-/// Public address(es) advertised as the UDP ASSOCIATE reply `BND.ADDR` (host
-/// only; the real relay port is kept). Holds the resolved address per family so
-/// the reply can advertise the one matching the client's connection family.
+/// Public host advertised as the UDP ASSOCIATE reply `BND.ADDR` (host only; the
+/// real relay port is kept). An IP is advertised directly; a hostname is resolved
+/// at UDP-associate time through the async resolver — so config load does no DNS,
+/// and a wedged resolver can neither hang the load nor leak abandoned threads. The
+/// address matching the client's connection family is chosen at that point.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UdpAdvertise {
-    v4: Option<Ipv4Addr>,
-    v6: Option<Ipv6Addr>,
-}
-
-impl UdpAdvertise {
-    /// The advertised address matching `local`'s (canonicalised) family, if one
-    /// was configured/resolved for that family. Returns `None` when nothing was
-    /// resolved for the family, so the caller can fall back to the bound address.
-    pub fn for_local(&self, local: IpAddr) -> Option<IpAddr> {
-        match local.to_canonical() {
-            IpAddr::V4(_) => self.v4.map(IpAddr::V4),
-            IpAddr::V6(_) => self.v6.map(IpAddr::V6),
-        }
-    }
-}
-
-/// How long config load waits for a `udp.advertise` hostname to resolve before
-/// giving up. The blocking system resolver (`getaddrinfo`) cannot be cancelled,
-/// and config load runs at `--check`, install validation, startup, and reload, so
-/// a wedged resolver must not hang them.
-const UDP_ADVERTISE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Resolves a `udp.advertise` value to the address(es) to advertise: an explicit
-/// IP is used as-is, a hostname is resolved to its A/AAAA records via the
-/// blocking system resolver, bounded by [`UDP_ADVERTISE_RESOLVE_TIMEOUT`]. Runs
-/// only at config load (startup / reload / `--check`), so a hostname that
-/// resolves to nothing fails the load loudly rather than silently advertising
-/// nothing.
-fn resolve_udp_advertise(spec: &str, lineno: usize) -> Result<UdpAdvertise> {
-    if let Ok(ip) = spec.parse::<IpAddr>() {
-        return Ok(advertise_from_ips(std::iter::once(ip)));
-    }
-    let host = spec.to_string();
-    resolve_udp_advertise_bounded(spec, lineno, UDP_ADVERTISE_RESOLVE_TIMEOUT, move || {
-        use std::net::ToSocketAddrs;
-        // `(host, 0)` resolves the name; the port is irrelevant (only IPs are kept).
-        (host.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-    })
-}
-
-/// Runs `resolve` (the blocking lookup) on a detached thread bounded by
-/// `timeout`, so a wedged resolver cannot hang config load. On timeout the
-/// thread is left to finish on its own (the lookup cannot be cancelled).
-/// Separated from [`resolve_udp_advertise`] so a test can inject a slow resolver.
-fn resolve_udp_advertise_bounded<F>(
-    spec: &str,
-    lineno: usize,
-    timeout: Duration,
-    resolve: F,
-) -> Result<UdpAdvertise>
-where
-    F: FnOnce() -> std::io::Result<Vec<IpAddr>> + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("udp-advertise-resolve".into())
-        .spawn(move || {
-            let _ = tx.send(resolve());
-        })
-        .map_err(|e| {
-            cfg_err(
-                lineno,
-                &format!("udp.advertise: could not spawn resolver thread: {e}"),
-            )
-        })?;
-    use std::sync::mpsc::RecvTimeoutError;
-    let ips = match rx.recv_timeout(timeout) {
-        Ok(Ok(ips)) => ips,
-        Ok(Err(e)) => {
-            return Err(cfg_err(
-                lineno,
-                &format!("udp.advertise: cannot resolve '{spec}': {e}"),
-            ))
-        }
-        Err(RecvTimeoutError::Timeout) => {
-            return Err(cfg_err(
-                lineno,
-                &format!("udp.advertise: timed out resolving '{spec}' after {timeout:?}"),
-            ))
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            return Err(cfg_err(
-                lineno,
-                &format!("udp.advertise: resolver thread for '{spec}' exited without a result"),
-            ))
-        }
-    };
-    let advertise = advertise_from_ips(ips.into_iter());
-    if advertise.v4.is_none() && advertise.v6.is_none() {
-        return Err(cfg_err(
-            lineno,
-            &format!("udp.advertise: '{spec}' resolved to no addresses"),
-        ));
-    }
-    Ok(advertise)
-}
-
-/// Folds resolved IPs into one address per family (the first of each family
-/// wins), canonicalising an IPv4-mapped IPv6 address to IPv4.
-fn advertise_from_ips(ips: impl Iterator<Item = IpAddr>) -> UdpAdvertise {
-    let mut advertise = UdpAdvertise { v4: None, v6: None };
-    for ip in ips {
-        match ip.to_canonical() {
-            IpAddr::V4(v4) => {
-                advertise.v4.get_or_insert(v4);
-            }
-            IpAddr::V6(v6) => {
-                advertise.v6.get_or_insert(v6);
-            }
-        }
-    }
-    advertise
+pub enum UdpAdvertise {
+    /// A literal IP address, advertised as-is (family-matched per association).
+    Ip(IpAddr),
+    /// A hostname, resolved per association.
+    Host(String),
 }
 
 /// Returns the single value of a scalar setting, rejecting trailing tokens that
@@ -2564,16 +2459,20 @@ socks pass "" { command: connect }"#,
     }
 
     #[test]
-    fn udp_advertise_parses_an_ipv4_and_matches_family() {
+    fn udp_advertise_parses_an_ip() {
         let cfg =
             Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5").unwrap();
-        let adv = cfg.udp_advertise.expect("udp.advertise should be set");
         assert_eq!(
-            adv.for_local("10.0.0.1".parse().unwrap()),
-            Some("203.0.113.5".parse().unwrap())
+            cfg.udp_advertise,
+            Some(UdpAdvertise::Ip("203.0.113.5".parse().unwrap()))
         );
-        // No IPv6 was configured, so an IPv6 client gets no override (fall back).
-        assert_eq!(adv.for_local("::1".parse().unwrap()), None);
+
+        let cfg =
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 2001:db8::1").unwrap();
+        assert_eq!(
+            cfg.udp_advertise,
+            Some(UdpAdvertise::Ip("2001:db8::1".parse().unwrap()))
+        );
 
         // Unset by default.
         assert!(Config::parse("internal: 0.0.0.0 port = 1080")
@@ -2583,52 +2482,27 @@ socks pass "" { command: connect }"#,
     }
 
     #[test]
-    fn udp_advertise_parses_an_ipv6() {
-        let cfg =
-            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 2001:db8::1").unwrap();
-        let adv = cfg.udp_advertise.unwrap();
+    fn udp_advertise_parses_a_hostname_without_resolving() {
+        // A non-IP value is kept as a hostname and resolved per association, not
+        // at config load — so a bad or wedged resolver never affects parsing.
+        let cfg = Config::parse(
+            "internal: 0.0.0.0 port = 1080\nudp.advertise: nonexistent.invalid.example",
+        )
+        .unwrap();
         assert_eq!(
-            adv.for_local("::1".parse().unwrap()),
-            Some("2001:db8::1".parse().unwrap())
+            cfg.udp_advertise,
+            Some(UdpAdvertise::Host("nonexistent.invalid.example".into()))
         );
-        assert_eq!(adv.for_local("10.0.0.1".parse().unwrap()), None);
     }
 
     #[test]
     fn udp_advertise_rejects_empty_and_trailing() {
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise:").is_err());
-        // Trailing token is rejected before any resolution is attempted.
+        // Trailing token is rejected at parse time.
         assert!(
             Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5 extra")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn udp_advertise_resolves_a_hostname() {
-        // Smoke test of the resolver path: localhost reliably resolves to a
-        // loopback address in at least one family.
-        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: localhost").unwrap();
-        let adv = cfg.udp_advertise.unwrap();
-        assert!(
-            adv.for_local("127.0.0.1".parse().unwrap()).is_some()
-                || adv.for_local("::1".parse().unwrap()).is_some(),
-            "localhost should resolve to at least one loopback address"
-        );
-    }
-
-    #[test]
-    fn udp_advertise_resolution_times_out_on_a_wedged_resolver() {
-        // A resolver that never returns must not hang config load: the bounded
-        // helper gives up after the timeout with a clear error (and leaves the
-        // doomed lookup thread to finish on its own).
-        let err =
-            resolve_udp_advertise_bounded("wedged.example", 1, Duration::from_millis(50), || {
-                std::thread::sleep(Duration::from_secs(60));
-                Ok(Vec::new())
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]

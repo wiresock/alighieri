@@ -12,23 +12,20 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   reply `BND.ADDR` instead of the locally-bound relay address, so a client that
   reaches the proxy through NAT (or via a different public address than it binds
   on locally) is told an address it can actually send datagrams to. The real
-  bound relay port is kept; an IP is used directly and a hostname is resolved at
-  config load (re-resolved on reload). The advertised address matches the
-  client's connection family (IPv4/IPv6), falling back to the bound address when
-  no match was resolved. Pairs with `udp.portrange` for a stable NAT port-forward.
+  bound relay port is kept; an IP is advertised directly and a hostname is
+  resolved per association through the async resolver (bounded by `dns.timeout`
+  and coalesced, and cached when `dns.cachettl` is set — config load does no
+  DNS). The advertised address matches the
+  client's connection family (IPv4/IPv6), falling back to the bound address (with
+  a warning) when the hostname cannot be resolved or has no address for the
+  family. Pairs with `udp.portrange` for a stable NAT port-forward.
 
 ### Fixed
 
-- `udp.advertise` hostname resolution no longer risks hanging config load on a
-  wedged resolver. It used the blocking system resolver during config load
-  (`--check`, install validation, startup, reload), so a slow or unresponsive DNS
-  server could stall those for the resolver's full timeout. Resolution now runs on
-  a detached thread bounded by a 5s timeout, failing the load with a clear error
-  instead of blocking.
-- A UDP ASSOCIATE from a client whose address family `udp.advertise` does not
-  cover now logs a warning. With an A-only (or AAAA-only) `udp.advertise`
-  hostname, a client of the other family fell back to the bound (possibly private)
-  relay address with only an info log; the mismatch is now surfaced.
+- The Linux installer's hardened-path warnings (`tls.acme.cache`, `logfile`) now
+  normalise the path with `realpath -m` before checking it against the writable
+  directory, so a traversal path like `/var/log/alighieri/../elsewhere.log` no
+  longer looks safe and slips past the warning.
 - The Linux installer now warns when `logfile` points outside the writable log
   directory (`/var/log/alighieri`), mirroring the ACME-cache check. The hardened
   unit's `ProtectSystem=strict` makes other paths read-only, so file logging to a

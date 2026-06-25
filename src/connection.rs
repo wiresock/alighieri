@@ -21,7 +21,7 @@ use crate::abuse::AbuseControls;
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
 use crate::auth::{AuthOutcome, CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
-use crate::config::{Config, Protocol, RateLimit};
+use crate::config::{Config, Protocol, RateLimit, UdpAdvertise};
 use crate::dns::DnsResolver;
 use crate::errors::{Error, Result};
 use crate::metrics::Metrics;
@@ -371,6 +371,60 @@ impl Connection {
         self.config.rules.evaluate_socks_detail(&ctx)
     }
 
+    /// The address to advertise in the UDP ASSOCIATE reply: the configured
+    /// `udp.advertise` host matching this client's address family (keeping the
+    /// real bound relay port), or the bound relay address when nothing applies
+    /// (unset, a hostname that can't be resolved, or no address for the family). A
+    /// hostname is resolved here through the async resolver — bounded by
+    /// `dns.timeout` and singleflight-coalesced (and cached when `dns.cachettl` is
+    /// set) — so config load never does DNS.
+    async fn advertised_reply_addr(&self, relay_addr: SocketAddr) -> SocketAddr {
+        let Some(advertise) = &self.config.udp_advertise else {
+            return relay_addr;
+        };
+        let candidates: Vec<IpAddr> = match advertise {
+            UdpAdvertise::Ip(ip) => vec![*ip],
+            UdpAdvertise::Host(host) => match self
+                .dns_resolver
+                .resolve_host(host, self.config.dns.cache_ttl, self.config.dns.timeout)
+                .await
+            {
+                Ok(ips) => ips,
+                Err(e) => {
+                    warn!(
+                        peer = %self.peer,
+                        host = %host,
+                        error = %e,
+                        "udp.advertise hostname could not be resolved; advertising the bound relay address"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+        // Key on the client's (peer) family, not the bound address: it is the
+        // family the client will send its UDP datagrams from and expects in the
+        // BND.ADDR. (The two match here, but the peer is the direct intent.)
+        match advertise_ip_for_family(&candidates, self.peer.ip()) {
+            Some(ip) => {
+                let mut advertised = relay_addr;
+                advertised.set_ip(ip);
+                advertised
+            }
+            None => {
+                if !candidates.is_empty() {
+                    // Configured/resolved, but nothing for this client's family, so
+                    // it gets the bound (possibly private/LAN) address.
+                    warn!(
+                        peer = %self.peer,
+                        relay = %relay_addr,
+                        "udp.advertise has no address for this client's family; advertising the bound relay address, which may be unreachable behind NAT"
+                    );
+                }
+                relay_addr
+            }
+        }
+    }
+
     /// Handles a UDP ASSOCIATE request.
     async fn handle_udp_associate(
         mut self,
@@ -442,20 +496,10 @@ impl Connection {
             .local_addr()
             .unwrap_or_else(|_| socks5::unspecified_v4());
         // Advertise the configured public host (with the real relay port) so a
-        // client reaching us via NAT is told an address it can send to; otherwise
-        // advertise the bound relay address.
-        let advertise = self.config.udp_advertise.as_ref();
-        let advertised = advertised_reply_addr(relay_addr, advertise);
-        if advertise.is_some_and(|adv| adv.for_local(relay_addr.ip()).is_none()) {
-            // The operator configured an advertised address, but none of the
-            // resolved families matches this client's — so it gets the bound
-            // (possibly private/LAN) relay address, which defeats the point.
-            warn!(
-                peer = %self.peer,
-                relay = %relay_addr,
-                "udp.advertise is configured but has no address for this client's family; advertising the bound relay address, which may be unreachable behind NAT"
-            );
-        }
+        // client reaching us via NAT is told an address it can send to; a hostname
+        // is resolved here via the async resolver. Falls back to the bound relay
+        // address when unset, unresolvable, or with no address for this family.
+        let advertised = self.advertised_reply_addr(relay_addr).await;
         socks5::write_reply(&mut self.stream, Reply::Succeeded, advertised).await?;
         info!(peer = %self.peer, relay = %relay_addr, advertised = %advertised, "udp associate established");
 
@@ -575,20 +619,15 @@ where
         .map_err(|_| Error::Timeout)?
 }
 
-/// The address to advertise in the UDP ASSOCIATE reply: the configured
-/// `udp.advertise` host matching the relay socket's family (keeping the real
-/// bound relay port), or the bound relay address when no advertise address
-/// applies (unset, or no address resolved for that family).
-fn advertised_reply_addr(
-    mut relay_addr: SocketAddr,
-    advertise: Option<&crate::config::UdpAdvertise>,
-) -> SocketAddr {
-    // `for_local` only returns a same-family address, so `set_ip` keeps the
-    // SocketAddr variant and the real bound port — just swapping the host.
-    if let Some(ip) = advertise.and_then(|adv| adv.for_local(relay_addr.ip())) {
-        relay_addr.set_ip(ip);
-    }
-    relay_addr
+/// From resolved candidate IPs, the one matching `client`'s canonical address
+/// family (an IPv4-mapped client address counts as IPv4). The caller applies the
+/// real bound port via `set_ip` and falls back to the bound address on `None`.
+fn advertise_ip_for_family(candidates: &[IpAddr], client: IpAddr) -> Option<IpAddr> {
+    let want_v4 = client.to_canonical().is_ipv4();
+    candidates
+        .iter()
+        .map(|ip| ip.to_canonical())
+        .find(|ip| ip.is_ipv4() == want_v4)
 }
 
 fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<SocketAddr> {
@@ -769,48 +808,33 @@ mod tests {
     }
 
     #[test]
-    fn advertised_reply_addr_overrides_host_and_keeps_port() {
-        let advertise = crate::config::Config::parse(
-            "internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5",
-        )
-        .unwrap()
-        .udp_advertise;
-        let relay: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+    fn advertise_ip_for_family_matches_canonical_family() {
+        let v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+
+        // IPv4 relay → the IPv4 candidate; IPv6 relay → the IPv6 candidate.
         assert_eq!(
-            advertised_reply_addr(relay, advertise.as_ref()),
-            "203.0.113.5:40000".parse().unwrap()
+            advertise_ip_for_family(&[v4, v6], "10.0.0.1".parse().unwrap()),
+            Some(v4)
         );
-    }
-
-    #[test]
-    fn advertised_reply_addr_falls_back_to_bound_addr() {
-        let relay: SocketAddr = "10.0.0.1:40000".parse().unwrap();
-        // Nothing configured.
-        assert_eq!(advertised_reply_addr(relay, None), relay);
-        // Configured, but no address for the relay's (IPv4) family.
-        let v6_only = crate::config::Config::parse(
-            "internal: 0.0.0.0 port = 1080\nudp.advertise: 2001:db8::1",
-        )
-        .unwrap()
-        .udp_advertise;
-        assert_eq!(advertised_reply_addr(relay, v6_only.as_ref()), relay);
-    }
-
-    #[test]
-    fn advertised_reply_addr_handles_ipv4_mapped_relay() {
-        // A dual-stack relay socket reports an IPv4 client as an IPv4-mapped IPv6
-        // local address. The IPv4 advertise address must still apply (and the
-        // reply become a plain IPv4 address), so a client reaching us via NAT
-        // gets a reachable BND.ADDR rather than the bound mapped address.
-        let advertise = crate::config::Config::parse(
-            "internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5",
-        )
-        .unwrap()
-        .udp_advertise;
-        let relay: SocketAddr = "[::ffff:10.0.0.1]:40000".parse().unwrap();
         assert_eq!(
-            advertised_reply_addr(relay, advertise.as_ref()),
-            "203.0.113.5:40000".parse().unwrap()
+            advertise_ip_for_family(&[v4, v6], "::1".parse().unwrap()),
+            Some(v6)
+        );
+
+        // A dual-stack relay reports an IPv4 client as an IPv4-mapped IPv6 address;
+        // it must still match the IPv4 candidate (the NAT case), so the reply
+        // becomes a plain IPv4 address.
+        assert_eq!(
+            advertise_ip_for_family(&[v4, v6], "::ffff:10.0.0.1".parse().unwrap()),
+            Some(v4)
+        );
+
+        // No candidate for the family (and the empty case) → fall back.
+        assert_eq!(advertise_ip_for_family(&[v4], "::1".parse().unwrap()), None);
+        assert_eq!(
+            advertise_ip_for_family(&[], "10.0.0.1".parse().unwrap()),
+            None
         );
     }
 
