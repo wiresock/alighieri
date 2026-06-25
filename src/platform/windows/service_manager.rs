@@ -116,6 +116,13 @@ pub fn execute_service_command<C: ServiceController>(
 ) -> ServiceCliResult<String> {
     match command {
         ServiceCommand::Install { config_path } => {
+            // Freeze the config path as absolute before anything stores it: the
+            // service runs under SCM from a different working directory, so a
+            // relative `--config` (resolved here against the installer's CWD)
+            // would otherwise resolve to a different file — or nothing — at
+            // service start. The launch arguments, marker, and message all use
+            // this absolute form.
+            let config_path = absolute_config_path(&config_path)?;
             prepare_service_directories(&config_path)?;
             validate_config(&config_path)?;
             let options = InstallOptions {
@@ -135,7 +142,7 @@ pub fn execute_service_command<C: ServiceController>(
             Ok(format!("uninstalled {SERVICE_NAME}"))
         }
         ServiceCommand::Start => {
-            let config_path = installed_config_path();
+            let config_path = installed_config_path()?;
             validate_config(&config_path)?;
             controller.start()?;
             Ok(format!("started {SERVICE_NAME}"))
@@ -145,7 +152,7 @@ pub fn execute_service_command<C: ServiceController>(
             Ok(format!("stopped {SERVICE_NAME}"))
         }
         ServiceCommand::Reload => {
-            let config_path = installed_config_path();
+            let config_path = installed_config_path()?;
             validate_config(&config_path)?;
             controller.reload()?;
             Ok(format!("requested reload of {SERVICE_NAME}"))
@@ -197,12 +204,41 @@ fn config_marker_path() -> PathBuf {
     default_base_dir().join(SERVICE_CONFIG_MARKER)
 }
 
-fn installed_config_path() -> PathBuf {
-    std::fs::read_to_string(config_marker_path())
-        .ok()
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(default_config_path)
+/// Resolves the install `--config` path to an absolute path against the
+/// installer's current directory, so the relative-vs-SCM working-directory
+/// mismatch above cannot point the service at the wrong file.
+fn absolute_config_path(config_path: &Path) -> ServiceCliResult<PathBuf> {
+    Ok(std::path::absolute(config_path)?)
+}
+
+fn installed_config_path() -> ServiceCliResult<PathBuf> {
+    read_installed_config_path(&config_marker_path())
+}
+
+/// Resolves the config path recorded at install time from `marker`. A genuinely
+/// absent marker falls back to the default (legacy installs predating the marker,
+/// or a never-installed service — `start` then fails cleanly at the SCM layer),
+/// but an unreadable or empty/corrupt marker is an explicit error rather than a
+/// silent fall back to validating a different config than the service runs.
+fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
+    match std::fs::read_to_string(marker) {
+        Ok(contents) => {
+            let trimmed = contents.trim();
+            if trimmed.is_empty() {
+                return Err(ServiceCliError::Service(format!(
+                    "the service config marker {} is empty or corrupt; reinstall the service \
+                     with 'alighieri service install --config <path>'",
+                    marker.display()
+                )));
+            }
+            Ok(PathBuf::from(trimmed))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_config_path()),
+        Err(e) => Err(ServiceCliError::Service(format!(
+            "cannot read the service config marker {}: {e}",
+            marker.display()
+        ))),
+    }
 }
 
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
@@ -707,6 +743,53 @@ mod tests {
         assert!(config.ends_with(Path::new("Alighieri").join("alighieri.conf")));
         let logs = default_log_dir();
         assert!(logs.ends_with(Path::new("Alighieri").join("logs")));
+    }
+
+    #[test]
+    fn absolute_config_path_makes_a_relative_path_absolute() {
+        // A relative `--config` must not be stored verbatim: the service runs
+        // from a different working directory and would resolve it elsewhere.
+        let abs = absolute_config_path(Path::new("alighieri.conf")).unwrap();
+        assert!(abs.is_absolute(), "not absolute: {}", abs.display());
+        assert!(abs.ends_with("alighieri.conf"), "{}", abs.display());
+        assert_ne!(abs, PathBuf::from("alighieri.conf"));
+
+        // An already-absolute path stays absolute.
+        assert!(
+            absolute_config_path(Path::new(r"C:\configs\alighieri.conf"))
+                .unwrap()
+                .is_absolute()
+        );
+    }
+
+    #[test]
+    fn read_installed_config_path_reads_and_trims_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("service-config-path.txt");
+        std::fs::write(&marker, "  C:\\configs\\alighieri.conf  \r\n").unwrap();
+        assert_eq!(
+            read_installed_config_path(&marker).unwrap(),
+            PathBuf::from(r"C:\configs\alighieri.conf")
+        );
+    }
+
+    #[test]
+    fn read_installed_config_path_falls_back_to_default_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("does-not-exist.txt");
+        assert_eq!(
+            read_installed_config_path(&marker).unwrap(),
+            default_config_path()
+        );
+    }
+
+    #[test]
+    fn read_installed_config_path_rejects_an_empty_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("service-config-path.txt");
+        std::fs::write(&marker, "   \r\n").unwrap();
+        let err = read_installed_config_path(&marker).unwrap_err();
+        assert!(err.to_string().contains("empty or corrupt"), "{err}");
     }
 
     #[test]
