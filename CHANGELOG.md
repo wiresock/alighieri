@@ -8,6 +8,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A TCP relay no longer hangs after one direction errors. The relay waited for
+  *both* copy directions to finish even when one returned an I/O error; with
+  `iotimeout: 0` (idle timeout disabled) a broken connection whose other half
+  stayed open but idle could wait forever and pin a connection permit. An error on
+  either direction now tears the relay down immediately (dropping the opposite
+  copy), while a clean half-close (EOF) still lets the other direction continue.
 - The Windows service CLI now rejects a config marker that holds a relative path
   instead of resolving it against the caller's working directory. New installs
   write an absolute path, but a marker from an older install (before the path was

@@ -183,13 +183,7 @@ where
             &down_total,
             idle,
         );
-        match idle {
-            None => {
-                let (up, down) = tokio::join!(up, down);
-                up.and(down)
-            }
-            Some(idle) => relay_until_idle(up, down, idle, &activity).await,
-        }
+        relay_both(up, down, idle, &activity).await
     };
     // Directions cut off by the idle watchdog have not shut their writers
     // down; doing it here is a no-op for the ones that finished normally.
@@ -202,12 +196,19 @@ where
     ))
 }
 
-/// Drives both copy directions while a watchdog checks the shared activity
-/// clock; returns early when the connection has been idle for `idle`.
-async fn relay_until_idle<U, D>(
+/// Drives both copy directions to completion, failing fast on errors.
+///
+/// A clean EOF on one direction (`Ok(())`) leaves the other running for a normal
+/// half-close, but an `Err` on either returns immediately and drops the opposite
+/// future — so a broken connection never keeps waiting on a half that stays open
+/// but idle. With no idle timeout (`iotimeout: 0`) that wait was unbounded and
+/// pinned the connection permit; the idle path merely delayed teardown by up to
+/// `idle`. When `idle` is set, a coarse watchdog ends the relay after the shared
+/// activity clock has been quiet that long.
+async fn relay_both<U, D>(
     up: U,
     down: D,
-    idle: Duration,
+    idle: Option<Duration>,
     activity: &ActivityClock,
 ) -> io::Result<()>
 where
@@ -215,28 +216,47 @@ where
     D: Future<Output = io::Result<()>>,
 {
     tokio::pin!(up, down);
-    let mut tick = tokio::time::interval(idle_tick_period(idle));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut up_result: Option<io::Result<()>> = None;
-    let mut down_result: Option<io::Result<()>> = None;
+    let mut up_done = false;
+    let mut down_done = false;
+    let mut ticker = idle.map(|idle| {
+        let mut tick = tokio::time::interval(idle_tick_period(idle));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick
+    });
     loop {
         tokio::select! {
-            res = &mut up, if up_result.is_none() => up_result = Some(res),
-            res = &mut down, if down_result.is_none() => down_result = Some(res),
-            _ = tick.tick() => {
-                if activity.idle_for() >= idle {
+            res = &mut up, if !up_done => {
+                res?; // propagate a copy error at once, dropping `down`
+                up_done = true;
+            }
+            res = &mut down, if !down_done => {
+                res?; // propagate a copy error at once, dropping `up`
+                down_done = true;
+            }
+            _ = maybe_tick(ticker.as_mut()) => {
+                // Reachable only when an idle timeout (and thus the ticker) is set.
+                if idle.is_some_and(|idle| activity.idle_for() >= idle) {
                     break; // no traffic in either direction for too long
                 }
                 continue;
             }
         }
-        if up_result.is_some() && down_result.is_some() {
+        if up_done && down_done {
             break;
         }
     }
-    up_result
-        .unwrap_or(Ok(()))
-        .and(down_result.unwrap_or(Ok(())))
+    Ok(())
+}
+
+/// Ticks `ticker` when an idle timeout is configured; otherwise never resolves,
+/// so the watchdog `select!` branch stays inert when there is no idle timeout.
+async fn maybe_tick(ticker: Option<&mut tokio::time::Interval>) {
+    match ticker {
+        Some(tick) => {
+            tick.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Copies from `r` to `w` until EOF or an error, marking shared activity and
@@ -841,6 +861,65 @@ mod tests {
             "expected ~2s of shaping, got {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_both_fails_fast_when_a_direction_errors() {
+        // With no idle timeout, an error on one direction must not keep waiting on
+        // the other half staying open — that would hang and pin the permit.
+        let activity = ActivityClock::new();
+        let up = async { Err::<(), io::Error>(io::Error::other("up failed")) };
+        let down = std::future::pending::<io::Result<()>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3600),
+            relay_both(up, down, None, &activity),
+        )
+        .await
+        .expect("relay must not hang when one direction errors");
+        assert!(outcome.is_err(), "the copy error must propagate");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_both_waits_for_the_open_half_after_a_clean_close() {
+        // A clean EOF (`Ok`) on one direction is a half-close: the other half must
+        // keep relaying rather than tear the connection down.
+        let activity = ActivityClock::new();
+        let up = async { Ok::<(), io::Error>(()) };
+        let down = std::future::pending::<io::Result<()>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            relay_both(up, down, None, &activity),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "relay must keep waiting for the open half after a clean half-close"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_both_completes_when_both_directions_finish() {
+        let activity = ActivityClock::new();
+        let up = async { Ok::<(), io::Error>(()) };
+        let down = async { Ok::<(), io::Error>(()) };
+        relay_both(up, down, None, &activity)
+            .await
+            .expect("both directions closing cleanly is success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_both_ends_on_idle_timeout() {
+        // Both directions stay open but silent; the watchdog must end the relay.
+        let activity = ActivityClock::new();
+        let up = std::future::pending::<io::Result<()>>();
+        let down = std::future::pending::<io::Result<()>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3600),
+            relay_both(up, down, Some(Duration::from_secs(10)), &activity),
+        )
+        .await
+        .expect("the idle watchdog must end the relay");
+        assert!(outcome.is_ok(), "an idle timeout ends the relay cleanly");
     }
 
     #[tokio::test(start_paused = true)]
