@@ -237,7 +237,20 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
         .open(marker)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default_config_path()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // No marker (legacy/never-installed, or it was removed). Fall back to
+            // the default config, but warn: if the service was installed with a
+            // custom --config, the CLI would otherwise validate a different file
+            // than the service actually runs.
+            let default = default_config_path();
+            eprintln!(
+                "warning: no service config marker at {}; validating the default config {}. \
+                 If the service was installed with a custom --config, reinstall to restore the marker.",
+                marker.display(),
+                default.display()
+            );
+            return Ok(default);
+        }
         Err(e) => {
             return Err(ServiceCliError::Service(format!(
                 "cannot read the service config marker {}: {}",

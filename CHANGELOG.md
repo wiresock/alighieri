@@ -19,6 +19,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The Windows service CLI now warns when `start`/`reload` falls back to the
+  default config because the install marker is absent. A custom-config service
+  whose marker was removed would otherwise have the CLI silently validate
+  `C:\ProgramData\Alighieri\alighieri.conf` instead of the config the service
+  runs; the fallback now prints a warning pointing to a reinstall. (A marker that
+  is present but unreadable/empty/relative/symlinked is still an explicit error.)
 - The Linux installer (`scripts/alighieri.sh`) now validates the config before
   writing the systemd unit. `install` wrote the unit and restarted even when the
   config was invalid; because the unit's `CAP_NET_BIND_SERVICE` is derived from
