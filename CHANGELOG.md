@@ -8,6 +8,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The Linux installer (`scripts/alighieri.sh`) now validates the config before
+  writing the systemd unit. `install` wrote the unit and restarted even when the
+  config was invalid; because the unit's `CAP_NET_BIND_SERVICE` is derived from
+  `--check --json` (which yields no capability for an unparseable config), a
+  config meant to bind `:443`/ACME got a unit without the capability — so after
+  the operator fixed the config, a plain `systemctl restart` still failed.
+  `install` now hard-fails on `--check` before writing the unit, mirroring the
+  upgrade path's pre-swap validation.
 - A TCP relay no longer hangs after one direction errors. The relay waited for
   *both* copy directions to finish even when one returned an I/O error; with
   `iotimeout: 0` (idle timeout disabled) a broken connection whose other half

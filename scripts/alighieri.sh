@@ -558,6 +558,16 @@ do_install() {
     chown "root:$SERVICE_USER" "$config_file"
     chmod 640 "$config_file"
 
+    # Validate the config before writing the unit and restarting. write_unit
+    # decides CAP_NET_BIND_SERVICE from `--check --json`, which yields no
+    # capability for a config that fails to parse — so installing over a broken
+    # config (meant to bind :443 or use ACME) would emit a unit that lacks the
+    # capability, and a plain restart after fixing the config would still fail.
+    # Abort the install instead, mirroring the upgrade path's pre-swap check.
+    if ! "$install_bin" --check "$config_file"; then
+        die "config $config_file failed validation; fix the errors above, then re-run install"
+    fi
+
     # Log directory for optional file logging. The default config logs to
     # stdout, which systemd captures into the journal. As with the config dir,
     # enforce mode/ownership explicitly so a reconfigure re-hardens an existing
