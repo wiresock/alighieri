@@ -225,6 +225,11 @@ where
     });
     loop {
         tokio::select! {
+            // Biased, watchdog last: when a copy future is ready in the same poll
+            // as an idle tick, the copy branch wins, so a ready error always
+            // propagates (via `res?`) instead of being masked by the watchdog
+            // returning `Ok`.
+            biased;
             res = &mut up, if !up_done => {
                 res?; // propagate a copy error at once, dropping `down`
                 up_done = true;
@@ -233,8 +238,11 @@ where
                 res?; // propagate a copy error at once, dropping `up`
                 down_done = true;
             }
+            // `maybe_tick` keeps this branch inert without an idle timeout. A
+            // `select!` precondition only skips *polling* the branch future — the
+            // async expression is still evaluated — so a guarded
+            // `ticker.as_mut().unwrap().tick()` would panic when the ticker is None.
             _ = maybe_tick(ticker.as_mut()) => {
-                // Reachable only when an idle timeout (and thus the ticker) is set.
                 if idle.is_some_and(|idle| activity.idle_for() >= idle) {
                     break; // no traffic in either direction for too long
                 }
