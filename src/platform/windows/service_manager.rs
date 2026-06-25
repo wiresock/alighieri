@@ -518,6 +518,25 @@ fn configure_rollback_error(configure_err: &str, delete: ServiceCliResult<()>) -
     }
 }
 
+/// `ERROR_SERVICE_EXISTS` — `create_service` failed because the service is
+/// already installed.
+const ERROR_SERVICE_EXISTS: i32 = 1073;
+
+/// Classifies a `create_service` failure. `ERROR_SERVICE_EXISTS` means an
+/// installation already exists, so a failed reinstall must NOT unregister the
+/// event source that existing installation relies on; any other failure created
+/// no service, so the source registered earlier in `install` is ours to drop.
+fn create_failure(e: windows_service::Error) -> InstallFailure {
+    let service_remains = matches!(
+        &e,
+        windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_EXISTS)
+    );
+    InstallFailure {
+        error: ServiceCliError::Service(explain_service_error(&e)),
+        service_remains,
+    }
+}
+
 impl ServiceController for WindowsServiceController {
     fn install(&self, options: &InstallOptions) -> ServiceCliResult<()> {
         event_log::register_source().map_err(|e| ServiceCliError::Service(explain_io_error(&e)))?;
@@ -555,7 +574,7 @@ impl ServiceController for WindowsServiceController {
 
             let service = manager
                 .create_service(&service_info, service_access)
-                .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
+                .map_err(create_failure)?;
             // Configure the freshly created service. On any failure, best-effort
             // delete it so a half-configured service is not left behind for the
             // operator to clean up by hand.
@@ -636,8 +655,12 @@ impl ServiceController for WindowsServiceController {
         service
             .delete()
             .map_err(|e| ServiceCliError::Service(explain_service_error(&e)))?;
-        event_log::unregister_source()
-            .map_err(|e| ServiceCliError::Service(explain_io_error(&e)))?;
+        // The service is gone now; failing to remove its Event Log source leaves
+        // only a stray registry key, not an installed service. Keep this
+        // best-effort so a failing `uninstall` means the *delete* failed (service
+        // still installed) — which `finalize_install`'s rollback relies on to
+        // report state accurately — rather than a leftover registration.
+        let _ = event_log::unregister_source();
         Ok(())
     }
 
@@ -1006,6 +1029,23 @@ mod tests {
         assert!(msg.contains("set_description failed"), "{msg}");
         assert!(msg.contains("delete access denied"), "{msg}");
         assert!(msg.contains("may still be installed"), "{msg}");
+    }
+
+    #[test]
+    fn create_failure_keeps_the_source_when_the_service_already_exists() {
+        // ERROR_SERVICE_EXISTS: a reinstall over an existing service must not
+        // unregister the event source that existing installation relies on.
+        let err =
+            windows_service::Error::Winapi(std::io::Error::from_raw_os_error(ERROR_SERVICE_EXISTS));
+        assert!(create_failure(err).service_remains);
+    }
+
+    #[test]
+    fn create_failure_drops_the_source_for_other_failures() {
+        // A non-"already exists" failure created no service, so the source
+        // registered earlier in `install` is ours to drop.
+        let err = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(5));
+        assert!(!create_failure(err).service_remains);
     }
 
     #[test]
