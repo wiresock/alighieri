@@ -569,13 +569,15 @@ where
 /// bound relay port), or the bound relay address when no advertise address
 /// applies (unset, or no address resolved for that family).
 fn advertised_reply_addr(
-    relay_addr: SocketAddr,
+    mut relay_addr: SocketAddr,
     advertise: Option<&crate::config::UdpAdvertise>,
 ) -> SocketAddr {
-    advertise
-        .and_then(|adv| adv.for_local(relay_addr.ip()))
-        .map(|ip| SocketAddr::new(ip, relay_addr.port()))
-        .unwrap_or(relay_addr)
+    // `for_local` only returns a same-family address, so `set_ip` keeps the
+    // SocketAddr variant and the real bound port — just swapping the host.
+    if let Some(ip) = advertise.and_then(|adv| adv.for_local(relay_addr.ip())) {
+        relay_addr.set_ip(ip);
+    }
+    relay_addr
 }
 
 fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<SocketAddr> {
