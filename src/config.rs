@@ -1016,28 +1016,76 @@ impl UdpAdvertise {
     }
 }
 
+/// How long config load waits for a `udp.advertise` hostname to resolve before
+/// giving up. The blocking system resolver (`getaddrinfo`) cannot be cancelled,
+/// and config load runs at `--check`, install validation, startup, and reload, so
+/// a wedged resolver must not hang them.
+const UDP_ADVERTISE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Resolves a `udp.advertise` value to the address(es) to advertise: an explicit
 /// IP is used as-is, a hostname is resolved to its A/AAAA records via the
-/// blocking system resolver. Runs only at config load (startup / reload /
-/// `--check`), so a hostname that resolves to nothing fails the load loudly
-/// rather than silently advertising nothing.
+/// blocking system resolver, bounded by [`UDP_ADVERTISE_RESOLVE_TIMEOUT`]. Runs
+/// only at config load (startup / reload / `--check`), so a hostname that
+/// resolves to nothing fails the load loudly rather than silently advertising
+/// nothing.
 fn resolve_udp_advertise(spec: &str, lineno: usize) -> Result<UdpAdvertise> {
-    use std::net::ToSocketAddrs;
     if let Ok(ip) = spec.parse::<IpAddr>() {
         return Ok(advertise_from_ips(std::iter::once(ip)));
     }
-    // `(host, 0)` resolves the name; the port is irrelevant (only the IPs are kept).
-    let advertise = advertise_from_ips(
-        (spec, 0u16)
+    let host = spec.to_string();
+    resolve_udp_advertise_bounded(spec, lineno, UDP_ADVERTISE_RESOLVE_TIMEOUT, move || {
+        use std::net::ToSocketAddrs;
+        // `(host, 0)` resolves the name; the port is irrelevant (only IPs are kept).
+        (host.as_str(), 0u16)
             .to_socket_addrs()
-            .map_err(|e| {
-                cfg_err(
-                    lineno,
-                    &format!("udp.advertise: cannot resolve '{spec}': {e}"),
-                )
-            })?
-            .map(|addr| addr.ip()),
-    );
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+    })
+}
+
+/// Runs `resolve` (the blocking lookup) on a detached thread bounded by
+/// `timeout`, so a wedged resolver cannot hang config load. On timeout the
+/// thread is left to finish on its own (the lookup cannot be cancelled).
+/// Separated from [`resolve_udp_advertise`] so a test can inject a slow resolver.
+fn resolve_udp_advertise_bounded<F>(
+    spec: &str,
+    lineno: usize,
+    timeout: Duration,
+    resolve: F,
+) -> Result<UdpAdvertise>
+where
+    F: FnOnce() -> std::io::Result<Vec<IpAddr>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("udp-advertise-resolve".into())
+        .spawn(move || {
+            let _ = tx.send(resolve());
+        })
+        .map_err(|e| {
+            cfg_err(
+                lineno,
+                &format!("udp.advertise: could not spawn resolver thread: {e}"),
+            )
+        })?;
+    let ips = match rx.recv_timeout(timeout) {
+        Ok(Ok(ips)) => ips,
+        Ok(Err(e)) => {
+            return Err(cfg_err(
+                lineno,
+                &format!("udp.advertise: cannot resolve '{spec}': {e}"),
+            ))
+        }
+        Err(_) => {
+            return Err(cfg_err(
+                lineno,
+                &format!(
+                    "udp.advertise: timed out resolving '{spec}' after {}s",
+                    timeout.as_secs()
+                ),
+            ))
+        }
+    };
+    let advertise = advertise_from_ips(ips.into_iter());
     if advertise.v4.is_none() && advertise.v6.is_none() {
         return Err(cfg_err(
             lineno,
@@ -2563,6 +2611,20 @@ socks pass "" { command: connect }"#,
                 || adv.for_local("::1".parse().unwrap()).is_some(),
             "localhost should resolve to at least one loopback address"
         );
+    }
+
+    #[test]
+    fn udp_advertise_resolution_times_out_on_a_wedged_resolver() {
+        // A resolver that never returns must not hang config load: the bounded
+        // helper gives up after the timeout with a clear error (and leaves the
+        // doomed lookup thread to finish on its own).
+        let err =
+            resolve_udp_advertise_bounded("wedged.example", 1, Duration::from_millis(50), || {
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(Vec::new())
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]

@@ -436,6 +436,24 @@ warn_acme_cache_outside_state_dir() {
          "or grant the unit write access to that path."
 }
 
+# Warn when the configured logfile is outside the unit's writable log directory.
+# Same hardening trap as the ACME cache: ProtectSystem=strict leaves the
+# filesystem read-only except ReadWritePaths=$LOG_DIR, so a logfile elsewhere
+# cannot be written and file logging fails at runtime. Ask the binary for the
+# resolved path rather than reparsing the config.
+warn_logfile_outside_log_dir() {
+    local install_bin="$1" config_file="$2" summary logfile
+    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 0
+    logfile="$(printf '%s\n' "$summary" | sed -n 's/.*"log_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$logfile" ] || return 0   # file logging not configured (or older binary)
+    case "$logfile" in
+        "$LOG_DIR"/*) return 0 ;; # under the writable log directory
+    esac
+    warn "logfile ($logfile) is outside the writable log directory $LOG_DIR;" \
+         "the hardened unit's ProtectSystem=strict makes it read-only, so file logging" \
+         "will fail at runtime. Put the logfile under $LOG_DIR/ or grant the unit write access."
+}
+
 write_unit() {
     local install_bin="$1" config_file="$2"
     # Grant the minimal capability to bind a privileged port only when the
@@ -602,6 +620,7 @@ do_install() {
         die "config $config_file failed validation; fix the errors above, then re-run install"
     fi
     warn_acme_cache_outside_state_dir "$install_bin" "$config_file"
+    warn_logfile_outside_log_dir "$install_bin" "$config_file"
 
     # Log directory for optional file logging. The default config logs to
     # stdout, which systemd captures into the journal. As with the config dir,

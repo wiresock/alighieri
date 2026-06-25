@@ -444,7 +444,18 @@ impl Connection {
         // Advertise the configured public host (with the real relay port) so a
         // client reaching us via NAT is told an address it can send to; otherwise
         // advertise the bound relay address.
-        let advertised = advertised_reply_addr(relay_addr, self.config.udp_advertise.as_ref());
+        let advertise = self.config.udp_advertise.as_ref();
+        let advertised = advertised_reply_addr(relay_addr, advertise);
+        if advertise.is_some_and(|adv| adv.for_local(relay_addr.ip()).is_none()) {
+            // The operator configured an advertised address, but none of the
+            // resolved families matches this client's — so it gets the bound
+            // (possibly private/LAN) relay address, which defeats the point.
+            warn!(
+                peer = %self.peer,
+                relay = %relay_addr,
+                "udp.advertise is configured but has no address for this client's family; advertising the bound relay address, which may be unreachable behind NAT"
+            );
+        }
         socks5::write_reply(&mut self.stream, Reply::Succeeded, advertised).await?;
         info!(peer = %self.peer, relay = %relay_addr, advertised = %advertised, "udp associate established");
 
@@ -783,6 +794,24 @@ mod tests {
         .unwrap()
         .udp_advertise;
         assert_eq!(advertised_reply_addr(relay, v6_only.as_ref()), relay);
+    }
+
+    #[test]
+    fn advertised_reply_addr_handles_ipv4_mapped_relay() {
+        // A dual-stack relay socket reports an IPv4 client as an IPv4-mapped IPv6
+        // local address. The IPv4 advertise address must still apply (and the
+        // reply become a plain IPv4 address), so a client reaching us via NAT
+        // gets a reachable BND.ADDR rather than the bound mapped address.
+        let advertise = crate::config::Config::parse(
+            "internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5",
+        )
+        .unwrap()
+        .udp_advertise;
+        let relay: SocketAddr = "[::ffff:10.0.0.1]:40000".parse().unwrap();
+        assert_eq!(
+            advertised_reply_addr(relay, advertise.as_ref()),
+            "203.0.113.5:40000".parse().unwrap()
+        );
     }
 
     #[test]
