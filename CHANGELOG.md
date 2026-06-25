@@ -6,6 +6,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- `udp.advertise`: advertise a public host (IP or hostname) as the UDP ASSOCIATE
+  reply `BND.ADDR` instead of the locally-bound relay address, so a client that
+  reaches the proxy through NAT (or via a different public address than it binds
+  on locally) is told an address it can actually send datagrams to. The real
+  bound relay port is kept; an IP is used directly and a hostname is resolved at
+  config load (re-resolved on reload). The advertised address matches the
+  client's connection family (IPv4/IPv6), falling back to the bound address when
+  no match was resolved. Pairs with `udp.portrange` for a stable NAT port-forward.
+
 ### Fixed
 
 - The Linux installer (`scripts/alighieri.sh`) now validates the config before

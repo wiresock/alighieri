@@ -50,7 +50,7 @@
 //! ```
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,6 +220,12 @@ pub struct Config {
     /// set `udp.strictreply: false` to relax to host-only matching for servers
     /// that legitimately answer from a different port (e.g. TFTP).
     pub udp_strict_reply: bool,
+    /// Public host advertised as the `BND.ADDR` in the UDP ASSOCIATE reply (the
+    /// real bound relay port is kept), for a proxy reached via NAT or a different
+    /// public address than it binds on locally. Resolved from `udp.advertise` at
+    /// config load — an IP is used directly, a hostname is resolved (and
+    /// re-resolved on reload). `None` advertises the locally-bound relay address.
+    pub udp_advertise: Option<UdpAdvertise>,
     /// How long shutdown waits for in-flight connections to finish before
     /// aborting the rest (`shutdown.draintimeout`, seconds). `0` cuts them
     /// immediately. Read at process start; a reload does not change it.
@@ -468,6 +474,7 @@ struct Builder {
     udp_timeout: Option<Duration>,
     udp_port_range: Option<PortRange>,
     udp_strict_reply: Option<bool>,
+    udp_advertise: Option<UdpAdvertise>,
     shutdown_drain_timeout: Option<Duration>,
     userlist: Option<PathBuf>,
     auth_cache_ttl: Option<Option<Duration>>,
@@ -596,6 +603,7 @@ impl Builder {
                 .unwrap_or(Duration::from_secs(DEFAULT_UDP_TIMEOUT_SECS)),
             udp_port_range: self.udp_port_range,
             udp_strict_reply: self.udp_strict_reply.unwrap_or(true),
+            udp_advertise: self.udp_advertise,
             shutdown_drain_timeout: self
                 .shutdown_drain_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_SECS)),
@@ -703,6 +711,10 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "udpstrictreply" | "udp.strictreply" => {
             b.udp_strict_reply = Some(parse_bool(vals, lineno)?);
+        }
+        "udpadvertise" | "udp.advertise" => {
+            let spec = expect_single(vals, lineno, "udp.advertise host")?;
+            b.udp_advertise = Some(resolve_udp_advertise(spec, lineno)?);
         }
         "shutdowndraintimeout" | "shutdown.draintimeout" => {
             let secs = parse_u64(vals, lineno)?;
@@ -981,6 +993,75 @@ fn parse_ip(vals: &[String], lineno: usize) -> Result<IpAddr> {
     let val = expect_single(vals, lineno, "IP address")?;
     val.parse()
         .map_err(|_| cfg_err(lineno, &format!("invalid IP address '{val}'")))
+}
+
+/// Public address(es) advertised as the UDP ASSOCIATE reply `BND.ADDR` (host
+/// only; the real relay port is kept). Holds the resolved address per family so
+/// the reply can advertise the one matching the client's connection family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpAdvertise {
+    v4: Option<Ipv4Addr>,
+    v6: Option<Ipv6Addr>,
+}
+
+impl UdpAdvertise {
+    /// The advertised address matching `local`'s (canonicalised) family, if one
+    /// was configured/resolved for that family. Returns `None` when nothing was
+    /// resolved for the family, so the caller can fall back to the bound address.
+    pub fn for_local(&self, local: IpAddr) -> Option<IpAddr> {
+        match local.to_canonical() {
+            IpAddr::V4(_) => self.v4.map(IpAddr::V4),
+            IpAddr::V6(_) => self.v6.map(IpAddr::V6),
+        }
+    }
+}
+
+/// Resolves a `udp.advertise` value to the address(es) to advertise: an explicit
+/// IP is used as-is, a hostname is resolved to its A/AAAA records via the
+/// blocking system resolver. Runs only at config load (startup / reload /
+/// `--check`), so a hostname that resolves to nothing fails the load loudly
+/// rather than silently advertising nothing.
+fn resolve_udp_advertise(spec: &str, lineno: usize) -> Result<UdpAdvertise> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = spec.parse::<IpAddr>() {
+        return Ok(advertise_from_ips(std::iter::once(ip)));
+    }
+    // `(host, 0)` resolves the name; the port is irrelevant (only the IPs are kept).
+    let advertise = advertise_from_ips(
+        (spec, 0u16)
+            .to_socket_addrs()
+            .map_err(|e| {
+                cfg_err(
+                    lineno,
+                    &format!("udp.advertise: cannot resolve '{spec}': {e}"),
+                )
+            })?
+            .map(|addr| addr.ip()),
+    );
+    if advertise.v4.is_none() && advertise.v6.is_none() {
+        return Err(cfg_err(
+            lineno,
+            &format!("udp.advertise: '{spec}' resolved to no addresses"),
+        ));
+    }
+    Ok(advertise)
+}
+
+/// Folds resolved IPs into one address per family (the first of each family
+/// wins), canonicalising an IPv4-mapped IPv6 address to IPv4.
+fn advertise_from_ips(ips: impl Iterator<Item = IpAddr>) -> UdpAdvertise {
+    let mut advertise = UdpAdvertise { v4: None, v6: None };
+    for ip in ips {
+        match ip.to_canonical() {
+            IpAddr::V4(v4) => {
+                advertise.v4.get_or_insert(v4);
+            }
+            IpAddr::V6(v6) => {
+                advertise.v6.get_or_insert(v6);
+            }
+        }
+    }
+    advertise
 }
 
 /// Returns the single value of a scalar setting, rejecting trailing tokens that
@@ -2428,6 +2509,60 @@ socks pass "" { command: connect }"#,
 
         // A non-boolean value is rejected like other booleans.
         assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.strictreply: maybe").is_err());
+    }
+
+    #[test]
+    fn udp_advertise_parses_an_ipv4_and_matches_family() {
+        let cfg =
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5").unwrap();
+        let adv = cfg.udp_advertise.expect("udp.advertise should be set");
+        assert_eq!(
+            adv.for_local("10.0.0.1".parse().unwrap()),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        // No IPv6 was configured, so an IPv6 client gets no override (fall back).
+        assert_eq!(adv.for_local("::1".parse().unwrap()), None);
+
+        // Unset by default.
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080")
+            .unwrap()
+            .udp_advertise
+            .is_none());
+    }
+
+    #[test]
+    fn udp_advertise_parses_an_ipv6() {
+        let cfg =
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 2001:db8::1").unwrap();
+        let adv = cfg.udp_advertise.unwrap();
+        assert_eq!(
+            adv.for_local("::1".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(adv.for_local("10.0.0.1".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn udp_advertise_rejects_empty_and_trailing() {
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise:").is_err());
+        // Trailing token is rejected before any resolution is attempted.
+        assert!(
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5 extra")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn udp_advertise_resolves_a_hostname() {
+        // Smoke test of the resolver path: localhost reliably resolves to a
+        // loopback address in at least one family.
+        let cfg = Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: localhost").unwrap();
+        let adv = cfg.udp_advertise.unwrap();
+        assert!(
+            adv.for_local("127.0.0.1".parse().unwrap()).is_some()
+                || adv.for_local("::1".parse().unwrap()).is_some(),
+            "localhost should resolve to at least one loopback address"
+        );
     }
 
     #[test]

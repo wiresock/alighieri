@@ -441,8 +441,12 @@ impl Connection {
         let relay_addr = relay_socket
             .local_addr()
             .unwrap_or_else(|_| socks5::unspecified_v4());
-        socks5::write_reply(&mut self.stream, Reply::Succeeded, relay_addr).await?;
-        info!(peer = %self.peer, relay = %relay_addr, "udp associate established");
+        // Advertise the configured public host (with the real relay port) so a
+        // client reaching us via NAT is told an address it can send to; otherwise
+        // advertise the bound relay address.
+        let advertised = advertised_reply_addr(relay_addr, self.config.udp_advertise.as_ref());
+        socks5::write_reply(&mut self.stream, Reply::Succeeded, advertised).await?;
+        info!(peer = %self.peer, relay = %relay_addr, advertised = %advertised, "udp associate established");
 
         let client_endpoint = requested_udp_endpoint(&request.dest, self.peer.ip());
 
@@ -558,6 +562,20 @@ where
     tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| Error::Timeout)?
+}
+
+/// The address to advertise in the UDP ASSOCIATE reply: the configured
+/// `udp.advertise` host matching the relay socket's family (keeping the real
+/// bound relay port), or the bound relay address when no advertise address
+/// applies (unset, or no address resolved for that family).
+fn advertised_reply_addr(
+    relay_addr: SocketAddr,
+    advertise: Option<&crate::config::UdpAdvertise>,
+) -> SocketAddr {
+    advertise
+        .and_then(|adv| adv.for_local(relay_addr.ip()))
+        .map(|ip| SocketAddr::new(ip, relay_addr.port()))
+        .unwrap_or(relay_addr)
 }
 
 fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<SocketAddr> {
@@ -735,6 +753,34 @@ mod tests {
         let endpoint =
             requested_udp_endpoint(&TargetAddr::Ip("0.0.0.0:53000".parse().unwrap()), client_ip);
         assert_eq!(endpoint, Some("127.0.0.1:53000".parse().unwrap()));
+    }
+
+    #[test]
+    fn advertised_reply_addr_overrides_host_and_keeps_port() {
+        let advertise = crate::config::Config::parse(
+            "internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5",
+        )
+        .unwrap()
+        .udp_advertise;
+        let relay: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        assert_eq!(
+            advertised_reply_addr(relay, advertise.as_ref()),
+            "203.0.113.5:40000".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn advertised_reply_addr_falls_back_to_bound_addr() {
+        let relay: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        // Nothing configured.
+        assert_eq!(advertised_reply_addr(relay, None), relay);
+        // Configured, but no address for the relay's (IPv4) family.
+        let v6_only = crate::config::Config::parse(
+            "internal: 0.0.0.0 port = 1080\nudp.advertise: 2001:db8::1",
+        )
+        .unwrap()
+        .udp_advertise;
+        assert_eq!(advertised_reply_addr(relay, v6_only.as_ref()), relay);
     }
 
     #[test]
