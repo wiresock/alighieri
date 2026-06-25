@@ -277,7 +277,20 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
             marker.display()
         )));
     }
-    Ok(PathBuf::from(trimmed))
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        // Installs write an absolute path; a relative one means a marker from an
+        // older install (before install absolutised the path) or a tampered one.
+        // Resolving it would validate against the CLI's working directory, not the
+        // service's — exactly the mismatch the install-side fix removed — so
+        // refuse it rather than silently validating the wrong file.
+        return Err(ServiceCliError::Service(format!(
+            "the service config marker {} contains a relative path ('{trimmed}'); reinstall \
+             the service with 'alighieri service install --config <absolute path>'",
+            marker.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
@@ -854,6 +867,41 @@ mod tests {
         std::fs::write(&marker, "   \r\n").unwrap();
         let err = read_installed_config_path(&marker).unwrap_err();
         assert!(err.to_string().contains("empty or corrupt"), "{err}");
+    }
+
+    #[test]
+    fn read_installed_config_path_rejects_a_relative_marker() {
+        // A marker from an older install (or tampering) holding a relative path
+        // would resolve against the CLI's working directory, not the service's.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("service-config-path.txt");
+        std::fs::write(&marker, "alighieri.conf\r\n").unwrap();
+        let err = read_installed_config_path(&marker).unwrap_err();
+        assert!(err.to_string().contains("relative path"), "{err}");
+    }
+
+    #[test]
+    fn read_installed_config_path_rejects_a_symlinked_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, r"C:\evil\redirected.conf").unwrap();
+        let marker = dir.path().join("service-config-path.txt");
+
+        // Creating a symlink needs SeCreateSymbolicLinkPrivilege (admin or
+        // Developer Mode). Skip if unavailable so this still covers CI (which can
+        // create symlinks) without failing on a non-elevated dev box.
+        if std::os::windows::fs::symlink_file(&target, &marker).is_err() {
+            eprintln!("skipping symlink test: cannot create symlinks in this environment");
+            return;
+        }
+
+        // The marker is opened as the reparse point itself and rejected as a
+        // non-regular file — the target's contents are never read.
+        let result = read_installed_config_path(&marker);
+        assert!(
+            matches!(&result, Err(ServiceCliError::Service(msg)) if msg.contains("not a regular file")),
+            "a symlinked marker must be rejected without following it, got {result:?}"
+        );
     }
 
     #[test]
