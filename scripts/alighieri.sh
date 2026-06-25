@@ -409,7 +409,8 @@ needs_net_bind_capability() {
 # correct, and it behaves identically everywhere (including busybox, which lacks
 # GNU `realpath -m`). Without this a traversal like `$STATE_DIR/../elsewhere`
 # would textually match the `$STATE_DIR/*` prefix and silently suppress the
-# warning. A leading `/` is preserved; the result has no trailing slash.
+# warning. A leading `/` is preserved; the result has no trailing slash, except
+# for root-only input, which normalises to `/`.
 normalize_path() {
     local path="$1" abs='' out='' rest comp
     case "$path" in

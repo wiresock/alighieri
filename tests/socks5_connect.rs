@@ -696,13 +696,17 @@ socks pass {
 }
 
 /// A hostname `udp.advertise` is resolved through the async resolver at associate
-/// time (config load does no DNS). `localhost` for a v4 client yields a v4
-/// loopback `BND.ADDR` — exercising the `resolve_host` path without hanging.
+/// time (config load does no DNS). The proxy binds on a *distinct* loopback
+/// (`127.0.0.2`) so a successful `localhost` resolution (`127.0.0.1`) is
+/// distinguishable from the relay-address fallback (`127.0.0.2`): if resolution
+/// regressed or returned no v4 address, the reply would be the relay's
+/// `127.0.0.2` and the assertion would fail. Skipped where `127.0.0.2` is not a
+/// usable loopback (e.g. default macOS, which only configures `127.0.0.1`).
 #[tokio::test]
 async fn udp_associate_advertises_resolved_hostname() {
     let cfg = Config::parse(
         r#"
-internal: 127.0.0.1:0
+internal: 127.0.0.2:0
 external: 127.0.0.1
 socksmethod: none
 udp.advertise: localhost
@@ -715,7 +719,16 @@ socks pass {
 "#,
     )
     .unwrap();
-    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let server = match Server::bind(cfg).await {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("skipping udp_associate_advertises_resolved_hostname: 127.0.0.2 loopback unavailable");
+            return;
+        }
+    };
+    let proxy_addr = server.local_addr().unwrap();
+    let _handle = tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut control = TcpStream::connect(proxy_addr).await.unwrap();
     handshake_noauth(&mut control).await;
@@ -724,7 +737,7 @@ socks pass {
     assert_eq!(
         advertised.ip(),
         "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
-        "localhost must resolve to the v4 loopback for a v4 client"
+        "localhost must resolve to 127.0.0.1, distinct from the 127.0.0.2 relay bind"
     );
     assert_ne!(advertised.port(), 0);
 }
