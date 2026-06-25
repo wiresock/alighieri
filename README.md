@@ -260,7 +260,7 @@ socks pass "allow-default" {
 | `udptimeout`       | `60`            | Idle timeout for UDP associations (seconds)          |
 | `udp.portrange`    | —               | Bind the client-facing UDP relay port (`BND.PORT`) within a fixed `MIN-MAX` range for firewalling; unset uses an ephemeral port |
 | `udp.strictreply`  | `true`          | Require UDP replies from the exact remote `host:port` contacted; set `false` to relax to host-only for compatibility (see below) |
-| `udp.advertise`    | —               | Public host (IP or hostname) advertised as the `BND.ADDR` in the UDP ASSOCIATE reply, for a proxy reached via NAT; the real relay port is kept. A hostname is resolved at load (re-resolved on reload) |
+| `udp.advertise`    | —               | Public host (IP or hostname) advertised as the `BND.ADDR` in the UDP ASSOCIATE reply, for a proxy reached via NAT; the real relay port is kept. A hostname is resolved per association via the async resolver (bounded by `dns.timeout`), falling back to the bound relay address if it cannot be resolved — so `--check` validates only its syntax, not reachability |
 | `maxconnections`   | `1024`          | Maximum concurrent client TCP connections            |
 | `shutdown.draintimeout` | `10`       | Seconds shutdown waits for in-flight connections before aborting the rest (`0` cuts immediately) |
 | `logoutput`        | `stdout`        | One or more of `stdout`, `stderr`, `file`            |
