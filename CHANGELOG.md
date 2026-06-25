@@ -8,6 +8,23 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A Windows service installed with a relative `--config` path now runs the file
+  the operator meant. The relative path (validated against the installer's
+  current directory) was stored verbatim in the SCM launch arguments and the
+  marker, but the service runs under SCM from a different working directory, so it
+  resolved a different file — or none — and failed to start or loaded the wrong
+  config. `service install` now resolves `--config` to an absolute path before
+  validating and storing it.
+- The Windows service CLI no longer silently falls back to the default config
+  when the install marker is present but unreadable. `installed_config_path`
+  swallowed every read error (`read_to_string(...).ok()`), so a permission error
+  or an empty/corrupt marker made `service start`/`reload` validate
+  `C:\ProgramData\Alighieri\alighieri.conf` instead of the installed config. A
+  genuinely absent marker still falls back to the default (legacy/never-installed
+  services); an unreadable or empty marker is now an explicit error. The marker is
+  also read without following a final-component symlink (rejecting a non-regular
+  file), so a reparse point planted in the `ProgramData` directory cannot redirect
+  the read — matching the symlink-safe marker write.
 - A Windows service `install` whose post-create configuration fails now reports
   when its own rollback fails. The `delete` that cleans up the just-created
   service was best-effort (`let _ = service.delete()`), so if it failed too, an
