@@ -413,6 +413,12 @@ const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
         note: "UDP reply matching mode is applied to new UDP associations",
     },
     ConfigSettingMetadata {
+        name: "udp.advertise",
+        reload: ReloadBehavior::Live,
+        applies_to: "new_connections",
+        note: "advertised UDP ASSOCIATE reply address is applied to new UDP associations",
+    },
+    ConfigSettingMetadata {
         name: "shutdown.draintimeout",
         reload: ReloadBehavior::Restart,
         applies_to: "process",
@@ -1579,6 +1585,7 @@ mod tests {
             "udptimeout",
             "udp.portrange",
             "udp.strictreply",
+            "udp.advertise",
             "shutdown.draintimeout",
             "userlist",
             "maxconnections",
