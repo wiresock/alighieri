@@ -402,6 +402,18 @@ needs_net_bind_capability() {
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
+# Normalise a path (collapsing `..` and redundant separators) when GNU realpath
+# is available; otherwise return it unchanged so the prefix checks below still
+# run, degrading to the pre-normalisation behavior on systems whose realpath
+# lacks `-m` (e.g. busybox) rather than aborting the install.
+normalize_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$1" 2>/dev/null || printf '%s\n' "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
@@ -428,7 +440,7 @@ warn_acme_cache_outside_state_dir() {
     fi
     # Normalise `..`/redundant separators first so a path like
     # $STATE_DIR/../elsewhere does not look like it is under the StateDirectory.
-    case "$(realpath -m -- "$cache")" in
+    case "$(normalize_path "$cache")" in
         "$STATE_DIR" | "$STATE_DIR"/*) return 0 ;; # under the writable StateDirectory
     esac
     warn "tls.acme.cache ($cache) is outside the service StateDirectory $STATE_DIR;" \
@@ -459,7 +471,7 @@ warn_logfile_outside_log_dir() {
     [ -n "$logfile" ] || return 0   # field present but empty: file logging not configured
     # Normalise `..`/redundant separators first so $LOG_DIR/../elsewhere does not
     # look like it is under the writable log directory.
-    case "$(realpath -m -- "$logfile")" in
+    case "$(normalize_path "$logfile")" in
         "$LOG_DIR"/*) return 0 ;; # under the writable log directory
     esac
     warn "logfile ($logfile) is outside the writable log directory $LOG_DIR;" \

@@ -400,7 +400,10 @@ impl Connection {
                 }
             },
         };
-        match advertise_ip_for_family(&candidates, relay_addr.ip()) {
+        // Key on the client's (peer) family, not the bound address: it is the
+        // family the client will send its UDP datagrams from and expects in the
+        // BND.ADDR. (The two match here, but the peer is the direct intent.)
+        match advertise_ip_for_family(&candidates, self.peer.ip()) {
             Some(ip) => {
                 let mut advertised = relay_addr;
                 advertised.set_ip(ip);
@@ -615,11 +618,11 @@ where
         .map_err(|_| Error::Timeout)?
 }
 
-/// From resolved candidate IPs, the one matching `local`'s canonical address
-/// family (an IPv4-mapped relay address counts as IPv4). The caller applies the
+/// From resolved candidate IPs, the one matching `client`'s canonical address
+/// family (an IPv4-mapped client address counts as IPv4). The caller applies the
 /// real bound port via `set_ip` and falls back to the bound address on `None`.
-fn advertise_ip_for_family(candidates: &[IpAddr], local: IpAddr) -> Option<IpAddr> {
-    let want_v4 = local.to_canonical().is_ipv4();
+fn advertise_ip_for_family(candidates: &[IpAddr], client: IpAddr) -> Option<IpAddr> {
+    let want_v4 = client.to_canonical().is_ipv4();
     candidates
         .iter()
         .map(|ip| ip.to_canonical())
