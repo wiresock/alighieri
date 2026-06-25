@@ -402,15 +402,48 @@ needs_net_bind_capability() {
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
-# Normalise a path (collapsing `..` and redundant separators) when GNU realpath
-# is available; otherwise return it unchanged so the prefix checks below still
-# run, degrading to the pre-normalisation behavior on systems whose realpath
-# lacks `-m` (e.g. busybox) rather than aborting the install.
+# Lexically normalise a path — collapse `.`, `..`, and redundant `/` — using only
+# shell parameter expansion, with no external command. Symlinks are deliberately
+# NOT resolved: the prefix checks below compare the *declared* config path against
+# the unit's StateDirectory/log dir, so the lexical form is both sufficient and
+# correct, and it behaves identically everywhere (including busybox, which lacks
+# GNU `realpath -m`). Without this a traversal like `$STATE_DIR/../elsewhere`
+# would textually match the `$STATE_DIR/*` prefix and silently suppress the
+# warning. A leading `/` is preserved; the result has no trailing slash.
 normalize_path() {
-    if command -v realpath >/dev/null 2>&1; then
-        realpath -m -- "$1" 2>/dev/null || printf '%s\n' "$1"
+    local path="$1" abs='' out='' rest comp
+    case "$path" in
+        /*) abs=1 ;;
+    esac
+    rest="$path"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            /*) rest="${rest#/}"; continue ;; # collapse leading / and // runs
+        esac
+        comp="${rest%%/*}"                     # next component, up to the slash
+        case "$rest" in
+            */*) rest="${rest#*/}" ;;
+            *) rest='' ;;
+        esac
+        case "$comp" in
+            '' | '.') ;;                       # drop empty and `.` segments
+            '..')
+                case "$out" in
+                    '') [ -n "$abs" ] || out='..' ;; # absolute: `..` at root is a no-op
+                    '..' | *'/..') out="$out/.." ;;  # relative escape: cannot pop a `..`
+                    */*) out="${out%/*}" ;;          # pop the last segment
+                    *) out='' ;;                     # pop the only segment
+                esac
+                ;;
+            *) if [ -z "$out" ]; then out="$comp"; else out="$out/$comp"; fi ;;
+        esac
+    done
+    if [ -n "$abs" ]; then
+        printf '%s\n' "/$out"
+    elif [ -n "$out" ]; then
+        printf '%s\n' "$out"
     else
-        printf '%s\n' "$1"
+        printf '%s\n' "."
     fi
 }
 
