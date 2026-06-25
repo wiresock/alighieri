@@ -247,7 +247,14 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
         }
     };
 
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata().map_err(|e| {
+        ServiceCliError::Service(format!(
+            "cannot inspect the service config marker {}: {}",
+            marker.display(),
+            explain_io_error(&e)
+        ))
+    })?;
+    if !metadata.is_file() {
         return Err(ServiceCliError::Service(format!(
             "the service config marker {} is not a regular file; refusing to follow it",
             marker.display()
@@ -255,7 +262,13 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
     }
 
     let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    file.read_to_string(&mut contents).map_err(|e| {
+        ServiceCliError::Service(format!(
+            "cannot read the service config marker {}: {}",
+            marker.display(),
+            explain_io_error(&e)
+        ))
+    })?;
     let trimmed = contents.trim();
     if trimmed.is_empty() {
         return Err(ServiceCliError::Service(format!(
