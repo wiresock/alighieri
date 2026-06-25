@@ -21,7 +21,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   or an empty/corrupt marker made `service start`/`reload` validate
   `C:\ProgramData\Alighieri\alighieri.conf` instead of the installed config. A
   genuinely absent marker still falls back to the default (legacy/never-installed
-  services); an unreadable or empty marker is now an explicit error.
+  services); an unreadable or empty marker is now an explicit error. The marker is
+  also read without following a final-component symlink (rejecting a non-regular
+  file), so a reparse point planted in the `ProgramData` directory cannot redirect
+  the read — matching the symlink-safe marker write.
 - A Windows service `install` whose post-create configuration fails now reports
   when its own rollback fails. The `delete` that cleans up the just-created
   service was best-effort (`let _ = service.delete()`), so if it failed too, an

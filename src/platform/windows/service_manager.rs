@@ -216,29 +216,55 @@ fn installed_config_path() -> ServiceCliResult<PathBuf> {
 }
 
 /// Resolves the config path recorded at install time from `marker`. A genuinely
-/// absent marker falls back to the default (legacy installs predating the marker,
-/// or a never-installed service — `start` then fails cleanly at the SCM layer),
-/// but an unreadable or empty/corrupt marker is an explicit error rather than a
-/// silent fall back to validating a different config than the service runs.
+/// absent marker falls back to the default config (legacy installs predating the
+/// marker, or a service that was never installed); a marker that is present but
+/// unreadable, not a regular file, or empty/corrupt is an explicit error rather
+/// than a silent fall back to validating a different config than the service
+/// runs. The marker is opened without following a final-component symlink
+/// (`ProgramData` subfolders can be standard-user-writable), mirroring the
+/// userlist/wizard sidecar handling.
 fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
-    match std::fs::read_to_string(marker) {
-        Ok(contents) => {
-            let trimmed = contents.trim();
-            if trimmed.is_empty() {
-                return Err(ServiceCliError::Service(format!(
-                    "the service config marker {} is empty or corrupt; reinstall the service \
-                     with 'alighieri service install --config <path>'",
-                    marker.display()
-                )));
-            }
-            Ok(PathBuf::from(trimmed))
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    // Open the reparse point itself rather than following it, then require a
+    // regular file, so a symlink planted at the marker path cannot redirect the
+    // read to another file.
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(marker)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default_config_path()),
+        Err(e) => {
+            return Err(ServiceCliError::Service(format!(
+                "cannot read the service config marker {}: {}",
+                marker.display(),
+                explain_io_error(&e)
+            )))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_config_path()),
-        Err(e) => Err(ServiceCliError::Service(format!(
-            "cannot read the service config marker {}: {e}",
+    };
+
+    if !file.metadata()?.is_file() {
+        return Err(ServiceCliError::Service(format!(
+            "the service config marker {} is not a regular file; refusing to follow it",
             marker.display()
-        ))),
+        )));
     }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Err(ServiceCliError::Service(format!(
+            "the service config marker {} is empty or corrupt; reinstall the service \
+             with 'alighieri service install --config <path>'",
+            marker.display()
+        )));
+    }
+    Ok(PathBuf::from(trimmed))
 }
 
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
