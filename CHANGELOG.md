@@ -8,6 +8,18 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A failed Windows service reinstall no longer removes the Event Log source the
+  existing installation uses. `install` registers the source before creating the
+  service, and a create failure unregistered it on the way out; when the failure
+  is `ERROR_SERVICE_EXISTS` (the service is already installed) the source is now
+  left in place, so attempting to reinstall over an existing service does not
+  break its event logging.
+- A failed config-marker write during `install` no longer claims the service may
+  still be installed when only the Event Log cleanup failed. The rollback
+  uninstalls the just-created service; unregistering the source is now
+  best-effort, so a failing `uninstall` means the service *delete* failed (the
+  service really remains) rather than a leftover registry key — keeping the
+  combined error accurate.
 - A Windows service installed with a relative `--config` path now runs the file
   the operator meant. The relative path (validated against the installer's
   current directory) was stored verbatim in the SCM launch arguments and the
