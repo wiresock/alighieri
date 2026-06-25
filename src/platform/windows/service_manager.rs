@@ -244,8 +244,9 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
             // than the service actually runs.
             let default = default_config_path();
             eprintln!(
-                "warning: no service config marker at {}; validating the default config {}. \
-                 If the service was installed with a custom --config, reinstall to restore the marker.",
+                "alighieri: warning: no service config marker at {}; validating the default \
+                 config {}. If the service was installed with a custom --config, reinstall to \
+                 restore the marker.",
                 marker.display(),
                 default.display()
             );
