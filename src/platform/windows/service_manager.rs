@@ -215,7 +215,29 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
 }
 
 fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
-    std::fs::write(config_marker_path(), config_path.display().to_string())?;
+    write_marker_atomically(&config_marker_path(), &config_path.display().to_string())?;
+    Ok(())
+}
+
+/// Writes the marker crash-safely: a sibling temp file is written and flushed,
+/// then renamed over `marker`. A direct `std::fs::write` truncates in place, so a
+/// crash mid-write could leave a truncated/partial path that later makes the CLI
+/// validate the wrong (or default) config; with the rename, readers always see a
+/// complete old-or-new file. (Matches the atomic persistence used for the
+/// userlist/config writes.) Separated from `config_marker_path` for unit testing.
+fn write_marker_atomically(marker: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let temp = marker.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&temp, marker) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -336,11 +358,51 @@ fn wait_for_service_stopped(service: &Service, timeout: Duration) -> ServiceCliR
 
 pub struct WindowsServiceController;
 
+/// A failed `WindowsServiceController::install` attempt: the error to report, and
+/// whether an SCM service was left behind because cleanup could not remove it (so
+/// the caller knows not to unregister the event source out from under it).
+struct InstallFailure {
+    error: ServiceCliError,
+    service_remains: bool,
+}
+
+impl From<ServiceCliError> for InstallFailure {
+    /// Failures before or while creating the service leave nothing behind.
+    fn from(error: ServiceCliError) -> Self {
+        InstallFailure {
+            error,
+            service_remains: false,
+        }
+    }
+}
+
+/// Builds the error for a post-create configuration failure, given the result of
+/// rolling the just-created service back. A successful rollback reports only the
+/// configuration error (net state: not installed); if the rollback `delete` also
+/// failed the service may still be installed, so both failures are surfaced and
+/// the operator is pointed at a manual uninstall. Mirrors `finalize_install`.
+fn configure_rollback_error(configure_err: &str, delete: ServiceCliResult<()>) -> InstallFailure {
+    match delete {
+        Ok(()) => InstallFailure {
+            error: ServiceCliError::Service(configure_err.to_string()),
+            service_remains: false,
+        },
+        Err(delete_err) => InstallFailure {
+            error: ServiceCliError::Service(format!(
+                "{configure_err}; rolling back the partially configured service also failed \
+                 ({delete_err}), so the {SERVICE_NAME} service may still be installed - run \
+                 'alighieri service uninstall' to remove it"
+            )),
+            service_remains: true,
+        },
+    }
+}
+
 impl ServiceController for WindowsServiceController {
     fn install(&self, options: &InstallOptions) -> ServiceCliResult<()> {
         event_log::register_source().map_err(|e| ServiceCliError::Service(explain_io_error(&e)))?;
 
-        let install_result = || {
+        let install_result = || -> Result<(), InstallFailure> {
             let manager_access =
                 ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
             let manager = ServiceManager::local_computer(None::<&str>, manager_access)
@@ -410,15 +472,29 @@ impl ServiceController for WindowsServiceController {
                     })
                 });
             if let Err(e) = configure {
-                let _ = service.delete();
-                return Err(ServiceCliError::Service(explain_service_error(&e)));
+                let configure_err = explain_service_error(&e);
+                let delete = service
+                    .delete()
+                    .map_err(|de| ServiceCliError::Service(explain_service_error(&de)));
+                return Err(configure_rollback_error(&configure_err, delete));
             }
             Ok(())
         };
 
-        if let Err(err) = install_result() {
-            let _ = event_log::unregister_source();
-            return Err(err);
+        match install_result() {
+            Ok(()) => {}
+            Err(InstallFailure {
+                error,
+                service_remains,
+            }) => {
+                // Keep the event source registered if a service survived a failed
+                // cleanup (it still needs it for its own logging; the eventual
+                // manual uninstall unregisters it). Otherwise drop it.
+                if !service_remains {
+                    let _ = event_log::unregister_source();
+                }
+                return Err(error);
+            }
         }
         // The "was installed" Event Log entry is reported from
         // `persist_config_marker` (the final install step), not here: a failed
@@ -738,5 +814,46 @@ mod tests {
             !controller.uninstalled.get(),
             "a successful install must not be rolled back"
         );
+    }
+
+    #[test]
+    fn configure_rollback_error_reports_only_config_error_when_rollback_succeeds() {
+        let failure = configure_rollback_error("set_description failed", Ok(()));
+        assert!(!failure.service_remains);
+        let msg = failure.error.to_string();
+        assert!(msg.contains("set_description failed"), "{msg}");
+        assert!(!msg.contains("may still be installed"), "{msg}");
+    }
+
+    #[test]
+    fn configure_rollback_error_surfaces_both_failures_when_rollback_fails() {
+        // Configuration failed AND the rollback delete failed: the service may
+        // still be installed, so both failures and a manual-uninstall hint must
+        // appear, and the caller must learn the service survived.
+        let failure = configure_rollback_error(
+            "set_description failed",
+            Err(ServiceCliError::Service("delete access denied".into())),
+        );
+        assert!(failure.service_remains);
+        let msg = failure.error.to_string();
+        assert!(msg.contains("set_description failed"), "{msg}");
+        assert!(msg.contains("delete access denied"), "{msg}");
+        assert!(msg.contains("may still be installed"), "{msg}");
+    }
+
+    #[test]
+    fn write_marker_atomically_replaces_existing_without_leaving_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("service-config-path.txt");
+        std::fs::write(&marker, "old-path").unwrap();
+
+        write_marker_atomically(&marker, r"C:\new\alighieri.conf").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            r"C:\new\alighieri.conf"
+        );
+        // The sibling temp must not linger after a successful write.
+        assert!(!dir.path().join("service-config-path.tmp").exists());
     }
 }
