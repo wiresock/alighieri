@@ -6,6 +6,26 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- A Windows service `install` whose post-create configuration fails now reports
+  when its own rollback fails. The `delete` that cleans up the just-created
+  service was best-effort (`let _ = service.delete()`), so if it failed too, an
+  AutoStart service could linger — with its config baked into the SCM launch
+  arguments but no marker — while the operator was told only that configuration
+  failed. The command now returns a combined error noting the service may still
+  be installed and to run `service uninstall`, and keeps the event source
+  registered when a service survives a failed cleanup. (Mirrors the marker-write
+  rollback in `finalize_install`.)
+- The Windows service config marker (`service-config-path.txt`) is now written
+  crash- and symlink-safely — a fresh, uniquely-named temp file (`create_new`, so
+  it cannot follow a symlink/reparse point pre-planted in the `ProgramData`
+  directory) is flushed (`sync_all`) and renamed over the marker, instead of a
+  direct `std::fs::write` that truncates in place. A crash mid-write could
+  otherwise leave a truncated path that makes the next `start`/`reload` validate
+  the wrong (or default) config; the rename also replaces a destination link
+  rather than writing through it. Matches the userlist/config atomic writes.
+
 ## [0.3.0] - 2026-06-24
 
 ### Changed
