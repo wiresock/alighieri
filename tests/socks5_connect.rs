@@ -617,6 +617,207 @@ socks pass {
     assert_eq!(&buf[header.payload_offset..n], b"udp6 ping");
 }
 
+/// A literal IPv4 `udp.advertise` must be encoded as the reply `BND.ADDR`, with
+/// the real (nonzero) relay port preserved. This is the NAT case: the client is
+/// handed the proxy's public address instead of its private bind, but the same
+/// port it must send datagrams to.
+#[tokio::test]
+async fn udp_associate_advertises_literal_ipv4() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+udp.advertise: 203.0.113.7
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let advertised = request_udp_associate(&mut control).await;
+
+    assert_eq!(
+        advertised.ip(),
+        "203.0.113.7".parse::<std::net::IpAddr>().unwrap(),
+        "the configured public IP must replace the bound relay address"
+    );
+    assert_ne!(
+        advertised.port(),
+        0,
+        "the real relay port must be preserved"
+    );
+}
+
+/// When `udp.advertise` has no address for the client's family — here a v6-only
+/// literal for a v4 client — the reply must fall back to the bound relay address
+/// rather than advertise an unreachable family. (Guards the `None` branch of
+/// `advertise_ip_for_family` end to end.)
+#[tokio::test]
+async fn udp_associate_advertise_wrong_family_falls_back_to_relay() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+udp.advertise: 2001:db8::1
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let advertised = request_udp_associate(&mut control).await;
+
+    assert!(
+        advertised.is_ipv4(),
+        "a v4 client must get a v4 BND.ADDR, got {advertised}"
+    );
+    assert_eq!(
+        advertised.ip(),
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        "the bound relay address is advertised when no candidate matches the family"
+    );
+    assert_ne!(advertised.port(), 0);
+}
+
+/// A hostname `udp.advertise` is resolved through the async resolver at associate
+/// time (config load does no DNS). `localhost` for a v4 client yields a v4
+/// loopback `BND.ADDR` — exercising the `resolve_host` path without hanging.
+#[tokio::test]
+async fn udp_associate_advertises_resolved_hostname() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+udp.advertise: localhost
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let advertised = request_udp_associate(&mut control).await;
+
+    assert_eq!(
+        advertised.ip(),
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        "localhost must resolve to the v4 loopback for a v4 client"
+    );
+    assert_ne!(advertised.port(), 0);
+}
+
+/// A `udp.advertise` hostname that cannot be resolved must not fail the
+/// association: it falls back to the bound relay address at associate time. The
+/// `.invalid` TLD never resolves (RFC 6761); a short `dns.timeout` bounds the
+/// lookup so the fallback path stays fast.
+#[tokio::test]
+async fn udp_associate_unresolvable_advertise_falls_back_to_relay() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+dns.timeout: 1
+udp.advertise: alighieri-no-such-host.invalid
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let advertised =
+        tokio::time::timeout(Duration::from_secs(5), request_udp_associate(&mut control))
+            .await
+            .expect("unresolvable udp.advertise must fall back, not hang the associate");
+
+    assert_eq!(
+        advertised.ip(),
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        "an unresolvable advertise host must fall back to the bound relay address"
+    );
+    assert_ne!(advertised.port(), 0);
+}
+
+/// A v6 client with a v6 `udp.advertise` literal must receive that v6 address in
+/// the reply (ATYP = 0x04) with the relay port preserved, proving family
+/// selection picks the matching candidate for a v6 peer. Skipped where IPv6
+/// loopback is unavailable.
+#[tokio::test]
+async fn udp_associate_advertises_literal_ipv6_for_v6_client() {
+    let cfg = Config::parse(
+        r#"
+internal: [::1]:0
+external: ::1
+socksmethod: none
+udp.advertise: 2001:db8::1
+client pass { }
+socks pass {
+    from: ::/0 to: ::/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let server = match Server::bind(cfg).await {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!(
+                "skipping udp_associate_advertises_literal_ipv6_for_v6_client: no IPv6 loopback"
+            );
+            return;
+        }
+    };
+    let proxy_addr = server.local_addr().unwrap();
+    let _handle = tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let advertised = request_udp_associate(&mut control).await;
+
+    assert_eq!(
+        advertised.ip(),
+        "2001:db8::1".parse::<std::net::IpAddr>().unwrap(),
+        "the v6 client must be advertised the matching v6 candidate"
+    );
+    assert_ne!(
+        advertised.port(),
+        0,
+        "the real relay port must be preserved"
+    );
+}
+
 /// A `command: connect` only policy must reject UDP ASSOCIATE up front with
 /// "connection not allowed by ruleset" — not establish an association that
 /// lingers until the idle timeout while every datagram is dropped.
