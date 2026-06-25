@@ -1067,6 +1067,7 @@ where
                 &format!("udp.advertise: could not spawn resolver thread: {e}"),
             )
         })?;
+    use std::sync::mpsc::RecvTimeoutError;
     let ips = match rx.recv_timeout(timeout) {
         Ok(Ok(ips)) => ips,
         Ok(Err(e)) => {
@@ -1075,13 +1076,19 @@ where
                 &format!("udp.advertise: cannot resolve '{spec}': {e}"),
             ))
         }
-        Err(_) => {
+        Err(RecvTimeoutError::Timeout) => {
             return Err(cfg_err(
                 lineno,
                 &format!(
                     "udp.advertise: timed out resolving '{spec}' after {}s",
                     timeout.as_secs()
                 ),
+            ))
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(cfg_err(
+                lineno,
+                &format!("udp.advertise: resolver thread for '{spec}' exited without a result"),
             ))
         }
     };
