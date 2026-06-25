@@ -442,8 +442,19 @@ warn_acme_cache_outside_state_dir() {
 # from the caller's `--check --json` summary rather than reparsing the config.
 warn_logfile_outside_log_dir() {
     local summary="$1" logfile
+    # An older --binary may not emit log_file at all. Unlike a present-but-empty
+    # field (file logging off), an absent field means the path can't be verified,
+    # so warn rather than silently skip the footgun.
+    case "$summary" in
+        *'"log_file"'*) : ;;
+        *)
+            warn "this alighieri does not report the logfile path (older --binary?);" \
+                 "if the config uses file logging, put the logfile under $LOG_DIR, or the" \
+                 "hardened unit (ProtectSystem=strict) will be unable to write it."
+            return 0 ;;
+    esac
     logfile="$(printf '%s\n' "$summary" | sed -n 's/.*"log_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-    [ -n "$logfile" ] || return 0   # file logging not configured (or older binary)
+    [ -n "$logfile" ] || return 0   # field present but empty: file logging not configured
     case "$logfile" in
         "$LOG_DIR"/*) return 0 ;; # under the writable log directory
     esac
