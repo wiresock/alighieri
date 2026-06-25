@@ -219,26 +219,71 @@ fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
     Ok(())
 }
 
-/// Writes the marker crash-safely: a sibling temp file is written and flushed,
-/// then renamed over `marker`. A direct `std::fs::write` truncates in place, so a
-/// crash mid-write could leave a truncated/partial path that later makes the CLI
-/// validate the wrong (or default) config; with the rename, readers always see a
-/// complete old-or-new file. (Matches the atomic persistence used for the
-/// userlist/config writes.) Separated from `config_marker_path` for unit testing.
+/// Writes the marker crash-safely: a fresh sibling temp file is written and
+/// flushed, then renamed over `marker`. A direct `std::fs::write` truncates in
+/// place, so a crash mid-write could leave a truncated/partial path that later
+/// makes the CLI validate the wrong (or default) config; with the rename, readers
+/// always see a complete old-or-new file (the rename also replaces a destination
+/// link rather than writing through it). Mirrors the atomic persistence used for
+/// the userlist/config writes; separated from `config_marker_path` for testing.
 fn write_marker_atomically(marker: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
 
-    let temp = marker.with_extension("tmp");
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&temp, marker) {
+    let (temp, mut file) = create_marker_temp(marker)?;
+    let result = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    // Clean the temp up on any failure after it was created (write, fsync, or
+    // rename) so a partial temp never lingers.
+    if let Err(e) = result.and_then(|()| std::fs::rename(&temp, marker)) {
         let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
     Ok(())
+}
+
+/// Creates a fresh, uniquely-named sibling temp file with `create_new`
+/// (`CREATE_NEW`). Because it refuses to open an existing name, it cannot follow
+/// a symlink/reparse point pre-planted in the directory — a real concern under
+/// `ProgramData`, whose subfolders a standard user may be able to write — and a
+/// unique `pid`-`nonce` name avoids collisions and stale-temp wedging. Mirrors
+/// `create_userlist_temp`.
+fn create_marker_temp(marker: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = marker
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = marker
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(SERVICE_CONFIG_MARKER));
+
+    for _ in 0..100 {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".tmp-{}-{nonce}", std::process::id()));
+        let temp = parent.join(temp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((temp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create unique temporary marker path",
+    ))
 }
 
 /// Records the installed config marker after the service is created, rolling the
@@ -853,7 +898,15 @@ mod tests {
             std::fs::read_to_string(&marker).unwrap(),
             r"C:\new\alighieri.conf"
         );
-        // The sibling temp must not linger after a successful write.
-        assert!(!dir.path().join("service-config-path.tmp").exists());
+        // No temp sibling lingers after a successful write: the directory holds
+        // only the marker file itself.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("service-config-path.txt")]
+        );
     }
 }

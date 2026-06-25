@@ -18,10 +18,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   registered when a service survives a failed cleanup. (Mirrors the marker-write
   rollback in `finalize_install`.)
 - The Windows service config marker (`service-config-path.txt`) is now written
-  crash-safely — a temp file is flushed (`sync_all`) and renamed over the marker,
-  instead of a direct `std::fs::write` that truncates in place. A crash mid-write
-  could otherwise leave a truncated path that makes the next `start`/`reload`
-  validate the wrong (or default) config.
+  crash- and symlink-safely — a fresh, uniquely-named temp file (`create_new`, so
+  it cannot follow a symlink/reparse point pre-planted in the `ProgramData`
+  directory) is flushed (`sync_all`) and renamed over the marker, instead of a
+  direct `std::fs::write` that truncates in place. A crash mid-write could
+  otherwise leave a truncated path that makes the next `start`/`reload` validate
+  the wrong (or default) config; the rename also replaces a destination link
+  rather than writing through it. Matches the userlist/config atomic writes.
 
 ## [0.3.0] - 2026-06-24
 
