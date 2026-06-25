@@ -220,16 +220,23 @@ async fn main() -> ExitCode {
 }
 
 /// Success JSON for `--check --json`. Beyond `ok`/`path`/`message` it reports
-/// the effective `listen` address (`internal:` is last-wins) and whether `acme`
-/// is enabled, so tooling — e.g. the systemd installer deciding whether to grant
-/// `CAP_NET_BIND_SERVICE` — can read the resolved facts without reparsing config.
+/// the effective `listen` address (`internal:` is last-wins), whether `acme` is
+/// enabled, and the resolved `acme_cache` directory (empty when ACME is off), so
+/// tooling — e.g. the systemd installer deciding whether to grant
+/// `CAP_NET_BIND_SERVICE`, or checking the ACME cache against the unit's writable
+/// StateDirectory — can read the resolved facts without reparsing config.
 fn check_ok_json(config_path: &Path, config: &Config) -> String {
     let acme = matches!(config.tls, Some(TlsConfig::Acme(_)));
+    let acme_cache = match &config.tls {
+        Some(TlsConfig::Acme(cfg)) => cfg.cache_dir.display().to_string(),
+        _ => String::new(),
+    };
     format!(
-        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{}}}",
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\"}}",
         json_escape(&config_path.display().to_string()),
         json_escape(&config.internal.to_string()),
-        acme
+        acme,
+        json_escape(&acme_cache)
     )
 }
 
@@ -1640,11 +1647,13 @@ mod tests {
         let json = check_ok_json(Path::new("test.conf"), &config);
         assert!(json.contains("\"listen\":\"0.0.0.0:443\""), "{json}");
         assert!(json.contains("\"acme\":true"), "{json}");
+        assert!(json.contains("\"acme_cache\":\"/tmp/acme\""), "{json}");
 
         let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
         assert!(json.contains("\"listen\":\"127.0.0.1:1080\""), "{json}");
         assert!(json.contains("\"acme\":false"), "{json}");
+        assert!(json.contains("\"acme_cache\":\"\""), "{json}");
     }
 
     #[test]

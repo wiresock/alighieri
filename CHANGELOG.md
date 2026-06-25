@@ -19,6 +19,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The Linux installer now warns when `tls.acme.cache` points outside the service
+  StateDirectory (`/var/lib/alighieri`). The hardened unit runs with
+  `ProtectSystem=strict`, so a cache elsewhere is read-only and ACME certificate
+  issuance/renewal fails at runtime; the installer now surfaces this at install
+  time instead. `alighieri --check --json` also reports the resolved `acme_cache`
+  path, so the installer (and other tooling) can check it without reparsing the
+  config.
 - The Windows service CLI now warns when `start`/`reload` falls back to the
   default config because the install marker is absent. A custom-config service
   whose marker was removed would otherwise have the CLI silently validate

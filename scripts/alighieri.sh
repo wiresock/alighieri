@@ -402,6 +402,40 @@ needs_net_bind_capability() {
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
+# Warn when the ACME cache is outside the unit's StateDirectory. The hardened
+# unit runs with ProtectSystem=strict, which leaves the filesystem read-only
+# except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
+# written, so certificate issuance/renewal fails at runtime. As with the
+# capability check, ask the binary for the resolved cache path rather than
+# reparsing the config (case-insensitive keywords, include: files).
+warn_acme_cache_outside_state_dir() {
+    local install_bin="$1" config_file="$2" summary cache
+    summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)" || return 0
+    # Only relevant when ACME is enabled.
+    case "$summary" in
+        *'"acme":true'*) : ;;
+        *) return 0 ;;
+    esac
+    # Tolerate optional whitespace around the JSON colon. An empty result means
+    # the binary reported "acme":true but no acme_cache field — i.e. an older
+    # --binary that predates it — so warn that the path could not be verified
+    # rather than silently skipping (the footgun may still apply).
+    cache="$(printf '%s\n' "$summary" | sed -n 's/.*"acme_cache"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [ -z "$cache" ]; then
+        warn "this alighieri does not report the ACME cache path (older --binary?);" \
+             "ensure tls.acme.cache is under the writable StateDirectory $STATE_DIR, or the" \
+             "hardened unit (ProtectSystem=strict) will be unable to write certificates."
+        return 0
+    fi
+    case "$cache" in
+        "$STATE_DIR" | "$STATE_DIR"/*) return 0 ;; # under the writable StateDirectory
+    esac
+    warn "tls.acme.cache ($cache) is outside the service StateDirectory $STATE_DIR;" \
+         "the hardened unit's ProtectSystem=strict makes it read-only, so ACME certificate" \
+         "writes will fail at runtime. Put the cache under $STATE_DIR/ (e.g. $STATE_DIR/acme)" \
+         "or grant the unit write access to that path."
+}
+
 write_unit() {
     local install_bin="$1" config_file="$2"
     # Grant the minimal capability to bind a privileged port only when the
@@ -567,6 +601,7 @@ do_install() {
     if ! "$install_bin" --check "$config_file"; then
         die "config $config_file failed validation; fix the errors above, then re-run install"
     fi
+    warn_acme_cache_outside_state_dir "$install_bin" "$config_file"
 
     # Log directory for optional file logging. The default config logs to
     # stdout, which systemd captures into the journal. As with the config dir,
