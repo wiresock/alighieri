@@ -426,7 +426,9 @@ warn_acme_cache_outside_state_dir() {
              "hardened unit (ProtectSystem=strict) will be unable to write certificates."
         return 0
     fi
-    case "$cache" in
+    # Normalise `..`/redundant separators first so a path like
+    # $STATE_DIR/../elsewhere does not look like it is under the StateDirectory.
+    case "$(realpath -m -- "$cache")" in
         "$STATE_DIR" | "$STATE_DIR"/*) return 0 ;; # under the writable StateDirectory
     esac
     warn "tls.acme.cache ($cache) is outside the service StateDirectory $STATE_DIR;" \
@@ -455,7 +457,9 @@ warn_logfile_outside_log_dir() {
     esac
     logfile="$(printf '%s\n' "$summary" | sed -n 's/.*"log_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     [ -n "$logfile" ] || return 0   # field present but empty: file logging not configured
-    case "$logfile" in
+    # Normalise `..`/redundant separators first so $LOG_DIR/../elsewhere does not
+    # look like it is under the writable log directory.
+    case "$(realpath -m -- "$logfile")" in
         "$LOG_DIR"/*) return 0 ;; # under the writable log directory
     esac
     warn "logfile ($logfile) is outside the writable log directory $LOG_DIR;" \
