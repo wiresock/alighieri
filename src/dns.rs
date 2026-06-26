@@ -518,28 +518,54 @@ fn order_addresses(addrs: &mut [SocketAddr], preference: DnsPreference) {
 /// for per-packet paths that check IP literals without building an address
 /// list.
 pub fn address_allowed(ip: IpAddr, policy: &DnsPolicy) -> bool {
-    // Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form
-    // before matching: the deny categories below recognise the real IPv4
-    // address, but not its mapped wrapper, so without this a request to
-    // `::ffff:127.0.0.1` would slip past a `loopback` (or `private`, etc.) deny.
-    let ip = ip.to_canonical();
+    // Collapse an IPv4-in-IPv6 wrapper to its real IPv4 form before matching: the
+    // deny categories below recognise the IPv4 address, not its wrapper, so
+    // without this `::ffff:127.0.0.1` (or `::127.0.0.1`) would slip past a
+    // `loopback` (or `private`, etc.) deny.
+    let ip = canonical_ip(ip);
     !policy
         .deny
         .iter()
         .any(|category| ip_matches_category(ip, *category))
 }
 
-/// Collapses IPv4-mapped IPv6 addresses to their IPv4 form so every downstream
-/// consumer — the deny policy, ACL CIDR matching, and the outbound connection —
-/// sees the real destination rather than the mapped wrapper that would dodge
-/// IPv4 rules.
+/// Collapses an IPv4-in-IPv6 *wrapper* to its embedded IPv4 so the deny
+/// categories and CIDR rules — which recognise the real IPv4 address, not its
+/// wrapper — apply. Handles both the IPv4-mapped form (`::ffff:a.b.c.d`, via
+/// [`IpAddr::to_canonical`]) and the deprecated IPv4-compatible form
+/// (`::a.b.c.d`, RFC 4291 §2.5.5.1), which `to_canonical` leaves as an opaque
+/// IPv6 address that would otherwise dodge every category (e.g. `::127.0.0.1`
+/// evading `loopback`). `::` and `::1` keep their own meanings. Genuine IPv6
+/// addresses — including NAT64/6to4/Teredo, which are real routable prefixes that
+/// must not be re-routed as IPv4 — are returned unchanged; those prefixes are
+/// instead covered by the `reserved` category. (Operates on `IpAddr`, which has
+/// no scope; the caller's `set_ip` is what preserves a `SocketAddr`'s scope.)
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    let ip = ip.to_canonical();
+    let IpAddr::V6(v6) = ip else { return ip };
+    // `to_ipv4` recognises both IPv4-in-IPv6 wrappers (`::a.b.c.d` and
+    // `::ffff:a.b.c.d`; the mapped form was already folded by `to_canonical`
+    // above). Exclude `::` (unspecified) and `::1` (loopback), which it would
+    // otherwise turn into `0.0.0.0`/`0.0.0.1`.
+    if let Some(v4) = v6.to_ipv4() {
+        if v6 != Ipv6Addr::UNSPECIFIED && v6 != Ipv6Addr::LOCALHOST {
+            return IpAddr::V4(v4);
+        }
+    }
+    ip
+}
+
+/// Collapses IPv4-in-IPv6 wrappers (`::ffff:a.b.c.d` and the deprecated
+/// `::a.b.c.d`) to their IPv4 form so every downstream consumer — the deny
+/// policy, ACL CIDR matching, and the outbound connection — sees the real
+/// destination rather than the wrapper that would dodge IPv4 rules.
 fn canonicalize_addrs(addrs: &mut [SocketAddr]) {
     for addr in addrs.iter_mut() {
         // `set_ip` keeps the port and — for a genuine IPv6 address, where
-        // `to_canonical` is a no-op — its `flowinfo`/`scope_id`. Only an actually
-        // mapped address changes family. Rebuilding via `SocketAddr::new` would
+        // `canonical_ip` is a no-op — its `flowinfo`/`scope_id`. Only an actual
+        // IPv4 wrapper changes family. Rebuilding via `SocketAddr::new` would
         // instead strip those fields from scoped (e.g. link-local) destinations.
-        addr.set_ip(addr.ip().to_canonical());
+        addr.set_ip(canonical_ip(addr.ip()));
     }
 }
 
@@ -601,9 +627,14 @@ fn is_documentation(ip: IpAddr) -> bool {
 /// `198.18.0.0/15` (benchmarking, RFC 2544), and `240.0.0.0/4` (reserved for
 /// future use, including the `255.255.255.255` limited broadcast).
 ///
-/// The IPv6 entries instead *overlap* more specific categories — `::` (also
-/// `unspecified`), `::1` (also `loopback`), and `2001:db8::/32` (also
-/// `documentation`) — so denying `reserved` alone still blocks those.
+/// The IPv6 entries cover `::` (also `unspecified`), `::1` (also `loopback`),
+/// and `2001:db8::/32` (also `documentation`) — so denying `reserved` alone still
+/// blocks those — plus the IPv4-embedding / special-use prefixes that have no
+/// dedicated category: 6to4 `2002::/16` (RFC 3056), the NAT64 well-known prefix
+/// `64:ff9b::/96` (RFC 6052), and the IETF protocol-assignments block
+/// `2001::/23` (RFC 2928), which includes Teredo `2001::/32` and ORCHIDv2
+/// `2001:20::/28`. (Folding of the IPv4-in-IPv6 *wrappers* `::ffff:a.b.c.d` and
+/// `::a.b.c.d` happens earlier, in `canonical_ip`.)
 ///
 /// Private (`10/8`, `172.16/12`, `192.168/16`), link-local, multicast, and the
 /// IPv4 `TEST-NET` documentation ranges have their own categories, so combine
@@ -620,9 +651,24 @@ fn is_reserved(ip: IpAddr) -> bool {
                 || (a == 198 && (b == 18 || b == 19))
         }
         IpAddr::V6(ip) => {
+            let s = ip.segments();
             ip == Ipv6Addr::UNSPECIFIED
                 || ip == Ipv6Addr::LOCALHOST
                 || is_documentation(IpAddr::V6(ip))
+                // 6to4 (RFC 3056): 2002::/16 — embeds an IPv4 address.
+                || s[0] == 0x2002
+                // NAT64 well-known prefix (RFC 6052): 64:ff9b::/96 — maps IPv4,
+                // so 64:ff9b::7f00:1 reaches 127.0.0.1 via a NAT64 gateway.
+                || (s[0] == 0x0064
+                    && s[1] == 0xff9b
+                    && s[2] == 0
+                    && s[3] == 0
+                    && s[4] == 0
+                    && s[5] == 0)
+                // IETF protocol-assignments block (RFC 2928): 2001::/23 — covers
+                // Teredo (2001::/32) and ORCHIDv2 (2001:20::/28); excludes the
+                // separate 2001:db8::/32 documentation range (handled above).
+                || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0)
         }
     }
 }
@@ -1033,6 +1079,31 @@ mod tests {
     }
 
     #[test]
+    fn address_allowed_canonicalizes_ipv4_compatible() {
+        // The deprecated IPv4-compatible form `::a.b.c.d` (which `to_canonical`
+        // does NOT fold) must also be collapsed, or `::127.0.0.1` would dodge a
+        // loopback deny the way `::ffff:127.0.0.1` once did (SSRF). `::1` is still
+        // caught here as IPv6 loopback — it is excluded from folding (not turned
+        // into `0.0.0.1`).
+        let deny = policy(
+            DnsPreference::System,
+            vec![
+                DnsDenyCategory::Loopback,
+                DnsDenyCategory::LinkLocal,
+                DnsDenyCategory::Private,
+            ],
+        );
+        for ip in ["::127.0.0.1", "::169.254.169.254", "::10.0.0.1", "::1"] {
+            assert!(
+                !address_allowed(ip.parse().unwrap(), &deny),
+                "{ip} should be denied"
+            );
+        }
+        // A genuine public address in compatible form still passes (folded to v4).
+        assert!(address_allowed("::8.8.8.8".parse().unwrap(), &deny));
+    }
+
+    #[test]
     fn reserved_covers_iana_special_ranges() {
         let deny = policy(DnsPreference::System, vec![DnsDenyCategory::Reserved]);
         // One representative (and a boundary) per reserved range.
@@ -1049,7 +1120,14 @@ mod tests {
             "255.255.255.255", // 240.0.0.0/4 + limited broadcast
             "::",
             "::1",
-            "2001:db8::1",       // IPv6 reserved
+            "2001:db8::1",       // documentation
+            "2002::1",           // 6to4 (2002::/16)
+            "2002:7f00:1::",     // 6to4 wrapping 127.0.0.1
+            "64:ff9b::7f00:1",   // NAT64 well-known prefix wrapping 127.0.0.1
+            "64:ff9b::1",        // NAT64 (boundary)
+            "2001::1",           // Teredo (2001::/32)
+            "2001:20::1",        // ORCHIDv2 (2001:20::/28)
+            "2001:1ff:ffff::",   // top of the 2001::/23 IETF block
             "::ffff:198.18.0.1", // mapped form still caught
         ] {
             assert!(
@@ -1060,12 +1138,15 @@ mod tests {
         // Public addresses just outside the reserved ranges still pass.
         for ip in [
             "8.8.8.8",
-            "100.63.255.255", // just below 100.64.0.0/10
-            "100.128.0.0",    // just above 100.64.0.0/10
-            "198.17.255.255", // just below 198.18.0.0/15
-            "198.20.0.0",     // just above 198.18.0.0/15
-            "192.88.98.255",  // adjacent to 192.88.99.0/24
-            "2001:4860:4860::8888",
+            "100.63.255.255",       // just below 100.64.0.0/10
+            "100.128.0.0",          // just above 100.64.0.0/10
+            "198.17.255.255",       // just below 198.18.0.0/15
+            "198.20.0.0",           // just above 198.18.0.0/15
+            "192.88.98.255",        // adjacent to 192.88.99.0/24
+            "2001:4860:4860::8888", // Google DNS — above the 2001::/23 block
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "2003::1",              // allocated unicast, just above 2002::/16
+            "2400::1",              // APNIC unicast
         ] {
             assert!(
                 address_allowed(ip.parse().unwrap(), &deny),
