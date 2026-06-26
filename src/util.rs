@@ -4,11 +4,13 @@ use std::time::Duration;
 
 /// Capped exponential backoff for a run of `attempt` consecutive failures:
 /// `base * 2^(attempt - 1)`, clamped to `max`. Callers pass the 1-based streak
-/// length; `0` and `1` both yield `base`. Used to keep a retry loop (accept,
-/// UDP recv) from spinning hot when an error persists, while recovering quickly
-/// from a single transient failure.
+/// length; `0` and `1` both yield `base`. The exponent is bounded only to keep
+/// the `1u32 << shift` multiply in range (`base * 2^31` exceeds any practical
+/// `max`), so `max` is the effective ceiling for any realistic `base`/`max`.
+/// Used to keep a retry loop (accept, UDP recv) from spinning hot when an error
+/// persists, while recovering quickly from a single transient failure.
 pub fn capped_exponential_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
-    let shift = attempt.saturating_sub(1).min(16);
+    let shift = attempt.saturating_sub(1).min(31);
     base.saturating_mul(1u32 << shift).min(max)
 }
 
@@ -50,6 +52,12 @@ mod tests {
         assert_eq!(capped_exponential_backoff(2, base, max), base * 2);
         assert_eq!(capped_exponential_backoff(3, base, max), base * 4);
         assert_eq!(capped_exponential_backoff(u32::MAX, base, max), max);
+        // A pair where max > base * 2^16 must still reach max — the exponent cap
+        // must not become a second, lower ceiling.
+        assert_eq!(
+            capped_exponential_backoff(u32::MAX, Duration::from_nanos(1), Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
         // Monotonic non-decreasing and always within [base, max].
         let mut prev = Duration::ZERO;
         for attempt in 0..40 {

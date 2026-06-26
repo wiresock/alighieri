@@ -86,10 +86,13 @@ async fn recv_resilient(
     buf: &mut [u8],
     consecutive_errors: &mut u32,
 ) -> io::Result<(usize, SocketAddr)> {
-    // Tracks a run of transient errors within this call so a socket that returns
-    // a transient error on *every* recv (e.g. a Windows ICMP-driven
-    // `ConnectionReset` that recurs) backs off instead of spinning. Resets
-    // implicitly when the call returns on the next success.
+    // Counts transient errors since the last successful recv in this call, to
+    // grow the backoff when a socket returns a transient error on *every* recv
+    // (e.g. a recurring Windows ICMP-driven `ConnectionReset`) so it cannot spin.
+    // A non-transient error in between does not reset this — it uses its own
+    // counter below, which tears the association down after
+    // `MAX_CONSECUTIVE_UDP_RECV_ERRORS` — so a mixed-error storm still backs off
+    // and ultimately gives up.
     let mut transient_errors: u32 = 0;
     loop {
         match socket.recv_from(buf).await {
