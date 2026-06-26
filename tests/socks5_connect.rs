@@ -532,6 +532,68 @@ async fn udp_associate_relays_datagrams() {
     assert_eq!(&buf[header.payload_offset..n], b"udp ping");
 }
 
+/// On a dual-stack `[::]` listener an IPv4 client is accepted as an IPv4-mapped
+/// peer, so the UDP relay socket is bound on a `::ffff:` (AF_INET6) address. This
+/// exercises the reply path for that case — the locked client endpoint must stay
+/// sendable on the v6 relay socket (a plain-IPv4 endpoint cannot be `send_to` on
+/// AF_INET6). Skipped where dual-stack v4-mapped accept is unavailable (e.g.
+/// Windows' default `IPV6_V6ONLY`, or a host without IPv6), detected by checking
+/// that the connected peer actually arrived IPv4-mapped.
+#[tokio::test]
+async fn udp_associate_relays_for_mapped_client_on_dual_stack_listener() {
+    let cfg = Config::parse(
+        r#"
+internal: [::]:0
+external: 127.0.0.1
+socksmethod: none
+client pass { }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let server = match Server::bind(cfg).await {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: cannot bind [::]:0");
+            return;
+        }
+    };
+    let listen = server.local_addr().unwrap();
+    let _handle = tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Reach the dual-stack listener over IPv4 so the peer arrives `::ffff:`-mapped.
+    let v4_listen = SocketAddr::new("127.0.0.1".parse().unwrap(), listen.port());
+    let Ok(mut control) = TcpStream::connect(v4_listen).await else {
+        eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: no IPv4 path to [::] listener");
+        return;
+    };
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+
+    let echo = start_udp_echo_server().await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"mapped ping");
+    // The advertised relay address may be `::ffff:127.0.0.1` or plain `127.0.0.1`;
+    // send over IPv4 either way.
+    let relay_v4 = SocketAddr::new(relay_addr.ip().to_canonical(), relay_addr.port());
+    udp.send_to(&datagram, relay_v4).await.unwrap();
+
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("relay did not reply to the IPv4-mapped client on the dual-stack socket")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(header.dest, TargetAddr::Ip(echo));
+    assert_eq!(&buf[header.payload_offset..n], b"mapped ping");
+}
+
 /// The default `external` (`0.0.0.0`) yields a dual-stack outbound, so the
 /// common case — a v4 destination — must still relay through the `::ffff:`
 /// mapped-send path. Guards against the dual-stack change breaking v4 UDP.

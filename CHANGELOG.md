@@ -27,8 +27,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   is matched against the client's address canonically, so an IPv4 client that
   appears as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is no longer
   mismatched against the plain-IPv4 endpoint — which silently relaxed the binding
-  to the looser "first datagram from this IP wins". The relay also canonicalises
-  each datagram's source before the lock and spoof checks.
+  to the looser "first datagram from this IP wins". The lock is kept in the
+  client's address family so it stays a valid reply target, and the relay
+  compares each datagram's source canonically.
 - The Linux installer's hardened-path warnings (`tls.acme.cache`, `logfile`) now
   normalise the path lexically — collapsing `.`, `..`, and redundant separators
   in-shell with no `realpath` dependency — before checking it against the

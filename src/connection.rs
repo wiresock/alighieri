@@ -637,19 +637,17 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
     if addr.port() == 0 {
         return None;
     }
-    // Compare and store canonically. On a dual-stack listener the client is an
-    // IPv4-mapped `::ffff:a.b.c.d`, while the ASSOCIATE request's DST.ADDR is the
-    // plain IPv4 `a.b.c.d`; a raw `==` would miss and silently drop the
-    // predeclared source lock, weakening the per-association source binding. The
-    // stored endpoint is canonical so it matches the form the relay canonicalises
-    // incoming datagrams into.
-    let client_ip = client_ip.to_canonical();
-    if addr.ip().is_unspecified() {
-        return Some(SocketAddr::new(client_ip, addr.port()));
-    }
-    let addr_ip = addr.ip().to_canonical();
-    if addr_ip == client_ip {
-        return Some(SocketAddr::new(addr_ip, addr.port()));
+    // Match canonically so a dual-stack client (an IPv4-mapped `::ffff:a.b.c.d`)
+    // still matches a plain-IPv4 DST.ADDR instead of silently dropping the
+    // predeclared source lock and weakening the per-association source binding.
+    // Bind the lock to the client's own address — the same family as the relay
+    // socket, so it stays a valid reply target — keeping the requested port. An
+    // unspecified DST.ADDR means "lock to my source", which is likewise the
+    // client address.
+    if addr.ip().is_unspecified() || addr.ip().to_canonical() == client_ip.to_canonical() {
+        let mut endpoint = *addr;
+        endpoint.set_ip(client_ip);
+        return Some(endpoint);
     }
     None
 }
@@ -816,19 +814,21 @@ mod tests {
     }
 
     #[test]
-    fn requested_udp_endpoint_canonicalizes_mapped_client() {
+    fn requested_udp_endpoint_locks_mapped_client_in_its_own_family() {
         // On a dual-stack listener a v4 client appears as `::ffff:a.b.c.d`, while
-        // its ASSOCIATE request carries the plain-IPv4 DST.ADDR. The lock must
-        // still be set (and in canonical form), not dropped to first-datagram-wins.
+        // its ASSOCIATE request carries the plain-IPv4 DST.ADDR. The lock must be
+        // set (not dropped to first-datagram-wins) and kept in the client's own
+        // family, so it stays a valid reply target on the dual-stack relay socket.
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let want = Some(SocketAddr::new(mapped, 53000));
         assert_eq!(
             requested_udp_endpoint(&TargetAddr::Ip("127.0.0.1:53000".parse().unwrap()), mapped),
-            Some("127.0.0.1:53000".parse().unwrap())
+            want
         );
-        // The unspecified case yields the canonical client address with the port.
+        // Unspecified DST.ADDR likewise locks to the (mapped) client address.
         assert_eq!(
             requested_udp_endpoint(&TargetAddr::Ip("0.0.0.0:53000".parse().unwrap()), mapped),
-            Some("127.0.0.1:53000".parse().unwrap())
+            want
         );
         // A genuinely different host is still rejected after canonicalisation.
         assert_eq!(
