@@ -23,9 +23,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - The Linux installer's hardened-path warnings (`tls.acme.cache`, `logfile`) now
-  normalise the path with `realpath -m` before checking it against the writable
-  directory, so a traversal path like `/var/log/alighieri/../elsewhere.log` no
-  longer looks safe and slips past the warning.
+  normalise the path lexically — collapsing `.`, `..`, and redundant separators
+  in-shell with no `realpath` dependency — before checking it against the
+  writable directory, so a traversal path like `/var/log/alighieri/../elsewhere.log`
+  no longer looks safe and slips past the warning. The previous `realpath -m`
+  approach silently degraded to the raw path (re-opening the gap) on systems
+  without GNU coreutils, e.g. busybox.
 - The Linux installer now warns when `logfile` points outside the writable log
   directory (`/var/log/alighieri`), mirroring the ACME-cache check. The hardened
   unit's `ProtectSystem=strict` makes other paths read-only, so file logging to a
