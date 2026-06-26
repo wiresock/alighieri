@@ -380,27 +380,27 @@ ensure_user() {
 # privileged. A binary too old to emit those fields yields neither match, so the
 # capability stays unset.
 needs_net_bind_capability() {
-    local summary="$1" port
+    local summary="$1" listen port
     case "$summary" in
         *'"acme":true'*) return 0 ;;
     esac
-    # A binary new enough always reports "listen". If it is absent the installed
-    # binary predates these fields (e.g. an older --binary), so we cannot tell
-    # whether a privileged bind is needed — warn rather than silently emit a unit
-    # that may fail to start.
-    case "$summary" in
-        *'"listen":"'*) : ;;
-        *)
-            warn "installed alighieri does not report listener details in --check --json;" \
-                 "if the config binds a port below 1024 or uses ACME, add CAP_NET_BIND_SERVICE" \
-                 "to $UNIT_FILE or upgrade the binary"
-            return 1 ;;
-    esac
-    port="$(printf '%s\n' "$summary" | sed -n 's/.*"listen":"\([^"]*\)".*/\1/p')"
-    port="${port##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
+    # Deriving the port needs "listen" reported as a non-empty string. An absent
+    # field, or a non-string value, means the installed binary predates these
+    # fields (e.g. an older --binary) or cannot be verified — warn rather than
+    # silently emit a unit that may fail to start. (Basing this on the extracted
+    # string, not mere presence, covers a non-string `"listen":` too.)
+    listen="$(printf '%s\n' "$summary" | json_string_field listen)"
+    if [ -z "$listen" ]; then
+        warn "installed alighieri does not report listener details in --check --json;" \
+             "if the config binds a port below 1024 or uses ACME, add CAP_NET_BIND_SERVICE" \
+             "to $UNIT_FILE or upgrade the binary"
+        return 1
+    fi
+    port="${listen##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
     case "$port" in
         '' | *[!0-9]*) return 1 ;;
     esac
+    port=$((10#$port))   # force base-10 so a leading zero is never read as octal
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
@@ -451,7 +451,7 @@ normalize_path() {
     fi
 }
 
-# Extract a top-level JSON string field's value from `--check --json` output,
+# Extract a JSON string field's value from the flat `--check --json` output,
 # honouring JSON string escapes. Reads the JSON on stdin and the field name as
 # $1; prints the unescaped value (no trailing newline), or nothing if the field
 # is absent or not a string. Unlike a plain `sed` capture (`"\([^"]*\)"`), a path
@@ -513,6 +513,32 @@ json_string_field() {
     '
 }
 
+# Whether a JSON field named $1 is present in the flat `--check --json` object,
+# escape- and key-aware to match `json_string_field`. A plain `case`/glob on
+# `"<key>"` would also match
+# the key name appearing as another field's *value* (e.g. `"message":"log_file"`)
+# and so wrongly report the field present. Reads the JSON on stdin; returns 0 if
+# a real `"<key>":` exists, 1 otherwise.
+json_has_field() {
+    awk -v key="$1" '
+    { json = json $0 }
+    END {
+        marker = "\"" key "\""
+        mlen = length(marker)
+        start = 1
+        while ((at = index(substr(json, start), marker)) > 0) {
+            pos = start + at - 1
+            start = pos + 1
+            if (pos > 1 && substr(json, pos - 1, 1) == "\\") continue
+            rest = substr(json, pos + mlen)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) == ":") exit 0   # a real key
+        }
+        exit 1
+    }
+    '
+}
+
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
@@ -558,14 +584,12 @@ warn_logfile_outside_log_dir() {
     # An older --binary may not emit log_file at all. Unlike a present-but-empty
     # field (file logging off), an absent field means the path can't be verified,
     # so warn rather than silently skip the footgun.
-    case "$summary" in
-        *'"log_file"'*) : ;;
-        *)
-            warn "this alighieri does not report the logfile path (older --binary?);" \
-                 "if the config uses file logging, put the logfile under $LOG_DIR, or the" \
-                 "hardened unit (ProtectSystem=strict) will be unable to write it."
-            return 0 ;;
-    esac
+    if ! printf '%s\n' "$summary" | json_has_field log_file; then
+        warn "this alighieri does not report the logfile path (older --binary?);" \
+             "if the config uses file logging, put the logfile under $LOG_DIR, or the" \
+             "hardened unit (ProtectSystem=strict) will be unable to write it."
+        return 0
+    fi
     logfile="$(printf '%s\n' "$summary" | json_string_field log_file)"
     [ -n "$logfile" ] || return 0   # field present but empty: file logging not configured
     # Normalise `..`/redundant separators first so $LOG_DIR/../elsewhere does not
@@ -666,6 +690,27 @@ run_selftest() {
         '{"message":"acme_cache","acme_cache":"/real/path"}' acme_cache "/real/path"
     _check_json "skips a quoted key-like substring in a value" \
         '{"path":"x\"acme_cache\"y","acme_cache":"/real"}' acme_cache "/real"
+
+    _check_has() { # description json key want(yes|no)
+        local got
+        if printf '%s' "$2" | json_has_field "$3"; then got=yes; else got=no; fi
+        if [ "$got" = "$4" ]; then
+            printf 'ok   json_has_field %s\n' "$1"
+        else
+            printf 'FAIL json_has_field %s: got %s want %s\n' "$1" "$got" "$4"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Field presence must be a real `"key":`, not the key name appearing as
+    # another field's value — otherwise the "older binary cannot verify this"
+    # warnings get suppressed and the bind capability mis-derived.
+    _check_has "present field" '{"listen":"127.0.0.1:80"}' listen yes
+    _check_has "absent field" '{"acme":true}' log_file no
+    _check_has "value equal to key name is not the field" \
+        '{"message":"log_file"}' log_file no
+    _check_has "quoted key-like substring in a value is not the field" \
+        '{"path":"a\"listen\"b"}' listen no
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
