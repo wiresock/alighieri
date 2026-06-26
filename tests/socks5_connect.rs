@@ -719,16 +719,17 @@ socks pass {
 "#,
     )
     .unwrap();
-    let server = match Server::bind(cfg).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("skipping udp_associate_advertises_resolved_hostname: 127.0.0.2 loopback unavailable");
-            return;
-        }
-    };
-    let proxy_addr = server.local_addr().unwrap();
-    let _handle = tokio::spawn(async move { server.run().await.ok() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Skip only the known platform gap — 127.0.0.2 not being a usable loopback
+    // (default macOS configures only 127.0.0.1) — by probing it directly. Any
+    // other bind failure must surface as a test failure, not a silent skip, so
+    // the proxy itself is started through start_proxy_with_config (which unwraps).
+    if TcpListener::bind("127.0.0.2:0").await.is_err() {
+        eprintln!(
+            "skipping udp_associate_advertises_resolved_hostname: 127.0.0.2 loopback unavailable"
+        );
+        return;
+    }
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
 
     let mut control = TcpStream::connect(proxy_addr).await.unwrap();
     handshake_noauth(&mut control).await;
@@ -802,18 +803,14 @@ socks pass {
 "#,
     )
     .unwrap();
-    let server = match Server::bind(cfg).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!(
-                "skipping udp_associate_advertises_literal_ipv6_for_v6_client: no IPv6 loopback"
-            );
-            return;
-        }
-    };
-    let proxy_addr = server.local_addr().unwrap();
-    let _handle = tokio::spawn(async move { server.run().await.ok() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Skip only when IPv6 loopback is genuinely unavailable, probed directly;
+    // any other bind failure must fail the test rather than skip, so the proxy is
+    // started through start_proxy_with_config (which unwraps).
+    if TcpListener::bind("[::1]:0").await.is_err() {
+        eprintln!("skipping udp_associate_advertises_literal_ipv6_for_v6_client: no IPv6 loopback");
+        return;
+    }
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
 
     let mut control = TcpStream::connect(proxy_addr).await.unwrap();
     handshake_noauth(&mut control).await;
