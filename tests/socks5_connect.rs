@@ -534,11 +534,12 @@ async fn udp_associate_relays_datagrams() {
 
 /// On a dual-stack `[::]` listener an IPv4 client is accepted as an IPv4-mapped
 /// peer, so the UDP relay socket is bound on a `::ffff:` (AF_INET6) address. This
-/// exercises the reply path for that case — the locked client endpoint must stay
-/// sendable on the v6 relay socket (a plain-IPv4 endpoint cannot be `send_to` on
-/// AF_INET6). Skipped where dual-stack v4-mapped accept is unavailable (e.g.
-/// Windows' default `IPV6_V6ONLY`, or a host without IPv6), detected by checking
-/// that the connected peer actually arrived IPv4-mapped.
+/// exercises that path end to end: the client must get a v4 (ATYP=0x01) BND.ADDR
+/// (not an IPv6-form reply it would misparse), and the locked client endpoint
+/// must stay sendable on the v6 relay socket (a plain-IPv4 endpoint cannot be
+/// `send_to` on AF_INET6), so the reply round-trips. Skipped when `[::]:0` cannot
+/// be bound or has no IPv4 path (e.g. Windows' default `IPV6_V6ONLY`, or a host
+/// without IPv6).
 #[tokio::test]
 async fn udp_associate_relays_for_mapped_client_on_dual_stack_listener() {
     let cfg = Config::parse(
@@ -574,15 +575,19 @@ socks pass {
     };
     handshake_noauth(&mut control).await;
     let relay_addr = request_udp_associate(&mut control).await;
+    // The v4 client must be handed a v4 (ATYP=0x01) BND.ADDR even though the relay
+    // socket is bound on a dual-stack `::ffff:` address — assert it directly
+    // rather than canonicalising, so a mapped (IPv6-form) reply would fail here.
+    assert!(
+        relay_addr.is_ipv4(),
+        "dual-stack relay must reply with a v4 BND.ADDR for a v4 client, got {relay_addr}"
+    );
 
     let echo = start_udp_echo_server().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
     datagram.extend_from_slice(b"mapped ping");
-    // The advertised relay address may be `::ffff:127.0.0.1` or plain `127.0.0.1`;
-    // send over IPv4 either way.
-    let relay_v4 = SocketAddr::new(relay_addr.ip().to_canonical(), relay_addr.port());
-    udp.send_to(&datagram, relay_v4).await.unwrap();
+    udp.send_to(&datagram, relay_addr).await.unwrap();
 
     let mut buf = [0u8; 1024];
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))

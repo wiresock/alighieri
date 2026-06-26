@@ -495,6 +495,11 @@ impl Connection {
         let relay_addr = relay_socket
             .local_addr()
             .unwrap_or_else(|_| socks5::unspecified_v4());
+        // On a dual-stack listener the relay socket is bound on an IPv4-mapped
+        // (`::ffff:`) local address, so report the canonical form to the client: a
+        // v4 client must get a v4 (ATYP=0x01) BND.ADDR it can parse, not the IPv6
+        // (mapped) encoding. A genuine IPv6 address is unchanged.
+        let relay_addr = SocketAddr::new(relay_addr.ip().to_canonical(), relay_addr.port());
         // Advertise the configured public host (with the real relay port) so a
         // client reaching us via NAT is told an address it can send to; a hostname
         // is resolved here via the async resolver. Falls back to the bound relay

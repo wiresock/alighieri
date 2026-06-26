@@ -30,6 +30,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   to the looser "first datagram from this IP wins". The lock is kept in the
   client's address family so it stays a valid reply target, and the relay
   compares each datagram's source canonically.
+- A UDP ASSOCIATE reply to an IPv4 client on a dual-stack (`[::]`) listener now
+  carries a plain-IPv4 `BND.ADDR` (`ATYP` 0x01) instead of the IPv4-mapped IPv6
+  form (`ATYP` 0x04), which an IPv4-only client could misparse.
 - The Linux installer's hardened-path warnings (`tls.acme.cache`, `logfile`) now
   normalise the path lexically — collapsing `.`, `..`, and redundant separators
   in-shell with no `realpath` dependency — before checking it against the
