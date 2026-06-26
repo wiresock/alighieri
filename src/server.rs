@@ -282,11 +282,10 @@ impl Server {
                 accepted = self.listener.accept() => match accepted {
                     Ok(pair) => Some(pair),
                     Err(e) => {
-                        self.metrics.accept_failed();
                         // A connection the peer aborted or reset before we
                         // accepted it, or an interrupted syscall, is benign churn
-                        // (e.g. a port scan): retry at once and do not count it
-                        // toward backoff.
+                        // (e.g. a port scan): retry at once, and do not count it
+                        // toward backoff or the failure metric.
                         if matches!(
                             e.kind(),
                             ErrorKind::ConnectionAborted
@@ -296,10 +295,11 @@ impl Server {
                             debug!(error = %e, "accept failed (transient); retrying");
                         } else {
                             // Other errors tend to persist (e.g. EMFILE/ENFILE
-                            // descriptor exhaustion). Back off with a capped
-                            // exponential delay so a degraded listener does not
-                            // spin the loop hot and flood the log. A successful
-                            // accept resets the streak.
+                            // descriptor exhaustion). Count them, then back off
+                            // with a capped exponential delay so a degraded
+                            // listener does not spin the loop hot and flood the
+                            // log. A successful accept resets the streak.
+                            self.metrics.accept_failed();
                             consecutive_accept_errors =
                                 consecutive_accept_errors.saturating_add(1);
                             let backoff = accept_backoff(consecutive_accept_errors);
@@ -733,9 +733,10 @@ const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(5);
 /// about once a second rather than stalling the listener for longer.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
-/// Capped exponential backoff for `attempt` consecutive accept failures
-/// (1-based): `ACCEPT_BACKOFF_BASE * 2^(attempt - 1)`, clamped to
-/// `ACCEPT_BACKOFF_MAX`. `attempt == 0` yields the base delay.
+/// Capped exponential backoff for a run of `attempt` consecutive accept
+/// failures: `ACCEPT_BACKOFF_BASE * 2^(attempt - 1)`, clamped to
+/// `ACCEPT_BACKOFF_MAX`. Callers pass the 1-based streak length; `0` and `1` both
+/// yield the base delay.
 fn accept_backoff(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(16);
     ACCEPT_BACKOFF_BASE

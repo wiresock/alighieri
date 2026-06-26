@@ -54,9 +54,11 @@ impl Metrics {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The listener's `accept()` returned an error. Makes a degraded listener
-    /// (e.g. under `EMFILE`/`ENFILE` file-descriptor exhaustion) observable
-    /// instead of only visible as log noise.
+    /// A persistent listener `accept()` failure — the kind that drives the accept
+    /// backoff (e.g. `EMFILE`/`ENFILE` file-descriptor exhaustion). Benign
+    /// per-connection churn (aborted/reset connects, `EINTR`), which is retried
+    /// immediately, is deliberately not counted, so this stays a clean signal of a
+    /// degraded listener rather than rising with port-scan noise.
     pub fn accept_failed(&self) {
         self.accept_failures.fetch_add(1, Ordering::Relaxed);
     }
