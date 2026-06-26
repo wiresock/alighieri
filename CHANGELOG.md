@@ -52,6 +52,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   no longer looks safe and slips past the warning. The previous `realpath -m`
   approach silently degraded to the raw path (re-opening the gap) on systems
   without GNU coreutils, e.g. busybox.
+- The Linux installer reads the `--check --json` path fields with an
+  escape-aware extractor (`awk`) instead of a plain `sed` capture, so a
+  `tls.acme.cache` or `logfile` path containing an escaped quote or backslash is
+  read in full and unescaped rather than truncated or misread — which could
+  otherwise produce a false or missed hardened-unit warning.
 - The Linux installer now warns when `logfile` points outside the writable log
   directory (`/var/log/alighieri`), mirroring the ACME-cache check. The hardened
   unit's `ProtectSystem=strict` makes other paths read-only, so file logging to a
