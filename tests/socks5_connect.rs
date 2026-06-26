@@ -4,7 +4,7 @@
 //! handshake → method selection → (optional auth) → request → relay.
 
 use std::io::Write;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -707,10 +707,12 @@ socks pass {
 #[tokio::test]
 async fn udp_associate_advertises_resolved_hostname() {
     // Derive what `localhost` resolves to from the same source the proxy uses
-    // (getaddrinfo), rather than hard-coding 127.0.0.1. A resolver error is
-    // surfaced before skipping so a transient/system failure is not masked as a
-    // silent "no IPv4 address" skip.
-    let localhost_v4: Vec<std::net::IpAddr> = match ("localhost", 0).to_socket_addrs() {
+    // (getaddrinfo), rather than hard-coding 127.0.0.1. `tokio::net::lookup_host`
+    // runs the blocking resolver on Tokio's blocking pool, so the async test
+    // thread is not blocked. A resolver error is surfaced before skipping so a
+    // transient/system failure is not masked as a silent "no IPv4 address" skip.
+    let localhost_v4: Vec<std::net::IpAddr> = match tokio::net::lookup_host(("localhost", 0)).await
+    {
         Ok(addrs) => addrs
             .map(|s| s.ip())
             .filter(std::net::IpAddr::is_ipv4)
@@ -725,6 +727,17 @@ async fn udp_associate_advertises_resolved_hostname() {
     if localhost_v4.is_empty() {
         eprintln!(
             "skipping udp_associate_advertises_resolved_hostname: localhost has no IPv4 address"
+        );
+        return;
+    }
+    // The "resolution applied, not the relay fallback" assertion below holds only
+    // because the relay bind IP (127.0.0.2) is not one of localhost's addresses.
+    // A custom /etc/hosts mapping localhost to 127.0.0.2 would make resolved and
+    // fallback indistinguishable, so skip rather than risk a false pass.
+    let relay_ip = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
+    if localhost_v4.contains(&relay_ip) {
+        eprintln!(
+            "skipping udp_associate_advertises_resolved_hostname: localhost resolves to the 127.0.0.2 relay IP"
         );
         return;
     }
