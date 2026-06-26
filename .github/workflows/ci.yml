@@ -91,8 +91,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Lint the Linux management scripts. shellcheck is preinstalled on the
-  # GitHub-hosted Ubuntu runners.
+  # Lint the Linux management scripts and run their bundled self-tests (the
+  # installer's path-normalisation and hardened-path warning logic). shellcheck
+  # is preinstalled on the GitHub-hosted Ubuntu runners.
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
@@ -100,6 +101,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
+      - name: Run installer self-tests
+        run: bash scripts/alighieri.sh __selftest
 
   # Verify the crate still builds on its declared minimum supported Rust
   # version (Cargo.toml `rust-version`). Clippy and rustfmt stay on the stable
