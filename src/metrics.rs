@@ -21,6 +21,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Default)]
 pub struct Metrics {
     accepted_connections: AtomicU64,
+    accept_failures: AtomicU64,
     active_connections: AtomicU64,
     client_denied_connections: AtomicU64,
     rate_limit_events: AtomicU64,
@@ -51,6 +52,15 @@ impl Metrics {
     pub fn accepted_connection(&self) {
         self.accepted_connections.fetch_add(1, Ordering::Relaxed);
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A persistent listener `accept()` failure — the kind that drives the accept
+    /// backoff (e.g. `EMFILE`/`ENFILE` file-descriptor exhaustion). Benign
+    /// per-connection churn (aborted/reset connects, `EINTR`), which is retried
+    /// immediately, is deliberately not counted, so this stays a clean signal of a
+    /// degraded listener rather than rising with port-scan noise.
+    pub fn accept_failed(&self) {
+        self.accept_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn closed_connection(&self) {
@@ -139,6 +149,11 @@ impl Metrics {
             &mut out,
             "alighieri_connections_accepted_total",
             self.accepted_connections.load(Ordering::Relaxed),
+        );
+        write_metric(
+            &mut out,
+            "alighieri_accept_failures_total",
+            self.accept_failures.load(Ordering::Relaxed),
         );
         write_metric(
             &mut out,

@@ -1,9 +1,11 @@
 //! The listener and accept loop.
 
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -244,6 +246,8 @@ impl Server {
         // Latched shutdown flag. `wait_for` also observes a signal that arrived
         // before this subscribe, so an early `begin_shutdown` is not missed.
         let mut shutdown_rx = self.shutdown.subscribe();
+        // Consecutive `accept()` failures, for the backoff below. Reset on success.
+        let mut consecutive_accept_errors: u32 = 0;
 
         loop {
             // Acquire a slot before accepting so we apply backpressure rather
@@ -263,22 +267,76 @@ impl Server {
 
             // Accept the next connection, letting a shutdown signal interrupt the
             // wait so an idle server stops promptly rather than after one more.
-            let (mut stream, peer) = tokio::select! {
+            // The accept yields `Some(pair)`, or `None` after an error (setting
+            // `pending_backoff` when the error warrants a delay). The backoff
+            // sleep happens *after* this `select!` so the shutdown-watch guard it
+            // produces is not held across that await (which would make the run
+            // future non-`Send`).
+            let mut pending_backoff: Option<Duration> = None;
+            let accepted = tokio::select! {
                 biased;
                 _ = shutdown_rx.wait_for(|&stop| stop) => {
                     drop(permit);
                     break;
                 }
                 accepted = self.listener.accept() => match accepted {
-                    Ok(pair) => pair,
+                    Ok(pair) => Some(pair),
                     Err(e) => {
-                        // Transient accept errors (e.g. EMFILE) should not kill
-                        // the server; log and continue after dropping the permit.
-                        warn!(error = %e, "accept failed");
-                        drop(permit);
-                        continue;
+                        // A connection the peer aborted or reset before we
+                        // accepted it, or an interrupted syscall, is benign churn
+                        // (e.g. a port scan): retry at once, and do not count it
+                        // toward backoff or the failure metric.
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::ConnectionAborted
+                                | ErrorKind::Interrupted
+                                | ErrorKind::ConnectionReset
+                        ) {
+                            debug!(error = %e, "accept failed (transient); retrying");
+                        } else {
+                            // Other errors tend to persist (e.g. EMFILE/ENFILE
+                            // descriptor exhaustion). Count them, then back off
+                            // with a capped exponential delay so a degraded
+                            // listener does not spin the loop hot and flood the
+                            // log. A successful accept resets the streak.
+                            self.metrics.accept_failed();
+                            consecutive_accept_errors =
+                                consecutive_accept_errors.saturating_add(1);
+                            let backoff = accept_backoff(consecutive_accept_errors);
+                            warn!(
+                                error = %e,
+                                consecutive = consecutive_accept_errors,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "accept failed; backing off"
+                            );
+                            pending_backoff = Some(backoff);
+                        }
+                        None
                     }
                 },
+            };
+            let (mut stream, peer) = match accepted {
+                // A successful accept clears the backoff streak.
+                Some(pair) => {
+                    consecutive_accept_errors = 0;
+                    pair
+                }
+                None => {
+                    // Release the slot; we are not handling a connection.
+                    drop(permit);
+                    if let Some(backoff) = pending_backoff {
+                        // Let shutdown interrupt the backoff so a degraded server
+                        // still stops promptly. `shutdown_rx` is free here (the
+                        // accept `select!` above has completed), so reuse it
+                        // rather than subscribing a fresh receiver each time.
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_rx.wait_for(|&stop| stop) => break,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                    }
+                    continue;
+                }
             };
 
             let local = match stream.local_addr() {
@@ -669,9 +727,43 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Base delay for the accept-failure backoff; doubles per consecutive failure.
+const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(5);
+/// Cap for the accept-failure backoff, so a persistent failure still retries
+/// about once a second rather than stalling the listener for longer.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Capped exponential backoff for a run of `attempt` consecutive accept
+/// failures: `ACCEPT_BACKOFF_BASE * 2^(attempt - 1)`, clamped to
+/// `ACCEPT_BACKOFF_MAX`. Callers pass the 1-based streak length; `0` and `1` both
+/// yield the base delay.
+fn accept_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    ACCEPT_BACKOFF_BASE
+        .saturating_mul(1u32 << shift)
+        .min(ACCEPT_BACKOFF_MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_backoff_grows_then_caps() {
+        // Doubles from the base, then clamps at the max (never zero, never above).
+        assert_eq!(accept_backoff(0), ACCEPT_BACKOFF_BASE);
+        assert_eq!(accept_backoff(1), ACCEPT_BACKOFF_BASE);
+        assert_eq!(accept_backoff(2), ACCEPT_BACKOFF_BASE * 2);
+        assert_eq!(accept_backoff(3), ACCEPT_BACKOFF_BASE * 4);
+        assert_eq!(accept_backoff(u32::MAX), ACCEPT_BACKOFF_MAX);
+        // Monotonic non-decreasing and always within bounds.
+        let mut prev = Duration::ZERO;
+        for attempt in 0..40 {
+            let d = accept_backoff(attempt);
+            assert!(d >= prev && d >= ACCEPT_BACKOFF_BASE && d <= ACCEPT_BACKOFF_MAX);
+            prev = d;
+        }
+    }
 
     #[test]
     fn proxy_trust_matches_ipv4_mapped_upstream() {

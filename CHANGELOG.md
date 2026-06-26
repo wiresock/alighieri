@@ -22,6 +22,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The accept loop no longer spins on persistent `accept()` failures. Under
+  file-descriptor exhaustion (`EMFILE`/`ENFILE`) it previously retried
+  immediately — burning CPU and flooding the log while already degraded — and now
+  backs off with a capped exponential delay (5 ms doubling to 1 s, reset on the
+  next successful accept and interruptible by shutdown). Benign per-connection
+  errors (`ECONNABORTED`/`ECONNRESET`/`EINTR`) still retry at once and are not
+  counted, and a new `alighieri_accept_failures_total` metric (incremented only
+  for the persistent failures) makes the condition observable.
 - A UDP ASSOCIATE client that predeclares its source endpoint now keeps the
   source-port lock on a dual-stack listener. The predeclared `DST.ADDR`/`DST.PORT`
   is matched against the client's address canonically, so an IPv4 client that
