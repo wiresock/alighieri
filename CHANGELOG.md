@@ -22,6 +22,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A UDP reply that fails to send back to the client is no longer dropped
+  silently; it now increments `alighieri_udp_send_failures_total` and logs at
+  debug (client address and error), mirroring the outbound direction so the
+  failure is diagnosable instead of invisible.
 - The accept loop no longer spins on persistent `accept()` failures. Under
   file-descriptor exhaustion (`EMFILE`/`ENFILE`) it previously retried
   immediately — burning CPU and flooding the log while already degraded — and now

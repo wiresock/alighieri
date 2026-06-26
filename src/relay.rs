@@ -728,8 +728,15 @@ async fn relay_remote_to_client(
             metrics.rate_limited();
             continue;
         }
-        if relay_socket.send_to(datagram, caddr).await.is_ok() {
-            metrics.udp_remote_packet_relayed(n as u64);
+        match relay_socket.send_to(datagram, caddr).await {
+            Ok(_) => metrics.udp_remote_packet_relayed(n as u64),
+            Err(e) => {
+                // Surface the failed reply instead of dropping it silently — e.g.
+                // a gone client socket or an endpoint-family mismatch — mirroring
+                // the outbound direction above.
+                metrics.udp_send_failed();
+                debug!(client = %caddr, error = %e, "UDP reply to client failed");
+            }
         }
     }
 }

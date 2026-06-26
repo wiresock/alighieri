@@ -136,9 +136,10 @@ impl Metrics {
         self.udp_packets_denied.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A datagram could not be forwarded to its destination (e.g. an IPv6 target
-    /// on an IPv4-only outbound socket, or a transient socket error). Makes the
-    /// otherwise-silent `send_to` failure observable.
+    /// A UDP datagram could not be sent — either outbound to its destination
+    /// (e.g. an IPv6 target on an IPv4-only outbound socket) or back to the client
+    /// (e.g. a gone client socket) — making the otherwise-silent `send_to` failure
+    /// observable in either direction.
     pub fn udp_send_failed(&self) {
         self.udp_send_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -543,6 +544,7 @@ mod tests {
     fn renders_core_counters() {
         let metrics = Metrics::default();
         metrics.accepted_connection();
+        metrics.accept_failed();
         metrics.closed_connection();
         metrics.closed_connection();
         metrics.rate_limited();
@@ -556,6 +558,7 @@ mod tests {
         let rendered = metrics.render_prometheus();
 
         assert!(rendered.contains("alighieri_connections_accepted_total 1\n"));
+        assert!(rendered.contains("alighieri_accept_failures_total 1\n"));
         assert!(rendered.contains("alighieri_connections_active 0\n"));
         assert!(rendered.contains("alighieri_rate_limit_events_total 1\n"));
         assert!(rendered.contains("alighieri_auth_failures_total 1\n"));
