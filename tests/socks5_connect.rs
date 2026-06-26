@@ -556,23 +556,42 @@ socks pass {
 "#,
     )
     .unwrap();
-    let server = match Server::bind(cfg).await {
-        Ok(s) => s,
+    // Probe dual-stack v4-mapped support *separately* so the real `Server::bind`
+    // below can fail loudly: bind a throwaway `[::]:0` listener and check an IPv4
+    // client can reach it. Only skip when that platform path is unavailable (no
+    // IPv6, or `IPV6_V6ONLY` — e.g. Windows' default), never on an unrelated
+    // bind/config regression in `Server::bind`.
+    let probe = match TcpListener::bind("[::]:0").await {
+        Ok(l) => l,
         Err(e) => {
             eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: cannot bind [::]:0: {e}");
             return;
         }
     };
+    let probe_addr = SocketAddr::new(
+        "127.0.0.1".parse().unwrap(),
+        probe.local_addr().unwrap().port(),
+    );
+    if TcpStream::connect(probe_addr).await.is_err() {
+        eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: no IPv4 path to a [::] listener (IPV6_V6ONLY?)");
+        return;
+    }
+    drop(probe);
+
+    // The environment supports the scenario, so the real bind must succeed —
+    // unwrap rather than skip, so an unrelated startup/bind regression surfaces.
+    let server = Server::bind(cfg)
+        .await
+        .expect("dual-stack [::]:0 bind must succeed once the support probe passed");
     let listen = server.local_addr().unwrap();
     let _handle = tokio::spawn(async move { server.run().await.ok() });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Reach the dual-stack listener over IPv4 so the peer arrives `::ffff:`-mapped.
     let v4_listen = SocketAddr::new("127.0.0.1".parse().unwrap(), listen.port());
-    let Ok(mut control) = TcpStream::connect(v4_listen).await else {
-        eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: no IPv4 path to [::] listener");
-        return;
-    };
+    let mut control = TcpStream::connect(v4_listen)
+        .await
+        .expect("IPv4 client must reach the dual-stack listener once the support probe passed");
     handshake_noauth(&mut control).await;
     let relay_addr = request_udp_associate(&mut control).await;
     // The v4 client must be handed a v4 (ATYP=0x01) BND.ADDR even though the relay
