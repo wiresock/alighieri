@@ -381,9 +381,10 @@ ensure_user() {
 # capability stays unset.
 needs_net_bind_capability() {
     local summary="$1" listen port
-    case "$summary" in
-        *'"acme":true'*) return 0 ;;
-    esac
+    # ACME forces the TLS-ALPN-01 challenge onto the privileged :443.
+    if printf '%s\n' "$summary" | json_bool_is_true acme; then
+        return 0
+    fi
     # Deriving the port needs "listen" reported as a non-empty string. An absent
     # field, or a non-string value, means the installed binary predates these
     # fields (e.g. an older --binary) or cannot be verified — warn rather than
@@ -539,6 +540,38 @@ json_has_field() {
     '
 }
 
+# Whether a JSON boolean field named $1 is present and `true`, in the flat
+# `--check --json` object. Escape- and key-aware like `json_has_field`, and
+# tolerant of whitespace after the colon, unlike a raw `*'"key":true'*` glob —
+# which also fails to match if the value is ever rendered as `"key": true`,
+# silently treating the field as false. Reads the JSON on stdin; returns 0 if a
+# real `"<key>":` has the literal value `true`, 1 otherwise.
+json_bool_is_true() {
+    awk -v key="$1" '
+    { json = json $0 }
+    END {
+        marker = "\"" key "\""
+        mlen = length(marker)
+        start = 1
+        while ((at = index(substr(json, start), marker)) > 0) {
+            pos = start + at - 1
+            start = pos + 1
+            if (pos > 1 && substr(json, pos - 1, 1) == "\\") continue
+            rest = substr(json, pos + mlen)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) != ":") continue   # not a key here
+            rest = substr(rest, 2)
+            sub(/^[[:space:]]*/, "", rest)
+            # The value must be the JSON literal `true` (terminated by a
+            # separator or end of input), not a string or another literal.
+            if (rest ~ /^true([[:space:],}]|$)/) exit 0
+            exit 1                                     # present but not true
+        }
+        exit 1                                         # absent
+    }
+    '
+}
+
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
@@ -548,10 +581,9 @@ json_has_field() {
 warn_acme_cache_outside_state_dir() {
     local summary="$1" cache
     # Only relevant when ACME is enabled.
-    case "$summary" in
-        *'"acme":true'*) : ;;
-        *) return 0 ;;
-    esac
+    if ! printf '%s\n' "$summary" | json_bool_is_true acme; then
+        return 0
+    fi
     # Tolerate optional whitespace around the JSON colon. An empty result means
     # the binary reported "acme":true but no acme_cache field — i.e. an older
     # --binary that predates it — so warn that the path could not be verified
@@ -711,6 +743,27 @@ run_selftest() {
         '{"message":"log_file"}' log_file no
     _check_has "quoted key-like substring in a value is not the field" \
         '{"path":"a\"listen\"b"}' listen no
+
+    _check_bool() { # description json key want(yes|no)
+        local got
+        if printf '%s' "$2" | json_bool_is_true "$3"; then got=yes; else got=no; fi
+        if [ "$got" = "$4" ]; then
+            printf 'ok   json_bool_is_true %s\n' "$1"
+        else
+            printf 'FAIL json_bool_is_true %s: got %s want %s\n' "$1" "$got" "$4"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # The boolean must be a real `"key":true`, tolerant of whitespace, and not
+    # fooled by the literal appearing in a string value or by a false/absent field.
+    _check_bool "true (compact)" '{"acme":true,"acme_cache":"/x"}' acme yes
+    _check_bool "true with space after colon" '{"acme": true}' acme yes
+    _check_bool "false" '{"acme":false}' acme no
+    _check_bool "absent" '{"acme_cache":"/x"}' acme no
+    _check_bool "string value true is not the boolean" '{"acme":"true"}' acme no
+    _check_bool "escaped key:true in a value with real false" \
+        '{"path":"\"acme\":true","acme":false}' acme no
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
