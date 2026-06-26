@@ -577,13 +577,14 @@ where
         // lock, and vice versa), but keep `src` in the socket's own family: it is
         // stored as the reply target below and must stay sendable on this socket.
         // The predeclared lock is likewise stored in the client's family by
-        // `requested_udp_endpoint`.
-        if src.ip().to_canonical() != client_ip {
+        // `requested_udp_endpoint`. Canonicalise the source once for both checks
+        // (this is the per-datagram hot path).
+        let src_canon_ip = src.ip().to_canonical();
+        if src_canon_ip != client_ip {
             continue; // reject spoofed / unrelated source
         }
         if let Some(locked) = client_endpoint.get() {
-            if locked.ip().to_canonical() != src.ip().to_canonical() || locked.port() != src.port()
-            {
+            if locked.ip().to_canonical() != src_canon_ip || locked.port() != src.port() {
                 continue;
             }
         }

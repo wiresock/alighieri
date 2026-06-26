@@ -558,8 +558,8 @@ socks pass {
     .unwrap();
     let server = match Server::bind(cfg).await {
         Ok(s) => s,
-        Err(_) => {
-            eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: cannot bind [::]:0");
+        Err(e) => {
+            eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: cannot bind [::]:0: {e}");
             return;
         }
     };
