@@ -451,6 +451,68 @@ normalize_path() {
     fi
 }
 
+# Extract a top-level JSON string field's value from `--check --json` output,
+# honouring JSON string escapes. Reads the JSON on stdin and the field name as
+# $1; prints the unescaped value (no trailing newline), or nothing if the field
+# is absent or not a string. Unlike a plain `sed` capture (`"\([^"]*\)"`), a path
+# containing an escaped quote (`\"`) is read in full rather than truncated, and
+# `\\`/`\"`/`\/`/`\n`/`\r`/`\t` are unescaped to their real characters so the
+# prefix checks below see the actual path. `\uXXXX` (emitted by the binary only
+# for control characters, which never appear in a real config path) is left
+# as-is. `awk` is a POSIX base utility, so this adds no new dependency.
+json_string_field() {
+    awk -v key="$1" '
+    { json = json $0 }
+    END {
+        marker = "\"" key "\""
+        mlen = length(marker)
+        # Scan every occurrence of "key" and accept only the one that is a real
+        # field: its opening quote is not escaped (so it is not inside a string
+        # value like a path containing the key name) and it is followed by `:` (a
+        # value occurrence is followed by `,`/`}`). [[:space:]] rather than
+        # \t/\r/\n, whose meaning inside a regex literal is not portable across
+        # POSIX awk implementations.
+        start = 1
+        while ((at = index(substr(json, start), marker)) > 0) {
+            pos = start + at - 1
+            start = pos + 1
+            if (pos > 1 && substr(json, pos - 1, 1) == "\\") continue
+            rest = substr(json, pos + mlen)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) != ":") continue
+            rest = substr(rest, 2)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) != "\"") exit   # value is not a string
+            rest = substr(rest, 2)
+            n = length(rest)
+            out = ""
+            i = 1
+            while (i <= n) {
+                c = substr(rest, i, 1)
+                if (c == "\\") {
+                    e = substr(rest, i + 1, 1)
+                    if (e == "\"") out = out "\""
+                    else if (e == "\\") out = out "\\"
+                    else if (e == "/") out = out "/"
+                    else if (e == "n") out = out "\n"
+                    else if (e == "r") out = out "\r"
+                    else if (e == "t") out = out "\t"
+                    else out = out "\\" e          # unknown escape (e.g. \uXXXX): keep literal
+                    i += 2
+                } else if (c == "\"") {
+                    break                          # unescaped closing quote
+                } else {
+                    out = out c
+                    i += 1
+                }
+            }
+            printf "%s", out
+            exit
+        }
+    }
+    '
+}
+
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
@@ -468,7 +530,7 @@ warn_acme_cache_outside_state_dir() {
     # the binary reported "acme":true but no acme_cache field — i.e. an older
     # --binary that predates it — so warn that the path could not be verified
     # rather than silently skipping (the footgun may still apply).
-    cache="$(printf '%s\n' "$summary" | sed -n 's/.*"acme_cache"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    cache="$(printf '%s\n' "$summary" | json_string_field acme_cache)"
     if [ -z "$cache" ]; then
         warn "this alighieri does not report the ACME cache path (older --binary?);" \
              "ensure tls.acme.cache is under the writable StateDirectory $STATE_DIR, or the" \
@@ -504,7 +566,7 @@ warn_logfile_outside_log_dir() {
                  "hardened unit (ProtectSystem=strict) will be unable to write it."
             return 0 ;;
     esac
-    logfile="$(printf '%s\n' "$summary" | sed -n 's/.*"log_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    logfile="$(printf '%s\n' "$summary" | json_string_field log_file)"
     [ -n "$logfile" ] || return 0   # field present but empty: file logging not configured
     # Normalise `..`/redundant separators first so $LOG_DIR/../elsewhere does not
     # look like it is under the writable log directory.
@@ -573,6 +635,37 @@ run_selftest() {
         warn_logfile_outside_log_dir "{\"log_file\":\"$LOG_DIR/app.log\"}"
     _check_warn "logfile traversal escape warns" warn \
         warn_logfile_outside_log_dir "{\"log_file\":\"$LOG_DIR/../evil.log\"}"
+
+    _check_json() { # description json key expected
+        local got
+        got="$(printf '%s' "$2" | json_string_field "$3")"
+        if [ "$got" = "$4" ]; then
+            printf 'ok   json_string_field %s\n' "$1"
+        else
+            printf 'FAIL json_string_field %s: got [%s] want [%s]\n' "$1" "$got" "$4"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # JSON string extraction must read an escaped path in full and unescape it,
+    # where the old `sed` capture truncated at the first `\"` and left `\\` literal.
+    _check_json "plain value" '{"acme_cache":"/var/lib/alighieri/acme"}' \
+        acme_cache "/var/lib/alighieri/acme"
+    _check_json "value among other fields" \
+        '{"listen":"0.0.0.0:1080","acme":true,"acme_cache":"/x","log_file":"/y"}' \
+        log_file "/y"
+    _check_json "escaped backslash" '{"acme_cache":"/var/lib/a\\b"}' \
+        acme_cache '/var/lib/a\b'
+    _check_json "escaped quote not truncated" '{"log_file":"/var/log/a\"b.log"}' \
+        log_file '/var/log/a"b.log'
+    _check_json "absent field is empty" '{"acme":true}' acme_cache ""
+    _check_json "empty string value" '{"log_file":""}' log_file ""
+    # An earlier field whose value is the key name (or contains it quoted) must
+    # not be mistaken for the field: only a real `"key":` is accepted.
+    _check_json "skips a value equal to the key name" \
+        '{"message":"acme_cache","acme_cache":"/real/path"}' acme_cache "/real/path"
+    _check_json "skips a quoted key-like substring in a value" \
+        '{"path":"x\"acme_cache\"y","acme_cache":"/real"}' acme_cache "/real"
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
