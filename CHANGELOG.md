@@ -22,6 +22,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The DNS deny categories now also catch IPv4-in-IPv6 forms and special-use IPv6
+  prefixes that previously slipped through (SSRF defense-in-depth). The deprecated
+  IPv4-compatible form (`::a.b.c.d`, e.g. `::127.0.0.1`) is folded to its IPv4
+  address like the IPv4-mapped form, and the `reserved` category now covers 6to4
+  (`2002::/16`), the NAT64 well-known prefix (`64:ff9b::/96`, which can reach
+  embedded IPv4 such as `127.0.0.1` via a NAT64 gateway), and the IETF
+  protocol-assignments block (`2001::/23`, including Teredo and ORCHIDv2).
 - The metrics listener's accept loop now backs off on persistent `accept()`
   failures instead of retrying immediately, mirroring the main listener — so a
   process-wide condition such as file-descriptor exhaustion (`EMFILE`/`ENFILE`)
