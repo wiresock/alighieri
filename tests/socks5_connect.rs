@@ -4,7 +4,7 @@
 //! handshake → method selection → (optional auth) → request → relay.
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -697,13 +697,32 @@ socks pass {
 
 /// A hostname `udp.advertise` is resolved through the async resolver at associate
 /// time (config load does no DNS). The proxy binds on a *distinct* loopback
-/// (`127.0.0.2`) so a successful `localhost` resolution (`127.0.0.1`) is
-/// distinguishable from the relay-address fallback (`127.0.0.2`): if resolution
-/// regressed or returned no v4 address, the reply would be the relay's
-/// `127.0.0.2` and the assertion would fail. Skipped where `127.0.0.2` is not a
-/// usable loopback (e.g. default macOS, which only configures `127.0.0.1`).
+/// (`127.0.0.2`) so a successful resolution is distinguishable from the
+/// relay-address fallback: the advertised IP must be one of the IPv4 addresses
+/// `localhost` actually resolves to (never the `127.0.0.2` relay), which fails if
+/// resolution regressed to the bound relay. The expected set is derived from the
+/// same system resolver the proxy uses (`getaddrinfo`), so the test does not
+/// assume `localhost` maps to `127.0.0.1`. Skipped where `127.0.0.2` is not a
+/// usable loopback (default macOS) or `localhost` has no IPv4 address.
 #[tokio::test]
 async fn udp_associate_advertises_resolved_hostname() {
+    // Derive what `localhost` resolves to from the same source the proxy uses
+    // (getaddrinfo), rather than hard-coding 127.0.0.1.
+    let localhost_v4: Vec<std::net::IpAddr> = ("localhost", 0)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .map(|s| s.ip())
+                .filter(std::net::IpAddr::is_ipv4)
+                .collect()
+        })
+        .unwrap_or_default();
+    if localhost_v4.is_empty() {
+        eprintln!(
+            "skipping udp_associate_advertises_resolved_hostname: localhost has no IPv4 address"
+        );
+        return;
+    }
     let cfg = Config::parse(
         r#"
 internal: 127.0.0.2:0
@@ -735,10 +754,11 @@ socks pass {
     handshake_noauth(&mut control).await;
     let advertised = request_udp_associate(&mut control).await;
 
-    assert_eq!(
-        advertised.ip(),
-        "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
-        "localhost must resolve to 127.0.0.1, distinct from the 127.0.0.2 relay bind"
+    assert!(
+        localhost_v4.contains(&advertised.ip()),
+        "advertised {} must be one of localhost's IPv4 addresses {localhost_v4:?} \
+         (resolution applied, not the 127.0.0.2 relay fallback)",
+        advertised.ip()
     );
     assert_ne!(advertised.port(), 0);
 }
