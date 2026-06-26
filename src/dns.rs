@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -536,18 +536,21 @@ pub fn address_allowed(ip: IpAddr, policy: &DnsPolicy) -> bool {
 /// (`::a.b.c.d`, RFC 4291 §2.5.5.1), which `to_canonical` leaves as an opaque
 /// IPv6 address that would otherwise dodge every category (e.g. `::127.0.0.1`
 /// evading `loopback`). `::` and `::1` keep their own meanings. Genuine IPv6
-/// addresses (including NAT64/6to4/Teredo, which are real routable prefixes that
-/// must not be re-routed as IPv4) are returned unchanged, preserving any scope;
-/// those prefixes are instead covered by the `reserved` category.
+/// addresses — including NAT64/6to4/Teredo, which are real routable prefixes that
+/// must not be re-routed as IPv4 — are returned unchanged; those prefixes are
+/// instead covered by the `reserved` category. (Operates on `IpAddr`, which has
+/// no scope; the caller's `set_ip` is what preserves a `SocketAddr`'s scope.)
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     let ip = ip.to_canonical();
     let IpAddr::V6(v6) = ip else { return ip };
-    let s = v6.segments();
-    // IPv4-compatible `::a.b.c.d`: the top 96 bits are zero. Exclude `::`
-    // (unspecified) and `::1` (loopback), which are not IPv4 wrappers.
-    let top_96_zero = s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0;
-    if top_96_zero && !(s[6] == 0 && s[7] <= 1) {
-        return IpAddr::V4(Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7])));
+    // `to_ipv4` recognises both IPv4-in-IPv6 wrappers (`::a.b.c.d` and
+    // `::ffff:a.b.c.d`; the mapped form was already folded by `to_canonical`
+    // above). Exclude `::` (unspecified) and `::1` (loopback), which it would
+    // otherwise turn into `0.0.0.0`/`0.0.0.1`.
+    if let Some(v4) = v6.to_ipv4() {
+        if v6 != Ipv6Addr::UNSPECIFIED && v6 != Ipv6Addr::LOCALHOST {
+            return IpAddr::V4(v4);
+        }
     }
     ip
 }
