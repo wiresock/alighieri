@@ -133,6 +133,7 @@ while [ $# -gt 0 ]; do
         --purge-state) PURGE_STATE=1 ;;
         --purge-user) PURGE_USER=1 ;;
         --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
+        __selftest) ACTION=__selftest ;; # hidden: run bundled self-tests (CI); no root needed
         *) usage >&2; die "unknown argument: $1" ;;
     esac
     shift
@@ -514,6 +515,71 @@ warn_logfile_outside_log_dir() {
          "will fail at runtime. Put the logfile under $LOG_DIR/ or grant the unit write access."
 }
 
+# Hidden, test-only entry point: exercise normalize_path and the two hardened-path
+# warnings against a fixed table of cases. Run by CI (`bash scripts/alighieri.sh
+# __selftest`) and intentionally kept off the operator-facing command surface.
+# Needs neither root nor systemd. Exits nonzero if any case is wrong.
+run_selftest() {
+    local failures=0
+
+    _check_norm() { # input expected
+        local got
+        got="$(normalize_path "$1")"
+        if [ "$got" = "$2" ]; then
+            printf 'ok   normalize_path %-34s -> %s\n' "$1" "$got"
+        else
+            printf 'FAIL normalize_path %-34s -> %s (want %s)\n' "$1" "$got" "$2"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Plain paths, `.`/redundant-slash collapse, `..` popping, root collapse, and
+    # relative escapes (which must be preserved, not silently dropped).
+    _check_norm "/var/lib/alighieri/acme" "/var/lib/alighieri/acme"
+    _check_norm "/var/lib/alighieri/" "/var/lib/alighieri"
+    _check_norm "/var/lib/alighieri/./acme" "/var/lib/alighieri/acme"
+    _check_norm "//var//lib//alighieri" "/var/lib/alighieri"
+    _check_norm "/a/../b" "/b"
+    _check_norm "/var/lib/alighieri/../../etc/passwd" "/var/etc/passwd"
+    _check_norm "/var/lib/alighieri/../../../etc" "/etc"
+    _check_norm "/var/lib/alighieri/../alighieri-evil" "/var/lib/alighieri-evil"
+    _check_norm "/" "/"
+    _check_norm "/.." "/"
+    _check_norm "/../" "/"
+    _check_norm "foo/../bar" "bar"
+    _check_norm "../../x" "../../x"
+    _check_norm ".." ".."
+
+    _check_warn() { # description want(warn|quiet) func summary
+        local desc="$1" want="$2" func="$3" summary="$4" out got
+        out="$("$func" "$summary" 2>&1)" || true
+        if [ -n "$out" ]; then got=warn; else got=quiet; fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   %s\n' "$desc"
+        else
+            printf 'FAIL %s: expected %s, got %s\n' "$desc" "$want" "$got"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # The warnings must stay silent for a path genuinely inside the writable dir
+    # and fire for a traversal that escapes it (normalize_path via the real helpers).
+    _check_warn "acme cache inside StateDirectory stays quiet" quiet \
+        warn_acme_cache_outside_state_dir "{\"acme\":true,\"acme_cache\":\"$STATE_DIR/acme\"}"
+    _check_warn "acme cache traversal escape warns" warn \
+        warn_acme_cache_outside_state_dir "{\"acme\":true,\"acme_cache\":\"$STATE_DIR/../evil\"}"
+    _check_warn "logfile inside log dir stays quiet" quiet \
+        warn_logfile_outside_log_dir "{\"log_file\":\"$LOG_DIR/app.log\"}"
+    _check_warn "logfile traversal escape warns" warn \
+        warn_logfile_outside_log_dir "{\"log_file\":\"$LOG_DIR/../evil.log\"}"
+
+    if [ "$failures" -ne 0 ]; then
+        printf '\n%d self-test(s) failed\n' "$failures" >&2
+        return 1
+    fi
+    printf '\nall self-tests passed\n'
+}
+
 write_unit() {
     local install_bin="$1" config_file="$2" summary="$3"
     # Grant the minimal capability to bind a privileged port only when the
@@ -672,8 +738,8 @@ do_install() {
 
     # Validate the config and capture the resolved facts in one `--check --json`,
     # reused below for the warnings and write_unit's CAP_NET_BIND_SERVICE decision
-    # rather than each re-running it (which also re-resolves a udp.advertise
-    # hostname). A config that fails to parse must abort the install — otherwise
+    # rather than each re-running the binary (`--check` only parses; it does no
+    # DNS). A config that fails to parse must abort the install — otherwise
     # write_unit, deriving the capability from a failed check, would emit a unit
     # that may lack the capability the config needs once fixed. On failure, re-run
     # in text mode to surface the human-readable error before aborting.
@@ -924,6 +990,12 @@ manage_menu() {
 case "$ACTION" in
     status) do_status; exit 0 ;;
 esac
+
+# Hidden self-test hook: run the bundled normalize_path / warning checks with no
+# root or systemd (used by CI). Must come before the require_* gates below.
+if [ "$ACTION" = "__selftest" ]; then
+    if run_selftest; then exit 0; else exit 1; fi
+fi
 
 # auto on an installed host with no TTY just prints status, which needs neither
 # root nor systemctl — handle it before enforcing those requirements.
