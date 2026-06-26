@@ -53,8 +53,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   approach silently degraded to the raw path (re-opening the gap) on systems
   without GNU coreutils, e.g. busybox.
 - The Linux installer parses the `--check --json` summary with escape- and
-  key-aware `awk` helpers instead of `sed`/glob. String fields (`tls.acme.cache`,
-  `logfile`, `listen`) are read in full and unescaped rather than truncated on an
+  key-aware `awk` helpers instead of `sed`/glob. String fields (`acme_cache`,
+  `log_file`, `listen`) are read in full and unescaped rather than truncated on an
   escaped quote, and field-presence checks match a real `"key":` rather than the
   key name appearing as another field's value. This avoids a false or missed
   hardened-unit warning — and a mis-derived `CAP_NET_BIND_SERVICE` — on unusual

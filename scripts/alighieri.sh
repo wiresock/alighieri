@@ -399,6 +399,7 @@ needs_net_bind_capability() {
     case "$port" in
         '' | *[!0-9]*) return 1 ;;
     esac
+    port=$((10#$port))   # force base-10 so a leading zero is never read as octal
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
@@ -449,7 +450,7 @@ normalize_path() {
     fi
 }
 
-# Extract a top-level JSON string field's value from `--check --json` output,
+# Extract a JSON string field's value from the flat `--check --json` output,
 # honouring JSON string escapes. Reads the JSON on stdin and the field name as
 # $1; prints the unescaped value (no trailing newline), or nothing if the field
 # is absent or not a string. Unlike a plain `sed` capture (`"\([^"]*\)"`), a path
@@ -511,8 +512,9 @@ json_string_field() {
     '
 }
 
-# Whether a top-level JSON field named $1 is present, escape- and key-aware to
-# match `json_string_field`. A plain `case`/glob on `"<key>"` would also match
+# Whether a JSON field named $1 is present in the flat `--check --json` object,
+# escape- and key-aware to match `json_string_field`. A plain `case`/glob on
+# `"<key>"` would also match
 # the key name appearing as another field's *value* (e.g. `"message":"log_file"`)
 # and so wrongly report the field present. Reads the JSON on stdin; returns 0 if
 # a real `"<key>":` exists, 1 otherwise.
