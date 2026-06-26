@@ -465,38 +465,50 @@ json_string_field() {
     { json = json $0 }
     END {
         marker = "\"" key "\""
-        at = index(json, marker)
-        if (at == 0) exit
-        rest = substr(json, at + length(marker))
-        sub(/^[ \t\r\n]*/, "", rest)
-        if (substr(rest, 1, 1) != ":") exit
-        rest = substr(rest, 2)
-        sub(/^[ \t\r\n]*/, "", rest)
-        if (substr(rest, 1, 1) != "\"") exit   # value is not a string
-        rest = substr(rest, 2)
-        n = length(rest)
-        out = ""
-        i = 1
-        while (i <= n) {
-            c = substr(rest, i, 1)
-            if (c == "\\") {
-                e = substr(rest, i + 1, 1)
-                if (e == "\"") out = out "\""
-                else if (e == "\\") out = out "\\"
-                else if (e == "/") out = out "/"
-                else if (e == "n") out = out "\n"
-                else if (e == "r") out = out "\r"
-                else if (e == "t") out = out "\t"
-                else out = out "\\" e            # unknown escape (e.g. \uXXXX): keep literal
-                i += 2
-            } else if (c == "\"") {
-                break                            # unescaped closing quote
-            } else {
-                out = out c
-                i += 1
+        mlen = length(marker)
+        # Scan every occurrence of "key" and accept only the one that is a real
+        # field: its opening quote is not escaped (so it is not inside a string
+        # value like a path containing the key name) and it is followed by `:` (a
+        # value occurrence is followed by `,`/`}`). [[:space:]] rather than
+        # \t/\r/\n, whose meaning inside a regex literal is not portable across
+        # POSIX awk implementations.
+        start = 1
+        while ((at = index(substr(json, start), marker)) > 0) {
+            pos = start + at - 1
+            start = pos + 1
+            if (pos > 1 && substr(json, pos - 1, 1) == "\\") continue
+            rest = substr(json, pos + mlen)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) != ":") continue
+            rest = substr(rest, 2)
+            sub(/^[[:space:]]*/, "", rest)
+            if (substr(rest, 1, 1) != "\"") exit   # value is not a string
+            rest = substr(rest, 2)
+            n = length(rest)
+            out = ""
+            i = 1
+            while (i <= n) {
+                c = substr(rest, i, 1)
+                if (c == "\\") {
+                    e = substr(rest, i + 1, 1)
+                    if (e == "\"") out = out "\""
+                    else if (e == "\\") out = out "\\"
+                    else if (e == "/") out = out "/"
+                    else if (e == "n") out = out "\n"
+                    else if (e == "r") out = out "\r"
+                    else if (e == "t") out = out "\t"
+                    else out = out "\\" e          # unknown escape (e.g. \uXXXX): keep literal
+                    i += 2
+                } else if (c == "\"") {
+                    break                          # unescaped closing quote
+                } else {
+                    out = out c
+                    i += 1
+                }
             }
+            printf "%s", out
+            exit
         }
-        printf "%s", out
     }
     '
 }
@@ -648,6 +660,12 @@ run_selftest() {
         log_file '/var/log/a"b.log'
     _check_json "absent field is empty" '{"acme":true}' acme_cache ""
     _check_json "empty string value" '{"log_file":""}' log_file ""
+    # An earlier field whose value is the key name (or contains it quoted) must
+    # not be mistaken for the field: only a real `"key":` is accepted.
+    _check_json "skips a value equal to the key name" \
+        '{"message":"acme_cache","acme_cache":"/real/path"}' acme_cache "/real/path"
+    _check_json "skips a quoted key-like substring in a value" \
+        '{"path":"x\"acme_cache\"y","acme_cache":"/real"}' acme_cache "/real"
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
