@@ -568,13 +568,23 @@ where
 {
     let mut buf = vec![0u8; UDP_BUF];
     let mut recv_errors = 0u32;
+    // Canonicalise the client's address once so the source check compares on the
+    // real family: a dual-stack socket reports an IPv4 client as `::ffff:a.b.c.d`.
+    let client_ip = client_ip.to_canonical();
     loop {
         let (n, src) = recv_resilient(&relay_socket, &mut buf, &mut recv_errors).await?;
-        if src.ip() != client_ip {
+        // Compare canonically (a mapped `::ffff:` source matches the plain-IPv4
+        // lock, and vice versa), but keep `src` in the socket's own family: it is
+        // stored as the reply target below and must stay sendable on this socket.
+        // The predeclared lock is likewise stored in the client's family by
+        // `requested_udp_endpoint`. Canonicalise the source once for both checks
+        // (this is the per-datagram hot path).
+        let src_canon_ip = src.ip().to_canonical();
+        if src_canon_ip != client_ip {
             continue; // reject spoofed / unrelated source
         }
         if let Some(locked) = client_endpoint.get() {
-            if *locked != src {
+            if locked.ip().to_canonical() != src_canon_ip || locked.port() != src.port() {
                 continue;
             }
         }
