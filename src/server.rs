@@ -283,11 +283,16 @@ impl Server {
                     Ok(pair) => Some(pair),
                     Err(e) => {
                         self.metrics.accept_failed();
-                        // A connection that aborted before we accepted it, or an
-                        // interrupted syscall, is benign churn: retry at once and
-                        // do not count it toward backoff.
-                        if matches!(e.kind(), ErrorKind::ConnectionAborted | ErrorKind::Interrupted)
-                        {
+                        // A connection the peer aborted or reset before we
+                        // accepted it, or an interrupted syscall, is benign churn
+                        // (e.g. a port scan): retry at once and do not count it
+                        // toward backoff.
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::ConnectionAborted
+                                | ErrorKind::Interrupted
+                                | ErrorKind::ConnectionReset
+                        ) {
                             debug!(error = %e, "accept failed (transient); retrying");
                         } else {
                             // Other errors tend to persist (e.g. EMFILE/ENFILE
@@ -320,12 +325,13 @@ impl Server {
                     // Release the slot; we are not handling a connection.
                     drop(permit);
                     if let Some(backoff) = pending_backoff {
-                        // A fresh receiver lets shutdown interrupt the backoff so a
-                        // degraded server still stops promptly.
-                        let mut backoff_shutdown = self.shutdown.subscribe();
+                        // Let shutdown interrupt the backoff so a degraded server
+                        // still stops promptly. `shutdown_rx` is free here (the
+                        // accept `select!` above has completed), so reuse it
+                        // rather than subscribing a fresh receiver each time.
                         tokio::select! {
                             biased;
-                            _ = backoff_shutdown.wait_for(|&stop| stop) => break,
+                            _ = shutdown_rx.wait_for(|&stop| stop) => break,
                             _ = tokio::time::sleep(backoff) => {}
                         }
                     }
