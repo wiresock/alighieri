@@ -709,21 +709,16 @@ async fn udp_associate_advertises_resolved_hostname() {
     // Derive what `localhost` resolves to from the same source the proxy uses
     // (getaddrinfo), rather than hard-coding 127.0.0.1. `tokio::net::lookup_host`
     // runs the blocking resolver on Tokio's blocking pool, so the async test
-    // thread is not blocked. A resolver error is surfaced before skipping so a
-    // transient/system failure is not masked as a silent "no IPv4 address" skip.
-    let localhost_v4: Vec<std::net::IpAddr> = match tokio::net::lookup_host(("localhost", 0)).await
-    {
-        Ok(addrs) => addrs
-            .map(|s| s.ip())
-            .filter(std::net::IpAddr::is_ipv4)
-            .collect(),
-        Err(e) => {
-            eprintln!(
-                "skipping udp_associate_advertises_resolved_hostname: resolving localhost failed: {e}"
-            );
-            return;
-        }
-    };
+    // thread is not blocked. A resolver *error* is a genuine fault (localhost must
+    // resolve on a working system), so fail loudly rather than skip — only the
+    // explicit platform gaps below (no IPv4 localhost, 127.0.0.2 unbindable) are
+    // skip conditions.
+    let localhost_v4: Vec<std::net::IpAddr> = tokio::net::lookup_host(("localhost", 0))
+        .await
+        .expect("resolving localhost must succeed; a resolver failure is a real fault, not a skip")
+        .map(|s| s.ip())
+        .filter(std::net::IpAddr::is_ipv4)
+        .collect();
     if localhost_v4.is_empty() {
         eprintln!(
             "skipping udp_associate_advertises_resolved_hostname: localhost has no IPv4 address"
