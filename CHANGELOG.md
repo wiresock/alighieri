@@ -22,6 +22,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- A UDP ASSOCIATE client that predeclares its source endpoint now keeps the
+  source-port lock on a dual-stack listener. The predeclared `DST.ADDR`/`DST.PORT`
+  is matched against the client's address canonically, so an IPv4 client that
+  appears as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is no longer
+  mismatched against the plain-IPv4 endpoint — which silently relaxed the binding
+  to the looser "first datagram from this IP wins". The relay also canonicalises
+  each datagram's source before the lock and spoof checks.
 - The Linux installer's hardened-path warnings (`tls.acme.cache`, `logfile`) now
   normalise the path lexically — collapsing `.`, `..`, and redundant separators
   in-shell with no `realpath` dependency — before checking it against the

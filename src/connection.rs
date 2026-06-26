@@ -513,8 +513,8 @@ impl Connection {
         let authorize = move |host: Option<&str>, dest_ip: IpAddr, dest_port: u16| -> bool {
             let ctx = SocksContext {
                 // Canonicalise for rule matching so IPv4 CIDR rules apply to
-                // mapped addresses; `client_ip` keeps its original form for the
-                // relay's source check and logging.
+                // mapped addresses; `client_ip` keeps its original form for
+                // logging (the relay canonicalises it for its own source check).
                 client_ip: client_ip.to_canonical(),
                 client_port,
                 dest_host: host,
@@ -637,11 +637,19 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
     if addr.port() == 0 {
         return None;
     }
+    // Compare and store canonically. On a dual-stack listener the client is an
+    // IPv4-mapped `::ffff:a.b.c.d`, while the ASSOCIATE request's DST.ADDR is the
+    // plain IPv4 `a.b.c.d`; a raw `==` would miss and silently drop the
+    // predeclared source lock, weakening the per-association source binding. The
+    // stored endpoint is canonical so it matches the form the relay canonicalises
+    // incoming datagrams into.
+    let client_ip = client_ip.to_canonical();
     if addr.ip().is_unspecified() {
         return Some(SocketAddr::new(client_ip, addr.port()));
     }
-    if addr.ip() == client_ip {
-        return Some(*addr);
+    let addr_ip = addr.ip().to_canonical();
+    if addr_ip == client_ip {
+        return Some(SocketAddr::new(addr_ip, addr.port()));
     }
     None
 }
@@ -805,6 +813,28 @@ mod tests {
         let endpoint =
             requested_udp_endpoint(&TargetAddr::Ip("0.0.0.0:53000".parse().unwrap()), client_ip);
         assert_eq!(endpoint, Some("127.0.0.1:53000".parse().unwrap()));
+    }
+
+    #[test]
+    fn requested_udp_endpoint_canonicalizes_mapped_client() {
+        // On a dual-stack listener a v4 client appears as `::ffff:a.b.c.d`, while
+        // its ASSOCIATE request carries the plain-IPv4 DST.ADDR. The lock must
+        // still be set (and in canonical form), not dropped to first-datagram-wins.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(
+            requested_udp_endpoint(&TargetAddr::Ip("127.0.0.1:53000".parse().unwrap()), mapped),
+            Some("127.0.0.1:53000".parse().unwrap())
+        );
+        // The unspecified case yields the canonical client address with the port.
+        assert_eq!(
+            requested_udp_endpoint(&TargetAddr::Ip("0.0.0.0:53000".parse().unwrap()), mapped),
+            Some("127.0.0.1:53000".parse().unwrap())
+        );
+        // A genuinely different host is still rejected after canonicalisation.
+        assert_eq!(
+            requested_udp_endpoint(&TargetAddr::Ip("127.0.0.2:53000".parse().unwrap()), mapped),
+            None
+        );
     }
 
     #[test]
