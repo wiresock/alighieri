@@ -17,6 +17,10 @@ use crate::acl::{RuleDecision, Scope, Verdict};
 const MAX_REQUEST_LINE: usize = 8 * 1024;
 const MAX_METRICS_CONNECTIONS: usize = 16;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Backoff bounds for persistent metrics-listener `accept()` failures, mirroring
+/// the main listener so the metrics loop cannot spin a core under FD exhaustion.
+const METRICS_ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(5);
+const METRICS_ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct Metrics {
@@ -366,16 +370,47 @@ pub async fn serve_metrics(listener: TcpListener, metrics: Arc<Metrics>) -> io::
     let addr = listener.local_addr()?;
     info!(listen = %addr, "metrics endpoint listening");
     let limiter = Arc::new(Semaphore::new(MAX_METRICS_CONNECTIONS));
+    let mut consecutive_accept_errors: u32 = 0;
     loop {
         let permit = match limiter.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
         };
         let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                consecutive_accept_errors = 0;
+                pair
+            }
             Err(e) => {
-                warn!(error = %e, "metrics accept failed");
                 drop(permit);
+                // Benign per-connection churn (a peer that vanished) retries at
+                // once; a persistent failure — e.g. EMFILE/ENFILE exhaustion,
+                // which is process-wide and hits this loop whenever the main one
+                // hits it — backs off so the metrics loop cannot spin a core and
+                // flood the log. Mirrors the main accept loop. (This task is
+                // aborted on shutdown, so the sleep needs no shutdown branch.)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionReset
+                ) {
+                    debug!(error = %e, "metrics accept failed (transient); retrying");
+                } else {
+                    consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                    let backoff = crate::util::capped_exponential_backoff(
+                        consecutive_accept_errors,
+                        METRICS_ACCEPT_BACKOFF_BASE,
+                        METRICS_ACCEPT_BACKOFF_MAX,
+                    );
+                    warn!(
+                        error = %e,
+                        consecutive = consecutive_accept_errors,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "metrics accept failed; backing off"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
                 continue;
             }
         };

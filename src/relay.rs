@@ -42,6 +42,11 @@ const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 /// dead port) are ignored entirely; only a sustained run of *other* failures —
 /// a genuinely broken socket — gives up.
 const MAX_CONSECUTIVE_UDP_RECV_ERRORS: u32 = 16;
+/// Backoff bounds for repeated UDP `recv_from` errors. A single transient error
+/// retries after `BASE` (negligible); a socket that errors on every recv backs
+/// off toward `MAX` so it cannot spin the relay task on a core.
+const UDP_RECV_BACKOFF_BASE: Duration = Duration::from_millis(1);
+const UDP_RECV_BACKOFF_MAX: Duration = Duration::from_millis(100);
 
 /// Best-effort enlarge a UDP relay socket's send and receive buffers so a burst
 /// of sustained high-rate traffic is absorbed rather than dropped by the kernel.
@@ -73,13 +78,19 @@ fn is_transient_recv_error(e: &io::Error) -> bool {
 /// `recv_from` on a UDP relay socket, tolerating transient errors. Ignores
 /// ICMP-driven/interrupted errors without counting them, resets the counter on
 /// success, and surfaces the error (tearing the association down) only once a
-/// run of *other* failures exceeds [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`]. Yields
-/// on every error so a socket that errors immediately cannot spin the task.
+/// run of *other* failures exceeds [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`]. Backs
+/// off (capped exponential) on every error so a socket that errors on every
+/// recv cannot spin the task on a core.
 async fn recv_resilient(
     socket: &UdpSocket,
     buf: &mut [u8],
     consecutive_errors: &mut u32,
 ) -> io::Result<(usize, SocketAddr)> {
+    // Tracks a run of transient errors within this call so a socket that returns
+    // a transient error on *every* recv (e.g. a Windows ICMP-driven
+    // `ConnectionReset` that recurs) backs off instead of spinning. Resets
+    // implicitly when the call returns on the next success.
+    let mut transient_errors: u32 = 0;
     loop {
         match socket.recv_from(buf).await {
             Ok(v) => {
@@ -87,8 +98,17 @@ async fn recv_resilient(
                 return Ok(v);
             }
             Err(e) if is_transient_recv_error(&e) => {
+                transient_errors = transient_errors.saturating_add(1);
                 debug!(error = %e, "udp relay recv: ignoring transient error");
-                tokio::task::yield_now().await;
+                // Back off (a real sleep, not a bare yield, which reschedules
+                // immediately and would still pin a core). Transient errors never
+                // count toward teardown.
+                tokio::time::sleep(crate::util::capped_exponential_backoff(
+                    transient_errors,
+                    UDP_RECV_BACKOFF_BASE,
+                    UDP_RECV_BACKOFF_MAX,
+                ))
+                .await;
             }
             Err(e) => {
                 *consecutive_errors += 1;
@@ -96,7 +116,12 @@ async fn recv_resilient(
                     return Err(e);
                 }
                 debug!(error = %e, count = *consecutive_errors, "udp relay recv error; continuing");
-                tokio::task::yield_now().await;
+                tokio::time::sleep(crate::util::capped_exponential_backoff(
+                    *consecutive_errors,
+                    UDP_RECV_BACKOFF_BASE,
+                    UDP_RECV_BACKOFF_MAX,
+                ))
+                .await;
             }
         }
     }

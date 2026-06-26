@@ -22,6 +22,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The metrics listener's accept loop now backs off on persistent `accept()`
+  failures instead of retrying immediately, mirroring the main listener — so a
+  process-wide condition such as file-descriptor exhaustion (`EMFILE`/`ENFILE`)
+  can no longer spin a CPU core and flood the log through the metrics endpoint.
+- The UDP relay's `recv_from` loop now backs off with a capped exponential delay
+  on repeated errors instead of a bare yield, so a socket that returns an error
+  on every receive (e.g. a recurring Windows ICMP `ConnectionReset`) can no
+  longer pin the relay task to a core.
 - A UDP reply that fails to send back to the client is no longer dropped
   silently; it now increments `alighieri_udp_send_failures_total` and logs at
   debug (client address and error), mirroring the outbound direction so the

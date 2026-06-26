@@ -734,14 +734,10 @@ const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(5);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Capped exponential backoff for a run of `attempt` consecutive accept
-/// failures: `ACCEPT_BACKOFF_BASE * 2^(attempt - 1)`, clamped to
-/// `ACCEPT_BACKOFF_MAX`. Callers pass the 1-based streak length; `0` and `1` both
-/// yield the base delay.
+/// failures, clamped to `ACCEPT_BACKOFF_MAX`. Callers pass the 1-based streak
+/// length; `0` and `1` both yield the base delay.
 fn accept_backoff(attempt: u32) -> Duration {
-    let shift = attempt.saturating_sub(1).min(16);
-    ACCEPT_BACKOFF_BASE
-        .saturating_mul(1u32 << shift)
-        .min(ACCEPT_BACKOFF_MAX)
+    crate::util::capped_exponential_backoff(attempt, ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX)
 }
 
 #[cfg(test)]
