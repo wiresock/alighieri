@@ -21,6 +21,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Default)]
 pub struct Metrics {
     accepted_connections: AtomicU64,
+    accept_failures: AtomicU64,
     active_connections: AtomicU64,
     client_denied_connections: AtomicU64,
     rate_limit_events: AtomicU64,
@@ -51,6 +52,13 @@ impl Metrics {
     pub fn accepted_connection(&self) {
         self.accepted_connections.fetch_add(1, Ordering::Relaxed);
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The listener's `accept()` returned an error. Makes a degraded listener
+    /// (e.g. under `EMFILE`/`ENFILE` file-descriptor exhaustion) observable
+    /// instead of only visible as log noise.
+    pub fn accept_failed(&self) {
+        self.accept_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn closed_connection(&self) {
@@ -139,6 +147,11 @@ impl Metrics {
             &mut out,
             "alighieri_connections_accepted_total",
             self.accepted_connections.load(Ordering::Relaxed),
+        );
+        write_metric(
+            &mut out,
+            "alighieri_accept_failures_total",
+            self.accept_failures.load(Ordering::Relaxed),
         );
         write_metric(
             &mut out,
