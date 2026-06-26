@@ -380,22 +380,23 @@ ensure_user() {
 # privileged. A binary too old to emit those fields yields neither match, so the
 # capability stays unset.
 needs_net_bind_capability() {
-    local summary="$1" port
+    local summary="$1" listen port
     case "$summary" in
         *'"acme":true'*) return 0 ;;
     esac
-    # A binary new enough always reports "listen". If it is absent the installed
-    # binary predates these fields (e.g. an older --binary), so we cannot tell
-    # whether a privileged bind is needed — warn rather than silently emit a unit
-    # that may fail to start.
-    if ! printf '%s\n' "$summary" | json_has_field listen; then
+    # Deriving the port needs "listen" reported as a non-empty string. An absent
+    # field, or a non-string value, means the installed binary predates these
+    # fields (e.g. an older --binary) or cannot be verified — warn rather than
+    # silently emit a unit that may fail to start. (Basing this on the extracted
+    # string, not mere presence, covers a non-string `"listen":` too.)
+    listen="$(printf '%s\n' "$summary" | json_string_field listen)"
+    if [ -z "$listen" ]; then
         warn "installed alighieri does not report listener details in --check --json;" \
              "if the config binds a port below 1024 or uses ACME, add CAP_NET_BIND_SERVICE" \
              "to $UNIT_FILE or upgrade the binary"
         return 1
     fi
-    port="$(printf '%s\n' "$summary" | json_string_field listen)"
-    port="${port##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
+    port="${listen##*:}"   # strip host, keep the trailing port (handles [ipv6]:port)
     case "$port" in
         '' | *[!0-9]*) return 1 ;;
     esac
