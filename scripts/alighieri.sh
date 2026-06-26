@@ -121,7 +121,9 @@ EOF
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
-        install | upgrade | uninstall | status)
+        install | upgrade | uninstall | status | __selftest)
+            # __selftest is hidden (CI self-tests, no root); it is still a command,
+            # so it obeys the same one-command mutual-exclusivity rule as the rest.
             [ "$COMMAND_SEEN" -eq 0 ] || die "only one command may be given (already '$ACTION'): $1"
             ACTION="$1"; COMMAND_SEEN=1 ;;
         help | -h | --help) usage; exit 0 ;; # help always wins, immediately
@@ -133,7 +135,6 @@ while [ $# -gt 0 ]; do
         --purge-state) PURGE_STATE=1 ;;
         --purge-user) PURGE_USER=1 ;;
         --purge-all) PURGE_CONFIG=1; PURGE_LOGS=1; PURGE_STATE=1; PURGE_USER=1 ;;
-        __selftest) ACTION=__selftest ;; # hidden: run bundled self-tests (CI); no root needed
         *) usage >&2; die "unknown argument: $1" ;;
     esac
     shift

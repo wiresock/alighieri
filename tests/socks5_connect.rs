@@ -707,16 +707,21 @@ socks pass {
 #[tokio::test]
 async fn udp_associate_advertises_resolved_hostname() {
     // Derive what `localhost` resolves to from the same source the proxy uses
-    // (getaddrinfo), rather than hard-coding 127.0.0.1.
-    let localhost_v4: Vec<std::net::IpAddr> = ("localhost", 0)
-        .to_socket_addrs()
-        .map(|addrs| {
-            addrs
-                .map(|s| s.ip())
-                .filter(std::net::IpAddr::is_ipv4)
-                .collect()
-        })
-        .unwrap_or_default();
+    // (getaddrinfo), rather than hard-coding 127.0.0.1. A resolver error is
+    // surfaced before skipping so a transient/system failure is not masked as a
+    // silent "no IPv4 address" skip.
+    let localhost_v4: Vec<std::net::IpAddr> = match ("localhost", 0).to_socket_addrs() {
+        Ok(addrs) => addrs
+            .map(|s| s.ip())
+            .filter(std::net::IpAddr::is_ipv4)
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "skipping udp_associate_advertises_resolved_hostname: resolving localhost failed: {e}"
+            );
+            return;
+        }
+    };
     if localhost_v4.is_empty() {
         eprintln!(
             "skipping udp_associate_advertises_resolved_hostname: localhost has no IPv4 address"
