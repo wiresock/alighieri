@@ -56,9 +56,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   key-aware `awk` helpers instead of `sed`/glob. String fields (`acme_cache`,
   `log_file`, `listen`) are read in full and unescaped rather than truncated on an
   escaped quote, and field-presence checks match a real `"key":` rather than the
-  key name appearing as another field's value. This avoids a false or missed
-  hardened-unit warning — and a mis-derived `CAP_NET_BIND_SERVICE` — on unusual
-  paths or with an older binary whose JSON omits a field.
+  key name appearing as another field's value. The `acme` boolean is matched the
+  same key-aware way and tolerates JSON whitespace (`"acme": true`), so neither a
+  formatting change nor an unusual config path can silently flip the ACME
+  capability/warning logic. This avoids a false or missed hardened-unit warning —
+  and a mis-derived `CAP_NET_BIND_SERVICE` — on unusual paths or with an older
+  binary whose JSON omits a field.
 - The Linux installer now warns when `logfile` points outside the writable log
   directory (`/var/log/alighieri`), mirroring the ACME-cache check. The hardened
   unit's `ProtectSystem=strict` makes other paths read-only, so file logging to a
