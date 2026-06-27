@@ -413,13 +413,30 @@ fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
 /// sole non-fatal case is a child that vanished mid-walk (it is simply gone).
 fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
     secure_path_acl(base)?;
-    secure_existing_children(base)?;
+    secure_existing_children(base, 0)?;
     Ok(())
 }
 
-fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
+/// Depth cap for the re-secure walk. The service's own layout is shallow
+/// (`logs/`, the ACME cache, the config); the contents of a pre-existing data
+/// directory may be attacker-controlled, so a deeply nested tree must not be able
+/// to overflow the stack via unbounded recursion (a denial-of-install). Far above
+/// any legitimate nesting, well below a stack-exhausting depth.
+const MAX_RESECURE_DEPTH: usize = 64;
+
+fn secure_existing_children(dir: &Path, depth: usize) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    // Bound the recursion so an attacker-planted deep tree cannot crash the
+    // installer. Exceeding the cap is fatal (fail closed), like the other walk
+    // failures.
+    if depth >= MAX_RESECURE_DEPTH {
+        return Err(std::io::Error::other(format!(
+            "service data directory nests deeper than {MAX_RESECURE_DEPTH} levels at {}; \
+             refusing to continue",
+            dir.display()
+        )));
+    }
     // Fail closed throughout, matching the caller: if we cannot enumerate,
     // inspect, or re-secure an existing child, propagate the error so the install
     // aborts rather than leave a possibly standard-user-writable sensitive file (a
@@ -481,7 +498,7 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
             // A subdirectory that vanished between the check above and this descent
             // surfaces as `NotFound` from its `read_dir`; that is the same benign
             // mid-walk removal, so tolerate it rather than abort the install.
-            match secure_existing_children(&path) {
+            match secure_existing_children(&path, depth + 1) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -546,8 +563,21 @@ fn create_secure_base_dir(base: &Path) -> std::io::Result<()> {
         // Capture the error before `LocalFree`, which can clobber the thread error.
         let err = std::io::Error::last_os_error();
         LocalFree(psd);
-        if created == 0 && err.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-            return Err(err);
+        if created == 0 {
+            if err.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(err);
+            }
+            // `ERROR_ALREADY_EXISTS` is also returned when a *regular file* occupies
+            // the path; only an existing directory is the benign idempotent case.
+            // (A reparse point was already refused by `fail_if_reparse_point`; stat
+            // without following regardless.) Reject anything else with a clear error
+            // rather than let later steps fail obscurely on a non-directory.
+            if !std::fs::symlink_metadata(base)?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} already exists and is not a directory", base.display()),
+                ));
+            }
         }
     }
     Ok(())
@@ -1664,6 +1694,30 @@ mod tests {
             std::collections::BTreeSet::from(["SY", "BA", "LS"]),
             "born-secure DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
         );
+    }
+
+    #[test]
+    fn create_secure_base_dir_rejects_a_file_at_the_path() {
+        // ERROR_ALREADY_EXISTS also fires for a regular file; that is not the benign
+        // idempotent case and must be a clear error, not a silent success.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("not-a-dir");
+        std::fs::write(&base, b"x").unwrap();
+        let err =
+            create_secure_base_dir(&base).expect_err("a file at the base path must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn secure_existing_children_bounds_recursion_depth() {
+        // At the depth cap the walk refuses rather than recursing further, so an
+        // attacker-planted deep tree cannot overflow the installer's stack.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let err = secure_existing_children(&dir, MAX_RESECURE_DEPTH)
+            .expect_err("hitting the depth cap must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
     }
 
     #[test]
