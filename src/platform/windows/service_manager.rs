@@ -313,8 +313,8 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     // A standard user who can write under `ProgramData` might pre-create the data
     // directory (or `logs/`) as a symlink/junction. Refuse to populate a reparse
     // point: creating files under it would follow the link and redirect these
-    // privileged writes outside the intended directory. This is *fatal*, unlike a
-    // best-effort ACL failure below.
+    // privileged writes outside the intended directory. Fatal, like the ACL
+    // hardening below — both fail the install rather than proceed insecurely.
     fail_if_reparse_point(&base)?;
     // Restrict the base directory's ACL before populating it. A `ProgramData`
     // subfolder is otherwise writable (and readable) by standard users through
@@ -389,15 +389,13 @@ fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
 /// cannot. Applies the protected DACL to the base, then walks and re-secures
 /// existing children: a re-install over an unhardened directory does not retro-
 /// actively update children's stored ACLs through the parent's new inheritable
-/// ACEs, so each must be reset explicitly. A failure to secure the base is
-/// returned, and the caller aborts the install (failing closed: an unsecured
-/// data directory is the privilege-escalation surface this exists to close).
-/// An unexpected reparse point anywhere under the tree is likewise returned as
-/// `InvalidData` — leaving it in place would keep a redirection primitive for
-/// later privileged opens. Per-child ACL failures (not reparse points) are
-/// logged but not fatal: the base is secured and newly created children inherit
-/// its ACL, so a stale child that resists re-securing is a far smaller risk than
-/// an unsecured base.
+/// ACEs, so each must be reset explicitly. Fails closed: any failure to secure
+/// the base *or* an existing child (it cannot be enumerated, inspected, or have
+/// its ACL reset), and any unexpected reparse point under the tree, is returned
+/// so the caller aborts the install. An unsecured data directory — or a stale,
+/// still-permissive config/userlist left under it — is the privilege-escalation
+/// surface this exists to close, so leaving one in place is not acceptable. The
+/// sole non-fatal case is a child that vanished mid-walk (it is simply gone).
 fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
     secure_path_acl(base)?;
     secure_existing_children(base)?;
@@ -407,28 +405,15 @@ fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
 fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!(
-                "alighieri: warning: could not enumerate {} to re-secure its contents ({e}); \
-                 existing files there may stay permissive.",
-                dir.display()
-            );
-            return Ok(());
-        }
-    };
+    // Fail closed throughout, matching the caller: if we cannot enumerate,
+    // inspect, or re-secure an existing child, propagate the error so the install
+    // aborts rather than leave a possibly standard-user-writable sensitive file (a
+    // stale config/userlist) under the now-protected base. The one benign
+    // exception is a child that vanished mid-walk (`NotFound`) — it is simply gone,
+    // not a redirection or a permissive file, so we skip it.
+    let entries = std::fs::read_dir(dir)?;
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                eprintln!(
-                    "alighieri: warning: could not read a directory entry under {} ({e}); skipping.",
-                    dir.display()
-                );
-                continue;
-            }
-        };
+        let entry = entry?;
         let path = entry.path();
         // `symlink_metadata` does not follow the link (unambiguously, matching
         // `fail_if_reparse_point`). Check the reparse-point attribute — which
@@ -437,13 +422,8 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
         // the data directory.
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
-            Err(e) => {
-                eprintln!(
-                    "alighieri: warning: could not inspect {} to re-secure it ({e}); skipping.",
-                    path.display()
-                );
-                continue;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             // We never create reparse points here, so an unexpected one is an
@@ -460,12 +440,13 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
             ));
         }
         if let Err(e) = secure_path_acl(&path) {
-            // `secure_path_acl`'s no-follow handle check returns `InvalidData` when
-            // the child is a reparse point — e.g. swapped in after the
-            // `symlink_metadata` check just above (a TOCTOU race the point-in-time
-            // attribute check cannot close). Treat it like the attribute check:
-            // this is the redirection primitive we abort for. Other failures stay
-            // best-effort warnings.
+            // A reparse point swapped in after the `symlink_metadata` check above
+            // (a TOCTOU race the point-in-time attribute check cannot close) makes
+            // `secure_path_acl`'s no-follow handle check return `InvalidData`;
+            // re-label it with the child path. Any other error means this child's
+            // ACL could not be reset — if it is a pre-existing config/userlist, its
+            // old (possibly permissive) ACL would persist under the secured base, so
+            // it is fatal too.
             if e.kind() == std::io::ErrorKind::InvalidData {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -475,10 +456,7 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
                     ),
                 ));
             }
-            eprintln!(
-                "alighieri: warning: could not restrict permissions on {} ({e}).",
-                path.display()
-            );
+            return Err(e);
         }
         if meta.is_dir() {
             secure_existing_children(&path)?;
