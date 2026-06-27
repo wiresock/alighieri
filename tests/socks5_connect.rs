@@ -1889,3 +1889,126 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp command: connect ud
     let header = socks5::parse_udp_header(&buf[..n]).unwrap();
     assert_eq!(&buf[header.payload_offset..n], b"from-other-port");
 }
+
+#[tokio::test]
+async fn connect_via_hostname_resolving_to_loopback_is_denied() {
+    // SSRF end-to-end: a CONNECT to a *hostname* that resolves to loopback must be
+    // refused once `dns.deny: loopback` is set, even though the request carries a
+    // name (ATYP=0x03) rather than a loopback IP literal — the deny applies after
+    // resolution. "localhost" resolves locally (hosts file), so this is
+    // deterministic and needs no network.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+dns.deny: loopback
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut client).await;
+
+    // CONNECT to "localhost":80 by name (ATYP=0x03).
+    let host = b"localhost";
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host);
+    req.extend_from_slice(&80u16.to_be_bytes());
+    client.write_all(&req).await.unwrap();
+
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply[0], 0x05);
+    assert_eq!(
+        reply[1], 0x04,
+        "a hostname resolving only to loopback must get HostUnreachable, got 0x{:02x}",
+        reply[1]
+    );
+}
+
+#[tokio::test]
+async fn maxconnections_backpressures_then_releases_on_close() {
+    // With a single permit the accept loop acquires it before accepting, so a
+    // second client cannot be serviced until the first releases it — and closing
+    // the first must release it (no leak on the normal-close path).
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+maxconnections: 1
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let echo = start_echo_server().await;
+
+    // Connection A takes the only permit and holds it open (relaying).
+    let mut a = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut a).await;
+    let _bound = request_connect(&mut a, echo).await;
+
+    // Connection B connects (kernel backlog) and sends a greeting, but the accept
+    // loop is parked on the permit, so no method-selection reply comes back.
+    let mut b = TcpStream::connect(proxy_addr).await.unwrap();
+    b.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut sel = [0u8; 2];
+    // A generous window: if B were not actually back-pressured it would reply well
+    // within this, so a timeout reliably means "blocked" rather than "slow runner".
+    let blocked = tokio::time::timeout(Duration::from_secs(1), b.read_exact(&mut sel)).await;
+    assert!(
+        blocked.is_err(),
+        "second connection must be back-pressured while the first holds the only permit"
+    );
+
+    // Close A -> its permit is released -> B's handshake now completes.
+    a.shutdown().await.ok();
+    drop(a);
+    tokio::time::timeout(Duration::from_secs(3), b.read_exact(&mut sel))
+        .await
+        .expect("closing the first connection must release the permit for the second")
+        .unwrap();
+    assert_eq!(sel, [0x05, 0x00]);
+}
+
+#[tokio::test]
+async fn handshake_timeout_releases_the_connection_permit() {
+    // The permit must be released on the handshake-timeout error path too, not
+    // only on a clean close. With a single permit and a 1s handshake timeout, a
+    // client that stalls the handshake is dropped; a following client must then be
+    // served, proving the permit did not leak.
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+handshaketimeout: 1
+maxconnections: 1
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
+"#,
+    )
+    .unwrap();
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let echo = start_echo_server().await;
+
+    // Connection A connects but never sends a greeting -> its handshake times out
+    // and the task ends on the error path, releasing the permit. Keep it open so
+    // the server side (the timeout) is what ends it, not a client-side EOF.
+    let _a = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // A following connection must be served once A's permit is freed.
+    let mut b = TcpStream::connect(proxy_addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        handshake_noauth(&mut b).await;
+        request_connect(&mut b, echo).await
+    })
+    .await
+    .expect("permit must be free after the stalled handshake timed out");
+}
