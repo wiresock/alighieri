@@ -28,7 +28,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   read the userlist's secrets. The protected DACL grants Full Control to SYSTEM
   and Administrators and Modify to the `LocalService` account the service runs as;
   previously the directory inherited `ProgramData`'s permissions, which can be
-  standard-user-writable.
+  standard-user-writable. The install fails closed: if the directory cannot be
+  secured (for example a standard user pre-created it with a DACL the installer
+  cannot rewrite, or planted a symlink/junction there), installation aborts with
+  an error rather than proceeding with an unsecured data directory.
 - `shutdown.draintimeout: 0` now logs a warning (rather than an info line) when
   it severs in-flight connections at shutdown, and the README and `--check`
   metadata clarify that `0` cuts immediately — the most aggressive setting, not

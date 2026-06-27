@@ -321,17 +321,21 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     // inherited permissions, so a non-admin could tamper with the config/userlist
     // the privileged service loads — local privilege escalation — or read the
     // userlist's secrets. Doing it before creating `logs/` and the config means
-    // those inherit the restricted ACL. Best-effort: warn rather than abort the
-    // install if it fails (the directory still functions), so an unusual
-    // filesystem or policy cannot block installation outright.
+    // those inherit the restricted ACL. Fail closed: if the directory cannot be
+    // secured, abort rather than run a service whose config a standard user can
+    // rewrite — the very escalation this guards against. Hardening fails in
+    // exactly the hostile case (a standard user pre-created the directory with a
+    // DACL the installer cannot rewrite), so warn-and-continue would fail open
+    // there; the common fresh install (we create and own the directory) is
+    // unaffected. A genuinely exotic environment that cannot apply the DACL
+    // surfaces as an install error to investigate, not a silently insecure
+    // service.
     if let Err(e) = harden_directory_dacl(&base) {
-        // `harden` reports `InvalidData` for a reparse point its no-follow handle
-        // check found — the base swapped for a symlink in the window after
-        // `fail_if_reparse_point` above, or a pre-planted child surfaced by the
-        // hardening walk. Either is a redirection primitive for later privileged
-        // opens, so abort rather than populate or operate through it; other
-        // failures stay best-effort (the directory still works, just less locked
-        // down). `e` names the offending path.
+        // `InvalidData` is the no-follow handle check reporting a reparse point —
+        // the base swapped for a symlink after `fail_if_reparse_point` above, or a
+        // pre-planted child surfaced by the walk — and `e` names the offending
+        // path. Any other error means the ACL itself could not be applied. Both
+        // are fatal.
         if e.kind() == std::io::ErrorKind::InvalidData {
             return Err(ServiceCliError::Service(format!(
                 "refusing to install into {}: a symlink or reparse point is present ({e}). \
@@ -339,11 +343,12 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
                 base.display()
             )));
         }
-        eprintln!(
-            "alighieri: warning: could not restrict permissions on {} ({e}); ensure standard \
-             users cannot write the service config or userlist there.",
+        return Err(ServiceCliError::Service(format!(
+            "refusing to install: could not secure {} ({e}). Its config and userlist would be \
+             writable by standard users (local privilege escalation). Resolve the permission \
+             problem — e.g. remove a data directory a standard user pre-created — and reinstall.",
             base.display()
-        );
+        )));
     }
     // `logs/` is created under the now-protected base; reject (rather than follow)
     // a symlink planted in the brief window before the base was hardened.
@@ -385,10 +390,14 @@ fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
 /// existing children: a re-install over an unhardened directory does not retro-
 /// actively update children's stored ACLs through the parent's new inheritable
 /// ACEs, so each must be reset explicitly. A failure to secure the base is
-/// returned (the caller warns). An unexpected reparse point anywhere under the
-/// tree is returned as `InvalidData` (the caller aborts the install) — leaving
-/// it in place would keep a redirection primitive for later privileged opens;
-/// other per-child failures are logged but not fatal.
+/// returned, and the caller aborts the install (failing closed: an unsecured
+/// data directory is the privilege-escalation surface this exists to close).
+/// An unexpected reparse point anywhere under the tree is likewise returned as
+/// `InvalidData` — leaving it in place would keep a redirection primitive for
+/// later privileged opens. Per-child ACL failures (not reparse points) are
+/// logged but not fatal: the base is secured and newly created children inherit
+/// its ACL, so a stale child that resists re-securing is a far smaller risk than
+/// an unsecured base.
 fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
     secure_path_acl(base)?;
     secure_existing_children(base)?;
