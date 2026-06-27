@@ -1519,13 +1519,26 @@ mod tests {
 
         // Protected (no inherited ACEs from ProgramData).
         assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
-        // The DACL grants *exactly* SYSTEM, Administrators, and LocalService — no
-        // other (broad or unexpected) principal. Extract each ACE's trustee (its
-        // final `;`-separated field) and compare the whole set, so a stray ACE is
-        // caught rather than only the specific principals checked individually.
-        let trustees: std::collections::BTreeSet<&str> = sddl
+        // The DACL is *exactly* three allow ACEs, one each for SYSTEM,
+        // Administrators, and LocalService. Parsing the ACEs (not just the trustee
+        // set) means a duplicate or deny ACE for an existing trustee — which would
+        // leave the trustee set unchanged — is caught too, alongside any stray
+        // principal. (Masks are not asserted: their read-back form varies, e.g. `FA`
+        // may expand to a hex bitmask.)
+        // Split on both delimiters so each ACE body is isolated and the trailing
+        // `)` (and the read-back string's NUL artifact) lands in a `;`-less chunk
+        // that the filter drops — robust to that junk, unlike trimming a lone `)`.
+        let aces: Vec<&str> = sddl
             .split(['(', ')'])
             .filter(|chunk| chunk.contains(';'))
+            .collect();
+        assert_eq!(aces.len(), 3, "DACL must have exactly three ACEs: {sddl}");
+        assert!(
+            aces.iter().all(|ace| ace.starts_with("A;")),
+            "every ACE must be an allow ACE, never a deny: {sddl}"
+        );
+        let trustees: std::collections::BTreeSet<&str> = aces
+            .iter()
             .filter_map(|ace| ace.rsplit(';').next())
             .collect();
         assert_eq!(
