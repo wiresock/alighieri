@@ -332,39 +332,114 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     Ok(())
 }
 
-/// Replaces `dir`'s ACL with a protected DACL (no inheritance from `ProgramData`)
-/// granting Full Control to `SYSTEM` and `Administrators`, and Modify to the
-/// `LocalService` account the service runs as (so it can still read the config
-/// and write logs/ACME under here) — and **nothing** to standard users. The
-/// inheritable (`OICI`) entries propagate to the files and subdirectories created
-/// afterward. SIDs are used rather than names so this is locale-independent.
-fn harden_directory_dacl(dir: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+/// Restricts the service data directory (and any pre-existing contents) so only
+/// `SYSTEM`/`Administrators` (Full) and the `LocalService` service account
+/// (Modify — read the config, write logs/ACME) can touch it, and standard users
+/// cannot. Applies the protected DACL to the base, then walks and re-secures
+/// existing children: a re-install over an unhardened directory does not retro-
+/// actively update children's stored ACLs through the parent's new inheritable
+/// ACEs, so each must be reset explicitly. A failure to secure the base is
+/// returned (the caller warns); per-child failures are logged but not fatal.
+fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
+    secure_path_acl(base)?;
+    secure_existing_children(base);
+    Ok(())
+}
+
+fn secure_existing_children(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // The dir-entry file type does not follow the link, so a planted symlink
+        // is detected here and skipped rather than recursed into or re-pointed.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_symlink() {
+            eprintln!(
+                "alighieri: warning: skipping unexpected reparse point under the service \
+                 directory: {}",
+                path.display()
+            );
+            continue;
+        }
+        if let Err(e) = secure_path_acl(&path) {
+            eprintln!(
+                "alighieri: warning: could not restrict permissions on {} ({e}).",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            secure_existing_children(&path);
+        }
+    }
+}
+
+/// Sets `path`'s owner to `Administrators` and a protected DACL (granting only
+/// `SYSTEM`/`Administrators` Full and `LocalService` Modify), operating on a
+/// handle opened **without following reparse points** so a symlink/junction a
+/// standard user may have planted in `ProgramData` cannot redirect the change
+/// onto a target outside the data directory (a TOCTOU). Taking ownership keeps a
+/// pre-creating user from staying owner and later rewriting the DACL; it needs
+/// elevation, so if it is refused the protected DACL is still applied on its own
+/// (the essential protection). SIDs (not names) keep this locale-independent.
+fn secure_path_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
-    // D:PAI = DACL, Protected (drop inherited ACEs), Auto-Inherited. ACEs:
-    //   SYSTEM (SY) and Administrators (BA): Full, object+container inheritable.
-    //   LocalService (LS): Modify (0x1301bf) so the service reads its config and
-    //   writes logs/ACME; not Full, so it cannot rewrite the ACL.
-    const SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+    // Standard access bits (stable constants, avoiding feature churn):
+    // READ_CONTROL to read the current descriptor (needed when switching the DACL
+    // to protected), WRITE_DAC to set the DACL, WRITE_OWNER to take ownership.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    // O:BA = owner Administrators. D:PAI = protected, auto-inherited DACL: SYSTEM
+    // (SY) and Administrators (BA) Full, LocalService (LS) Modify (0x1301bf), all
+    // object+container inheritable so children created afterward inherit them.
+    const SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+
+    // `BACKUP_SEMANTICS` is required to open a directory handle; `OPEN_REPARSE_POINT`
+    // opens the link itself rather than its target. Prefer a handle that can also
+    // take ownership, but fall back to `WRITE_DAC` alone when taking ownership is
+    // not permitted (an unprivileged caller has implicit `WRITE_DAC` over an owned
+    // object but not `WRITE_OWNER`): the protected DACL is the essential lock-out.
+    let open = |access: u32| {
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    let (handle, with_owner) = match open(READ_CONTROL | WRITE_DAC | WRITE_OWNER) {
+        Ok(handle) => (handle, true),
+        Err(_) => (open(READ_CONTROL | WRITE_DAC)?, false),
+    };
+    if handle.metadata()?.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to set permissions on a symlink/reparse point",
+        ));
+    }
+    let raw = handle.as_raw_handle();
     let sddl_w: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut path_w: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
 
     // SAFETY: standard Win32 security calls. `ConvertString...` allocates a
-    // self-relative descriptor that `LocalFree` releases; `GetSecurityDescriptorDacl`
-    // returns a pointer into that descriptor, which stays valid until the free.
+    // self-relative descriptor freed by `LocalFree`; the DACL/owner pointers point
+    // into it and stay valid until then. `raw` is a live directory handle.
     unsafe {
         let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -379,22 +454,44 @@ fn harden_directory_dacl(dir: &Path) -> std::io::Result<()> {
         let mut present = 0;
         let mut pdacl: *mut ACL = std::ptr::null_mut();
         let mut defaulted = 0;
+        let mut powner: PSID = std::ptr::null_mut();
+        let mut owner_defaulted = 0;
         if GetSecurityDescriptorDacl(psd, &mut present, &mut pdacl, &mut defaulted) == 0
             || present == 0
+            || GetSecurityDescriptorOwner(psd, &mut powner, &mut owner_defaulted) == 0
         {
             let err = std::io::Error::last_os_error();
             LocalFree(psd);
             return Err(err);
         }
-        let rc = SetNamedSecurityInfoW(
-            path_w.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            pdacl,
-            std::ptr::null_mut(),
-        );
+        let dacl_only = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        // With the owner handle, set owner + protected DACL; if setting the owner
+        // is still refused, or we only have the DACL handle, apply just the
+        // protected DACL — what actually locks out standard users.
+        let mut rc = if with_owner {
+            SetSecurityInfo(
+                raw as _,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | dacl_only,
+                powner,
+                std::ptr::null_mut(),
+                pdacl,
+                std::ptr::null_mut(),
+            )
+        } else {
+            1 // skip straight to the DACL-only path below
+        };
+        if rc != 0 {
+            rc = SetSecurityInfo(
+                raw as _,
+                SE_FILE_OBJECT,
+                dacl_only,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                pdacl,
+                std::ptr::null_mut(),
+            );
+        }
         LocalFree(psd);
         if rc != 0 {
             return Err(std::io::Error::from_raw_os_error(rc as i32));
@@ -1263,7 +1360,10 @@ mod tests {
                 &mut len,
             );
             assert_ne!(ok, 0, "converting the descriptor to SDDL failed");
-            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(sddl_ptr, len as usize));
+            // `len` counts the terminating NUL; exclude it so the string has no
+            // trailing `\0`.
+            let chars = (len as usize).saturating_sub(1);
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(sddl_ptr, chars));
             LocalFree(sddl_ptr.cast());
             LocalFree(psd);
             sddl
@@ -1331,5 +1431,25 @@ mod tests {
             !sddl.contains(";;;AU)"),
             "Authenticated Users must not be granted: {sddl}"
         );
+    }
+
+    #[test]
+    fn harden_directory_dacl_refuses_a_symlinked_base() {
+        // A standard user who plants a symlink/junction where the data directory
+        // goes must not redirect the ACL change onto its target (TOCTOU). The
+        // reparse-point-aware open + check refuses it instead.
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        // Creating a symlink needs privilege (Developer Mode / admin); skip if not.
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            eprintln!(
+                "skipping harden_directory_dacl_refuses_a_symlinked_base: cannot create symlinks"
+            );
+            return;
+        }
+        let err = harden_directory_dacl(&link).expect_err("a symlinked base must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
