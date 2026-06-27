@@ -495,6 +495,14 @@ and a `client` rule `to:` stay IP/CIDR-only. An earlier `block { to: 10.0.0.0/8 
 still rejects a domain that *resolves* into a denied range, so deny-by-default
 and DNS-rebinding protection are preserved.
 
+Hostname patterns use a strict DNS-label grammar: each label is 1–63 characters
+of `a-z`, `0-9`, and `-` (not starting or ending with a hyphen), matched
+case-insensitively, with an optional trailing dot. This is intentionally narrower
+than what the proxy accepts as a *requested* destination — a client may ask for a
+name containing an underscore or a non-ASCII (IDN) label, which cannot be written
+as an exact `to:` hostname pattern. Such destinations are still governed by
+IP/CIDR rules (matched after resolution) and by deny-by-default.
+
 A `socks` rule may carry a **`bandwidth: BYTES/WINDOW_SECONDS`** limit that
 throttles each matching **CONNECT** relay (a per-session token bucket: sustained
 `BYTES / WINDOW` with a burst up to `BYTES`). It is enforced like

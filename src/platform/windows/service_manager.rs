@@ -1647,7 +1647,22 @@ mod tests {
         let dir = parent.path().join("svc-data");
         std::fs::create_dir(&dir).unwrap();
 
-        harden_directory_dacl(&dir).expect("hardening an owned directory must succeed");
+        // Applying the DACL needs privileges a non-elevated account may lack
+        // (`service install` always runs elevated, as does CI). Treat an
+        // access-denied here as a skip — like the symlink tests nearby — so the
+        // suite stays green on an ordinary developer machine rather than failing
+        // before the read-back skip below can even run.
+        if let Err(e) = harden_directory_dacl(&dir) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "skipping harden_directory_dacl_locks_out_standard_users: this account \
+                     cannot apply the DACL ({e})"
+                );
+                reset_dacl_for_cleanup(&dir);
+                return;
+            }
+            panic!("hardening an owned directory must succeed: {e}");
+        }
         let sddl = read_dacl_sddl(&dir);
         // Restore access immediately so the temp dir is always removable.
         reset_dacl_for_cleanup(&dir);
@@ -1697,7 +1712,18 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let base = parent.path().join("born-secure");
 
-        create_secure_base_dir(&base).expect("creating the secured base must succeed");
+        // Creating with the protected DACL needs privileges a non-elevated account
+        // may lack; skip on access-denied (see the harden test above).
+        if let Err(e) = create_secure_base_dir(&base) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!(
+                    "skipping create_secure_base_dir_is_born_protected: this account cannot \
+                     create the secured directory ({e})"
+                );
+                return;
+            }
+            panic!("creating the secured base must succeed: {e}");
+        }
         // Read the protected DACL back *before* resetting; that is what we assert
         // on. If this account is locked out of reading it (non-elevated), skip.
         let sddl = read_dacl_sddl(&base);
