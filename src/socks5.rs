@@ -172,6 +172,38 @@ const ATYP_V4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
+/// Rejects domain names that are unsafe to log or resolve. A SOCKS5 `DOMAIN`
+/// field is otherwise arbitrary bytes: an ASCII control character (CR, LF, NUL,
+/// TAB, ...) would forge log lines once the destination is Displayed into a text
+/// log, and be passed raw to the system resolver. Also rejects structurally
+/// invalid labels — empty (e.g. `a..b`, `.a`) or longer than the DNS 63-byte
+/// limit. A single trailing dot (an absolute name) is allowed, and the character
+/// set is otherwise unrestricted, so IDN/punycode and underscores still pass.
+/// The total length is already bounded to 255 by the wire format's one-byte
+/// length prefix.
+fn validate_domain(name: &str) -> Result<()> {
+    if name.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::Protocol(
+            "domain name contains a control character".into(),
+        ));
+    }
+    // Treat a single trailing dot as an absolute name: strip it so the final
+    // label is not seen as empty.
+    let stem = name.strip_suffix('.').unwrap_or(name);
+    if stem.is_empty() {
+        return Err(Error::Protocol("domain name has no labels".into()));
+    }
+    for label in stem.split('.') {
+        if label.is_empty() {
+            return Err(Error::Protocol("domain name has an empty label".into()));
+        }
+        if label.len() > 63 {
+            return Err(Error::Protocol("domain name label exceeds 63 bytes".into()));
+        }
+    }
+    Ok(())
+}
+
 /// Reads an `ATYP`-prefixed address followed by a 2-byte big-endian port.
 pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<TargetAddr> {
     let atyp = r.read_u8().await?;
@@ -203,6 +235,7 @@ pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<TargetA
             r.read_exact(&mut buf).await?;
             let domain = String::from_utf8(buf)
                 .map_err(|_| Error::Protocol("domain name is not valid UTF-8".into()))?;
+            validate_domain(&domain)?;
             let port = r.read_u16().await?;
             Ok(TargetAddr::Domain(domain, port))
         }
@@ -457,6 +490,7 @@ pub fn parse_udp_header(buf: &[u8]) -> Result<UdpHeader> {
             }
             let domain = String::from_utf8(buf[pos..pos + len].to_vec())
                 .map_err(|_| Error::Protocol("UDP domain not UTF-8".into()))?;
+            validate_domain(&domain)?;
             pos += len;
             let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
@@ -660,6 +694,65 @@ mod tests {
             matches!(err, Error::Protocol(ref m) if m.contains("not valid UTF-8")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_domain_rejects_control_characters() {
+        // CR/LF would forge log lines (the destination is logged); NUL/TAB are
+        // likewise invalid in a hostname.
+        for bad in [
+            "ex\rample.com",
+            "ex\nample.com",
+            "ex\0ample.com",
+            "ex\tample.com",
+        ] {
+            assert!(validate_domain(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_domain_rejects_malformed_labels() {
+        assert!(validate_domain("foo..bar").is_err()); // empty interior label
+        assert!(validate_domain(".foo").is_err()); // empty leading label
+        assert!(validate_domain(".").is_err()); // no labels
+        let oversize = format!("{}.com", "a".repeat(64)); // label over 63 bytes
+        assert!(validate_domain(&oversize).is_err());
+    }
+
+    #[test]
+    fn validate_domain_accepts_normal_and_absolute_names() {
+        for ok in [
+            "example.com",
+            "a.b.c.example.org",
+            "under_score.example",   // underscores occur in real records
+            "xn--bcher-kva.example", // IDN/punycode
+            "host.example.com.",     // absolute name (trailing dot)
+        ] {
+            assert!(validate_domain(ok).is_ok(), "{ok:?} must be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_crlf_in_domain() {
+        // ATYP=0x03 with a CR/LF in the domain must be rejected by the parser, so
+        // the value never reaches the logger or resolver.
+        let host = b"ev\r\nil.com";
+        let mut bytes = vec![0x03u8, host.len() as u8];
+        bytes.extend_from_slice(host);
+        bytes.extend_from_slice(&80u16.to_be_bytes());
+        let mut cur = Cursor::new(bytes);
+        assert!(read_target_addr(&mut cur).await.is_err());
+    }
+
+    #[test]
+    fn parse_udp_header_rejects_crlf_in_domain() {
+        // The UDP header parser shares the same domain validation.
+        let host = b"ev\r\nil.com";
+        let mut datagram = vec![0x00, 0x00, 0x00, ATYP_DOMAIN, host.len() as u8];
+        datagram.extend_from_slice(host);
+        datagram.extend_from_slice(&53u16.to_be_bytes());
+        datagram.extend_from_slice(b"payload");
+        assert!(parse_udp_header(&datagram).is_err());
     }
 
     #[tokio::test]

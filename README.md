@@ -318,9 +318,13 @@ and configuration errors report file and line context.
 `unspecified`, `documentation`, and `reserved`. For IPv4, `reserved` covers the
 IANA special-purpose ranges the other categories do not — `0.0.0.0/8`,
 `100.64.0.0/10` (CGNAT), `192.0.0.0/24`, `192.88.99.0/24` (6to4), `198.18.0.0/15`
-(benchmarking), and `240.0.0.0/4` (including the broadcast address). For IPv6 it
-instead overlaps the specific categories, matching `::` (unspecified), `::1`
-(loopback), and `2001:db8::/32` (documentation). Private, link-local, multicast,
+(benchmarking), and `240.0.0.0/4` (including the broadcast address). For IPv6,
+`reserved` matches `::` (unspecified), `::1` (loopback), `2001:db8::/32`
+(documentation), `2002::/16` (6to4), `64:ff9b::/96` (the NAT64 well-known prefix,
+which can reach embedded IPv4 such as `127.0.0.1` via a NAT64 gateway), and
+`2001::/23` (the IETF protocol-assignments block, including Teredo and ORCHIDv2).
+IPv4-in-IPv6 forms of the IPv4 reserved ranges are caught too. Private,
+link-local, multicast,
 and the `TEST-NET` documentation ranges have their own categories, so combine
 `reserved` with them (e.g. `private linklocal loopback reserved`) for broader
 coverage. For example:
@@ -564,7 +568,8 @@ For each attempt Alighieri runs the program and writes two newline-terminated
 lines to its **stdin** — the username, then the password (never on the command
 line or environment, which can leak). Exit status `0` allows the connection;
 anything else, or a timeout, denies it. The script should read with `read -r`,
-and credentials containing a newline or NUL byte are rejected to keep the
+and credentials containing a line feed (LF), carriage return (CR), or NUL byte
+are rejected to keep the
 framing unambiguous. Successful results are cached exactly like the userlist
 (`auth.cachettl`), and with `auth.command` set the `username` method no longer
 requires a `userlist`. To bound resource use, at most 64 verifier processes run
