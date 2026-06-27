@@ -325,15 +325,17 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     // install if it fails (the directory still functions), so an unusual
     // filesystem or policy cannot block installation outright.
     if let Err(e) = harden_directory_dacl(&base) {
-        // `harden`'s no-follow handle check is authoritative (TOCTOU-safe) and
-        // returns `InvalidData` for a reparse point — e.g. if the base was swapped
-        // for a symlink in the window after `fail_if_reparse_point` above. In that
-        // case abort rather than populate through it; other failures stay
-        // best-effort (the directory still works, just less locked down).
+        // `harden` reports `InvalidData` for a reparse point its no-follow handle
+        // check found — the base swapped for a symlink in the window after
+        // `fail_if_reparse_point` above, or a pre-planted child surfaced by the
+        // hardening walk. Either is a redirection primitive for later privileged
+        // opens, so abort rather than populate or operate through it; other
+        // failures stay best-effort (the directory still works, just less locked
+        // down). `e` names the offending path.
         if e.kind() == std::io::ErrorKind::InvalidData {
             return Err(ServiceCliError::Service(format!(
-                "refusing to install into {}: it is a symlink or reparse point. Remove it and \
-                 reinstall.",
+                "refusing to install into {}: a symlink or reparse point is present ({e}). \
+                 Remove it and reinstall.",
                 base.display()
             )));
         }
@@ -383,14 +385,17 @@ fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
 /// existing children: a re-install over an unhardened directory does not retro-
 /// actively update children's stored ACLs through the parent's new inheritable
 /// ACEs, so each must be reset explicitly. A failure to secure the base is
-/// returned (the caller warns); per-child failures are logged but not fatal.
+/// returned (the caller warns). An unexpected reparse point anywhere under the
+/// tree is returned as `InvalidData` (the caller aborts the install) — leaving
+/// it in place would keep a redirection primitive for later privileged opens;
+/// other per-child failures are logged but not fatal.
 fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
     secure_path_acl(base)?;
-    secure_existing_children(base);
+    secure_existing_children(base)?;
     Ok(())
 }
 
-fn secure_existing_children(dir: &Path) {
+fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let entries = match std::fs::read_dir(dir) {
@@ -401,7 +406,7 @@ fn secure_existing_children(dir: &Path) {
                  existing files there may stay permissive.",
                 dir.display()
             );
-            return;
+            return Ok(());
         }
     };
     for entry in entries {
@@ -432,12 +437,18 @@ fn secure_existing_children(dir: &Path) {
             }
         };
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            eprintln!(
-                "alighieri: warning: skipping unexpected reparse point under the service \
-                 directory: {}",
-                path.display()
-            );
-            continue;
+            // We never create reparse points here, so an unexpected one is an
+            // attacker-planted redirection. Locking the parent DACL does not undo
+            // it — the link target is already fixed — so skipping it would leave a
+            // live primitive for later privileged opens under the data directory
+            // (config reads, log/ACME writes). Abort the install instead.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected reparse point under the service data directory: {}",
+                    path.display()
+                ),
+            ));
         }
         if let Err(e) = secure_path_acl(&path) {
             eprintln!(
@@ -446,9 +457,10 @@ fn secure_existing_children(dir: &Path) {
             );
         }
         if meta.is_dir() {
-            secure_existing_children(&path);
+            secure_existing_children(&path)?;
         }
     }
+    Ok(())
 }
 
 /// Sets `path`'s owner to `Administrators` and a protected DACL (granting only
@@ -1526,6 +1538,38 @@ mod tests {
         }
         let err = harden_directory_dacl(&link).expect_err("a symlinked base must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn harden_directory_dacl_refuses_a_planted_reparse_child() {
+        // A reparse point planted *inside* the data directory (before a re-install
+        // hardens it) must abort the install, not be skipped: locking the parent
+        // DACL leaves the link's target fixed, so a later privileged open under the
+        // directory would still be redirected through it.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("evil");
+        // Creating a symlink needs privilege (Developer Mode / admin); skip if not.
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            eprintln!(
+                "skipping harden_directory_dacl_refuses_a_planted_reparse_child: cannot create \
+                 symlinks"
+            );
+            return;
+        }
+        let err =
+            harden_directory_dacl(&base).expect_err("a planted reparse child must be refused");
+        // Restore base access so the temp dir is always removable (it was hardened
+        // before the walk reached the child).
+        reset_dacl_for_cleanup(&base);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("evil"),
+            "error should name the offending child: {err}"
+        );
     }
 
     #[test]
