@@ -307,11 +307,414 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
     Ok(path)
 }
 
+/// The protected DACL (no owner) shared by the born-secure create and the
+/// re-harden path so they cannot drift: `D:PAI` = protected, auto-inherited;
+/// SYSTEM (SY) and Administrators (BA) Full, LocalService (LS) Modify (0x1301bf),
+/// all object+container inheritable so children created afterward inherit them.
+const HARDENED_DACL_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
-    std::fs::create_dir_all(default_base_dir())?;
-    std::fs::create_dir_all(default_log_dir())?;
+    let base = default_base_dir();
+    // A standard user who can write under `ProgramData` might pre-create the data
+    // directory (or `logs/`) as a symlink/junction. Refuse a reparse point *before*
+    // any filesystem write at this path: `create_dir_all` on a pre-planted link
+    // would follow it and could create its target outside the intended directory.
+    // Fatal, like the ACL hardening below — both fail the install rather than
+    // proceed insecurely. (A link swapped in after this check is still caught: the
+    // no-follow handle check in `secure_path_acl` refuses a reparse base too.)
+    fail_if_reparse_point(&base)?;
+    // Create the base directory with the protected DACL applied *atomically*, so a
+    // fresh install never passes through a window where it inherits `ProgramData`'s
+    // standard-user-writable ACL. Otherwise a standard user racing the install
+    // could open a write handle to the directory (or a child) while it is still
+    // permissive and keep it past the hardening step — Windows does not revoke
+    // already-open handles when the DACL is later tightened. If it already exists
+    // this is a no-op and `harden_directory_dacl` below secures the existing one.
+    create_secure_base_dir(&base)?;
+    // Restrict the base directory's ACL before populating it. A `ProgramData`
+    // subfolder is otherwise writable (and readable) by standard users through
+    // inherited permissions, so a non-admin could tamper with the config/userlist
+    // the privileged service loads — local privilege escalation — or read the
+    // userlist's secrets. Doing it before creating `logs/` and the config means
+    // those inherit the restricted ACL. Fail closed: if the directory cannot be
+    // secured, abort rather than run a service whose config a standard user can
+    // rewrite — the very escalation this guards against. Hardening fails in
+    // exactly the hostile case (a standard user pre-created the directory with a
+    // DACL the installer cannot rewrite), so warn-and-continue would fail open
+    // there; the common fresh install (we create and own the directory) is
+    // unaffected. A genuinely exotic environment that cannot apply the DACL
+    // surfaces as an install error to investigate, not a silently insecure
+    // service.
+    if let Err(e) = harden_directory_dacl(&base) {
+        // `InvalidData` is the no-follow handle check reporting a reparse point —
+        // the base swapped for a symlink after `fail_if_reparse_point` above, or a
+        // pre-planted child surfaced by the walk — and `e` names the offending
+        // path. Any other error means the ACL itself could not be applied. Both
+        // are fatal.
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            return Err(ServiceCliError::Service(format!(
+                "refusing to install into {}: a symlink or reparse point is present ({e}). \
+                 Remove it and reinstall.",
+                base.display()
+            )));
+        }
+        return Err(ServiceCliError::Service(format!(
+            "refusing to install: could not secure {} ({e}). Its config and userlist would be \
+             writable by standard users (local privilege escalation). Resolve the permission \
+             problem — e.g. remove a data directory a standard user pre-created — and reinstall.",
+            base.display()
+        )));
+    }
+    // `logs/` is created under the now-protected base; reject (rather than follow)
+    // a symlink planted in the brief window before the base was hardened.
+    let logs = default_log_dir();
+    fail_if_reparse_point(&logs)?;
+    std::fs::create_dir_all(&logs)?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Fails if `path` exists and is a reparse point (symlink/junction). A path that
+/// does not exist yet, or is a regular file/directory, is fine. Used to refuse
+/// following a pre-planted link when populating the service data directory.
+fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+            Err(ServiceCliError::Service(format!(
+                "refusing to install into {}: it is a symlink or reparse point. Remove it and \
+                 reinstall.",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()), // a regular file or directory
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // not created yet
+        // Any other error means we could not verify the path is safe — fail
+        // closed rather than populate something we cannot inspect.
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Restricts the service data directory (and any pre-existing contents) so only
+/// `SYSTEM`/`Administrators` (Full) and the `LocalService` service account
+/// (Modify — read the config, write logs/ACME) can touch it, and standard users
+/// cannot. Applies the protected DACL to the base, then walks and re-secures
+/// existing children: a re-install over an unhardened directory does not retro-
+/// actively update children's stored ACLs through the parent's new inheritable
+/// ACEs, so each must be reset explicitly. Fails closed: any failure to secure
+/// the base *or* an existing child (it cannot be enumerated, inspected, or have
+/// its ACL reset), and any unexpected reparse point under the tree, is returned
+/// so the caller aborts the install. An unsecured data directory — or a stale,
+/// still-permissive config/userlist left under it — is the privilege-escalation
+/// surface this exists to close, so leaving one in place is not acceptable. The
+/// sole non-fatal case is a child that vanished mid-walk (it is simply gone).
+fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
+    secure_path_acl(base)?;
+    secure_existing_children(base, 0)?;
+    Ok(())
+}
+
+/// Depth cap for the re-secure walk. The service's own layout is shallow
+/// (`logs/`, the ACME cache, the config); the contents of a pre-existing data
+/// directory may be attacker-controlled, so a deeply nested tree must not be able
+/// to overflow the stack via unbounded recursion (a denial-of-install). Far above
+/// any legitimate nesting, well below a stack-exhausting depth.
+const MAX_RESECURE_DEPTH: usize = 64;
+
+fn secure_existing_children(dir: &Path, depth: usize) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    // Bound the recursion so an attacker-planted deep tree cannot crash the
+    // installer. Exceeding the cap is fatal (fail closed), like the other walk
+    // failures.
+    if depth >= MAX_RESECURE_DEPTH {
+        return Err(std::io::Error::other(format!(
+            "service data directory nests deeper than {MAX_RESECURE_DEPTH} levels at {}; \
+             refusing to continue",
+            dir.display()
+        )));
+    }
+    // Fail closed throughout, matching the caller: if we cannot enumerate,
+    // inspect, or re-secure an existing child, propagate the error so the install
+    // aborts rather than leave a possibly standard-user-writable sensitive file (a
+    // stale config/userlist) under the now-protected base. The one benign
+    // exception is a child that vanished mid-walk (`NotFound`) — it is simply gone,
+    // not a redirection or a permissive file, so we skip it.
+    let entries = std::fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        // `symlink_metadata` does not follow the link (unambiguously, matching
+        // `fail_if_reparse_point`). Check the reparse-point attribute — which
+        // covers junctions/mount points, not just symlinks — so we never secure
+        // or, worse, recurse *through* a planted reparse point onto a tree outside
+        // the data directory.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            // We never create reparse points here, so an unexpected one is an
+            // attacker-planted redirection. Locking the parent DACL does not undo
+            // it — the link target is already fixed — so skipping it would leave a
+            // live primitive for later privileged opens under the data directory
+            // (config reads, log/ACME writes). Abort the install instead.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected reparse point under the service data directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if let Err(e) = secure_path_acl(&path) {
+            // A reparse point swapped in after the `symlink_metadata` check above
+            // (a TOCTOU race the point-in-time attribute check cannot close) makes
+            // `secure_path_acl`'s no-follow handle check return `InvalidData`;
+            // re-label it with the child path. A child that vanished in that same
+            // window is benign (it is gone, not a permissive file), so skip it. Any
+            // other error means this child's ACL could not be reset — if it is a
+            // pre-existing config/userlist, its old (possibly permissive) ACL would
+            // persist under the secured base, so it is fatal too.
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected reparse point under the service data directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(e);
+        }
+        if meta.is_dir() {
+            // A subdirectory that vanished between the check above and this descent
+            // surfaces as `NotFound` from its `read_dir`; that is the same benign
+            // mid-walk removal, so tolerate it rather than abort the install.
+            match secure_existing_children(&path, depth + 1) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates `base` with the [`HARDENED_DACL_SDDL`] protected DACL applied
+/// atomically (born secure), so a fresh install never passes through a window
+/// where the directory inherits `ProgramData`'s standard-user-writable ACL — a
+/// window in which a racing standard user could open a handle that survives the
+/// later hardening. If `base` already exists this is a no-op (the caller hardens
+/// the existing directory); any other failure propagates so the install fails
+/// closed. The owner is left as the creator and `secure_path_acl` takes ownership
+/// afterward — setting owner at create time would need elevation the SDDL omits.
+fn create_secure_base_dir(base: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    // The parent (`ProgramData`) already exists; create it defensively so only the
+    // leaf is the security-sensitive create.
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let wide: Vec<u16> = base
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let sddl_w: Vec<u16> = HARDENED_DACL_SDDL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: standard Win32 calls. `ConvertString...` allocates a self-relative
+    // descriptor freed by `LocalFree`; it stays valid through the `CreateDirectoryW`
+    // call that borrows it via `SECURITY_ATTRIBUTES`.
+    unsafe {
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(wide.as_ptr(), &sa);
+        // Capture the error before `LocalFree`, which can clobber the thread error.
+        let err = std::io::Error::last_os_error();
+        LocalFree(psd);
+        if created == 0 {
+            if err.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+                return Err(err);
+            }
+            // `ERROR_ALREADY_EXISTS` is also returned when a *regular file* occupies
+            // the path; only an existing directory is the benign idempotent case.
+            // (A reparse point was already refused by `fail_if_reparse_point`; stat
+            // without following regardless.) Reject anything else with a clear error
+            // rather than let later steps fail obscurely on a non-directory.
+            if !std::fs::symlink_metadata(base)?.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} already exists and is not a directory", base.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sets `path`'s owner to `Administrators` and a protected DACL (granting only
+/// `SYSTEM`/`Administrators` Full and `LocalService` Modify), operating on a
+/// handle opened **without following reparse points** so a symlink/junction a
+/// standard user may have planted in `ProgramData` cannot redirect the change
+/// onto a target outside the data directory (a TOCTOU). Taking ownership keeps a
+/// pre-creating user from staying owner and later rewriting the DACL; it needs
+/// elevation, so if it is refused the protected DACL is still applied on its own
+/// (the essential protection). SIDs (not names) keep this locale-independent.
+fn secure_path_acl(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    // Standard access bits (stable constants, avoiding feature churn):
+    // READ_CONTROL to read the current descriptor (needed when switching the DACL
+    // to protected), WRITE_DAC to set the DACL, WRITE_OWNER to take ownership,
+    // FILE_READ_ATTRIBUTES so `handle.metadata()` can read the reparse-point
+    // attribute below — the owner gets READ_CONTROL/WRITE_DAC implicitly but not
+    // attribute-read, so without this the no-follow check could fail spuriously on
+    // a child whose ACL does not grant it.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    // `O:BA` (owner Administrators) prepended to the shared protected DACL, so the
+    // born-secure create and this re-harden apply the same ACEs.
+    let sddl = format!("O:BA{HARDENED_DACL_SDDL}");
+
+    // `BACKUP_SEMANTICS` is required to open a directory handle; `OPEN_REPARSE_POINT`
+    // opens the link itself rather than its target. Prefer a handle that can also
+    // take ownership, but fall back to `WRITE_DAC` alone when taking ownership is
+    // not permitted (an unprivileged caller has implicit `WRITE_DAC` over an owned
+    // object but not `WRITE_OWNER`): the protected DACL is the essential lock-out.
+    let open = |access: u32| {
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    };
+    let (handle, with_owner) =
+        match open(READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES) {
+            Ok(handle) => (handle, true),
+            Err(_) => (
+                open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?,
+                false,
+            ),
+        };
+    // The handle refers to the link itself (OPEN_REPARSE_POINT). Refuse any
+    // reparse point — symlink or junction/mount point — via the attribute, which
+    // `file_type().is_symlink()` would miss for junctions.
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if handle.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to set permissions on a symlink/reparse point",
+        ));
+    }
+    let raw = handle.as_raw_handle();
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: standard Win32 security calls. `ConvertString...` allocates a
+    // self-relative descriptor freed by `LocalFree`; the DACL/owner pointers point
+    // into it and stay valid until then. `raw` is a live directory handle.
+    unsafe {
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut present = 0;
+        let mut pdacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = 0;
+        let mut powner: PSID = std::ptr::null_mut();
+        let mut owner_defaulted = 0;
+        if GetSecurityDescriptorDacl(psd, &mut present, &mut pdacl, &mut defaulted) == 0
+            || present == 0
+            || GetSecurityDescriptorOwner(psd, &mut powner, &mut owner_defaulted) == 0
+        {
+            let err = std::io::Error::last_os_error();
+            LocalFree(psd);
+            return Err(err);
+        }
+        let dacl_only = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+        // With the owner handle, set owner + protected DACL; if setting the owner
+        // is still refused, or we only have the DACL handle, apply just the
+        // protected DACL — what actually locks out standard users.
+        let mut rc = if with_owner {
+            SetSecurityInfo(
+                raw as _,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | dacl_only,
+                powner,
+                std::ptr::null_mut(),
+                pdacl,
+                std::ptr::null_mut(),
+            )
+        } else {
+            1 // skip straight to the DACL-only path below
+        };
+        if rc != 0 {
+            rc = SetSecurityInfo(
+                raw as _,
+                SE_FILE_OBJECT,
+                dacl_only,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                pdacl,
+                std::ptr::null_mut(),
+            );
+        }
+        LocalFree(psd);
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
     }
     Ok(())
 }
@@ -1134,5 +1537,258 @@ mod tests {
             names,
             vec![std::ffi::OsString::from("service-config-path.txt")]
         );
+    }
+
+    /// Reads back a directory's DACL as an SDDL string. Uses the well-known
+    /// 2-letter SID abbreviations (`SY`/`BA`/`LS`/...), so assertions on it are
+    /// locale-independent (unlike `icacls`'s resolved account names).
+    fn read_dacl_sddl(dir: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        let path_w: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut psd,
+            );
+            assert_eq!(rc, 0, "GetNamedSecurityInfoW failed (code {rc})");
+            let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+            let mut len = 0u32;
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut len,
+            );
+            assert_ne!(ok, 0, "converting the descriptor to SDDL failed");
+            // `len` counts the terminating NUL; exclude it so the string has no
+            // trailing `\0`.
+            let chars = (len as usize).saturating_sub(1);
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(sddl_ptr, chars));
+            LocalFree(sddl_ptr.cast());
+            LocalFree(psd);
+            sddl
+        }
+    }
+
+    /// Drops the protection and grants everyone, so the temp directory can be
+    /// removed afterward whatever account runs the test (the owner can always
+    /// rewrite the DACL).
+    fn reset_dacl_for_cleanup(dir: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let mut path_w: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                path_w.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(), // a NULL DACL grants full access to everyone
+                std::ptr::null_mut(),
+            )
+        };
+        // Make a cleanup failure visible/deterministic rather than leaving an
+        // undeletable temp directory behind.
+        assert_eq!(rc, 0, "resetting the test DACL failed (code {rc})");
+    }
+
+    #[test]
+    fn harden_directory_dacl_locks_out_standard_users() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("svc-data");
+        std::fs::create_dir(&dir).unwrap();
+
+        harden_directory_dacl(&dir).expect("hardening an owned directory must succeed");
+        let sddl = read_dacl_sddl(&dir);
+        // Restore access immediately so the temp dir is always removable.
+        reset_dacl_for_cleanup(&dir);
+
+        // Protected (no inherited ACEs from ProgramData).
+        assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
+        // The DACL is *exactly* three allow ACEs, one each for SYSTEM,
+        // Administrators, and LocalService. Parsing the ACEs (not just the trustee
+        // set) means a duplicate or deny ACE for an existing trustee — which would
+        // leave the trustee set unchanged — is caught too, alongside any stray
+        // principal. (Masks are not asserted: their read-back form varies, e.g. `FA`
+        // may expand to a hex bitmask.)
+        // Split on both delimiters so each ACE body is isolated and the trailing
+        // `)` (and the read-back string's NUL artifact) lands in a `;`-less chunk
+        // that the filter drops — robust to that junk, unlike trimming a lone `)`.
+        let aces: Vec<&str> = sddl
+            .split(['(', ')'])
+            .filter(|chunk| chunk.contains(';'))
+            .collect();
+        assert_eq!(aces.len(), 3, "DACL must have exactly three ACEs: {sddl}");
+        assert!(
+            aces.iter().all(|ace| ace.starts_with("A;")),
+            "every ACE must be an allow ACE, never a deny: {sddl}"
+        );
+        let trustees: std::collections::BTreeSet<&str> = aces
+            .iter()
+            .filter_map(|ace| ace.rsplit(';').next())
+            .collect();
+        assert_eq!(
+            trustees,
+            std::collections::BTreeSet::from(["SY", "BA", "LS"]),
+            "DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
+        );
+    }
+
+    #[test]
+    fn create_secure_base_dir_is_born_protected() {
+        // The base must be created already locked down, never passing through a
+        // window with ProgramData's inherited (standard-user-writable) ACL.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("born-secure");
+
+        create_secure_base_dir(&base).expect("creating the secured base must succeed");
+        assert!(
+            base.is_dir(),
+            "the base directory must exist: {}",
+            base.display()
+        );
+        let sddl = read_dacl_sddl(&base);
+        // Idempotent: a second call over the existing directory is a no-op success.
+        create_secure_base_dir(&base).expect("an existing base must be a no-op");
+        // Restore access so the temp dir is always removable.
+        reset_dacl_for_cleanup(&base);
+
+        assert!(
+            sddl.starts_with("D:P"),
+            "born-secure DACL must be protected: {sddl}"
+        );
+        let trustees: std::collections::BTreeSet<&str> = sddl
+            .split(['(', ')'])
+            .filter(|chunk| chunk.contains(';'))
+            .filter_map(|ace| ace.rsplit(';').next())
+            .collect();
+        assert_eq!(
+            trustees,
+            std::collections::BTreeSet::from(["SY", "BA", "LS"]),
+            "born-secure DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
+        );
+    }
+
+    #[test]
+    fn create_secure_base_dir_rejects_a_file_at_the_path() {
+        // ERROR_ALREADY_EXISTS also fires for a regular file; that is not the benign
+        // idempotent case and must be a clear error, not a silent success.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("not-a-dir");
+        std::fs::write(&base, b"x").unwrap();
+        let err =
+            create_secure_base_dir(&base).expect_err("a file at the base path must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn secure_existing_children_bounds_recursion_depth() {
+        // At the depth cap the walk refuses rather than recursing further, so an
+        // attacker-planted deep tree cannot overflow the installer's stack.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let err = secure_existing_children(&dir, MAX_RESECURE_DEPTH)
+            .expect_err("hitting the depth cap must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn harden_directory_dacl_refuses_a_symlinked_base() {
+        // A standard user who plants a symlink/junction where the data directory
+        // goes must not redirect the ACL change onto its target (TOCTOU). The
+        // reparse-point-aware open + check refuses it instead.
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        // Creating a symlink needs privilege (Developer Mode / admin); skip if not.
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            eprintln!(
+                "skipping harden_directory_dacl_refuses_a_symlinked_base: cannot create symlinks"
+            );
+            return;
+        }
+        let err = harden_directory_dacl(&link).expect_err("a symlinked base must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn harden_directory_dacl_refuses_a_planted_reparse_child() {
+        // A reparse point planted *inside* the data directory (before a re-install
+        // hardens it) must abort the install, not be skipped: locking the parent
+        // DACL leaves the link's target fixed, so a later privileged open under the
+        // directory would still be redirected through it.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("evil");
+        // Creating a symlink needs privilege (Developer Mode / admin); skip if not.
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            eprintln!(
+                "skipping harden_directory_dacl_refuses_a_planted_reparse_child: cannot create \
+                 symlinks"
+            );
+            return;
+        }
+        let err =
+            harden_directory_dacl(&base).expect_err("a planted reparse child must be refused");
+        // Restore base access so the temp dir is always removable (it was hardened
+        // before the walk reached the child).
+        reset_dacl_for_cleanup(&base);
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("evil"),
+            "error should name the offending child: {err}"
+        );
+    }
+
+    #[test]
+    fn fail_if_reparse_point_rejects_a_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        // A regular directory and a not-yet-existing path are both allowed.
+        fail_if_reparse_point(&real).expect("a regular directory is allowed");
+        fail_if_reparse_point(&parent.path().join("missing")).expect("a missing path is allowed");
+        // A symlink is rejected (skip where symlink creation needs privilege).
+        let link = parent.path().join("link");
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            eprintln!("skipping fail_if_reparse_point_rejects_a_symlink: cannot create symlinks");
+            return;
+        }
+        assert!(matches!(
+            fail_if_reparse_point(&link),
+            Err(ServiceCliError::Service(_))
+        ));
     }
 }
