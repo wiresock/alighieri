@@ -835,11 +835,12 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                     "tls.acme.domains requires at least one domain",
                 ));
             }
-            // Reject a structurally malformed domain at config load rather than
-            // handing it to the ACME stack. (Stricter ACME eligibility — no
-            // underscores/IDN — remains the ACME stack's concern.)
+            // Reject a name a public CA cannot issue for via TLS-ALPN-01 (wildcard,
+            // underscore, raw Unicode, bad hyphen, trailing dot) at config load,
+            // rather than starting up and only failing later in the ACME order with
+            // no usable certificate.
             for domain in vals {
-                crate::net::validate_hostname(domain).map_err(|e| {
+                crate::net::validate_acme_domain(domain).map_err(|e| {
                     // `{domain:?}` escapes the value so a rejected control character
                     // cannot forge the error/log line it appears in.
                     cfg_err(
@@ -2554,9 +2555,10 @@ socks pass "" { command: connect }"#,
 
     #[test]
     fn acme_domains_reject_malformed_entries() {
-        // Every tls.acme.domains entry is validated during parsing, so a malformed
-        // one fails --check rather than reaching the ACME stack.
-        for bad in ["foo..bar", "."] {
+        // Every tls.acme.domains entry is validated during parsing, so a name that
+        // is malformed (foo..bar/.) or that a CA cannot issue for via TLS-ALPN-01
+        // (wildcard, underscore) fails --check rather than reaching the ACME stack.
+        for bad in ["foo..bar", ".", "*.example.com", "_svc.example.com"] {
             let src = format!("internal: 0.0.0.0 port = 1080\ntls.acme.domains: {bad}");
             let err = Config::parse(&src).unwrap_err().to_string();
             assert!(
@@ -2564,6 +2566,8 @@ socks pass "" { command: connect }"#,
                 "expected a host-validation error for {bad:?}, got: {err}"
             );
         }
+        // (Acceptance of a valid issuable name is covered by net::validate_acme_domain
+        // tests; a full ACME config needs more fields than this unit asserts.)
     }
 
     #[test]
