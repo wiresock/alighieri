@@ -287,13 +287,16 @@ impl CommandAuth {
         cache_ttl: Option<Duration>,
         timeout: Duration,
     ) -> AuthOutcome {
-        // Reject credentials containing the stdin line delimiter (newline) or a
+        // Reject credentials containing a stdin line delimiter (LF or CR) or a
         // NUL up front — before any cache/tag work — so such pathological input
-        // can neither reach the command nor waste a tag derivation. RFC 1929
-        // fields are arbitrary bytes, but these values do not occur in practice.
+        // can neither reach the command nor desync the two-line stdin framing
+        // below (a verifier that splits on CRLF would otherwise see a different
+        // username/password boundary). RFC 1929 fields are arbitrary bytes, but
+        // these values do not occur in practice, and the userlist path already
+        // rejects CR/LF (`validate_username`); this matches it.
         if [username, password]
             .iter()
-            .any(|s| s.contains('\n') || s.contains('\0'))
+            .any(|s| s.contains(['\n', '\r', '\0']))
         {
             return AuthOutcome::Denied;
         }
@@ -339,7 +342,7 @@ impl CommandAuth {
         let Ok(permit) = self.limiter.clone().acquire_owned().await else {
             return false; // The limiter is never closed; fail closed regardless.
         };
-        // `verify_async` has already rejected credentials containing a newline or
+        // `verify_async` has already rejected credentials containing CR, LF, or
         // NUL, so the two-line stdin framing below is unambiguous.
         let child = match tokio::process::Command::new(&self.program)
             .args(&self.args)
@@ -946,14 +949,25 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn command_auth_rejects_embedded_delimiters() {
-        // A command that always succeeds; the newline in the password must still
-        // be rejected before it runs, to keep the stdin framing unambiguous.
+        // A command that always succeeds; a CR, LF, or NUL in either field must
+        // still be rejected before it runs, to keep the two-line stdin framing
+        // unambiguous (a verifier splitting on CRLF would otherwise mis-parse).
         let auth = sh_auth("exit 0");
-        assert_eq!(
-            auth.verify_async("alice", "sec\nret", None, Duration::from_secs(5))
-                .await,
-            AuthOutcome::Denied
-        );
+        for (user, pass) in [
+            ("alice", "sec\nret"), // LF in password
+            ("alice", "sec\rret"), // CR in password
+            ("al\rice", "secret"), // CR in username
+            ("al\nice", "secret"), // LF in username
+            ("alice", "sec\0ret"), // NUL in password
+            ("al\0ice", "secret"), // NUL in username
+        ] {
+            assert_eq!(
+                auth.verify_async(user, pass, None, Duration::from_secs(5))
+                    .await,
+                AuthOutcome::Denied,
+                "credentials with an embedded delimiter must be denied: {user:?}/{pass:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

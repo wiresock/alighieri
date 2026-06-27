@@ -22,6 +22,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- The external auth verifier (`auth.command`) now rejects credentials containing
+  a carriage return, matching the existing line-feed and NUL rejection (and the
+  userlist path's CR/LF rejection). A client-supplied `\r` could otherwise desync
+  the two-line `username\npassword\n` stdin framing for a verifier that splits on
+  CRLF.
 - The DNS deny categories now also catch IPv4-in-IPv6 forms and special-use IPv6
   prefixes that previously slipped through (SSRF defense-in-depth). The deprecated
   IPv4-compatible form (`::a.b.c.d`, e.g. `::127.0.0.1`) is folded to its IPv4
