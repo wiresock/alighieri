@@ -325,6 +325,18 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     // install if it fails (the directory still functions), so an unusual
     // filesystem or policy cannot block installation outright.
     if let Err(e) = harden_directory_dacl(&base) {
+        // `harden`'s no-follow handle check is authoritative (TOCTOU-safe) and
+        // returns `InvalidData` for a reparse point — e.g. if the base was swapped
+        // for a symlink in the window after `fail_if_reparse_point` above. In that
+        // case abort rather than populate through it; other failures stay
+        // best-effort (the directory still works, just less locked down).
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            return Err(ServiceCliError::Service(format!(
+                "refusing to install into {}: it is a symlink or reparse point. Remove it and \
+                 reinstall.",
+                base.display()
+            )));
+        }
         eprintln!(
             "alighieri: warning: could not restrict permissions on {} ({e}); ensure standard \
              users cannot write the service config or userlist there.",
@@ -1453,28 +1465,21 @@ mod tests {
         // Restore access immediately so the temp dir is always removable.
         reset_dacl_for_cleanup(&dir);
 
-        // Protected (no inherited ACEs from ProgramData)...
+        // Protected (no inherited ACEs from ProgramData).
         assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
-        // ...the three intended trustees are present...
-        assert!(sddl.contains(";;;SY)"), "SYSTEM ACE missing: {sddl}");
-        assert!(
-            sddl.contains(";;;BA)"),
-            "Administrators ACE missing: {sddl}"
-        );
-        assert!(sddl.contains(";;;LS)"), "LocalService ACE missing: {sddl}");
-        // ...and no broad principal (Everyone / Users / Authenticated Users) can
-        // write the config or userlist.
-        assert!(
-            !sddl.contains(";;;WD)"),
-            "Everyone must not be granted: {sddl}"
-        );
-        assert!(
-            !sddl.contains(";;;BU)"),
-            "Users must not be granted: {sddl}"
-        );
-        assert!(
-            !sddl.contains(";;;AU)"),
-            "Authenticated Users must not be granted: {sddl}"
+        // The DACL grants *exactly* SYSTEM, Administrators, and LocalService — no
+        // other (broad or unexpected) principal. Extract each ACE's trustee (its
+        // final `;`-separated field) and compare the whole set, so a stray ACE is
+        // caught rather than only the specific principals checked individually.
+        let trustees: std::collections::BTreeSet<&str> = sddl
+            .split(['(', ')'])
+            .filter(|chunk| chunk.contains(';'))
+            .filter_map(|ace| ace.rsplit(';').next())
+            .collect();
+        assert_eq!(
+            trustees,
+            std::collections::BTreeSet::from(["SY", "BA", "LS"]),
+            "DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
         );
     }
 
