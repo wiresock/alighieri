@@ -494,7 +494,7 @@ impl Server {
                 // drain, so an operator who set it expecting that sees the loss.
                 warn!(
                     active,
-                    "shutdown.draintimeout is 0: cutting in-flight connections immediately without draining"
+                    "shutdown: draintimeout is 0, cutting in-flight connections immediately without draining"
                 );
                 conns.shutdown().await;
             } else {
