@@ -1909,6 +1909,20 @@ tls.acme.staging: on
     }
 
     #[test]
+    fn acme_domains_normalize_trailing_dot() {
+        // A tolerated trailing dot (FQDN) is stripped when stored, so the ACME stack
+        // receives a clean identifier.
+        let cfg = Config::parse(
+            "internal: 0.0.0.0:443\ntls.acme.domains: proxy.example.com.\ntls.acme.cache: /tmp/acme",
+        )
+        .unwrap();
+        let Some(TlsConfig::Acme(acme)) = cfg.tls else {
+            panic!("expected an ACME TLS config");
+        };
+        assert_eq!(acme.domains, vec!["proxy.example.com".to_string()]);
+    }
+
+    #[test]
     fn acme_email_rejects_multiple_addresses() {
         let err = Config::parse(
             "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme\ntls.acme.email: a@example.com b@example.com",
@@ -2562,8 +2576,8 @@ socks pass "" { command: connect }"#,
     fn acme_domains_reject_malformed_entries() {
         // Every tls.acme.domains entry is validated during parsing, so a name that
         // is malformed (foo..bar/.) or that a CA cannot issue for via TLS-ALPN-01
-        // (wildcard, underscore, single-label, IP) fails --check rather than
-        // reaching the ACME stack.
+        // (wildcard, underscore, single-label, IP, special-use TLD) fails --check
+        // rather than reaching the ACME stack.
         for bad in [
             "foo..bar",
             ".",
@@ -2571,6 +2585,7 @@ socks pass "" { command: connect }"#,
             "_svc.example.com",
             "localhost",
             "127.0.0.1",
+            "router.local",
         ] {
             let src = format!("internal: 0.0.0.0 port = 1080\ntls.acme.domains: {bad}");
             let err = Config::parse(&src).unwrap_err().to_string();
