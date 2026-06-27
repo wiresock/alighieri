@@ -173,18 +173,24 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
 /// Rejects domain names that are unsafe to log or resolve. A SOCKS5 `DOMAIN`
-/// field is otherwise arbitrary bytes: an ASCII control character (CR, LF, NUL,
-/// TAB, ...) would forge log lines once the destination is Displayed into a text
-/// log, and be passed raw to the system resolver. Also rejects structurally
-/// invalid labels — empty (e.g. `a..b`, `.a`) or longer than the DNS 63-byte
-/// limit. A single trailing dot (an absolute name) is allowed, and the character
-/// set is otherwise unrestricted, so IDN/punycode and underscores still pass.
-/// The total length is already bounded to 255 by the wire format's one-byte
-/// length prefix.
+/// field is otherwise arbitrary bytes: a control or whitespace character (CR, LF,
+/// NUL, the Unicode C1 controls and line/paragraph separators, spaces, ...) would
+/// break or forge log lines once the destination is Displayed into a text log,
+/// and be passed raw to the system resolver. Also rejects structurally invalid
+/// labels — empty (e.g. `a..b`, `.a`) or longer than the DNS 63-byte limit. A
+/// single trailing dot (an absolute name) is allowed, and the character set is
+/// otherwise unrestricted, so IDN/punycode and underscores still pass (Unicode
+/// bidi/format characters are not rejected — a deliberate, narrow scope). The
+/// total length is already bounded to 255 by the wire format's one-byte length
+/// prefix.
 fn validate_domain(name: &str) -> Result<()> {
-    if name.bytes().any(|b| b.is_ascii_control()) {
+    // Reject any control or whitespace character, not just ASCII: this catches the
+    // Unicode C1 controls and NEL (U+0085), the line/paragraph separators
+    // (U+2028/U+2029), and spaces — all invalid in a hostname and able to break or
+    // spoof a text log line, or confuse the resolver.
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(Error::Protocol(
-            "domain name contains a control character".into(),
+            "domain name contains a control or whitespace character".into(),
         ));
     }
     // Treat a single trailing dot as an absolute name: strip it so the final
@@ -705,6 +711,22 @@ mod tests {
             "ex\nample.com",
             "ex\0ample.com",
             "ex\tample.com",
+        ] {
+            assert!(validate_domain(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_domain_rejects_unicode_controls_and_whitespace() {
+        // Beyond ASCII controls: Unicode NEL (U+0085), the line/paragraph
+        // separators (U+2028/U+2029), a plain space, and a non-breaking space
+        // (U+00A0) are all log-confusing and invalid in a hostname.
+        for bad in [
+            "ex\u{85}ample.com",
+            "ex\u{2028}ample.com",
+            "ex\u{2029}ample.com",
+            "ex ample.com",
+            "ex\u{a0}ample.com",
         ] {
             assert!(validate_domain(bad).is_err(), "{bad:?} must be rejected");
         }

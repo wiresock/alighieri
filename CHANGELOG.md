@@ -23,12 +23,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 ### Fixed
 
 - SOCKS5 domain destinations are now validated when parsed (for both TCP requests
-  and UDP datagrams): a name containing an ASCII control character (CR, LF, NUL,
-  ...) or a structurally invalid label (empty, or longer than the DNS 63-byte
-  limit) is rejected. Previously any UTF-8 was accepted and used raw, so a control
-  character in a domain could forge lines in a text log (the destination is
-  logged) or be passed verbatim to the resolver. A single trailing dot (absolute
-  name) and IDN/underscore labels are still accepted.
+  and UDP datagrams): a name containing a control or whitespace character (CR, LF,
+  NUL, the Unicode C1 controls and line/paragraph separators, spaces, ...) or a
+  structurally invalid label (empty, or longer than the DNS 63-byte limit) is
+  rejected. Previously any UTF-8 was accepted and used raw, so such a character in
+  a domain could break or forge lines in a text log (the destination is logged) or
+  be passed verbatim to the resolver. A single trailing dot (absolute name) and
+  IDN/underscore labels are still accepted.
 - The Windows installer now restricts the ACL on its `ProgramData\Alighieri` data
   directory at install time, so a standard user can no longer write the config or
   userlist the privileged service loads (a local privilege-escalation surface) or
