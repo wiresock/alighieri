@@ -393,18 +393,43 @@ fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
 fn secure_existing_children(dir: &Path) {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "alighieri: warning: could not enumerate {} to re-secure its contents ({e}); \
+                 existing files there may stay permissive.",
+                dir.display()
+            );
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "alighieri: warning: could not read a directory entry under {} ({e}); skipping.",
+                    dir.display()
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         // `symlink_metadata` does not follow the link (unambiguously, matching
         // `fail_if_reparse_point`). Check the reparse-point attribute — which
         // covers junctions/mount points, not just symlinks — so we never secure
         // or, worse, recurse *through* a planted reparse point onto a tree outside
         // the data directory.
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                eprintln!(
+                    "alighieri: warning: could not inspect {} to re-secure it ({e}); skipping.",
+                    path.display()
+                );
+                continue;
+            }
         };
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             eprintln!(
