@@ -309,13 +309,15 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
 
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     let base = default_base_dir();
-    std::fs::create_dir_all(&base)?;
     // A standard user who can write under `ProgramData` might pre-create the data
-    // directory (or `logs/`) as a symlink/junction. Refuse to populate a reparse
-    // point: creating files under it would follow the link and redirect these
-    // privileged writes outside the intended directory. Fatal, like the ACL
-    // hardening below — both fail the install rather than proceed insecurely.
+    // directory (or `logs/`) as a symlink/junction. Refuse a reparse point *before*
+    // any filesystem write at this path: `create_dir_all` on a pre-planted link
+    // would follow it and could create its target outside the intended directory.
+    // Fatal, like the ACL hardening below — both fail the install rather than
+    // proceed insecurely. (A link swapped in after this check is still caught: the
+    // no-follow handle check in `secure_path_acl` refuses a reparse base too.)
     fail_if_reparse_point(&base)?;
+    std::fs::create_dir_all(&base)?;
     // Restrict the base directory's ACL before populating it. A `ProgramData`
     // subfolder is otherwise writable (and readable) by standard users through
     // inherited permissions, so a non-admin could tamper with the config/userlist
