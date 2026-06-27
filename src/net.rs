@@ -215,20 +215,31 @@ pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
 
 /// Validates a `tls.acme.domains` identifier more strictly than
 /// [`validate_hostname`]: it must be a name a public CA can actually issue a
-/// **TLS-ALPN-01** certificate for. On top of the structural checks, every label
-/// must be ASCII **LDH** (letter/digit/hyphen) with no leading or trailing hyphen,
-/// and the name must not be a wildcard (`*.…` needs DNS-01, which this does not
-/// use), contain an underscore or a raw-Unicode label (supply punycode `xn--`
-/// instead), or carry a trailing dot. Catching these at config load avoids a
-/// `--check`-clean start that then fails inside the ACME order/renewal task,
-/// leaving the proxy with no usable certificate.
+/// **TLS-ALPN-01** certificate for. On top of the structural checks it must be a
+/// multi-label DNS name (not an IP address, and not a single-label/local name like
+/// `localhost`), and every label must be ASCII **LDH** (letter/digit/hyphen) with
+/// no leading or trailing hyphen — so wildcards (`*.…` needs DNS-01, which this
+/// does not use), underscores, and raw-Unicode labels (supply punycode `xn--`) are
+/// rejected. A single trailing dot (an absolute name) is tolerated and normalised
+/// away by the caller. Catching these at config load avoids a `--check`-clean
+/// start that then fails inside the ACME order/renewal task with no usable
+/// certificate.
 pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
-    // Structure (control/whitespace, empty labels, 63/253 limits) first.
+    // Structure (control/whitespace, empty labels, 63/253 limits) first; this also
+    // tolerates a single trailing dot, so validate the stem below.
     validate_hostname(name)?;
-    if name.ends_with('.') {
-        return Err("must not end with a dot for ACME".into());
+    let stem = name.strip_suffix('.').unwrap_or(name);
+    if stem.parse::<IpAddr>().is_ok() {
+        return Err("must be a DNS name, not an IP address".into());
     }
-    for label in name.split('.') {
+    if !stem.contains('.') {
+        return Err(
+            "must be a multi-label DNS name (a public CA cannot issue for a single-label or \
+             local name)"
+                .into(),
+        );
+    }
+    for label in stem.split('.') {
         // `validate_hostname` already rejected empty / over-long labels.
         if !label
             .bytes()
@@ -474,8 +485,11 @@ mod tests {
             "é.example.com",    // raw Unicode (use punycode)
             "-bad.example.com", // leading hyphen
             "bad-.example.com", // trailing hyphen
-            "example.com.",     // trailing dot
             "foo..bar",         // structural (empty label) still caught
+            "localhost",        // single-label / no public TLD
+            "127.0.0.1",        // IPv4 is not a DNS identifier
+            "127.0.0.1.",       // ...nor with a trailing dot
+            "::1",              // IPv6 is not a DNS identifier
         ] {
             assert!(
                 validate_acme_domain(bad).is_err(),
@@ -491,6 +505,7 @@ mod tests {
             "a.b.example.org",
             "host-1.example.com",        // an internal hyphen is fine
             "xn--bcher-kva.example.com", // IDN supplied as punycode
+            "example.com.",              // a single trailing dot (FQDN) is tolerated
         ] {
             assert!(validate_acme_domain(ok).is_ok(), "{ok:?} must be accepted");
         }

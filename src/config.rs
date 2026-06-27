@@ -835,10 +835,10 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                     "tls.acme.domains requires at least one domain",
                 ));
             }
-            // Reject a name a public CA cannot issue for via TLS-ALPN-01 (wildcard,
-            // underscore, raw Unicode, bad hyphen, trailing dot) at config load,
-            // rather than starting up and only failing later in the ACME order with
-            // no usable certificate.
+            // Reject a name a public CA cannot issue for via TLS-ALPN-01 (IP
+            // address, single-label/local name, wildcard, underscore, raw Unicode,
+            // bad hyphen) at config load, rather than starting up and only failing
+            // later in the ACME order with no usable certificate.
             for domain in vals {
                 crate::net::validate_acme_domain(domain).map_err(|e| {
                     // `{domain:?}` escapes the value so a rejected control character
@@ -849,7 +849,12 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                     )
                 })?;
             }
-            b.tls_acme_domains = vals.to_vec();
+            // Store the canonical form: a tolerated trailing dot (FQDN) is stripped
+            // so the ACME stack receives a clean identifier.
+            b.tls_acme_domains = vals
+                .iter()
+                .map(|d| d.strip_suffix('.').unwrap_or(d).to_string())
+                .collect();
         }
         "tlsacmeemail" | "tls.acme.email" => match vals {
             [] => return Err(cfg_err(lineno, "tls.acme.email requires an address")),
@@ -2557,8 +2562,16 @@ socks pass "" { command: connect }"#,
     fn acme_domains_reject_malformed_entries() {
         // Every tls.acme.domains entry is validated during parsing, so a name that
         // is malformed (foo..bar/.) or that a CA cannot issue for via TLS-ALPN-01
-        // (wildcard, underscore) fails --check rather than reaching the ACME stack.
-        for bad in ["foo..bar", ".", "*.example.com", "_svc.example.com"] {
+        // (wildcard, underscore, single-label, IP) fails --check rather than
+        // reaching the ACME stack.
+        for bad in [
+            "foo..bar",
+            ".",
+            "*.example.com",
+            "_svc.example.com",
+            "localhost",
+            "127.0.0.1",
+        ] {
             let src = format!("internal: 0.0.0.0 port = 1080\ntls.acme.domains: {bad}");
             let err = Config::parse(&src).unwrap_err().to_string();
             assert!(

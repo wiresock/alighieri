@@ -36,11 +36,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   over the 253-byte DNS limit) fails `--check` instead of silently failing to
   resolve and falling back at runtime, or being handed to the ACME stack.
 - `tls.acme.domains` entries are additionally validated against what a public CA
-  can issue for via TLS-ALPN-01: ASCII LDH labels only (no wildcards — those need
-  DNS-01 — no underscores, and no raw Unicode; supply punycode `xn--` for IDN), no
-  leading/trailing hyphen, and no trailing dot. A non-issuable name now fails
-  `--check` rather than starting the proxy and only then failing the ACME order
-  with no usable certificate.
+  can issue for via TLS-ALPN-01: a multi-label DNS name (not an IP address, and not
+  a single-label/local name like `localhost`) with ASCII LDH labels only (no
+  wildcards — those need DNS-01 — no underscores, and no raw Unicode; supply
+  punycode `xn--` for IDN) and no leading/trailing hyphen. A single trailing dot
+  (FQDN) is accepted and normalised away. A non-issuable name now fails `--check`
+  rather than starting the proxy and only then failing the ACME order with no
+  usable certificate.
 - The Windows installer now restricts the ACL on its `ProgramData\Alighieri` data
   directory at install time, so a standard user can no longer write the config or
   userlist the privileged service loads (a local privilege-escalation surface) or
