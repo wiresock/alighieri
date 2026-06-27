@@ -307,6 +307,12 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
     Ok(path)
 }
 
+/// The protected DACL (no owner) shared by the born-secure create and the
+/// re-harden path so they cannot drift: `D:PAI` = protected, auto-inherited;
+/// SYSTEM (SY) and Administrators (BA) Full, LocalService (LS) Modify (0x1301bf),
+/// all object+container inheritable so children created afterward inherit them.
+const HARDENED_DACL_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     let base = default_base_dir();
     // A standard user who can write under `ProgramData` might pre-create the data
@@ -317,7 +323,14 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     // proceed insecurely. (A link swapped in after this check is still caught: the
     // no-follow handle check in `secure_path_acl` refuses a reparse base too.)
     fail_if_reparse_point(&base)?;
-    std::fs::create_dir_all(&base)?;
+    // Create the base directory with the protected DACL applied *atomically*, so a
+    // fresh install never passes through a window where it inherits `ProgramData`'s
+    // standard-user-writable ACL. Otherwise a standard user racing the install
+    // could open a write handle to the directory (or a child) while it is still
+    // permissive and keep it past the hardening step — Windows does not revoke
+    // already-open handles when the DACL is later tightened. If it already exists
+    // this is a no-op and `harden_directory_dacl` below secures the existing one.
+    create_secure_base_dir(&base)?;
     // Restrict the base directory's ACL before populating it. A `ProgramData`
     // subfolder is otherwise writable (and readable) by standard users through
     // inherited permissions, so a non-admin could tamper with the config/userlist
@@ -478,6 +491,68 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Creates `base` with the [`HARDENED_DACL_SDDL`] protected DACL applied
+/// atomically (born secure), so a fresh install never passes through a window
+/// where the directory inherits `ProgramData`'s standard-user-writable ACL — a
+/// window in which a racing standard user could open a handle that survives the
+/// later hardening. If `base` already exists this is a no-op (the caller hardens
+/// the existing directory); any other failure propagates so the install fails
+/// closed. The owner is left as the creator and `secure_path_acl` takes ownership
+/// afterward — setting owner at create time would need elevation the SDDL omits.
+fn create_secure_base_dir(base: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    // The parent (`ProgramData`) already exists; create it defensively so only the
+    // leaf is the security-sensitive create.
+    if let Some(parent) = base.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let wide: Vec<u16> = base
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let sddl_w: Vec<u16> = HARDENED_DACL_SDDL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: standard Win32 calls. `ConvertString...` allocates a self-relative
+    // descriptor freed by `LocalFree`; it stays valid through the `CreateDirectoryW`
+    // call that borrows it via `SECURITY_ATTRIBUTES`.
+    unsafe {
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(wide.as_ptr(), &sa);
+        // Capture the error before `LocalFree`, which can clobber the thread error.
+        let err = std::io::Error::last_os_error();
+        LocalFree(psd);
+        if created == 0 && err.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Sets `path`'s owner to `Administrators` and a protected DACL (granting only
 /// `SYSTEM`/`Administrators` Full and `LocalService` Modify), operating on a
 /// handle opened **without following reparse points** so a symlink/junction a
@@ -514,10 +589,9 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-    // O:BA = owner Administrators. D:PAI = protected, auto-inherited DACL: SYSTEM
-    // (SY) and Administrators (BA) Full, LocalService (LS) Modify (0x1301bf), all
-    // object+container inheritable so children created afterward inherit them.
-    const SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+    // `O:BA` (owner Administrators) prepended to the shared protected DACL, so the
+    // born-secure create and this re-harden apply the same ACEs.
+    let sddl = format!("O:BA{HARDENED_DACL_SDDL}");
 
     // `BACKUP_SEMANTICS` is required to open a directory handle; `OPEN_REPARSE_POINT`
     // opens the link itself rather than its target. Prefer a handle that can also
@@ -550,7 +624,7 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
         ));
     }
     let raw = handle.as_raw_handle();
-    let sddl_w: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
 
     // SAFETY: standard Win32 security calls. `ConvertString...` allocates a
     // self-relative descriptor freed by `LocalFree`; the DACL/owner pointers point
@@ -1554,6 +1628,41 @@ mod tests {
             trustees,
             std::collections::BTreeSet::from(["SY", "BA", "LS"]),
             "DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
+        );
+    }
+
+    #[test]
+    fn create_secure_base_dir_is_born_protected() {
+        // The base must be created already locked down, never passing through a
+        // window with ProgramData's inherited (standard-user-writable) ACL.
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("born-secure");
+
+        create_secure_base_dir(&base).expect("creating the secured base must succeed");
+        assert!(
+            base.is_dir(),
+            "the base directory must exist: {}",
+            base.display()
+        );
+        let sddl = read_dacl_sddl(&base);
+        // Idempotent: a second call over the existing directory is a no-op success.
+        create_secure_base_dir(&base).expect("an existing base must be a no-op");
+        // Restore access so the temp dir is always removable.
+        reset_dacl_for_cleanup(&base);
+
+        assert!(
+            sddl.starts_with("D:P"),
+            "born-secure DACL must be protected: {sddl}"
+        );
+        let trustees: std::collections::BTreeSet<&str> = sddl
+            .split(['(', ')'])
+            .filter(|chunk| chunk.contains(';'))
+            .filter_map(|ace| ace.rsplit(';').next())
+            .collect();
+        assert_eq!(
+            trustees,
+            std::collections::BTreeSet::from(["SY", "BA", "LS"]),
+            "born-secure DACL trustees must be exactly SYSTEM/Administrators/LocalService: {sddl}"
         );
     }
 
