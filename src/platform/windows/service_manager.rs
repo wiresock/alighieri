@@ -443,10 +443,11 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
             // A reparse point swapped in after the `symlink_metadata` check above
             // (a TOCTOU race the point-in-time attribute check cannot close) makes
             // `secure_path_acl`'s no-follow handle check return `InvalidData`;
-            // re-label it with the child path. Any other error means this child's
-            // ACL could not be reset — if it is a pre-existing config/userlist, its
-            // old (possibly permissive) ACL would persist under the secured base, so
-            // it is fatal too.
+            // re-label it with the child path. A child that vanished in that same
+            // window is benign (it is gone, not a permissive file), so skip it. Any
+            // other error means this child's ACL could not be reset — if it is a
+            // pre-existing config/userlist, its old (possibly permissive) ACL would
+            // persist under the secured base, so it is fatal too.
             if e.kind() == std::io::ErrorKind::InvalidData {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -456,10 +457,20 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
                     ),
                 ));
             }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
             return Err(e);
         }
         if meta.is_dir() {
-            secure_existing_children(&path)?;
+            // A subdirectory that vanished between the check above and this descent
+            // surfaces as `NotFound` from its `read_dir`; that is the same benign
+            // mid-walk removal, so tolerate it rather than abort the install.
+            match secure_existing_children(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())
@@ -492,10 +503,15 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
 
     // Standard access bits (stable constants, avoiding feature churn):
     // READ_CONTROL to read the current descriptor (needed when switching the DACL
-    // to protected), WRITE_DAC to set the DACL, WRITE_OWNER to take ownership.
+    // to protected), WRITE_DAC to set the DACL, WRITE_OWNER to take ownership,
+    // FILE_READ_ATTRIBUTES so `handle.metadata()` can read the reparse-point
+    // attribute below — the owner gets READ_CONTROL/WRITE_DAC implicitly but not
+    // attribute-read, so without this the no-follow check could fail spuriously on
+    // a child whose ACL does not grant it.
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     // O:BA = owner Administrators. D:PAI = protected, auto-inherited DACL: SYSTEM
     // (SY) and Administrators (BA) Full, LocalService (LS) Modify (0x1301bf), all
     // object+container inheritable so children created afterward inherit them.
@@ -512,10 +528,14 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
     };
-    let (handle, with_owner) = match open(READ_CONTROL | WRITE_DAC | WRITE_OWNER) {
-        Ok(handle) => (handle, true),
-        Err(_) => (open(READ_CONTROL | WRITE_DAC)?, false),
-    };
+    let (handle, with_owner) =
+        match open(READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES) {
+            Ok(handle) => (handle, true),
+            Err(_) => (
+                open(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?,
+                false,
+            ),
+        };
     // The handle refers to the link itself (OPEN_REPARSE_POINT). Refuse any
     // reparse point — symlink or junction/mount point — via the attribute, which
     // `file_type().is_symlink()` would miss for junctions.
