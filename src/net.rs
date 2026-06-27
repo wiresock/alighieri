@@ -220,10 +220,11 @@ pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
 /// `localhost`), and every label must be ASCII **LDH** (letter/digit/hyphen) with
 /// no leading or trailing hyphen — so wildcards (`*.…` needs DNS-01, which this
 /// does not use), underscores, and raw-Unicode labels (supply punycode `xn--`) are
-/// rejected. A single trailing dot (an absolute name) is tolerated and normalised
-/// away by the caller. Catching these at config load avoids a `--check`-clean
-/// start that then fails inside the ACME order/renewal task with no usable
-/// certificate.
+/// rejected. The rightmost label must not be a special-use/non-public TLD (`.local`,
+/// `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`).
+/// A single trailing dot (an absolute name) is tolerated and normalised away by the
+/// caller. Catching these at config load avoids a `--check`-clean start that then
+/// fails inside the ACME order/renewal task with no usable certificate.
 pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
     // Structure (control/whitespace, empty labels, 63/253 limits) first; this also
     // tolerates a single trailing dot, so validate the stem below.
@@ -253,6 +254,28 @@ pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
         if label.starts_with('-') || label.ends_with('-') {
             return Err("has a label with a leading or trailing hyphen".into());
         }
+    }
+    // Special-use / non-public top-level domains (RFC 6761 test/example/invalid/
+    // localhost, RFC 6762 local, RFC 8375 home.arpa via the .arpa infrastructure
+    // TLD, ICANN private-use .internal, RFC 7686 .onion): a public CA issues for
+    // none of these. A static list suffices — these are RFC-stable, unlike the
+    // public-suffix list, which would need bundling/updating and could then start
+    // rejecting legitimate new TLDs.
+    const SPECIAL_USE_TLDS: &[&str] = &[
+        "local",
+        "localhost",
+        "test",
+        "invalid",
+        "example",
+        "internal",
+        "arpa",
+        "onion",
+    ];
+    let tld = stem.rsplit('.').next().unwrap_or(stem);
+    if SPECIAL_USE_TLDS.iter().any(|s| tld.eq_ignore_ascii_case(s)) {
+        return Err(format!(
+            "ends in the special-use TLD '.{tld}', which no public CA issues certificates for"
+        ));
     }
     Ok(())
 }
@@ -490,6 +513,13 @@ mod tests {
             "127.0.0.1",        // IPv4 is not a DNS identifier
             "127.0.0.1.",       // ...nor with a trailing dot
             "::1",              // IPv6 is not a DNS identifier
+            "router.local",     // special-use TLD (mDNS)
+            "app.test",         // special-use TLD (RFC 6761)
+            "service.invalid",  // special-use TLD (RFC 6761)
+            "host.home.arpa",   // .arpa infrastructure TLD (RFC 8375)
+            "x.internal",       // ICANN private-use TLD
+            "h.onion",          // Tor (RFC 7686)
+            "DEV.LOCAL",        // denylist is case-insensitive
         ] {
             assert!(
                 validate_acme_domain(bad).is_err(),
