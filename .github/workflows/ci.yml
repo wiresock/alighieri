@@ -38,6 +38,12 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test (lib, bins, integration, examples)
         run: cargo test --all-targets --locked
+        env:
+          # On Windows, require the ProgramData DACL tests to actually run: they
+          # skip on a non-elevated account, so without this a runner that cannot
+          # apply the DACL could report green while never verifying it. Empty on
+          # Linux (the tests are Windows-only), where it has no effect.
+          ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
       - name: Doctests
         run: cargo test --doc --locked
 

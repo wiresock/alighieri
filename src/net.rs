@@ -170,6 +170,48 @@ impl std::str::FromStr for PortRange {
     }
 }
 
+/// Rejects host names that are unsafe to log or resolve. Shared by the SOCKS
+/// request/UDP parsers (client-supplied destinations) and config parsing
+/// (`udp.advertise`, `tls.acme.domains`), so all three reject the same shapes.
+///
+/// Rejects any control or whitespace character (CR, LF, NUL, the Unicode C1
+/// controls and line/paragraph separators, spaces, ...) — which would break or
+/// forge a text log line, or be passed raw to the resolver — and structurally
+/// invalid labels (empty, e.g. `a..b` / `.a` / `.`, or longer than the DNS
+/// 63-byte limit), and names whose total exceeds the 253-byte DNS limit. A
+/// single trailing dot (an absolute name) is allowed; the
+/// character set is otherwise unrestricted, so IDN/punycode and underscores still
+/// pass. This is a safety/structure check, not full hostname canonicalisation —
+/// Unicode bidi/format characters are not rejected, and ACME name *eligibility*
+/// remains the ACME stack's concern. The error is a fragment a caller prefixes
+/// with context (e.g. `domain name {e}`).
+pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
+    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("contains a control or whitespace character".into());
+    }
+    // Treat a single trailing dot as an absolute name: strip it so the final
+    // label is not seen as empty.
+    let stem = name.strip_suffix('.').unwrap_or(name);
+    if stem.is_empty() {
+        return Err("has no labels".into());
+    }
+    // RFC 1035 caps a domain name at 253 bytes in text form. The SOCKS wire format
+    // bounds its own field to 255, but config values (udp.advertise, ACME) are
+    // unbounded, so enforce it here for all callers.
+    if stem.len() > 253 {
+        return Err("exceeds the maximum DNS name length of 253 bytes".into());
+    }
+    for label in stem.split('.') {
+        if label.is_empty() {
+            return Err("has an empty label".into());
+        }
+        if label.len() > 63 {
+            return Err("has a label longer than 63 bytes".into());
+        }
+    }
+    Ok(())
+}
+
 /// A destination hostname matcher for a `socks` rule `to:` selector.
 ///
 /// Matched against the hostname the client requested *before* resolution, so a
@@ -332,6 +374,63 @@ impl AddrSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_hostname_rejects_control_characters() {
+        // CR/LF would forge log lines (the destination is logged); NUL/TAB are
+        // likewise invalid in a hostname.
+        for bad in [
+            "ex\rample.com",
+            "ex\nample.com",
+            "ex\0ample.com",
+            "ex\tample.com",
+        ] {
+            assert!(validate_hostname(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_hostname_rejects_unicode_controls_and_whitespace() {
+        // Beyond ASCII controls: Unicode NEL (U+0085), the line/paragraph
+        // separators (U+2028/U+2029), a plain space, and a non-breaking space
+        // (U+00A0) are all log-confusing and invalid in a hostname.
+        for bad in [
+            "ex\u{85}ample.com",
+            "ex\u{2028}ample.com",
+            "ex\u{2029}ample.com",
+            "ex ample.com",
+            "ex\u{a0}ample.com",
+        ] {
+            assert!(validate_hostname(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_hostname_rejects_malformed_labels() {
+        assert!(validate_hostname("foo..bar").is_err()); // empty interior label
+        assert!(validate_hostname(".foo").is_err()); // empty leading label
+        assert!(validate_hostname(".").is_err()); // no labels
+        assert!(validate_hostname("foo..").is_err()); // multiple trailing dots
+        assert!(validate_hostname("foo.").is_ok()); // single trailing dot (FQDN)
+        let oversize = format!("{}.com", "a".repeat(64)); // label over 63 bytes
+        assert!(validate_hostname(&oversize).is_err());
+        // Total length over the 253-byte DNS limit (each label is within 63).
+        let too_long = vec!["a".repeat(63); 4].join("."); // 255 bytes
+        assert!(validate_hostname(&too_long).is_err());
+    }
+
+    #[test]
+    fn validate_hostname_accepts_normal_and_absolute_names() {
+        for ok in [
+            "example.com",
+            "a.b.c.example.org",
+            "under_score.example",   // underscores occur in real records
+            "xn--bcher-kva.example", // IDN/punycode
+            "host.example.com.",     // absolute name (trailing dot)
+        ] {
+            assert!(validate_hostname(ok).is_ok(), "{ok:?} must be accepted");
+        }
+    }
 
     #[test]
     fn cidr_v4_contains() {
