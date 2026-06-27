@@ -1579,6 +1579,10 @@ mod tests {
             // so it can no longer read the descriptor. Signal a skip, not a failure.
             const ERROR_ACCESS_DENIED: u32 = 5;
             if rc == ERROR_ACCESS_DENIED {
+                // `psd` is null on failure (nothing to free), but free it
+                // defensively in case the API ever sets it on error —
+                // `LocalFree(null)` is a no-op.
+                LocalFree(psd);
                 return None;
             }
             assert_eq!(rc, 0, "GetNamedSecurityInfoW failed (code {rc})");
