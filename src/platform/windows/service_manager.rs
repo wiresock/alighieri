@@ -308,10 +308,97 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
 }
 
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
-    std::fs::create_dir_all(default_base_dir())?;
+    let base = default_base_dir();
+    std::fs::create_dir_all(&base)?;
+    // Restrict the base directory's ACL before populating it. A `ProgramData`
+    // subfolder is otherwise writable (and readable) by standard users through
+    // inherited permissions, so a non-admin could tamper with the config/userlist
+    // the privileged service loads — local privilege escalation — or read the
+    // userlist's secrets. Doing it before creating `logs/` and the config means
+    // those inherit the restricted ACL. Best-effort: warn rather than abort the
+    // install if it fails (the directory still functions), so an unusual
+    // filesystem or policy cannot block installation outright.
+    if let Err(e) = harden_directory_dacl(&base) {
+        eprintln!(
+            "alighieri: warning: could not restrict permissions on {} ({e}); ensure standard \
+             users cannot write the service config or userlist there.",
+            base.display()
+        );
+    }
     std::fs::create_dir_all(default_log_dir())?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Replaces `dir`'s ACL with a protected DACL (no inheritance from `ProgramData`)
+/// granting Full Control to `SYSTEM` and `Administrators`, and Modify to the
+/// `LocalService` account the service runs as (so it can still read the config
+/// and write logs/ACME under here) — and **nothing** to standard users. The
+/// inheritable (`OICI`) entries propagate to the files and subdirectories created
+/// afterward. SIDs are used rather than names so this is locale-independent.
+fn harden_directory_dacl(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // D:PAI = DACL, Protected (drop inherited ACEs), Auto-Inherited. ACEs:
+    //   SYSTEM (SY) and Administrators (BA): Full, object+container inheritable.
+    //   LocalService (LS): Modify (0x1301bf) so the service reads its config and
+    //   writes logs/ACME; not Full, so it cannot rewrite the ACL.
+    const SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;LS)";
+    let sddl_w: Vec<u16> = SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut path_w: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: standard Win32 security calls. `ConvertString...` allocates a
+    // self-relative descriptor that `LocalFree` releases; `GetSecurityDescriptorDacl`
+    // returns a pointer into that descriptor, which stays valid until the free.
+    unsafe {
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut present = 0;
+        let mut pdacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = 0;
+        if GetSecurityDescriptorDacl(psd, &mut present, &mut pdacl, &mut defaulted) == 0
+            || present == 0
+        {
+            let err = std::io::Error::last_os_error();
+            LocalFree(psd);
+            return Err(err);
+        }
+        let rc = SetNamedSecurityInfoW(
+            path_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            pdacl,
+            std::ptr::null_mut(),
+        );
+        LocalFree(psd);
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
     }
     Ok(())
 }
@@ -1133,6 +1220,116 @@ mod tests {
         assert_eq!(
             names,
             vec![std::ffi::OsString::from("service-config-path.txt")]
+        );
+    }
+
+    /// Reads back a directory's DACL as an SDDL string. Uses the well-known
+    /// 2-letter SID abbreviations (`SY`/`BA`/`LS`/...), so assertions on it are
+    /// locale-independent (unlike `icacls`'s resolved account names).
+    fn read_dacl_sddl(dir: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        let path_w: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut psd,
+            );
+            assert_eq!(rc, 0, "GetNamedSecurityInfoW failed (code {rc})");
+            let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+            let mut len = 0u32;
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut len,
+            );
+            assert_ne!(ok, 0, "converting the descriptor to SDDL failed");
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(sddl_ptr, len as usize));
+            LocalFree(sddl_ptr.cast());
+            LocalFree(psd);
+            sddl
+        }
+    }
+
+    /// Drops the protection and grants everyone, so the temp directory can be
+    /// removed afterward whatever account runs the test (the owner can always
+    /// rewrite the DACL).
+    fn reset_dacl_for_cleanup(dir: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let mut path_w: Vec<u16> = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            SetNamedSecurityInfoW(
+                path_w.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(), // a NULL DACL grants full access to everyone
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    #[test]
+    fn harden_directory_dacl_locks_out_standard_users() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("svc-data");
+        std::fs::create_dir(&dir).unwrap();
+
+        harden_directory_dacl(&dir).expect("hardening an owned directory must succeed");
+        let sddl = read_dacl_sddl(&dir);
+        // Restore access immediately so the temp dir is always removable.
+        reset_dacl_for_cleanup(&dir);
+
+        // Protected (no inherited ACEs from ProgramData)...
+        assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
+        // ...the three intended trustees are present...
+        assert!(sddl.contains(";;;SY)"), "SYSTEM ACE missing: {sddl}");
+        assert!(
+            sddl.contains(";;;BA)"),
+            "Administrators ACE missing: {sddl}"
+        );
+        assert!(sddl.contains(";;;LS)"), "LocalService ACE missing: {sddl}");
+        // ...and no broad principal (Everyone / Users / Authenticated Users) can
+        // write the config or userlist.
+        assert!(
+            !sddl.contains(";;;WD)"),
+            "Everyone must not be granted: {sddl}"
+        );
+        assert!(
+            !sddl.contains(";;;BU)"),
+            "Users must not be granted: {sddl}"
+        );
+        assert!(
+            !sddl.contains(";;;AU)"),
+            "Authenticated Users must not be granted: {sddl}"
         );
     }
 }
