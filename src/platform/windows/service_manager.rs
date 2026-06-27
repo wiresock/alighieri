@@ -386,11 +386,12 @@ fn secure_existing_children(dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `DirEntry::metadata` does not follow the link. Check the reparse-point
-        // attribute (which covers junctions/mount points, not just symlinks) so we
-        // never secure or, worse, recurse *through* a planted reparse point onto a
-        // tree outside the data directory.
-        let Ok(meta) = entry.metadata() else {
+        // `symlink_metadata` does not follow the link (unambiguously, matching
+        // `fail_if_reparse_point`). Check the reparse-point attribute — which
+        // covers junctions/mount points, not just symlinks — so we never secure
+        // or, worse, recurse *through* a planted reparse point onto a tree outside
+        // the data directory.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
