@@ -178,7 +178,8 @@ impl std::str::FromStr for PortRange {
 /// controls and line/paragraph separators, spaces, ...) — which would break or
 /// forge a text log line, or be passed raw to the resolver — and structurally
 /// invalid labels (empty, e.g. `a..b` / `.a` / `.`, or longer than the DNS
-/// 63-byte limit). A single trailing dot (an absolute name) is allowed; the
+/// 63-byte limit), and names whose total exceeds the 253-byte DNS limit. A
+/// single trailing dot (an absolute name) is allowed; the
 /// character set is otherwise unrestricted, so IDN/punycode and underscores still
 /// pass. This is a safety/structure check, not full hostname canonicalisation —
 /// Unicode bidi/format characters are not rejected, and ACME name *eligibility*
@@ -193,6 +194,12 @@ pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
     let stem = name.strip_suffix('.').unwrap_or(name);
     if stem.is_empty() {
         return Err("has no labels".into());
+    }
+    // RFC 1035 caps a domain name at 253 bytes in text form. The SOCKS wire format
+    // bounds its own field to 255, but config values (udp.advertise, ACME) are
+    // unbounded, so enforce it here for all callers.
+    if stem.len() > 253 {
+        return Err("exceeds the maximum DNS name length of 253 bytes".into());
     }
     for label in stem.split('.') {
         if label.is_empty() {
@@ -403,8 +410,13 @@ mod tests {
         assert!(validate_hostname("foo..bar").is_err()); // empty interior label
         assert!(validate_hostname(".foo").is_err()); // empty leading label
         assert!(validate_hostname(".").is_err()); // no labels
+        assert!(validate_hostname("foo..").is_err()); // multiple trailing dots
+        assert!(validate_hostname("foo.").is_ok()); // single trailing dot (FQDN)
         let oversize = format!("{}.com", "a".repeat(64)); // label over 63 bytes
         assert!(validate_hostname(&oversize).is_err());
+        // Total length over the 253-byte DNS limit (each label is within 63).
+        let too_long = vec!["a".repeat(63); 4].join("."); // 255 bytes
+        assert!(validate_hostname(&too_long).is_err());
     }
 
     #[test]

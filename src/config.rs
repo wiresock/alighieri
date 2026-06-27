@@ -721,7 +721,10 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                     // a malformed one now so `--check` catches it instead of it
                     // silently failing to resolve and falling back at runtime.
                     crate::net::validate_hostname(spec).map_err(|e| {
-                        cfg_err(lineno, &format!("invalid udp.advertise host '{spec}': {e}"))
+                        // `{spec:?}` escapes the value: it is one validation rejects
+                        // (e.g. a control char), so it must not land verbatim in the
+                        // error/log output it would otherwise forge.
+                        cfg_err(lineno, &format!("invalid udp.advertise host {spec:?}: {e}"))
                     })?;
                     UdpAdvertise::Host(spec.clone())
                 }
@@ -837,9 +840,11 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             // underscores/IDN — remains the ACME stack's concern.)
             for domain in vals {
                 crate::net::validate_hostname(domain).map_err(|e| {
+                    // `{domain:?}` escapes the value so a rejected control character
+                    // cannot forge the error/log line it appears in.
                     cfg_err(
                         lineno,
-                        &format!("invalid tls.acme.domains entry '{domain}': {e}"),
+                        &format!("invalid tls.acme.domains entry {domain:?}: {e}"),
                     )
                 })?;
             }
