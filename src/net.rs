@@ -221,8 +221,8 @@ pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
 /// no leading or trailing hyphen — so wildcards (`*.…` needs DNS-01, which this
 /// does not use), underscores, and raw-Unicode labels (supply punycode `xn--`) are
 /// rejected. The rightmost label must not be a special-use/non-public TLD (`.local`,
-/// `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`).
-/// A single trailing dot (an absolute name) is tolerated and normalised away by the
+/// `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`,
+/// `.alt`). A single trailing dot (an absolute name) is tolerated and normalised away by the
 /// caller. Catching these at config load avoids a `--check`-clean start that then
 /// fails inside the ACME order/renewal task with no usable certificate.
 pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
@@ -257,10 +257,10 @@ pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
     }
     // Special-use / non-public top-level domains (RFC 6761 test/example/invalid/
     // localhost, RFC 6762 local, RFC 8375 home.arpa via the .arpa infrastructure
-    // TLD, ICANN private-use .internal, RFC 7686 .onion): a public CA issues for
-    // none of these. A static list suffices — these are RFC-stable, unlike the
-    // public-suffix list, which would need bundling/updating and could then start
-    // rejecting legitimate new TLDs.
+    // TLD, ICANN private-use .internal, RFC 7686 .onion, RFC 9539 .alt): a public
+    // CA issues for none of these. A static list suffices — these are RFC-stable,
+    // unlike the public-suffix list, which would need bundling/updating and could
+    // then start rejecting legitimate new TLDs.
     const SPECIAL_USE_TLDS: &[&str] = &[
         "local",
         "localhost",
@@ -270,6 +270,7 @@ pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
         "internal",
         "arpa",
         "onion",
+        "alt",
     ];
     let tld = stem.rsplit('.').next().unwrap_or(stem);
     if SPECIAL_USE_TLDS.iter().any(|s| tld.eq_ignore_ascii_case(s)) {
@@ -519,6 +520,7 @@ mod tests {
             "host.home.arpa",   // .arpa infrastructure TLD (RFC 8375)
             "x.internal",       // ICANN private-use TLD
             "h.onion",          // Tor (RFC 7686)
+            "site.alt",         // alternative networks (RFC 9539)
             "DEV.LOCAL",        // denylist is case-insensitive
         ] {
             assert!(

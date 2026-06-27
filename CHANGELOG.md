@@ -38,7 +38,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `tls.acme.domains` entries are additionally validated against what a public CA
   can issue for via TLS-ALPN-01: a multi-label public DNS name — not an IP address,
   a single-label/local name like `localhost`, or a special-use TLD (`.local`,
-  `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`) —
+  `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`,
+  `.alt`) —
   with ASCII LDH labels only (no wildcards — those need DNS-01 — no underscores, and
   no raw Unicode; supply punycode `xn--` for IDN) and no leading/trailing hyphen. A
   single trailing dot (FQDN) is accepted and normalised away. A non-issuable name

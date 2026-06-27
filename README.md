@@ -437,8 +437,8 @@ over TLS-ALPN-01, and `--check` rejects one that cannot: it must be a multi-labe
 public DNS name made of ASCII letter/digit/hyphen labels (no leading or trailing
 hyphen). Wildcards (`*.example.com`, which would need DNS-01), underscores,
 IP addresses, single-label/local names (`localhost`), and the special-use TLDs
-`.local`, `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, and
-`.onion` are rejected. Internationalised names must be supplied as punycode
+`.local`, `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`,
+`.onion`, and `.alt` are rejected. Internationalised names must be supplied as punycode
 (`xn--…`); a single trailing dot (an absolute name) is accepted and normalised
 away.
 
