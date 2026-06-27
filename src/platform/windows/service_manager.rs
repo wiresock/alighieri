@@ -451,6 +451,21 @@ fn secure_existing_children(dir: &Path) -> std::io::Result<()> {
             ));
         }
         if let Err(e) = secure_path_acl(&path) {
+            // `secure_path_acl`'s no-follow handle check returns `InvalidData` when
+            // the child is a reparse point — e.g. swapped in after the
+            // `symlink_metadata` check just above (a TOCTOU race the point-in-time
+            // attribute check cannot close). Treat it like the attribute check:
+            // this is the redirection primitive we abort for. Other failures stay
+            // best-effort warnings.
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected reparse point under the service data directory: {}",
+                        path.display()
+                    ),
+                ));
+            }
             eprintln!(
                 "alighieri: warning: could not restrict permissions on {} ({e}).",
                 path.display()
