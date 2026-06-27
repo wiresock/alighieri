@@ -585,6 +585,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_request_rejects_bad_version() {
+        // A request must carry VER=0x05, like the greeting.
+        let bytes = [0x04u8, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x50];
+        let mut cur = Cursor::new(bytes.to_vec());
+        assert!(read_request(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_unknown_command() {
+        // CMD 0x09 is not CONNECT/BIND/UDP ASSOCIATE.
+        let bytes = [VERSION, 0x09, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x50];
+        let mut cur = Cursor::new(bytes.to_vec());
+        assert!(read_request(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_unsupported_atyp() {
+        // ATYP 0x02 is unassigned; reject it rather than misread the following
+        // bytes as an address (a parser that fell through could desync the stream).
+        let bytes = [0x02u8, 1, 2, 3, 4, 0x00, 0x50];
+        let mut cur = Cursor::new(bytes.to_vec());
+        let err = read_target_addr(&mut cur).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ref m) if m.contains("unsupported address type")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_truncated_ipv4() {
+        // ATYP=0x01 with only three address octets and no port: error on the short
+        // read rather than block or fabricate an address.
+        let bytes = [0x01u8, 1, 2, 3];
+        let mut cur = Cursor::new(bytes.to_vec());
+        assert!(read_target_addr(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_truncated_ipv6() {
+        // ATYP=0x04 with only four of sixteen octets.
+        let bytes = [0x04u8, 0, 0, 0, 0];
+        let mut cur = Cursor::new(bytes.to_vec());
+        assert!(read_target_addr(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_truncated_domain() {
+        // Length byte claims 10 bytes but only three follow (and no port).
+        let bytes = [0x03u8, 0x0a, b'f', b'o', b'o'];
+        let mut cur = Cursor::new(bytes.to_vec());
+        assert!(read_target_addr(&mut cur).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_empty_domain() {
+        // ATYP=0x03 with a zero length byte is invalid (matches the UDP parser).
+        let bytes = [0x03u8, 0x00, 0x00, 0x50];
+        let mut cur = Cursor::new(bytes.to_vec());
+        let err = read_target_addr(&mut cur).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ref m) if m.contains("empty domain")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_target_addr_rejects_non_utf8_domain() {
+        // A two-byte domain of invalid UTF-8 (0xff 0xfe) followed by a port.
+        let bytes = [0x03u8, 0x02, 0xff, 0xfe, 0x00, 0x50];
+        let mut cur = Cursor::new(bytes.to_vec());
+        let err = read_target_addr(&mut cur).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ref m) if m.contains("not valid UTF-8")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_userpass_ok() {
         let mut bytes = vec![AUTH_VERSION, 0x04];
         bytes.extend_from_slice(b"user");

@@ -1189,6 +1189,45 @@ mod tests {
         assert_eq!(resolved, vec!["8.8.8.8:53".parse().unwrap()]);
     }
 
+    #[tokio::test]
+    async fn resolver_denies_hostname_resolving_to_denied_ip() {
+        // SSRF: the deny policy must apply to a *resolved hostname*, not only IP
+        // literals. A name whose DNS answer is a loopback address must yield no
+        // allowed target, so the proxy cannot be steered at an internal host via a
+        // name that points there. Mock the backend so the answer is deterministic.
+        let backend: Arc<TestLookupFn> = Arc::new(|_host, port| {
+            Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+        });
+        let resolver = DnsResolver::with_lookup(backend);
+        let target = TargetAddr::Domain("intranet.evil.test".into(), 80);
+
+        let deny = policy(DnsPreference::System, vec![DnsDenyCategory::Loopback]);
+        assert!(
+            resolver
+                .resolve_all(&target, &deny)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a hostname resolving to loopback must be denied post-resolution"
+        );
+        assert!(
+            resolver
+                .resolve_one(&target, &deny)
+                .await
+                .unwrap()
+                .is_none(),
+            "resolve_one must yield no allowed address for a denied resolution"
+        );
+
+        // Sanity: with no deny the same hostname resolves, proving the empty result
+        // above is the policy filtering it out rather than a lookup failure.
+        let open = policy(DnsPreference::System, Vec::new());
+        assert_eq!(
+            resolver.resolve_one(&target, &open).await.unwrap(),
+            Some(SocketAddr::from(([127, 0, 0, 1], 80))),
+        );
+    }
+
     #[test]
     fn orders_ipv4_first() {
         let mut addrs = vec![

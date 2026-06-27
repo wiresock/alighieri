@@ -1280,4 +1280,51 @@ mod tests {
 
         assoc.abort();
     }
+
+    #[tokio::test]
+    async fn udp_datagram_to_denied_destination_is_dropped() {
+        // The per-datagram authorizer is consulted for every client datagram; when
+        // it denies a destination the datagram must not be forwarded. (The default
+        // test policy allows loopback, so the drop here is the authorizer's doing,
+        // not the address filter's.)
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let dest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        // Authorizer denies every datagram.
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| false,
+        ));
+
+        let IpAddr::V4(dest_ip) = dest_addr.ip() else {
+            unreachable!()
+        };
+        let mut datagram = vec![0u8, 0, 0, 1]; // RSV RSV FRAG ATYP=IPv4
+        datagram.extend_from_slice(&dest_ip.octets());
+        datagram.extend_from_slice(&dest_addr.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        client.send_to(&datagram, relay_addr).await.unwrap();
+
+        // The denied datagram must never reach the destination.
+        let mut dbuf = [0u8; 64];
+        let forwarded =
+            tokio::time::timeout(Duration::from_millis(300), dest.recv_from(&mut dbuf)).await;
+        assert!(
+            forwarded.is_err(),
+            "a datagram the authorizer denied must not be forwarded to the destination"
+        );
+
+        assoc.abort();
+    }
 }
