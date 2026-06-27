@@ -310,6 +310,12 @@ fn read_installed_config_path(marker: &Path) -> ServiceCliResult<PathBuf> {
 fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
     let base = default_base_dir();
     std::fs::create_dir_all(&base)?;
+    // A standard user who can write under `ProgramData` might pre-create the data
+    // directory (or `logs/`) as a symlink/junction. Refuse to populate a reparse
+    // point: creating files under it would follow the link and redirect these
+    // privileged writes outside the intended directory. This is *fatal*, unlike a
+    // best-effort ACL failure below.
+    fail_if_reparse_point(&base)?;
     // Restrict the base directory's ACL before populating it. A `ProgramData`
     // subfolder is otherwise writable (and readable) by standard users through
     // inherited permissions, so a non-admin could tamper with the config/userlist
@@ -325,11 +331,33 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
             base.display()
         );
     }
-    std::fs::create_dir_all(default_log_dir())?;
+    // `logs/` is created under the now-protected base; reject a symlink planted in
+    // the brief window before the base was hardened before following it.
+    let logs = default_log_dir();
+    fail_if_reparse_point(&logs)?;
+    std::fs::create_dir_all(&logs)?;
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+/// Fails if `path` exists and is a reparse point (symlink/junction). A path that
+/// does not exist yet, or is a regular file/directory, is fine. Used to refuse
+/// following a pre-planted link when populating the service data directory.
+fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+            Err(ServiceCliError::Service(format!(
+                "refusing to install into {}: it is a symlink or reparse point. Remove it and \
+                 reinstall.",
+                path.display()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Restricts the service data directory (and any pre-existing contents) so only
@@ -1451,5 +1479,25 @@ mod tests {
         }
         let err = harden_directory_dacl(&link).expect_err("a symlinked base must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fail_if_reparse_point_rejects_a_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        // A regular directory and a not-yet-existing path are both allowed.
+        fail_if_reparse_point(&real).expect("a regular directory is allowed");
+        fail_if_reparse_point(&parent.path().join("missing")).expect("a missing path is allowed");
+        // A symlink is rejected (skip where symlink creation needs privilege).
+        let link = parent.path().join("link");
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            eprintln!("skipping fail_if_reparse_point_rejects_a_symlink: cannot create symlinks");
+            return;
+        }
+        assert!(matches!(
+            fail_if_reparse_point(&link),
+            Err(ServiceCliError::Service(_))
+        ));
     }
 }
