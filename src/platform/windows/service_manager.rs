@@ -356,7 +356,11 @@ fn fail_if_reparse_point(path: &Path) -> ServiceCliResult<()> {
                 path.display()
             )))
         }
-        _ => Ok(()),
+        Ok(_) => Ok(()), // a regular file or directory
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), // not created yet
+        // Any other error means we could not verify the path is safe — fail
+        // closed rather than populate something we cannot inspect.
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -375,17 +379,21 @@ fn harden_directory_dacl(base: &Path) -> std::io::Result<()> {
 }
 
 fn secure_existing_children(dir: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        // The dir-entry file type does not follow the link, so a planted symlink
-        // is detected here and skipped rather than recursed into or re-pointed.
-        let Ok(file_type) = entry.file_type() else {
+        let path = entry.path();
+        // `DirEntry::metadata` does not follow the link. Check the reparse-point
+        // attribute (which covers junctions/mount points, not just symlinks) so we
+        // never secure or, worse, recurse *through* a planted reparse point onto a
+        // tree outside the data directory.
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let path = entry.path();
-        if file_type.is_symlink() {
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             eprintln!(
                 "alighieri: warning: skipping unexpected reparse point under the service \
                  directory: {}",
@@ -399,7 +407,7 @@ fn secure_existing_children(dir: &Path) {
                 path.display()
             );
         }
-        if file_type.is_dir() {
+        if meta.is_dir() {
             secure_existing_children(&path);
         }
     }
@@ -456,7 +464,12 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
         Ok(handle) => (handle, true),
         Err(_) => (open(READ_CONTROL | WRITE_DAC)?, false),
     };
-    if handle.metadata()?.file_type().is_symlink() {
+    // The handle refers to the link itself (OPEN_REPARSE_POINT). Refuse any
+    // reparse point — symlink or junction/mount point — via the attribute, which
+    // `file_type().is_symlink()` would miss for junctions.
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if handle.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "refusing to set permissions on a symlink/reparse point",
@@ -1412,7 +1425,7 @@ mod tests {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        unsafe {
+        let rc = unsafe {
             SetNamedSecurityInfoW(
                 path_w.as_mut_ptr(),
                 SE_FILE_OBJECT,
@@ -1421,8 +1434,11 @@ mod tests {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(), // a NULL DACL grants full access to everyone
                 std::ptr::null_mut(),
-            );
-        }
+            )
+        };
+        // Make a cleanup failure visible/deterministic rather than leaving an
+        // undeletable temp directory behind.
+        assert_eq!(rc, 0, "resetting the test DACL failed (code {rc})");
     }
 
     #[test]
