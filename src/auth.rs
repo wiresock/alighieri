@@ -296,7 +296,7 @@ impl CommandAuth {
         // rejects CR/LF (`validate_username`); this matches it.
         if [username, password]
             .iter()
-            .any(|s| s.contains('\n') || s.contains('\r') || s.contains('\0'))
+            .any(|s| s.contains(['\n', '\r', '\0']))
         {
             return AuthOutcome::Denied;
         }
@@ -959,6 +959,7 @@ mod tests {
             ("al\rice", "secret"), // CR in username
             ("al\nice", "secret"), // LF in username
             ("alice", "sec\0ret"), // NUL in password
+            ("al\0ice", "secret"), // NUL in username
         ] {
             assert_eq!(
                 auth.verify_async(user, pass, None, Duration::from_secs(5))
