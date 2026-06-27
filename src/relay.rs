@@ -1324,6 +1324,13 @@ mod tests {
             forwarded.is_err(),
             "a datagram the authorizer denied must not be forwarded to the destination"
         );
+        // Guard against a vacuous pass: the timeout above must mean the datagram
+        // was dropped by a *running* association, not that the task died and never
+        // processed it.
+        assert!(
+            !assoc.is_finished(),
+            "association task exited prematurely; the no-forward result is not meaningful"
+        );
 
         assoc.abort();
     }
