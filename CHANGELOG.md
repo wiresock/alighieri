@@ -30,6 +30,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   a domain could break or forge lines in a text log (the destination is logged) or
   be passed verbatim to the resolver. A single trailing dot (absolute name) and
   IDN/underscore labels are still accepted.
+- The same hostname validation now also applies at config load to the
+  `udp.advertise` host and every `tls.acme.domains` entry, so a malformed name
+  (empty label, root-only `.`, over-63-byte label, control/whitespace) fails
+  `--check` instead of silently failing to resolve and falling back at runtime, or
+  being handed to the ACME stack. (ACME name *eligibility* — which also rejects
+  underscores/IDN — remains the ACME stack's concern.)
 - The Windows installer now restricts the ACL on its `ProgramData\Alighieri` data
   directory at install time, so a standard user can no longer write the config or
   userlist the privileged service loads (a local privilege-escalation surface) or

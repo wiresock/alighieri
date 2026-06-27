@@ -172,44 +172,6 @@ const ATYP_V4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
-/// Rejects domain names that are unsafe to log or resolve. A SOCKS5 `DOMAIN`
-/// field is otherwise arbitrary bytes: a control or whitespace character (CR, LF,
-/// NUL, the Unicode C1 controls and line/paragraph separators, spaces, ...) would
-/// break or forge log lines once the destination is Displayed into a text log,
-/// and be passed raw to the system resolver. Also rejects structurally invalid
-/// labels — empty (e.g. `a..b`, `.a`) or longer than the DNS 63-byte limit. A
-/// single trailing dot (an absolute name) is allowed, and the character set is
-/// otherwise unrestricted, so IDN/punycode and underscores still pass (Unicode
-/// bidi/format characters are not rejected — a deliberate, narrow scope). The
-/// total length is already bounded to 255 by the wire format's one-byte length
-/// prefix.
-fn validate_domain(name: &str) -> Result<()> {
-    // Reject any control or whitespace character, not just ASCII: this catches the
-    // Unicode C1 controls and NEL (U+0085), the line/paragraph separators
-    // (U+2028/U+2029), and spaces — all invalid in a hostname and able to break or
-    // spoof a text log line, or confuse the resolver.
-    if name.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(Error::Protocol(
-            "domain name contains a control or whitespace character".into(),
-        ));
-    }
-    // Treat a single trailing dot as an absolute name: strip it so the final
-    // label is not seen as empty.
-    let stem = name.strip_suffix('.').unwrap_or(name);
-    if stem.is_empty() {
-        return Err(Error::Protocol("domain name has no labels".into()));
-    }
-    for label in stem.split('.') {
-        if label.is_empty() {
-            return Err(Error::Protocol("domain name has an empty label".into()));
-        }
-        if label.len() > 63 {
-            return Err(Error::Protocol("domain name label exceeds 63 bytes".into()));
-        }
-    }
-    Ok(())
-}
-
 /// Reads an `ATYP`-prefixed address followed by a 2-byte big-endian port.
 pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<TargetAddr> {
     let atyp = r.read_u8().await?;
@@ -241,7 +203,8 @@ pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<TargetA
             r.read_exact(&mut buf).await?;
             let domain = String::from_utf8(buf)
                 .map_err(|_| Error::Protocol("domain name is not valid UTF-8".into()))?;
-            validate_domain(&domain)?;
+            crate::net::validate_hostname(&domain)
+                .map_err(|e| Error::Protocol(format!("domain name {e}")))?;
             let port = r.read_u16().await?;
             Ok(TargetAddr::Domain(domain, port))
         }
@@ -496,7 +459,8 @@ pub fn parse_udp_header(buf: &[u8]) -> Result<UdpHeader> {
             }
             let domain = String::from_utf8(buf[pos..pos + len].to_vec())
                 .map_err(|_| Error::Protocol("UDP domain not UTF-8".into()))?;
-            validate_domain(&domain)?;
+            crate::net::validate_hostname(&domain)
+                .map_err(|e| Error::Protocol(format!("UDP domain {e}")))?;
             pos += len;
             let port = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
             pos += 2;
@@ -700,58 +664,6 @@ mod tests {
             matches!(err, Error::Protocol(ref m) if m.contains("not valid UTF-8")),
             "unexpected error: {err:?}"
         );
-    }
-
-    #[test]
-    fn validate_domain_rejects_control_characters() {
-        // CR/LF would forge log lines (the destination is logged); NUL/TAB are
-        // likewise invalid in a hostname.
-        for bad in [
-            "ex\rample.com",
-            "ex\nample.com",
-            "ex\0ample.com",
-            "ex\tample.com",
-        ] {
-            assert!(validate_domain(bad).is_err(), "{bad:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn validate_domain_rejects_unicode_controls_and_whitespace() {
-        // Beyond ASCII controls: Unicode NEL (U+0085), the line/paragraph
-        // separators (U+2028/U+2029), a plain space, and a non-breaking space
-        // (U+00A0) are all log-confusing and invalid in a hostname.
-        for bad in [
-            "ex\u{85}ample.com",
-            "ex\u{2028}ample.com",
-            "ex\u{2029}ample.com",
-            "ex ample.com",
-            "ex\u{a0}ample.com",
-        ] {
-            assert!(validate_domain(bad).is_err(), "{bad:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn validate_domain_rejects_malformed_labels() {
-        assert!(validate_domain("foo..bar").is_err()); // empty interior label
-        assert!(validate_domain(".foo").is_err()); // empty leading label
-        assert!(validate_domain(".").is_err()); // no labels
-        let oversize = format!("{}.com", "a".repeat(64)); // label over 63 bytes
-        assert!(validate_domain(&oversize).is_err());
-    }
-
-    #[test]
-    fn validate_domain_accepts_normal_and_absolute_names() {
-        for ok in [
-            "example.com",
-            "a.b.c.example.org",
-            "under_score.example",   // underscores occur in real records
-            "xn--bcher-kva.example", // IDN/punycode
-            "host.example.com.",     // absolute name (trailing dot)
-        ] {
-            assert!(validate_domain(ok).is_ok(), "{ok:?} must be accepted");
-        }
     }
 
     #[tokio::test]

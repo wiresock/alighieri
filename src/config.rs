@@ -716,7 +716,15 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             let spec = expect_single(vals, lineno, "udp.advertise host")?;
             b.udp_advertise = Some(match spec.parse::<IpAddr>() {
                 Ok(ip) => UdpAdvertise::Ip(ip),
-                Err(_) => UdpAdvertise::Host(spec.clone()),
+                Err(_) => {
+                    // A non-IP value is a hostname resolved per association — reject
+                    // a malformed one now so `--check` catches it instead of it
+                    // silently failing to resolve and falling back at runtime.
+                    crate::net::validate_hostname(spec).map_err(|e| {
+                        cfg_err(lineno, &format!("invalid udp.advertise host '{spec}': {e}"))
+                    })?;
+                    UdpAdvertise::Host(spec.clone())
+                }
             });
         }
         "shutdowndraintimeout" | "shutdown.draintimeout" => {
@@ -823,6 +831,17 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
                     lineno,
                     "tls.acme.domains requires at least one domain",
                 ));
+            }
+            // Reject a structurally malformed domain at config load rather than
+            // handing it to the ACME stack. (Stricter ACME eligibility — no
+            // underscores/IDN — remains the ACME stack's concern.)
+            for domain in vals {
+                crate::net::validate_hostname(domain).map_err(|e| {
+                    cfg_err(
+                        lineno,
+                        &format!("invalid tls.acme.domains entry '{domain}': {e}"),
+                    )
+                })?;
             }
             b.tls_acme_domains = vals.to_vec();
         }
@@ -2503,6 +2522,43 @@ socks pass "" { command: connect }"#,
             Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5 extra")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn udp_advertise_rejects_malformed_hostname() {
+        // A non-IP advertise value is a hostname; a structurally malformed one
+        // must be caught at config load, not silently fall back at runtime. (Each
+        // is a single token reaching the validator; a space-separated value is
+        // instead rejected earlier as multiple tokens.)
+        let oversize = format!("{}.com", "a".repeat(64));
+        for bad in ["foo..bar", ".", oversize.as_str()] {
+            let src = format!("internal: 0.0.0.0 port = 1080\nudp.advertise: {bad}");
+            let err = Config::parse(&src).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid udp.advertise host"),
+                "expected a host-validation error for {bad:?}, got: {err}"
+            );
+        }
+        // A normal hostname (and an IP) are still accepted.
+        assert!(
+            Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: relay.example.com")
+                .is_ok()
+        );
+        assert!(Config::parse("internal: 0.0.0.0 port = 1080\nudp.advertise: 203.0.113.5").is_ok());
+    }
+
+    #[test]
+    fn acme_domains_reject_malformed_entries() {
+        // Every tls.acme.domains entry is validated during parsing, so a malformed
+        // one fails --check rather than reaching the ACME stack.
+        for bad in ["foo..bar", "."] {
+            let src = format!("internal: 0.0.0.0 port = 1080\ntls.acme.domains: {bad}");
+            let err = Config::parse(&src).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid tls.acme.domains entry"),
+                "expected a host-validation error for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[test]

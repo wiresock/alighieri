@@ -1641,6 +1641,18 @@ mod tests {
         }
     }
 
+    /// A DACL test cannot run in this privilege context (it could not apply or read
+    /// back the protected DACL). Skips by default so an ordinary developer machine
+    /// stays green, but if `ALIGHIERI_REQUIRE_DACL_TESTS` is set — CI sets it on the
+    /// Windows job — the skip becomes a hard failure, so a non-elevated runner
+    /// cannot report green without ever verifying the hardened DACL.
+    fn skip_dacl_test_or_panic(reason: &str) {
+        if std::env::var_os("ALIGHIERI_REQUIRE_DACL_TESTS").is_some_and(|v| !v.is_empty()) {
+            panic!("a DACL test would skip but ALIGHIERI_REQUIRE_DACL_TESTS is set: {reason}");
+        }
+        eprintln!("skipping DACL test: {reason}");
+    }
+
     #[test]
     fn harden_directory_dacl_locks_out_standard_users() {
         let parent = tempfile::tempdir().unwrap();
@@ -1654,10 +1666,7 @@ mod tests {
         // before the read-back skip below can even run.
         if let Err(e) = harden_directory_dacl(&dir) {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!(
-                    "skipping harden_directory_dacl_locks_out_standard_users: this account \
-                     cannot apply the DACL ({e})"
-                );
+                skip_dacl_test_or_panic(&format!("this account cannot apply the DACL ({e})"));
                 reset_dacl_for_cleanup(&dir);
                 return;
             }
@@ -1667,10 +1676,7 @@ mod tests {
         // Restore access immediately so the temp dir is always removable.
         reset_dacl_for_cleanup(&dir);
         let Some(sddl) = sddl else {
-            eprintln!(
-                "skipping harden_directory_dacl_locks_out_standard_users: the hardened DACL is \
-                 not readable by this (non-elevated) account"
-            );
+            skip_dacl_test_or_panic("the hardened DACL is not readable by this account");
             return;
         };
 
@@ -1716,10 +1722,9 @@ mod tests {
         // may lack; skip on access-denied (see the harden test above).
         if let Err(e) = create_secure_base_dir(&base) {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
-                eprintln!(
-                    "skipping create_secure_base_dir_is_born_protected: this account cannot \
-                     create the secured directory ({e})"
-                );
+                skip_dacl_test_or_panic(&format!(
+                    "this account cannot create the secured directory ({e})"
+                ));
                 return;
             }
             panic!("creating the secured base must succeed: {e}");
@@ -1731,10 +1736,7 @@ mod tests {
         // below run with full access rather than through the locked-down ACL.
         reset_dacl_for_cleanup(&base);
         let Some(sddl) = sddl else {
-            eprintln!(
-                "skipping create_secure_base_dir_is_born_protected: the protected DACL is not \
-                 readable by this (non-elevated) account"
-            );
+            skip_dacl_test_or_panic("the born-secure DACL is not readable by this account");
             return;
         };
         assert!(
