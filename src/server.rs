@@ -487,12 +487,14 @@ impl Server {
         if active > 0 {
             let drain_timeout = self.process_config.shutdown_drain_timeout;
             if drain_timeout.is_zero() {
-                // `shutdown.draintimeout: 0` — cut in-flight connections at once,
+                // `shutdown.draintimeout: 0` cuts in-flight connections at once,
                 // skipping the (immediately-elapsing) timeout and its misleading
-                // "drain timed out" warning.
-                info!(
+                // "drain timed out" warning. Warn that live connections are being
+                // severed: 0 is the most aggressive setting, not an "unlimited"
+                // drain, so an operator who set it expecting that sees the loss.
+                warn!(
                     active,
-                    "shutdown: cutting in-flight connections immediately"
+                    "shutdown.draintimeout is 0: cutting in-flight connections immediately without draining"
                 );
                 conns.shutdown().await;
             } else {

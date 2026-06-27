@@ -22,6 +22,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- `shutdown.draintimeout: 0` now logs a warning (rather than an info line) when
+  it severs in-flight connections at shutdown, and the README and `--check`
+  metadata clarify that `0` cuts immediately — the most aggressive setting, not
+  an "unlimited" drain. Avoids the footgun of setting `0` expecting "no deadline"
+  and silently cutting long-lived relays on every restart.
 - The external auth verifier (`auth.command`) now rejects credentials containing
   a carriage return, matching the existing line-feed and NUL rejection (and the
   userlist path's CR/LF rejection). A client-supplied `\r` could otherwise desync

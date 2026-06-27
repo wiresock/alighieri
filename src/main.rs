@@ -439,7 +439,7 @@ const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
         name: "shutdown.draintimeout",
         reload: ReloadBehavior::Restart,
         applies_to: "process",
-        note: "drain timeout is read from the startup configuration at shutdown",
+        note: "drain timeout is read from the startup configuration at shutdown; 0 cuts in-flight connections immediately (it is not an unlimited drain)",
     },
     ConfigSettingMetadata {
         name: "maxconnections",

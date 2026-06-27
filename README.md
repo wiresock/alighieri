@@ -262,7 +262,7 @@ socks pass "allow-default" {
 | `udp.strictreply`  | `true`          | Require UDP replies from the exact remote `host:port` contacted; set `false` to relax to host-only for compatibility (see below) |
 | `udp.advertise`    | —               | Public host (IP or hostname) advertised as the `BND.ADDR` in the UDP ASSOCIATE reply, for a proxy reached via NAT; the real relay port is kept. A hostname is resolved per association via the async resolver (bounded by `dns.timeout`), falling back to the bound relay address if it cannot be resolved — so `--check` validates only its syntax, not reachability |
 | `maxconnections`   | `1024`          | Maximum concurrent client TCP connections            |
-| `shutdown.draintimeout` | `10`       | Seconds shutdown waits for in-flight connections before aborting the rest (`0` cuts immediately) |
+| `shutdown.draintimeout` | `10`       | Seconds shutdown waits for in-flight connections before aborting the rest. `0` severs them immediately (the most aggressive setting — it is **not** an "unlimited" drain; a shutdown then logs a warning) |
 | `logoutput`        | `stdout`        | One or more of `stdout`, `stderr`, `file`            |
 | `logfile`          | —               | File path used when `logoutput` includes `file`      |
 | `logformat`        | `text`          | Log encoding: `text` or `json`                       |
