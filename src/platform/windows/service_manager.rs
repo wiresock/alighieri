@@ -343,8 +343,8 @@ fn prepare_service_directories(config_path: &Path) -> ServiceCliResult<()> {
             base.display()
         );
     }
-    // `logs/` is created under the now-protected base; reject a symlink planted in
-    // the brief window before the base was hardened before following it.
+    // `logs/` is created under the now-protected base; reject (rather than follow)
+    // a symlink planted in the brief window before the base was hardened.
     let logs = default_log_dir();
     fail_if_reparse_point(&logs)?;
     std::fs::create_dir_all(&logs)?;
