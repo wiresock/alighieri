@@ -724,6 +724,7 @@ mod tests {
         for bad in [
             "ex\u{85}ample.com",
             "ex\u{2028}ample.com",
+            "ex\u{2029}ample.com",
             "ex ample.com",
             "ex\u{a0}ample.com",
         ] {
