@@ -1316,10 +1316,12 @@ mod tests {
         datagram.extend_from_slice(b"ping");
         client.send_to(&datagram, relay_addr).await.unwrap();
 
-        // The denied datagram must never reach the destination.
+        // The denied datagram must never reach the destination. A generous window
+        // (matching the adjacent relay tests) so a slow-but-real forward would
+        // still be observed rather than mistaken for the expected drop.
         let mut dbuf = [0u8; 64];
         let forwarded =
-            tokio::time::timeout(Duration::from_millis(300), dest.recv_from(&mut dbuf)).await;
+            tokio::time::timeout(Duration::from_secs(1), dest.recv_from(&mut dbuf)).await;
         assert!(
             forwarded.is_err(),
             "a datagram the authorizer denied must not be forwarded to the destination"

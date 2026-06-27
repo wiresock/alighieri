@@ -1959,7 +1959,9 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
     let mut b = TcpStream::connect(proxy_addr).await.unwrap();
     b.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut sel = [0u8; 2];
-    let blocked = tokio::time::timeout(Duration::from_millis(300), b.read_exact(&mut sel)).await;
+    // A generous window: if B were not actually back-pressured it would reply well
+    // within this, so a timeout reliably means "blocked" rather than "slow runner".
+    let blocked = tokio::time::timeout(Duration::from_secs(1), b.read_exact(&mut sel)).await;
     assert!(
         blocked.is_err(),
         "second connection must be back-pressured while the first holds the only permit"
