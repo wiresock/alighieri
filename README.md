@@ -433,7 +433,7 @@ Let's Encrypt's rate limits), and certificates renew in the background with no
 restart. `tls.acme.*` is mutually exclusive with `tls.certfile`/`tls.keyfile`.
 
 `--check` rejects a `tls.acme.domains` entry that a public CA clearly cannot issue
-for over TLS-ALPN-01: each must be a multi-label public DNS name made of ASCII
+for over TLS-ALPN-01: each must be a multi-label DNS name made of ASCII
 letter/digit/hyphen labels (no leading or trailing hyphen). Wildcards
 (`*.example.com`, which would need DNS-01), underscores, IP addresses,
 single-label/local names (`localhost`), and the special-use TLDs `.local`,

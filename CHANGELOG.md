@@ -35,9 +35,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   (empty label, root-only `.`, over-63-byte label, control/whitespace, or a total
   over the 253-byte DNS limit) fails `--check` instead of silently failing to
   resolve and falling back at runtime, or being handed to the ACME stack.
-- `tls.acme.domains` entries are additionally rejected at `--check` when they are a
-  shape a public CA clearly cannot issue for via TLS-ALPN-01: each must be a
-  multi-label public DNS name — not an IP address, a single-label/local name like
+- `tls.acme.domains` entries are additionally rejected at `--check` when they have
+  a shape a public CA clearly cannot issue for via TLS-ALPN-01: each must be a
+  multi-label DNS name — not an IP address, a single-label/local name like
   `localhost`, or a special-use TLD (`.local`, `.test`, `.invalid`, `.localhost`,
   `.example`, `.internal`, `.arpa`, `.onion`, `.alt`) — with ASCII LDH labels only
   (no wildcards — those need DNS-01 — no underscores, and no raw Unicode; supply
