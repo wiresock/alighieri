@@ -432,15 +432,17 @@ certificates so they survive restarts without re-requesting (which would hit
 Let's Encrypt's rate limits), and certificates renew in the background with no
 restart. `tls.acme.*` is mutually exclusive with `tls.certfile`/`tls.keyfile`.
 
-Each `tls.acme.domains` entry must be a name a public CA can actually issue for
-over TLS-ALPN-01, and `--check` rejects one that cannot: it must be a multi-label
-public DNS name made of ASCII letter/digit/hyphen labels (no leading or trailing
-hyphen). Wildcards (`*.example.com`, which would need DNS-01), underscores,
-IP addresses, single-label/local names (`localhost`), and the special-use TLDs
-`.local`, `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`,
-`.onion`, and `.alt` are rejected. Internationalised names must be supplied as punycode
+`--check` rejects a `tls.acme.domains` entry that a public CA clearly cannot issue
+for over TLS-ALPN-01: each must be a multi-label DNS name made of ASCII
+letter/digit/hyphen labels (no leading or trailing hyphen). Wildcards
+(`*.example.com`, which would need DNS-01), underscores, IP addresses,
+single-label/local names (`localhost`), and the special-use TLDs `.local`,
+`.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`, and
+`.alt` are rejected. Internationalised names must be supplied as punycode
 (`xn--…`); a single trailing dot (an absolute name) is accepted and normalised
-away.
+away. This is a fail-fast on clearly-invalid shapes and suffixes — whether the TLD
+is actually delegated, an `xn--` label is valid IDNA, and the name exists in DNS
+and is reachable on port 443 are verified by ACME at issuance.
 
 Because the challenge is validated by an inbound connection, ACME interacts with
 the admission gates. With **`proxyprotocol`** enabled, any validation connection
