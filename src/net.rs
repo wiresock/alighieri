@@ -213,18 +213,24 @@ pub(crate) fn validate_hostname(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates a `tls.acme.domains` identifier more strictly than
-/// [`validate_hostname`]: it must be a name a public CA can actually issue a
-/// **TLS-ALPN-01** certificate for. On top of the structural checks it must be a
-/// multi-label DNS name (not an IP address, and not a single-label/local name like
+/// Rejects a `tls.acme.domains` identifier that a public CA clearly cannot issue a
+/// **TLS-ALPN-01** certificate for, validating more strictly than
+/// [`validate_hostname`]. On top of the structural checks it must be a multi-label
+/// DNS name (not an IP address, and not a single-label/local name like
 /// `localhost`), and every label must be ASCII **LDH** (letter/digit/hyphen) with
 /// no leading or trailing hyphen — so wildcards (`*.…` needs DNS-01, which this
 /// does not use), underscores, and raw-Unicode labels (supply punycode `xn--`) are
 /// rejected. The rightmost label must not be a special-use/non-public TLD (`.local`,
 /// `.test`, `.invalid`, `.localhost`, `.example`, `.internal`, `.arpa`, `.onion`,
-/// `.alt`). A single trailing dot (an absolute name) is tolerated and normalised away by the
-/// caller. Catching these at config load avoids a `--check`-clean start that then
-/// fails inside the ACME order/renewal task with no usable certificate.
+/// `.alt`). A single trailing dot (an absolute name) is tolerated and normalised
+/// away by the caller.
+///
+/// This is a fail-fast on clearly-non-issuable *shapes and suffixes*, not a
+/// guarantee of issuability: whether the rightmost label is a delegated public
+/// TLD, whether an `xn--` label is valid IDNA, and whether the name exists in DNS
+/// and is reachable for the challenge, remain the ACME order's checks at runtime.
+/// Catching the obvious cases at config load still avoids a `--check`-clean start
+/// that then fails issuance with no usable certificate.
 pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
     // Structure (control/whitespace, empty labels, 63/253 limits) first; this also
     // tolerates a single trailing dot, so validate the stem below.
@@ -257,7 +263,7 @@ pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
     }
     // Special-use / non-public top-level domains (RFC 6761 test/example/invalid/
     // localhost, RFC 6762 local, RFC 8375 home.arpa via the .arpa infrastructure
-    // TLD, ICANN private-use .internal, RFC 7686 .onion, RFC 9539 .alt): a public
+    // TLD, ICANN private-use .internal, RFC 7686 .onion, RFC 9476 .alt): a public
     // CA issues for none of these. A static list suffices — these are RFC-stable,
     // unlike the public-suffix list, which would need bundling/updating and could
     // then start rejecting legitimate new TLDs.
@@ -520,7 +526,7 @@ mod tests {
             "host.home.arpa",   // .arpa infrastructure TLD (RFC 8375)
             "x.internal",       // ICANN private-use TLD
             "h.onion",          // Tor (RFC 7686)
-            "site.alt",         // alternative networks (RFC 9539)
+            "site.alt",         // alternative networks (RFC 9476)
             "DEV.LOCAL",        // denylist is case-insensitive
         ] {
             assert!(
