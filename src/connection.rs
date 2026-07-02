@@ -654,24 +654,73 @@ impl Connection {
         // Per-rule bandwidth applies to CONNECT relays; UDP uses the per-client
         // limit only (datagrams may match different rules each).
         let throttle = self.throttle(None);
+        let options = relay::UdpAssociateOptions {
+            client_ip,
+            client_endpoint,
+            idle: self.config.udp_timeout,
+            dns_policy: self.config.dns.clone(),
+            dns_resolver: self.dns_resolver.clone(),
+            metrics: self.metrics.clone(),
+            throttle,
+            outbound_dual,
+            strict_reply: self.config.udp_strict_reply,
+        };
+
+        // The per-datagram plugin verdict. With no plugins (or the feature off) it
+        // is a forward-all closure the compiler monomorphizes away, leaving the UDP
+        // relay byte-for-byte as it was.
+        #[cfg(feature = "plugins")]
+        let run_result = if self.plugins.is_empty() {
+            relay::run_udp_associate(
+                self.stream,
+                relay_socket,
+                outbound,
+                options,
+                authorize,
+                |_, _, _| true,
+            )
+            .await
+        } else {
+            let host = self.plugins.clone();
+            // v1 UDP has no association-level control plane yet, so datagram tags
+            // are empty; a plugin's on_datagram keys on direction/dst/payload.
+            let tags = crate::plugin::TagSet::new();
+            let on_datagram = move |is_reply: bool, dst: SocketAddr, payload: &[u8]| -> bool {
+                use crate::plugin::{DatagramCtx, DatagramVerdict, Direction};
+                let dir = if is_reply {
+                    Direction::TargetToClient
+                } else {
+                    Direction::ClientToTarget
+                };
+                host.on_datagram(&DatagramCtx {
+                    dir,
+                    dst,
+                    payload,
+                    tags: &tags,
+                }) != DatagramVerdict::Drop
+            };
+            relay::run_udp_associate(
+                self.stream,
+                relay_socket,
+                outbound,
+                options,
+                authorize,
+                on_datagram,
+            )
+            .await
+        };
+
+        #[cfg(not(feature = "plugins"))]
         let run_result = relay::run_udp_associate(
             self.stream,
             relay_socket,
             outbound,
-            relay::UdpAssociateOptions {
-                client_ip,
-                client_endpoint,
-                idle: self.config.udp_timeout,
-                dns_policy: self.config.dns.clone(),
-                dns_resolver: self.dns_resolver.clone(),
-                metrics: self.metrics.clone(),
-                throttle,
-                outbound_dual,
-                strict_reply: self.config.udp_strict_reply,
-            },
+            options,
             authorize,
+            |_, _, _| true,
         )
         .await;
+
         metrics.udp_association_closed();
         run_result?;
 

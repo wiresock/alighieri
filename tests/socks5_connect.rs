@@ -2023,7 +2023,8 @@ mod plugin_intercept {
     use std::sync::Mutex;
 
     use alighieri::plugin::{
-        self, FlowCtx, FlowStats, Plugin, PluginHost, StreamArgs, StreamInterceptor,
+        self, DatagramCtx, DatagramVerdict, FlowCtx, FlowStats, Plugin, PluginHost, StreamArgs,
+        StreamInterceptor,
     };
     use async_trait::async_trait;
 
@@ -2119,5 +2120,51 @@ mod plugin_intercept {
             payload.len() as u64,
             "on_flow_end should report the relayed byte count"
         );
+    }
+
+    /// Drops every datagram on the UDP path.
+    struct DropUdpPlugin;
+    #[async_trait]
+    impl Plugin for DropUdpPlugin {
+        fn name(&self) -> &str {
+            "drop-udp"
+        }
+        fn on_datagram(&self, _ctx: &DatagramCtx<'_>) -> DatagramVerdict {
+            DatagramVerdict::Drop
+        }
+    }
+
+    #[tokio::test]
+    async fn on_datagram_drop_blocks_udp_through_associate() {
+        let host = PluginHost::new(vec![Arc::new(DropUdpPlugin)]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_udp_echo_server().await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut client).await;
+        let relay_addr = request_udp_associate(&mut client).await;
+
+        // A SOCKS UDP datagram (RSV RSV FRAG ATYP=IPv4 DST.ADDR DST.PORT DATA) to
+        // the echo server. on_datagram drops it, so the echo never receives it and
+        // no reply comes back.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(echo_v4) = echo else {
+            panic!("echo server should be IPv4")
+        };
+        let mut datagram = vec![0u8, 0, 0, 1];
+        datagram.extend_from_slice(&echo_v4.ip().octets());
+        datagram.extend_from_slice(&echo_v4.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay_addr).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), udp.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "on_datagram Drop should block the datagram, so no reply returns"
+        );
+
+        drop(client);
     }
 }
