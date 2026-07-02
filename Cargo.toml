@@ -65,6 +65,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# For the plugin-interception integration test (feature-gated); implementing the
+# `Plugin`/`StreamInterceptor` traits needs the same `#[async_trait]` macro.
+async-trait = "0.1"
 
 [profile.release]
 opt-level = 3

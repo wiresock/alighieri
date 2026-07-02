@@ -22,28 +22,37 @@
 //! - **`#[non_exhaustive]` everywhere.** New fields/variants can be added without
 //!   a breaking release.
 //!
-//! This first increment is the control plane, the dispatch rules, and the
-//! verdict/trait surface. The stream and datagram *data-plane argument* types
-//! ([`StreamArgs`] and friends) are intentionally minimal here and grow in a
-//! later increment when the hooks are wired into the connection path; because
-//! they are `#[non_exhaustive]` and plugins only *receive* them, filling them in
-//! is not a breaking change.
+//! The control plane, the stream data plane ([`StreamArgs`],
+//! [`PeekableClientStream`], [`splice`]/[`relay`]), and the per-datagram verdict
+//! are wired into the connection path. The datagram data plane is a
+//! [`DatagramVerdict`] the core acts on while keeping the UDP loop; the datagram
+//! hook itself is invoked from the UDP relay in a later increment. Every argument
+//! type is `#[non_exhaustive]`, so growing them (e.g. an explicit
+//! throttle-wrapped target) is not a breaking change for plugins, which only
+//! *receive* them.
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 
 use crate::acl::RuleDecision;
+use crate::client_stream::ClientStream;
 
-// Small, stable engine enums that are part of the SDK's vocabulary. Unlike
+// Small, stable engine types that are part of the SDK's vocabulary. Unlike
 // `RuleDecision` (hidden behind the `RuleInfo` facade), these are safe to expose
-// directly: they are the SOCKS/rule primitives a plugin reasons about.
+// directly: they are the SOCKS/rule primitives a plugin reasons about, and — for
+// `Throttle` — an opaque handle the interceptor only forwards to `splice`/`relay`.
 pub use crate::acl::Verdict;
 pub use crate::config::Protocol;
 pub use crate::socks5::Command;
+pub use crate::throttle::Throttle;
 
 // ---------------------------------------------------------------------------
 // Control-plane context and facades
@@ -200,8 +209,12 @@ impl FlowStats {
 // ---------------------------------------------------------------------------
 
 /// Owns a TCP relay after a plugin opts in via [`Plugin::intercept`]. This is
-/// where TLS-MITM will live: the interceptor consumes the flow, relays (or
-/// terminates and re-originates) it, and returns [`FlowStats`].
+/// where TLS-MITM lives: the interceptor consumes the flow, relays (or terminates
+/// and re-originates) it, and returns [`FlowStats`].
+///
+/// For the pass-through decision, call [`splice`]; to relay two streams under the
+/// proxy's shaping and idle-timeout guarantees (e.g. the decrypted halves on the
+/// inspect path), call [`relay`].
 #[async_trait]
 pub trait StreamInterceptor: Send {
     /// Takes over the relay for one flow and runs it to completion.
@@ -210,17 +223,141 @@ pub trait StreamInterceptor: Send {
 
 /// Everything a [`StreamInterceptor`] needs to honor the proxy's guarantees.
 ///
-/// This is a forward declaration. The v1 stream data plane — the buffered,
-/// peekable client side and the throttle-wrapped target, so shaping and idle
-/// enforcement stay in the core — lands when the `intercept` hook is wired into
-/// the connection path. Because the type is `#[non_exhaustive]` and plugins only
-/// *receive* it, adding those fields later is not a breaking change.
+/// The client side arrives as a [`PeekableClientStream`] so an interceptor can
+/// read the first bytes (a TLS ClientHello) and then either consume them (MITM) or
+/// replay-and-splice (pass-through). The target is already TCP-connected and
+/// ACL/DNS-vetted. `throttle` carries the flow's shaping buckets; hand the whole
+/// `StreamArgs` to [`splice`], or pass `throttle` to [`relay`], so shaping and the
+/// idle timeout stay enforced by the core rather than the plugin.
 #[non_exhaustive]
 pub struct StreamArgs {
+    /// The client side, buffered so the ClientHello can be peeked non-destructively.
+    pub client: PeekableClientStream,
+    /// The connected, ACL/DNS-vetted target.
+    pub target: TcpStream,
     /// The canonical resolved target address.
     pub dst: SocketAddr,
     /// The idle timeout the interceptor must honor.
     pub io_timeout: Duration,
+    /// The flow's shaping buckets (per-client and/or per-rule), or `None`.
+    pub throttle: Option<Throttle>,
+}
+
+/// The client side of an intercepted flow: a [`ClientStream`] with a peek buffer
+/// so an interceptor can inspect the first bytes without consuming them.
+pub type PeekableClientStream = Peekable<ClientStream>;
+
+/// An `AsyncRead`/`AsyncWrite` wrapper that can buffer ("peek") the first bytes of
+/// a stream without consuming them: a later read — or a [`splice`] — replays the
+/// peeked bytes first, then continues from the underlying stream.
+pub struct Peekable<S> {
+    inner: S,
+    /// Peeked-but-not-yet-read bytes; `buf[pos..]` is still pending.
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<S> Peekable<S> {
+    /// Wraps `inner` with an empty peek buffer.
+    pub fn new(inner: S) -> Self {
+        Peekable {
+            inner,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> Peekable<S> {
+    /// Buffers up to `want` bytes from the stream *without consuming them* and
+    /// returns the buffered prefix. Subsequent reads (and `peek`s) still see these
+    /// bytes. Returns fewer than `want` bytes only at end of stream.
+    ///
+    /// The caller must bound `want` (e.g. to one maximum TLS record) so a slow or
+    /// oversized first message cannot grow the buffer without limit.
+    pub async fn peek(&mut self, want: usize) -> io::Result<&[u8]> {
+        let mut chunk = [0u8; 4096];
+        while self.buf.len() - self.pos < want {
+            let n = self.inner.read(&mut chunk).await?;
+            if n == 0 {
+                break; // end of stream
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+        let end = (self.pos + want).min(self.buf.len());
+        Ok(&self.buf[self.pos..end])
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Peekable<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        // Drain any peeked bytes first, then fall through to the underlying stream.
+        if this.pos < this.buf.len() {
+            let pending = &this.buf[this.pos..];
+            let n = pending.len().min(out.remaining());
+            out.put_slice(&pending[..n]);
+            this.pos += n;
+            if this.pos == this.buf.len() {
+                this.buf.clear();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, out)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Peekable<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Relays `client` and `target` in both directions under the proxy's idle-timeout
+/// and shaping guarantees, returning the byte counts as [`FlowStats`]. This is the
+/// pass-through relay behind [`splice`], and it also serves the inspect path
+/// (relaying the two decrypted halves under the same guarantees).
+pub async fn relay<C, R>(
+    client: C,
+    target: R,
+    io_timeout: Duration,
+    throttle: Option<Throttle>,
+) -> io::Result<FlowStats>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let (up, down) = crate::relay::relay_generic(client, target, io_timeout, throttle).await?;
+    Ok(FlowStats::new(up, down))
+}
+
+/// The opaque pass-through relay: an interceptor that peeks and decides "not this
+/// one" replays the peeked bytes and splices with this. Byte-for-byte equivalent
+/// to the core's TCP relay.
+pub async fn splice(args: StreamArgs) -> io::Result<FlowStats> {
+    let StreamArgs {
+        client,
+        target,
+        io_timeout,
+        throttle,
+        ..
+    } = args;
+    relay(client, target, io_timeout, throttle).await
 }
 
 // ---------------------------------------------------------------------------
@@ -402,8 +539,25 @@ impl std::fmt::Debug for PluginHost {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
 
     // --- fixtures ---------------------------------------------------------
+
+    /// A `StreamArgs` backed by a real loopback TCP pair, for exercising an
+    /// interceptor's `run` without a full connection.
+    async fn loopback_stream_args() -> StreamArgs {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (target, _) = listener.accept().await.unwrap();
+        StreamArgs {
+            client: PeekableClientStream::new(ClientStream::Tcp(client)),
+            target,
+            dst: addr,
+            io_timeout: Duration::from_secs(30),
+            throttle: None,
+        }
+    }
 
     fn decision() -> RuleDecision {
         RuleDecision {
@@ -529,6 +683,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peek_buffers_without_consuming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"hello world").await.unwrap();
+        let mut peekable = Peekable::new(reader);
+        // Peeking twice returns the same bytes; nothing is consumed.
+        assert_eq!(peekable.peek(5).await.unwrap(), b"hello");
+        assert_eq!(peekable.peek(5).await.unwrap(), b"hello");
+        // A subsequent read still sees the peeked bytes first, in order.
+        let mut out = vec![0u8; 11];
+        peekable.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"hello world");
+    }
+
+    #[tokio::test]
     async fn empty_host_is_the_zero_cost_default() {
         let host = PluginHost::default();
         assert!(host.is_empty());
@@ -586,13 +755,7 @@ mod tests {
         let ctx = flow_ctx(TagSet::new());
 
         let interceptor = host.intercept(&ctx).expect("an owner should claim the flow");
-        let stats = interceptor
-            .run(StreamArgs {
-                dst: ctx.dest,
-                io_timeout: Duration::from_secs(30),
-            })
-            .await
-            .unwrap();
+        let stats = interceptor.run(loopback_stream_args().await).await.unwrap();
         assert_eq!(stats.to_target, 1, "the first owner (id 1) wins the race");
 
         let none = PluginHost::new(vec![Arc::new(Passer)]);

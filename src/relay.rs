@@ -174,6 +174,28 @@ pub async fn relay_tcp(
     }
 }
 
+/// Like [`relay_tcp`] but generic over any two `AsyncRead + AsyncWrite` streams —
+/// the relay a plugin stream interceptor uses for pass-through (`plugin::splice`)
+/// and for the decrypted inspect path (`plugin::relay`). Uses `tokio::io::split`
+/// on both sides (no owned-split fast path), which is fine off the default relay
+/// hot path.
+#[cfg(feature = "plugins")]
+pub async fn relay_generic<C, R>(
+    client: C,
+    remote: R,
+    idle: Duration,
+    throttle: Option<Throttle>,
+) -> io::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let (cr, cw) = tokio::io::split(client);
+    let (rr, rw) = tokio::io::split(remote);
+    let idle_opt = if idle.is_zero() { None } else { Some(idle) };
+    relay_streams(cr, cw, rr, rw, idle_opt, throttle).await
+}
+
 /// The idle timeout applies to the connection as a whole: traffic in either
 /// direction keeps it alive, matching Dante's `iotimeout`. A coarse watchdog
 /// enforces it so the hot copy loops never re-arm timers per read.
