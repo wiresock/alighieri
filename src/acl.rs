@@ -23,6 +23,9 @@ use crate::socks5::Command;
 
 /// Whether a matching rule allows or denies the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// Re-exported by the plugin SDK; `#[non_exhaustive]` so a future verdict stays an
+// additive change for plugins that match on it.
+#[non_exhaustive]
 pub enum Verdict {
     Pass,
     Block,

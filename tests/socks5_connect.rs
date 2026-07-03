@@ -2023,8 +2023,8 @@ mod plugin_intercept {
     use std::sync::Mutex;
 
     use alighieri::plugin::{
-        self, DatagramCtx, DatagramVerdict, FlowCtx, FlowStats, Plugin, PluginHost, StreamArgs,
-        StreamInterceptor,
+        self, DatagramCtx, DatagramVerdict, FlowCtx, FlowDecision, FlowStats, Plugin, PluginHost,
+        StreamArgs, StreamInterceptor,
     };
     use async_trait::async_trait;
 
@@ -2166,5 +2166,45 @@ mod plugin_intercept {
         );
 
         drop(client);
+    }
+
+    /// Denies a flow in `on_flow`, and records whether `intercept` was (wrongly)
+    /// reached afterward.
+    struct DenyPlugin(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    #[async_trait]
+    impl Plugin for DenyPlugin {
+        fn name(&self) -> &str {
+            "deny"
+        }
+        async fn on_flow(&self, _ctx: &mut FlowCtx<'_>) -> FlowDecision {
+            FlowDecision::Deny("test-deny")
+        }
+        fn intercept(&self, _ctx: &FlowCtx<'_>) -> Option<Box<dyn StreamInterceptor>> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn on_flow_deny_closes_after_success_reply_and_skips_intercept() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let intercepted = std::sync::Arc::new(AtomicBool::new(false));
+        let host = PluginHost::new(vec![std::sync::Arc::new(DenyPlugin(intercepted.clone()))]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_echo_server().await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut client).await;
+        // The deny happens after the relay handoff, so the SOCKS reply is Succeeded.
+        let _bound = request_connect(&mut client, echo).await;
+
+        // Then the connection is closed with no data (the flow was denied).
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "a denied flow must close after the success reply");
+        assert!(
+            !intercepted.load(Ordering::SeqCst),
+            "intercept must not run once on_flow returned Deny"
+        );
     }
 }

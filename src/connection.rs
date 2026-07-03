@@ -408,16 +408,31 @@ impl Connection {
             tags: TagSet::new(),
         };
 
-        // Control plane. A deny after the SOCKS success reply can only close the
-        // connection; the client sees `Succeeded` then an immediate close.
-        if let FlowDecision::Deny(reason) = self.plugins.on_flow(&mut ctx).await {
+        // Control plane. `on_flow` is a fast per-flow hook, so it is bounded by the
+        // handshake timeout like every other pre-relay step — a hung plugin must not
+        // pin a connection permit and the connected target indefinitely. A deny (or
+        // timeout) after the SOCKS success reply can only close the connection; the
+        // client sees `Succeeded` then an immediate close.
+        let decision = match tokio::time::timeout(
+            self.config.handshake_timeout,
+            self.plugins.on_flow(&mut ctx),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(_) => {
+                info!(peer = %self.peer, dest = %target, "on_flow timed out; closing");
+                return Ok(());
+            }
+        };
+        if let FlowDecision::Deny(reason) = decision {
             info!(peer = %self.peer, dest = %target, reason, "flow denied by plugin");
             return Ok(());
         }
 
         // Data plane. The first plugin to claim the flow owns the relay; otherwise
         // the opaque relay runs.
-        let (up, down) = match self.plugins.intercept(&ctx) {
+        let result = match self.plugins.intercept(&ctx) {
             Some(interceptor) => {
                 let args = StreamArgs {
                     client: PeekableClientStream::new(self.stream),
@@ -426,15 +441,22 @@ impl Connection {
                     io_timeout: self.config.io_timeout,
                     throttle,
                 };
-                let stats = interceptor.run(args).await?;
-                (stats.to_target, stats.to_client)
+                interceptor
+                    .run(args)
+                    .await
+                    .map(|s| (s.to_target, s.to_client))
             }
-            None => relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?,
+            None => relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await,
         };
 
+        // `on_flow_end` pairs with `on_flow`: fire it whenever `on_flow` ran, even if
+        // the relay/interceptor errored (a MITM interceptor makes an error the common
+        // case), so a plugin's per-flow state is always torn down.
+        let (up, down) = result.as_ref().ok().copied().unwrap_or((0, 0));
         self.plugins
             .on_flow_end(&ctx, &FlowStats::new(up, down))
             .await;
+        result?;
         self.metrics.tcp_relay_closed(up, down);
         debug!(peer = %self.peer, dest = %target, up, down, "connect closed");
         Ok(())

@@ -67,6 +67,9 @@ impl Method {
 
 /// A SOCKS5 request command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Re-exported by the plugin SDK; `#[non_exhaustive]` so a future command stays an
+// additive change for plugins that match on it.
+#[non_exhaustive]
 pub enum Command {
     /// `0x01` — establish a TCP connection to the target.
     Connect,

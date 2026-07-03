@@ -82,6 +82,9 @@ impl AuthKind {
 
 /// A transport protocol selector for `socks` rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Re-exported by the plugin SDK; `#[non_exhaustive]` so a future transport stays
+// an additive change for plugins that match on it.
+#[non_exhaustive]
 pub enum Protocol {
     Tcp,
     Udp,
