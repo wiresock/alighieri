@@ -787,10 +787,12 @@ where
         }
         // Per-datagram plugin verdict (target→client). Dropped before marking
         // activity, so a dropped reply does not keep the association alive — the
-        // same treatment an unsolicited-source reply gets above.
+        // same treatment an unsolicited-source reply gets above. Pass the
+        // canonical peer (`remote_canon`), not the raw `::ffff:`-mapped source a
+        // dual-stack socket reports, so `dst` matches the client→target direction.
         if !on_datagram(
             true,
-            remote_src,
+            remote_canon,
             &buf[socks5::UDP_IP_HEADER_MAX..socks5::UDP_IP_HEADER_MAX + n],
         ) {
             continue;

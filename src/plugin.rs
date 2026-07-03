@@ -366,6 +366,7 @@ pub async fn splice(args: StreamArgs) -> io::Result<FlowStats> {
 
 /// The direction a datagram is travelling on the UDP path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Direction {
     /// Client → target (the request path).
     ClientToTarget,
@@ -399,8 +400,10 @@ pub enum DatagramVerdict {
 pub struct DatagramCtx<'a> {
     /// Which direction this datagram is travelling.
     pub dir: Direction,
-    /// The datagram's remote peer. On `ClientToTarget`, new destinations are
-    /// already DNS/ACL-vetted by the core; on `TargetToClient`, it is the reply
+    /// The datagram's remote peer, as a **canonical** address in both directions
+    /// (an IPv4-in-IPv6 `::ffff:` reply from a dual-stack socket is unmapped), so a
+    /// plugin can correlate request and reply with a plain `==`. On `ClientToTarget`
+    /// it is the DNS/ACL-vetted destination; on `TargetToClient` it is the reply
     /// source.
     pub dst: SocketAddr,
     /// The UDP payload (e.g. a QUIC Initial).
