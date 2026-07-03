@@ -2209,9 +2209,13 @@ mod plugin_intercept {
         // The deny happens after the relay handoff, so the SOCKS reply is Succeeded.
         let _bound = request_connect(&mut client, echo).await;
 
-        // Then the connection is closed with no data (the flow was denied).
+        // Then the connection is closed with no data (the flow was denied). Bound
+        // the read so a regression that fails to close cannot hang the suite.
         let mut buf = [0u8; 1];
-        let n = client.read(&mut buf).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("a denied flow must close, not hang")
+            .unwrap();
         assert_eq!(n, 0, "a denied flow must close after the success reply");
 
         // Give the server task a moment to run on_flow_end after closing.

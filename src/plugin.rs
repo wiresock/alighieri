@@ -339,14 +339,14 @@ impl<S> Peekable<S> {
 pub const MAX_PEEK: usize = 16 * 1024;
 
 impl<S: AsyncRead + Unpin> Peekable<S> {
-    /// Buffers up to `want` bytes (capped at [`MAX_PEEK`]) from the stream *without
-    /// consuming them* and returns the buffered prefix. Subsequent reads (and
-    /// `peek`s) still see these bytes.
+    /// Buffers the stream's first bytes *without consuming them* and returns the
+    /// buffered prefix; subsequent reads (and `peek`s) still see these bytes.
     ///
-    /// Returns fewer than `want` bytes at end of stream **or** when `want` exceeds
-    /// [`MAX_PEEK`]. It otherwise blocks until `want` bytes arrive, so a caller must
-    /// impose its own deadline if the peer may stall (e.g. wrap the call in a
-    /// timeout).
+    /// `want` is capped at [`MAX_PEEK`], so the effective request is
+    /// `want.min(MAX_PEEK)`. `peek` returns fewer bytes than that effective request
+    /// only at end of stream; otherwise it blocks until that many bytes arrive, so a
+    /// caller must impose its own deadline if the peer may stall (e.g. wrap the call
+    /// in a timeout).
     pub async fn peek(&mut self, want: usize) -> io::Result<&[u8]> {
         let want = want.min(MAX_PEEK);
         // Reclaim any already-consumed prefix so an interleaved read/peek pattern
