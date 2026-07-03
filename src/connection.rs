@@ -417,20 +417,20 @@ impl Connection {
         // A deny or timeout is still an end-of-flow: earlier plugins ran `on_flow`
         // and returned `Continue` (allocating per-flow state), so `on_flow_end` must
         // still fire to pair with them.
-        let decision = match tokio::time::timeout(
+        let flow_decision = match tokio::time::timeout(
             self.config.handshake_timeout,
             self.plugins.on_flow(&mut ctx),
         )
         .await
         {
-            Ok(decision) => decision,
+            Ok(flow_decision) => flow_decision,
             Err(_) => {
                 info!(peer = %self.peer, dest = %target, "on_flow timed out; closing");
                 self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
                 return Ok(());
             }
         };
-        if let FlowDecision::Deny(reason) = decision {
+        if let FlowDecision::Deny(reason) = flow_decision {
             info!(peer = %self.peer, dest = %target, reason, "flow denied by plugin");
             self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
             return Ok(());

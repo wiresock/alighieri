@@ -357,7 +357,11 @@ impl<S: AsyncRead + Unpin> Peekable<S> {
         }
         let mut chunk = [0u8; 4096];
         while self.buf.len() < want {
-            let n = self.inner.read(&mut chunk).await?;
+            // Read only the bytes still needed to reach `want`, so the buffer is
+            // capped exactly at `want` (<= MAX_PEEK); over-reading here would leave
+            // `self.buf` up to a chunk larger than the advertised cap.
+            let cap = (want - self.buf.len()).min(chunk.len());
+            let n = self.inner.read(&mut chunk[..cap]).await?;
             if n == 0 {
                 break; // end of stream
             }
