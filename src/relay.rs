@@ -81,7 +81,7 @@ fn is_transient_recv_error(e: &io::Error) -> bool {
 /// run of *other* failures exceeds [`MAX_CONSECUTIVE_UDP_RECV_ERRORS`]. Backs
 /// off (capped exponential) on every error so a socket that errors on every
 /// recv cannot spin the task on a core.
-async fn recv_resilient(
+pub(crate) async fn recv_resilient(
     socket: &UdpSocket,
     buf: &mut [u8],
     consecutive_errors: &mut u32,
@@ -128,6 +128,48 @@ async fn recv_resilient(
             }
         }
     }
+}
+
+/// Whether a datagram received on the client-facing relay socket is from the
+/// legitimate client. Its source IP must equal the association's client IP —
+/// compared canonically, so a `::ffff:`-mapped source matches a plain-IPv4 lock
+/// and vice versa — and, once the client endpoint is `locked`, its full
+/// `ip:port` must match the lock (any other port of the client is rejected).
+/// `client_ip` must already be canonical (`IpAddr::to_canonical`); the source is
+/// canonicalised here once for both checks, which is the per-datagram hot path.
+///
+/// This is the single source of truth for the client-leg source/lock invariant,
+/// shared between the core relay loop and the plugin datagram facade.
+pub(crate) fn client_source_accepted(
+    src: SocketAddr,
+    client_ip: IpAddr,
+    locked: Option<SocketAddr>,
+) -> bool {
+    let src_canon_ip = src.ip().to_canonical();
+    if src_canon_ip != client_ip {
+        return false; // spoofed / unrelated source
+    }
+    if let Some(locked) = locked {
+        if locked.ip().to_canonical() != src_canon_ip || locked.port() != src.port() {
+            return false; // a different port of the client, once locked
+        }
+    }
+    true
+}
+
+/// Parses the SOCKS5 UDP request header of a client datagram, rejecting
+/// fragmented datagrams (`FRAG != 0`) — fragmentation is rarely used and is a
+/// common evasion vector. Returns `None` to drop the datagram (unparseable or
+/// fragmented).
+///
+/// The single source of truth for the client-leg framing invariant, shared
+/// between the core relay loop and the plugin datagram facade.
+pub(crate) fn parse_client_header(buf: &[u8]) -> Option<socks5::UdpHeader> {
+    let header = socks5::parse_udp_header(buf).ok()?;
+    if header.frag != 0 {
+        return None; // drop fragments
+    }
+    Some(header)
 }
 
 /// Runtime options for a UDP ASSOCIATE relay.
@@ -633,29 +675,19 @@ where
     let client_ip = client_ip.to_canonical();
     loop {
         let (n, src) = recv_resilient(&relay_socket, &mut buf, &mut recv_errors).await?;
-        // Compare canonically (a mapped `::ffff:` source matches the plain-IPv4
-        // lock, and vice versa), but keep `src` in the socket's own family: it is
-        // stored as the reply target below and must stay sendable on this socket.
-        // The predeclared lock is likewise stored in the client's family by
-        // `requested_udp_endpoint`. Canonicalise the source once for both checks
-        // (this is the per-datagram hot path).
-        let src_canon_ip = src.ip().to_canonical();
-        if src_canon_ip != client_ip {
-            continue; // reject spoofed / unrelated source
-        }
-        if let Some(locked) = client_endpoint.get() {
-            if locked.ip().to_canonical() != src_canon_ip || locked.port() != src.port() {
-                continue;
-            }
+        // Accept only datagrams from the legitimate client. `src` is kept in the
+        // socket's own family (it is stored as the reply target below and must
+        // stay sendable on this socket); the check canonicalises internally. The
+        // predeclared lock is stored in the client's family by
+        // `requested_udp_endpoint`.
+        if !client_source_accepted(src, client_ip, client_endpoint.get().copied()) {
+            continue; // spoofed / unrelated / off-lock source
         }
 
-        let header = match socks5::parse_udp_header(&buf[..n]) {
-            Ok(h) => h,
-            Err(_) => continue,
+        let header = match parse_client_header(&buf[..n]) {
+            Some(h) => h,
+            None => continue, // unparseable or fragmented
         };
-        if header.frag != 0 {
-            continue; // drop fragments
-        }
         // IP literals — the common case for UDP — skip the resolver and its
         // address-list allocation entirely.
         let dest = match &header.dest {
@@ -1499,5 +1531,86 @@ mod tests {
             "a reply dropped by on_datagram must not reach the client"
         );
         assoc.abort();
+    }
+
+    // -- client-leg validation primitives (shared with the plugin datagram facade) --
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn client_source_rejects_a_different_ip() {
+        let client_ip = sa("203.0.113.7:0").ip().to_canonical();
+        assert!(client_source_accepted(
+            sa("203.0.113.7:5000"),
+            client_ip,
+            None
+        ));
+        assert!(!client_source_accepted(
+            sa("203.0.113.8:5000"),
+            client_ip,
+            None
+        ));
+    }
+
+    #[test]
+    fn client_source_matches_across_v4_mapped_v6() {
+        // A dual-stack relay socket reports an IPv4 client as `::ffff:a.b.c.d`;
+        // it must match a plain-IPv4 lock, and vice versa.
+        let client_ip = sa("203.0.113.7:0").ip().to_canonical();
+        assert!(client_source_accepted(
+            sa("[::ffff:203.0.113.7]:5000"),
+            client_ip,
+            None
+        ));
+        let mapped_ip = sa("[::ffff:203.0.113.7]:0").ip().to_canonical();
+        assert!(client_source_accepted(
+            sa("203.0.113.7:5000"),
+            mapped_ip,
+            None
+        ));
+    }
+
+    #[test]
+    fn client_source_enforces_the_endpoint_lock() {
+        let client_ip = sa("203.0.113.7:0").ip().to_canonical();
+        let lock = sa("203.0.113.7:5000");
+        // Same ip:port as the lock is accepted; a different port of the same
+        // client is rejected once locked.
+        assert!(client_source_accepted(
+            sa("203.0.113.7:5000"),
+            client_ip,
+            Some(lock)
+        ));
+        assert!(!client_source_accepted(
+            sa("203.0.113.7:6000"),
+            client_ip,
+            Some(lock)
+        ));
+        // The lock comparison is also canonical across the v4/v6-mapped forms.
+        assert!(client_source_accepted(
+            sa("[::ffff:203.0.113.7]:5000"),
+            client_ip,
+            Some(lock)
+        ));
+    }
+
+    #[test]
+    fn parse_client_header_drops_fragments_and_garbage() {
+        // A well-formed, unfragmented v4 header (ATYP=0x01) parses.
+        let mut good = vec![0x00, 0x00, 0x00, 0x01, 203, 0, 113, 9, 0x01, 0xbb];
+        good.extend_from_slice(b"payload");
+        let header = parse_client_header(&good).expect("valid header parses");
+        assert_eq!(header.frag, 0);
+        assert_eq!(&good[header.payload_offset..], b"payload");
+
+        // FRAG != 0 is dropped even though the rest is well-formed.
+        let mut fragmented = good.clone();
+        fragmented[2] = 0x01;
+        assert!(parse_client_header(&fragmented).is_none());
+
+        // Unparseable garbage (bad reserved bytes) is dropped.
+        assert!(parse_client_header(&[0xff, 0xff, 0x00, 0x01]).is_none());
     }
 }
