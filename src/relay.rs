@@ -949,6 +949,14 @@ impl ClientDatagrams {
             if !client_source_accepted(src, self.client_ip, self.client_endpoint.get().copied()) {
                 continue; // spoofed / unrelated / off-lock source
             }
+            // Domain-addressed datagrams are unsupported on a taken-over
+            // association (dropped below). Reject on the raw ATYP byte before the
+            // full parse, which would otherwise allocate and validate the domain
+            // string for untrusted input — the same short-circuit idea as the
+            // fragment drop inside `parse_client_header`.
+            if buf[..n].get(3) == Some(&socks5::ATYP_DOMAIN) {
+                continue;
+            }
             let header = match parse_client_header(&buf[..n]) {
                 Some(h) => h,
                 None => continue, // unparseable or fragmented
@@ -956,10 +964,8 @@ impl ClientDatagrams {
             let payload_offset = header.payload_offset;
             let origin = match header.dest {
                 TargetAddr::Ip(sa) => SocketAddr::new(sa.ip().to_canonical(), sa.port()),
-                TargetAddr::Domain(..) => {
-                    debug!("datagram facade: dropping domain-addressed datagram (proxy-side DNS unsupported on takeover)");
-                    continue;
-                }
+                // Pre-filtered on the ATYP byte above; kept for exhaustiveness.
+                TargetAddr::Domain(..) => continue,
             };
             // A fully validated datagram locks the client endpoint (kept in the
             // socket's own family so it stays a valid reply target) and refreshes
@@ -983,6 +989,14 @@ impl ClientDatagrams {
         };
         // Lay the header in front of the payload in one buffer (header tail is
         // written into the headroom, then the datagram starts at `start`).
+        //
+        // NOTE: this allocates per datagram, unlike the core relay's
+        // `relay_remote_to_client`, which reuses a headroom buffer. A zero-alloc
+        // path here needs a buffer whose lifetime spans the async send without a
+        // lock held across `.await`; that buffer model is co-designed with the
+        // quinn `AsyncUdpSocket` shim (its GSO `Transmit` batching may emit
+        // several datagrams per call), so it is deferred to that PR rather than
+        // fixed on this still-unwired facade.
         let mut datagram = vec![0u8; socks5::UDP_IP_HEADER_MAX + payload.len()];
         datagram[socks5::UDP_IP_HEADER_MAX..].copy_from_slice(payload);
         let prefix: &mut [u8; socks5::UDP_IP_HEADER_MAX] = (&mut datagram
@@ -2142,18 +2156,22 @@ mod facade_tests {
             Arc::new(OnceLock::new()),
         );
 
-        // No datagram received yet: send has nowhere to go and must be a silent Ok.
-        let phantom = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        cd.send("203.0.113.1:443".parse().unwrap(), b"pong")
-            .await
-            .unwrap();
+        // No datagram received yet: send has nowhere to go and must be a silent
+        // Ok. Use a real local socket's address as `from` so that if send ever
+        // mistakenly delivered to `from` (the plausible bug), this would catch it.
+        let would_be_target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let from = would_be_target.local_addr().unwrap();
+        cd.send(from, b"pong").await.unwrap();
         assert!(cd.client_endpoint().is_none());
         let mut b = [0u8; 64];
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), phantom.recv_from(&mut b))
-                .await
-                .is_err(),
-            "nothing is sent before the client endpoint is locked"
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                would_be_target.recv_from(&mut b)
+            )
+            .await
+            .is_err(),
+            "send before the endpoint lock must not deliver anywhere, not even to `from`"
         );
     }
 
