@@ -66,7 +66,7 @@ pub use crate::throttle::Throttle;
 // drives: the client leg (framed, invariant-enforcing) and the origin leg
 // (DNS-deny/ACL-gated). Defined next to the relay internals they wrap; the
 // takeover seam that hands them to a plugin lands with `AssociationArgs`.
-pub use crate::relay::{ClientDatagrams, UpstreamOriginator, UpstreamTarget};
+pub use crate::relay::{ClientDatagrams, DatagramAuthorizer, UpstreamOriginator, UpstreamTarget};
 
 // ---------------------------------------------------------------------------
 // Control-plane context and facades
@@ -630,10 +630,7 @@ pub struct AssociationArgs {
 
 impl AssociationArgs {
     /// Builds an `AssociationArgs` from its parts. The engine builds it at the
-    /// association handoff. It is `pub(crate)` for now because the facade
-    /// constructors it needs are not yet public; a public constructor lands with
-    /// the public [`ClientDatagrams`]/[`UpstreamOriginator`] constructors so plugin
-    /// authors can build one in their own tests.
+    /// association handoff.
     pub(crate) fn new(
         client: ClientDatagrams,
         upstream: UpstreamOriginator,
@@ -644,6 +641,19 @@ impl AssociationArgs {
             upstream,
             io_timeout,
         }
+    }
+
+    /// Builds an `AssociationArgs` from facades a plugin assembled itself — for a
+    /// [`DatagramInterceptor`] exercised in its own tests (build the two facades via
+    /// [`ClientDatagrams::for_interceptor`] / [`UpstreamOriginator::for_interceptor`]
+    /// over loopback sockets, then drive `run`). The engine builds the production
+    /// one internally at the takeover handoff.
+    pub fn for_interceptor(
+        client: ClientDatagrams,
+        upstream: UpstreamOriginator,
+        io_timeout: Duration,
+    ) -> Self {
+        AssociationArgs::new(client, upstream, io_timeout)
     }
 }
 

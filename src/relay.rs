@@ -1030,6 +1030,32 @@ impl ClientDatagrams {
         }
     }
 
+    /// Builds a client-leg facade over an already-bound relay `socket`, for an
+    /// out-of-core [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
+    /// its tests. Only datagrams whose source IP equals `client_ip` are accepted;
+    /// `client_endpoint` may pre-seed the client's UDP endpoint (`None` locks to the
+    /// first validated datagram). The idle clock and metrics are private no-ops and
+    /// no shaping is applied — the core injects its own shared state on the real
+    /// takeover path.
+    pub fn for_interceptor(
+        socket: Arc<UdpSocket>,
+        client_ip: IpAddr,
+        client_endpoint: Option<SocketAddr>,
+    ) -> Self {
+        let lock = Arc::new(OnceLock::new());
+        if let Some(endpoint) = client_endpoint {
+            let _ = lock.set(endpoint);
+        }
+        ClientDatagrams::new(
+            socket,
+            client_ip,
+            lock,
+            Arc::new(ActivityClock::new()),
+            None,
+            Metrics::new(),
+        )
+    }
+
     /// Receives the next datagram genuinely from the client, with the SOCKS5
     /// header stripped. Datagrams that fail a client-leg invariant are dropped
     /// and the method keeps waiting: a wrong source IP, a port other than the
@@ -1150,9 +1176,10 @@ impl UpstreamTarget {
 /// The per-destination SOCKS ACL a taken-over association consults for every
 /// upstream destination: `(host, ip, port) -> allowed`. It also records its own
 /// rule-hit / deny metrics. Shared (`Arc`) so the closure the core already built
-/// for the connection is reused unchanged.
+/// for the connection is reused unchanged. An out-of-core interceptor supplies its
+/// own (e.g. `Arc::new(|_, _, _| true)` in tests).
 #[cfg(feature = "plugins")]
-pub(crate) type DatagramAuthorizer = Arc<dyn Fn(Option<&str>, IpAddr, u16) -> bool + Send + Sync>;
+pub type DatagramAuthorizer = Arc<dyn Fn(Option<&str>, IpAddr, u16) -> bool + Send + Sync>;
 
 /// The origin-facing leg of a taken-over UDP association. Every destination must
 /// clear [`authorize`](Self::authorize) (DNS-deny + the SOCKS ACL) before a
@@ -1199,6 +1226,30 @@ impl UpstreamOriginator {
             throttle,
             metrics,
         }
+    }
+
+    /// Builds an origin-leg facade over an already-bound `outbound` socket, for an
+    /// out-of-core [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
+    /// its tests. `dns_policy` and `authorize` are the same DNS-deny and SOCKS-ACL
+    /// gates the core would apply (use an allow-all `dns_policy` and
+    /// `Arc::new(|_, _, _| true)` in tests). The idle clock and metrics are private
+    /// no-ops and no shaping is applied.
+    pub fn for_interceptor(
+        outbound: Arc<UdpSocket>,
+        outbound_dual: bool,
+        dns_policy: DnsPolicy,
+        authorize: DatagramAuthorizer,
+    ) -> Self {
+        UpstreamOriginator::new(
+            outbound,
+            outbound_dual,
+            dns_policy,
+            authorize,
+            Arc::new(Mutex::new(ContactedRemotes::new(true))),
+            Arc::new(ActivityClock::new()),
+            None,
+            Metrics::new(),
+        )
     }
 
     /// Vets an IP destination against DNS-deny and the SOCKS ACL (with `host` for
@@ -2411,5 +2462,62 @@ mod facade_tests {
                 .is_err(),
             "an unsolicited reply from an uncontacted source must be dropped"
         );
+    }
+
+    // -- public constructors (external interceptor construction) --
+
+    /// The `for_interceptor` constructors build real facades an out-of-core
+    /// interceptor can drive: assemble an `AssociationArgs` over loopback sockets
+    /// exactly as a plugin would in its own tests, and prove `splice_association`
+    /// relays a datagram to an origin and back.
+    #[tokio::test]
+    async fn for_interceptor_constructors_drive_splice_association() {
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_addr = relay.local_addr().unwrap();
+        let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let client = ClientDatagrams::for_interceptor(relay, IpAddr::from([127, 0, 0, 1]), None);
+        let upstream = UpstreamOriginator::for_interceptor(
+            outbound,
+            false,
+            permissive_policy(),
+            acl_allow_all(),
+        );
+        let args = crate::plugin::AssociationArgs::for_interceptor(
+            client,
+            upstream,
+            Duration::from_secs(5),
+        );
+        let spliced = tokio::spawn(crate::plugin::splice_association(args));
+
+        // A UDP echo origin.
+        let echo = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let echo_addr = echo.local_addr().unwrap();
+        {
+            let echo = echo.clone();
+            tokio::spawn(async move {
+                let mut b = [0u8; 512];
+                while let Ok((n, peer)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], peer).await;
+                }
+            });
+        }
+
+        // A client sends a SOCKS-wrapped datagram; splice forwards it to the echo
+        // and relays the echo's reply back.
+        let cli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        cli.send_to(&socks_dg(echo_addr, b"ping"), relay_addr)
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), cli.recv_from(&mut buf))
+            .await
+            .expect("the spliced association should relay the echo back")
+            .unwrap();
+        let hdr = socks5::parse_udp_header(&buf[..n]).unwrap();
+        assert_eq!(hdr.dest, TargetAddr::Ip(echo_addr));
+        assert_eq!(&buf[hdr.payload_offset..n], b"ping");
+        spliced.abort();
     }
 }
