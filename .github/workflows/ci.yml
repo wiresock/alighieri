@@ -36,6 +36,12 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy (all targets, warnings denied)
         run: cargo clippy --all-targets --locked -- -D warnings
+      # The plugin SDK is behind an off-by-default `plugins` feature, so the
+      # default steps never compile it. Lint and test it explicitly on both
+      # platforms so the feature-gated module and its core call sites cannot
+      # bitrot. The default steps stay too, proving the stock build is unchanged.
+      - name: Clippy (plugins feature, warnings denied)
+        run: cargo clippy --all-targets --locked --features plugins -- -D warnings
       - name: Test (lib, bins, integration, examples)
         run: cargo test --all-targets --locked
         env:
@@ -43,6 +49,10 @@ jobs:
           # skip on a non-elevated account, so without this a runner that cannot
           # apply the DACL could report green while never verifying it. Empty on
           # Linux (the tests are Windows-only), where it has no effect.
+          ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
+      - name: Test (plugins feature)
+        run: cargo test --all-targets --locked --features plugins
+        env:
           ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
       - name: Doctests
         run: cargo test --doc --locked
@@ -125,3 +135,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build all targets on the MSRV toolchain
         run: cargo build --all-targets --locked
+      # Verify the feature-gated plugin SDK (and its extra dependency,
+      # async-trait) also builds on the MSRV toolchain.
+      - name: Build with the plugins feature on the MSRV toolchain
+        run: cargo build --all-targets --locked --features plugins
