@@ -18,6 +18,7 @@
 //! - [`relay`]: TCP bidirectional relay and the UDP associate relay.
 //! - [`runtime`]: shared process/service runtime helpers.
 //! - [`tls`]: optional TLS listener setup.
+//! - `plugin` (feature `plugins`, off by default): the plugin SDK interface.
 
 pub mod abuse;
 pub mod acl;
@@ -30,6 +31,8 @@ pub mod errors;
 pub mod metrics;
 pub mod net;
 pub mod platform;
+#[cfg(feature = "plugins")]
+pub mod plugin;
 pub mod proxy_protocol;
 pub mod relay;
 pub mod runtime;

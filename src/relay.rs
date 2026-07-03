@@ -174,6 +174,28 @@ pub async fn relay_tcp(
     }
 }
 
+/// Like [`relay_tcp`] but generic over any two `AsyncRead + AsyncWrite` streams —
+/// the relay a plugin stream interceptor uses for pass-through (`plugin::splice`)
+/// and for the decrypted inspect path (`plugin::relay`). Uses `tokio::io::split`
+/// on both sides (no owned-split fast path), which is fine off the default relay
+/// hot path.
+#[cfg(feature = "plugins")]
+pub async fn relay_generic<C, R>(
+    client: C,
+    remote: R,
+    idle: Duration,
+    throttle: Option<Throttle>,
+) -> io::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    let (cr, cw) = tokio::io::split(client);
+    let (rr, rw) = tokio::io::split(remote);
+    let idle_opt = if idle.is_zero() { None } else { Some(idle) };
+    relay_streams(cr, cw, rr, rw, idle_opt, throttle).await
+}
+
 /// The idle timeout applies to the connection as a whole: traffic in either
 /// direction keeps it alive, matching Dante's `iotimeout`. A coarse watchdog
 /// enforces it so the hot copy loops never re-arm timers per read.
@@ -372,16 +394,22 @@ async fn shaped_wait(wait: Duration, activity: &ActivityClock, idle: Option<Dura
 ///   forwarded, so UDP traffic obeys the same rule set as TCP.
 /// - Fragmented datagrams (`FRAG != 0`) are dropped — fragmentation is rarely
 ///   used and is a common evasion vector.
-pub async fn run_udp_associate<C, F>(
+pub async fn run_udp_associate<C, F, G>(
     mut control: C,
     relay_socket: UdpSocket,
     outbound: UdpSocket,
     options: UdpAssociateOptions,
     authorize: F,
+    on_datagram: G,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     F: Fn(Option<&str>, IpAddr, u16) -> bool + Send + Sync + 'static,
+    // Per-datagram plugin verdict, `(is_reply, dst, payload) -> forward?`. Kept as
+    // core types (not `plugin::DatagramVerdict`) so the UDP relay stays compiled in
+    // every build; the default caller passes `|_, _, _| true`, which monomorphizes
+    // the check away. `false` drops the datagram, exactly like an authorize denial.
+    G: Fn(bool, SocketAddr, &[u8]) -> bool + Clone + Send + Sync + 'static,
 {
     let relay_socket = Arc::new(relay_socket);
     let outbound = Arc::new(outbound);
@@ -410,6 +438,7 @@ where
         contacted.clone(),
         options.outbound_dual,
         authorize,
+        on_datagram.clone(),
     ));
     let mut remote_to_client = tokio::spawn(relay_remote_to_client(
         outbound,
@@ -419,6 +448,7 @@ where
         client_endpoint,
         activity.clone(),
         contacted,
+        on_datagram,
     ));
 
     // Idleness is enforced with a coarse periodic check rather than a timer
@@ -577,7 +607,7 @@ fn idle_tick_period(idle: Duration) -> Duration {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn relay_client_to_remote<F>(
+async fn relay_client_to_remote<F, G>(
     relay_socket: Arc<UdpSocket>,
     outbound: Arc<UdpSocket>,
     client_ip: IpAddr,
@@ -590,9 +620,11 @@ async fn relay_client_to_remote<F>(
     contacted: Arc<Mutex<ContactedRemotes>>,
     outbound_dual: bool,
     authorize: F,
+    on_datagram: G,
 ) -> Result<()>
 where
     F: Fn(Option<&str>, IpAddr, u16) -> bool,
+    G: Fn(bool, SocketAddr, &[u8]) -> bool,
 {
     let mut buf = vec![0u8; UDP_BUF];
     let mut recv_errors = 0u32;
@@ -653,6 +685,13 @@ where
         if !authorize(host, dest.ip(), dest.port()) {
             continue;
         }
+        // Per-datagram plugin verdict (client→target). A drop behaves exactly like
+        // an authorize denial: the datagram is not recorded as a contacted remote,
+        // forwarded, or counted as activity, so the association invariants below are
+        // untouched.
+        if !on_datagram(false, dest, &buf[header.payload_offset..n]) {
+            continue;
+        }
         let _ = client_endpoint.set(src);
         // Remember the destination before sending, so a fast reply is already
         // recognised by relay_remote_to_client; replies from any other remote are
@@ -704,7 +743,8 @@ where
     }
 }
 
-async fn relay_remote_to_client(
+#[allow(clippy::too_many_arguments)]
+async fn relay_remote_to_client<G>(
     outbound: Arc<UdpSocket>,
     relay_socket: Arc<UdpSocket>,
     metrics: Arc<Metrics>,
@@ -712,7 +752,11 @@ async fn relay_remote_to_client(
     client_endpoint: Arc<OnceLock<SocketAddr>>,
     activity: Arc<ActivityClock>,
     contacted: Arc<Mutex<ContactedRemotes>>,
-) -> Result<()> {
+    on_datagram: G,
+) -> Result<()>
+where
+    G: Fn(bool, SocketAddr, &[u8]) -> bool,
+{
     // Headroom in front of the receive area lets the relay prepend the SOCKS
     // header in place instead of allocating per packet.
     let mut buf = vec![0u8; socks5::UDP_IP_HEADER_MAX + UDP_BUF];
@@ -739,6 +783,18 @@ async fn relay_remote_to_client(
             .unwrap_or_else(|e| e.into_inner())
             .contains(remote_canon)
         {
+            continue;
+        }
+        // Per-datagram plugin verdict (target→client). Dropped before marking
+        // activity, so a dropped reply does not keep the association alive — the
+        // same treatment an unsolicited-source reply gets above. Pass the
+        // canonical peer (`remote_canon`), not the raw `::ffff:`-mapped source a
+        // dual-stack socket reports, so `dst` matches the client→target direction.
+        if !on_datagram(
+            true,
+            remote_canon,
+            &buf[socks5::UDP_IP_HEADER_MAX..socks5::UDP_IP_HEADER_MAX + n],
+        ) {
             continue;
         }
         // A reply for an established association counts as activity; packets that
@@ -1049,6 +1105,7 @@ mod tests {
             outbound,
             options,
             |_, _, _| true,
+            |_, _, _| true,
         ));
 
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1083,6 +1140,7 @@ mod tests {
             outbound,
             options,
             |_, _, _| true,
+            |_, _, _| true,
         ));
 
         let junk = tokio::spawn(async move {
@@ -1116,6 +1174,7 @@ mod tests {
             relay_socket,
             outbound,
             options,
+            |_, _, _| true,
             |_, _, _| true,
         ));
 
@@ -1211,6 +1270,7 @@ mod tests {
             outbound,
             options,
             |_, _, _| true,
+            |_, _, _| true,
         ));
 
         // The client never sends, so the contacted set stays empty: a reply to the
@@ -1250,6 +1310,7 @@ mod tests {
             relay_socket,
             outbound,
             options,
+            |_, _, _| true,
             |_, _, _| true,
         ));
 
@@ -1305,6 +1366,7 @@ mod tests {
             outbound,
             options,
             |_, _, _| false,
+            |_, _, _| true,
         ));
 
         let IpAddr::V4(dest_ip) = dest_addr.ip() else {
@@ -1334,6 +1396,108 @@ mod tests {
             "association task exited prematurely; the no-forward result is not meaningful"
         );
 
+        assoc.abort();
+    }
+
+    // The per-datagram verdict (the plugin `on_datagram` hook, threaded as a core
+    // closure) can drop a client→target datagram even when `authorize` allows it.
+    #[tokio::test]
+    async fn on_datagram_can_drop_client_to_target() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let dest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,            // authorize: allow all
+            |is_reply, _, _| is_reply, // on_datagram: drop client→target, allow replies
+        ));
+
+        let IpAddr::V4(dest_ip) = dest_addr.ip() else {
+            unreachable!()
+        };
+        let mut datagram = vec![0u8, 0, 0, 1];
+        datagram.extend_from_slice(&dest_ip.octets());
+        datagram.extend_from_slice(&dest_addr.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        client.send_to(&datagram, relay_addr).await.unwrap();
+
+        let mut dbuf = [0u8; 64];
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(1), dest.recv_from(&mut dbuf)).await;
+        assert!(
+            forwarded.is_err(),
+            "a datagram dropped by on_datagram must not be forwarded to the destination"
+        );
+        assert!(
+            !assoc.is_finished(),
+            "association task exited prematurely; the no-forward result is not meaningful"
+        );
+        assoc.abort();
+    }
+
+    // The reply-direction verdict is a genuinely new call site: forward the
+    // client→target datagram (so the destination replies) but drop the reply — the
+    // client must never see it.
+    #[tokio::test]
+    async fn on_datagram_can_drop_target_to_client() {
+        let relay_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_socket.local_addr().unwrap();
+        let outbound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound_addr = outbound.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let dest = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let (control, _control_peer) = tokio::io::duplex(1024);
+        let mut options = udp_options(client_addr.ip(), Duration::from_secs(5));
+        options.client_endpoint = Some(client_addr);
+        let assoc = tokio::spawn(run_udp_associate(
+            control,
+            relay_socket,
+            outbound,
+            options,
+            |_, _, _| true,             // authorize: allow all
+            |is_reply, _, _| !is_reply, // on_datagram: forward client→target, drop replies
+        ));
+
+        let IpAddr::V4(dest_ip) = dest_addr.ip() else {
+            unreachable!()
+        };
+        let mut datagram = vec![0u8, 0, 0, 1];
+        datagram.extend_from_slice(&dest_ip.octets());
+        datagram.extend_from_slice(&dest_addr.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        client.send_to(&datagram, relay_addr).await.unwrap();
+
+        // The destination receives the forwarded datagram and replies.
+        let mut dbuf = [0u8; 64];
+        let (dn, _) = tokio::time::timeout(Duration::from_secs(1), dest.recv_from(&mut dbuf))
+            .await
+            .expect("dest should receive the forwarded datagram")
+            .unwrap();
+        assert_eq!(&dbuf[..dn], b"ping");
+        dest.send_to(b"pong", outbound_addr).await.unwrap();
+
+        // But the reply is dropped by on_datagram, so the client never sees it.
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "a reply dropped by on_datagram must not reach the client"
+        );
         assoc.abort();
     }
 }

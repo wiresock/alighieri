@@ -2012,3 +2012,159 @@ socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
     .await
     .expect("permit must be free after the stalled handshake timed out");
 }
+
+/// End-to-end coverage of the plugin stream-interception seam: a registered plugin
+/// claims a CONNECT flow, peeks the first bytes without consuming them, splices the
+/// rest through, and receives an `on_flow_end` notification.
+#[cfg(feature = "plugins")]
+mod plugin_intercept {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    use alighieri::plugin::{
+        self, DatagramCtx, DatagramVerdict, FlowCtx, FlowStats, Plugin, PluginHost, StreamArgs,
+        StreamInterceptor,
+    };
+    use async_trait::async_trait;
+
+    /// Shared state a test can inspect after the flow completes.
+    #[derive(Default)]
+    struct Recorder {
+        intercepted: AtomicBool,
+        peeked: Mutex<Vec<u8>>,
+        flow_end_up: AtomicU64,
+    }
+
+    /// Peeks the first 5 bytes (recording them), then splices the flow through
+    /// unchanged — proving peek is non-destructive and splice replays the peeked
+    /// bytes.
+    struct PeekSpliceInterceptor(Arc<Recorder>);
+    #[async_trait]
+    impl StreamInterceptor for PeekSpliceInterceptor {
+        async fn run(self: Box<Self>, mut args: StreamArgs) -> std::io::Result<FlowStats> {
+            let peeked = args.client.peek(5).await?.to_vec();
+            *self.0.peeked.lock().unwrap() = peeked;
+            plugin::splice(args).await
+        }
+    }
+
+    struct RecordingPlugin(Arc<Recorder>);
+    #[async_trait]
+    impl Plugin for RecordingPlugin {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn intercept(&self, _ctx: &FlowCtx<'_>) -> Option<Box<dyn StreamInterceptor>> {
+            self.0.intercepted.store(true, Ordering::SeqCst);
+            Some(Box::new(PeekSpliceInterceptor(self.0.clone())))
+        }
+        async fn on_flow_end(&self, _ctx: &FlowCtx<'_>, stats: &FlowStats) {
+            self.0.flow_end_up.store(stats.to_target, Ordering::SeqCst);
+        }
+    }
+
+    async fn start_proxy_with_plugins(
+        host: PluginHost,
+    ) -> (tokio::task::JoinHandle<Option<()>>, SocketAddr) {
+        let server = Server::bind(permissive_config())
+            .await
+            .unwrap()
+            .with_plugins(host);
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move { server.run().await.ok() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (handle, addr)
+    }
+
+    #[tokio::test]
+    async fn stream_interceptor_peeks_and_splices_through_connect() {
+        let recorder = Arc::new(Recorder::default());
+        let host = PluginHost::new(vec![Arc::new(RecordingPlugin(recorder.clone()))]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_echo_server().await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut client).await;
+        let _bound = request_connect(&mut client, echo).await;
+
+        let payload = b"hello world";
+        client.write_all(payload).await.unwrap();
+        client.shutdown().await.ok();
+
+        // The interceptor peeked the first bytes but spliced everything through, so
+        // the echo target received (and returned) the full, unmodified payload.
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+
+        // on_flow_end runs on the server task after its relay finishes; wait for it.
+        for _ in 0..100 {
+            if recorder.flow_end_up.load(Ordering::SeqCst) >= payload.len() as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            recorder.intercepted.load(Ordering::SeqCst),
+            "intercept() should have claimed the flow"
+        );
+        assert_eq!(
+            &*recorder.peeked.lock().unwrap(),
+            b"hello",
+            "peek should have seen the first bytes without consuming them"
+        );
+        assert_eq!(
+            recorder.flow_end_up.load(Ordering::SeqCst),
+            payload.len() as u64,
+            "on_flow_end should report the relayed byte count"
+        );
+    }
+
+    /// Drops every datagram on the UDP path.
+    struct DropUdpPlugin;
+    #[async_trait]
+    impl Plugin for DropUdpPlugin {
+        fn name(&self) -> &str {
+            "drop-udp"
+        }
+        fn on_datagram(&self, _ctx: &DatagramCtx<'_>) -> DatagramVerdict {
+            DatagramVerdict::Drop
+        }
+    }
+
+    #[tokio::test]
+    async fn on_datagram_drop_blocks_udp_through_associate() {
+        let host = PluginHost::new(vec![Arc::new(DropUdpPlugin)]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_udp_echo_server().await;
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut client).await;
+        let relay_addr = request_udp_associate(&mut client).await;
+
+        // A SOCKS UDP datagram (RSV RSV FRAG ATYP=IPv4 DST.ADDR DST.PORT DATA) to
+        // the echo server. on_datagram drops it, so the echo never receives it and
+        // no reply comes back.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let SocketAddr::V4(echo_v4) = echo else {
+            panic!("echo server should be IPv4")
+        };
+        let mut datagram = vec![0u8, 0, 0, 1];
+        datagram.extend_from_slice(&echo_v4.ip().octets());
+        datagram.extend_from_slice(&echo_v4.port().to_be_bytes());
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay_addr).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), udp.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "on_datagram Drop should block the datagram, so no reply returns"
+        );
+
+        drop(client);
+    }
+}

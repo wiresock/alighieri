@@ -46,6 +46,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "tls12", "webpki-roots"] }
 # StreamExt to drive the rustls-acme certificate-renewal state.
 tokio-stream = "0.1"
+# Async methods on the object-safe `Plugin` / `StreamInterceptor` traits. Pulled
+# in only by the `plugins` feature, so a stock build compiles none of it.
+async-trait = { version = "0.1", optional = true }
+
+[features]
+# The plugin SDK (`alighieri::plugin`). Off by default: a stock build carries no
+# plugin code, no extra dependencies, and no added attack surface.
+plugins = ["dep:async-trait"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -57,6 +65,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# For the plugin-interception integration test (feature-gated); implementing the
+# `Plugin`/`StreamInterceptor` traits needs the same `#[async_trait]` macro.
+async-trait = "0.1"
 
 [profile.release]
 opt-level = 3

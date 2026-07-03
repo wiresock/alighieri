@@ -34,6 +34,10 @@ pub struct Server {
     max_connections: usize,
     metrics: Arc<Metrics>,
     abuse: Arc<AbuseControls>,
+    /// Restart-only registry of active plugins. Empty unless registered via
+    /// [`Server::with_plugins`]; not part of the hot-reloaded [`ServerState`].
+    #[cfg(feature = "plugins")]
+    plugins: Arc<crate::plugin::PluginHost>,
     metrics_addr: Option<SocketAddr>,
     metrics_listener: Mutex<Option<TcpListener>>,
     tls_listener: Option<tls::TlsListener>,
@@ -141,6 +145,8 @@ impl Server {
             max_connections,
             metrics: Metrics::new(),
             abuse,
+            #[cfg(feature = "plugins")]
+            plugins: Arc::new(crate::plugin::PluginHost::default()),
             metrics_addr,
             metrics_listener: Mutex::new(metrics_listener),
             tls_listener,
@@ -148,6 +154,17 @@ impl Server {
             has_run: AtomicBool::new(false),
             shutdown: watch::channel(false).0,
         })
+    }
+
+    /// Registers the plugin set (a build-time registry) for this server. Because
+    /// plugins are statically linked, this is how a private build injects its
+    /// compiled-in plugins; call it once after [`Server::bind`] and before
+    /// [`Server::run`]. The set is restart-only — a config reload does not change
+    /// it.
+    #[cfg(feature = "plugins")]
+    pub fn with_plugins(mut self, plugins: crate::plugin::PluginHost) -> Self {
+        self.plugins = Arc::new(plugins);
+        self
     }
 
     /// Returns the actual local address the listener is bound to (useful when
@@ -384,6 +401,8 @@ impl Server {
             let metrics = self.metrics.clone();
             let tls_listener = self.tls_listener.clone();
             let abuse = self.abuse.clone();
+            #[cfg(feature = "plugins")]
+            let plugins = self.plugins.clone();
             let handshake_timeout = config.handshake_timeout;
             conns.spawn(async move {
                 // Resolve the real client address from a trusted upstream's
@@ -434,6 +453,8 @@ impl Server {
                     abuse,
                     dns_resolver,
                     throttle_bucket,
+                    #[cfg(feature = "plugins")]
+                    plugins,
                 };
                 if let Some(listener) = tls_listener {
                     match tokio::time::timeout(handshake_timeout, listener.accept(stream)).await {

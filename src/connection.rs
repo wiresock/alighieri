@@ -42,6 +42,8 @@ pub struct Connection {
     abuse: Arc<AbuseControls>,
     dns_resolver: Arc<DnsResolver>,
     throttle_bucket: Option<Arc<Mutex<TokenBucket>>>,
+    #[cfg(feature = "plugins")]
+    plugins: Arc<crate::plugin::PluginHost>,
 }
 
 pub struct ConnectionResources {
@@ -52,6 +54,9 @@ pub struct ConnectionResources {
     pub abuse: Arc<AbuseControls>,
     pub dns_resolver: Arc<DnsResolver>,
     pub throttle_bucket: Option<Arc<Mutex<TokenBucket>>>,
+    /// The restart-only registry of active plugins (empty by default).
+    #[cfg(feature = "plugins")]
+    pub plugins: Arc<crate::plugin::PluginHost>,
 }
 
 impl Connection {
@@ -75,6 +80,8 @@ impl Connection {
             abuse: resources.abuse,
             dns_resolver: resources.dns_resolver,
             throttle_bucket: resources.throttle_bucket,
+            #[cfg(feature = "plugins")]
+            plugins: resources.plugins,
         }
     }
 
@@ -341,9 +348,93 @@ impl Connection {
             "connect established"
         );
 
+        self.finish_connect(target, remote, req_host, decision)
+            .await
+    }
+
+    /// Runs the CONNECT relay to completion. Without the `plugins` feature (or with
+    /// no plugins registered) this is today's opaque relay, byte-for-byte; with an
+    /// active plugin it runs the control-plane hooks and any stream interceptor.
+    async fn finish_connect(
+        self,
+        target: SocketAddr,
+        remote: TcpStream,
+        req_host: Option<&str>,
+        decision: crate::acl::RuleDecision,
+    ) -> Result<()> {
+        // `req_host` feeds the plugin `FlowCtx`; without the feature it is unused.
+        #[cfg(not(feature = "plugins"))]
+        let _ = req_host;
+
         let throttle = self.throttle(decision.bandwidth.as_ref());
+
+        // The zero-cost gate: with plugins registered, take the plugin path;
+        // otherwise fall through to the unchanged relay.
+        #[cfg(feature = "plugins")]
+        if !self.plugins.is_empty() {
+            return self
+                .finish_connect_with_plugins(target, remote, req_host, decision, throttle)
+                .await;
+        }
+
         let (up, down) =
             relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?;
+        self.metrics.tcp_relay_closed(up, down);
+        debug!(peer = %self.peer, dest = %target, up, down, "connect closed");
+        Ok(())
+    }
+
+    #[cfg(feature = "plugins")]
+    async fn finish_connect_with_plugins(
+        self,
+        target: SocketAddr,
+        remote: TcpStream,
+        req_host: Option<&str>,
+        decision: crate::acl::RuleDecision,
+        throttle: Option<Throttle>,
+    ) -> Result<()> {
+        use crate::plugin::{
+            FlowCtx, FlowDecision, FlowStats, PeekableClientStream, RuleInfo, StreamArgs, TagSet,
+        };
+
+        let mut ctx = FlowCtx {
+            client: self.peer,
+            proxy: self.local,
+            command: Command::Connect,
+            protocol: Protocol::Tcp,
+            dest_host: req_host,
+            dest: target,
+            rule: RuleInfo::from(&decision),
+            tags: TagSet::new(),
+        };
+
+        // Control plane. A deny after the SOCKS success reply can only close the
+        // connection; the client sees `Succeeded` then an immediate close.
+        if let FlowDecision::Deny(reason) = self.plugins.on_flow(&mut ctx).await {
+            info!(peer = %self.peer, dest = %target, reason, "flow denied by plugin");
+            return Ok(());
+        }
+
+        // Data plane. The first plugin to claim the flow owns the relay; otherwise
+        // the opaque relay runs.
+        let (up, down) = match self.plugins.intercept(&ctx) {
+            Some(interceptor) => {
+                let args = StreamArgs {
+                    client: PeekableClientStream::new(self.stream),
+                    target: remote,
+                    dst: target,
+                    io_timeout: self.config.io_timeout,
+                    throttle,
+                };
+                let stats = interceptor.run(args).await?;
+                (stats.to_target, stats.to_client)
+            }
+            None => relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?,
+        };
+
+        self.plugins
+            .on_flow_end(&ctx, &FlowStats::new(up, down))
+            .await;
         self.metrics.tcp_relay_closed(up, down);
         debug!(peer = %self.peer, dest = %target, up, down, "connect closed");
         Ok(())
@@ -562,24 +653,73 @@ impl Connection {
         // Per-rule bandwidth applies to CONNECT relays; UDP uses the per-client
         // limit only (datagrams may match different rules each).
         let throttle = self.throttle(None);
+        let options = relay::UdpAssociateOptions {
+            client_ip,
+            client_endpoint,
+            idle: self.config.udp_timeout,
+            dns_policy: self.config.dns.clone(),
+            dns_resolver: self.dns_resolver.clone(),
+            metrics: self.metrics.clone(),
+            throttle,
+            outbound_dual,
+            strict_reply: self.config.udp_strict_reply,
+        };
+
+        // The per-datagram plugin verdict. With no plugins (or the feature off) it
+        // is a forward-all closure the compiler monomorphizes away, leaving the UDP
+        // relay byte-for-byte as it was.
+        #[cfg(feature = "plugins")]
+        let run_result = if self.plugins.is_empty() {
+            relay::run_udp_associate(
+                self.stream,
+                relay_socket,
+                outbound,
+                options,
+                authorize,
+                |_, _, _| true,
+            )
+            .await
+        } else {
+            let host = self.plugins.clone();
+            // v1 UDP has no association-level control plane yet, so datagram tags
+            // are empty; a plugin's on_datagram keys on direction/dst/payload.
+            let tags = crate::plugin::TagSet::new();
+            let on_datagram = move |is_reply: bool, dst: SocketAddr, payload: &[u8]| -> bool {
+                use crate::plugin::{DatagramCtx, DatagramVerdict, Direction};
+                let dir = if is_reply {
+                    Direction::TargetToClient
+                } else {
+                    Direction::ClientToTarget
+                };
+                host.on_datagram(&DatagramCtx {
+                    dir,
+                    dst,
+                    payload,
+                    tags: &tags,
+                }) != DatagramVerdict::Drop
+            };
+            relay::run_udp_associate(
+                self.stream,
+                relay_socket,
+                outbound,
+                options,
+                authorize,
+                on_datagram,
+            )
+            .await
+        };
+
+        #[cfg(not(feature = "plugins"))]
         let run_result = relay::run_udp_associate(
             self.stream,
             relay_socket,
             outbound,
-            relay::UdpAssociateOptions {
-                client_ip,
-                client_endpoint,
-                idle: self.config.udp_timeout,
-                dns_policy: self.config.dns.clone(),
-                dns_resolver: self.dns_resolver.clone(),
-                metrics: self.metrics.clone(),
-                throttle,
-                outbound_dual,
-                strict_reply: self.config.udp_strict_reply,
-            },
+            options,
             authorize,
+            |_, _, _| true,
         )
         .await;
+
         metrics.udp_association_closed();
         run_result?;
 
