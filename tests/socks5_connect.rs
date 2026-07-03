@@ -2206,7 +2206,8 @@ mod plugin_intercept {
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         handshake_noauth(&mut client).await;
-        // The deny happens after the relay handoff, so the SOCKS reply is Succeeded.
+        // `on_flow` (and its deny) runs after the SOCKS success reply is sent but
+        // before the relay/intercept, so the CONNECT reply is still Succeeded.
         let _bound = request_connect(&mut client, echo).await;
 
         // Then the connection is closed with no data (the flow was denied). Bound

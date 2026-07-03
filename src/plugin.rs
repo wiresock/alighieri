@@ -118,8 +118,8 @@ pub struct RuleInfo {
 
 impl RuleInfo {
     /// Builds a `RuleInfo` from its parts. Mainly for plugin authors constructing a
-    /// [`FlowCtx`] in their own unit tests; the engine builds one via
-    /// [`From<&RuleDecision>`](RuleInfo#impl-From<%26RuleDecision>).
+    /// [`FlowCtx`] in their own unit tests; the engine builds one from the ACL
+    /// decision via the crate-internal `From<&RuleDecision>` impl.
     pub fn new(verdict: Verdict, source_line: Option<usize>, rule_name: Option<Arc<str>>) -> Self {
         RuleInfo {
             verdict,
