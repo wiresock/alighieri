@@ -1031,7 +1031,7 @@ impl ClientDatagrams {
     }
 
     /// Builds a client-leg facade over an already-bound relay `socket`, for an
-    /// out-of-core [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
+    /// out-of-crate [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
     /// its tests. Only datagrams whose source IP equals `client_ip` are accepted;
     /// `client_endpoint` may pre-seed the client's UDP endpoint (`None` locks to the
     /// first validated datagram). The idle clock and metrics are private no-ops and
@@ -1176,7 +1176,7 @@ impl UpstreamTarget {
 /// The per-destination SOCKS ACL a taken-over association consults for every
 /// upstream destination: `(host, ip, port) -> allowed`. It also records its own
 /// rule-hit / deny metrics. Shared (`Arc`) so the closure the core already built
-/// for the connection is reused unchanged. An out-of-core interceptor supplies its
+/// for the connection is reused unchanged. An out-of-crate interceptor supplies its
 /// own (e.g. `Arc::new(|_, _, _| true)` in tests).
 #[cfg(feature = "plugins")]
 pub type DatagramAuthorizer = Arc<dyn Fn(Option<&str>, IpAddr, u16) -> bool + Send + Sync>;
@@ -1229,14 +1229,17 @@ impl UpstreamOriginator {
     }
 
     /// Builds an origin-leg facade over an already-bound `outbound` socket, for an
-    /// out-of-core [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
-    /// its tests. `dns_policy` and `authorize` are the same DNS-deny and SOCKS-ACL
+    /// out-of-crate [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
+    /// its tests. `strict_reply` matches the `udp.strictreply` option: when `true`
+    /// a reply must come from the exact remote `host:port` contacted, otherwise
+    /// host-only. `dns_policy` and `authorize` are the same DNS-deny and SOCKS-ACL
     /// gates the core would apply (use an allow-all `dns_policy` and
     /// `Arc::new(|_, _, _| true)` in tests). The idle clock and metrics are private
     /// no-ops and no shaping is applied.
     pub fn for_interceptor(
         outbound: Arc<UdpSocket>,
         outbound_dual: bool,
+        strict_reply: bool,
         dns_policy: DnsPolicy,
         authorize: DatagramAuthorizer,
     ) -> Self {
@@ -1245,7 +1248,7 @@ impl UpstreamOriginator {
             outbound_dual,
             dns_policy,
             authorize,
-            Arc::new(Mutex::new(ContactedRemotes::new(true))),
+            Arc::new(Mutex::new(ContactedRemotes::new(strict_reply))),
             Arc::new(ActivityClock::new()),
             None,
             Metrics::new(),
@@ -2466,7 +2469,7 @@ mod facade_tests {
 
     // -- public constructors (external interceptor construction) --
 
-    /// The `for_interceptor` constructors build real facades an out-of-core
+    /// The `for_interceptor` constructors build real facades an out-of-crate
     /// interceptor can drive: assemble an `AssociationArgs` over loopback sockets
     /// exactly as a plugin would in its own tests, and prove `splice_association`
     /// relays a datagram to an origin and back.
@@ -2480,6 +2483,7 @@ mod facade_tests {
         let upstream = UpstreamOriginator::for_interceptor(
             outbound,
             false,
+            true,
             permissive_policy(),
             acl_allow_all(),
         );
