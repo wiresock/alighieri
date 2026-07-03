@@ -599,7 +599,14 @@ where
     );
     let args = crate::plugin::AssociationArgs::new(client, upstream, options.idle);
 
-    let mut task = tokio::spawn(async move { interceptor.run(args).await });
+    // Drive the interceptor in-future (not a detached `tokio::spawn`): if this
+    // function is itself cancelled — e.g. the connection task is aborted on
+    // shutdown drain (`JoinSet::shutdown`) — dropping this future drops the pinned
+    // interceptor with it, so the interceptor and the sockets it owns are torn
+    // down rather than orphaned. On the normal teardown paths (control-close or
+    // idle) the loop breaks and the interceptor is likewise dropped at return.
+    let interceptor = interceptor.run(args);
+    tokio::pin!(interceptor);
 
     let idle_enabled = !options.idle.is_zero();
     let tick_period = if idle_enabled {
@@ -611,7 +618,7 @@ where
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ctrl_buf = [0u8; 512];
 
-    let result = loop {
+    loop {
         tokio::select! {
             // The control connection is only a teardown signal (its closing ends
             // the association); data on it must not refresh the UDP idle timer.
@@ -621,29 +628,24 @@ where
                     Ok(_) => continue,
                 }
             }
-            res = &mut task => break flatten_interceptor(res),
+            res = &mut interceptor => break flatten_interceptor(res),
             _ = idle_tick.tick() => {
                 if idle_enabled && activity.idle_for() >= options.idle {
                     break Ok(());
                 }
             }
         }
-    };
-    task.abort();
-    result
+    }
 }
 
-/// Flattens the interceptor task's join result. The interceptor's [`FlowStats`]
-/// are discarded here (the facades already record the UDP relay byte metrics);
-/// only success/failure of the association matters to the caller.
+/// Flattens the interceptor's result. The interceptor's [`FlowStats`] are
+/// discarded here (the facades already record the UDP relay byte metrics); only
+/// success/failure of the association matters to the caller.
 #[cfg(feature = "plugins")]
-fn flatten_interceptor(
-    joined: std::result::Result<io::Result<crate::plugin::FlowStats>, tokio::task::JoinError>,
-) -> Result<()> {
-    match joined {
-        Ok(Ok(_stats)) => Ok(()),
-        Ok(Err(e)) => Err(crate::errors::Error::Io(e)),
-        Err(e) => Err(crate::errors::Error::Io(std::io::Error::other(e))),
+fn flatten_interceptor(res: io::Result<crate::plugin::FlowStats>) -> Result<()> {
+    match res {
+        Ok(_stats) => Ok(()),
+        Err(e) => Err(crate::errors::Error::Io(e)),
     }
 }
 

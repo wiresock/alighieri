@@ -647,8 +647,9 @@ impl AssociationArgs {
     }
 }
 
-/// A read buffer sized for a whole UDP datagram (max 65535 bytes).
-const ASSOCIATION_BUF: usize = 64 * 1024;
+/// A read buffer sized to hold a whole UDP datagram (the 65535-byte maximum),
+/// matching the core relay's `UDP_BUF`.
+const ASSOCIATION_BUF: usize = 65_535;
 
 /// The opaque pass-through for a taken-over association: an interceptor that peeks
 /// and decides "not this one" relays the association transparently with this,
