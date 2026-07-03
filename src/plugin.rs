@@ -19,8 +19,12 @@
 //!   stable view of the ACL decision), an SDK-owned [`TagSet`], and copies — not
 //!   the engine's `RuleDecision`, `Throttle`, or config types — so the engine can
 //!   refactor its guts without breaking private plugin crates.
-//! - **`#[non_exhaustive]` everywhere.** New fields/variants can be added without
-//!   a breaking release.
+//! - **Evolvable types.** Every public type with public fields or variants (the
+//!   argument/context types — [`FlowCtx`], [`StreamArgs`], [`DatagramCtx`],
+//!   [`FlowDecision`], [`DatagramVerdict`], [`Direction`], …) is
+//!   `#[non_exhaustive]`; types with private fields ([`TagSet`], [`RuleInfo`],
+//!   [`PluginHost`], [`Peekable`]) evolve through their methods. Either way, fields
+//!   and variants can be added without a breaking release.
 //!
 //! All three data-plane paths are wired into the connection path: the control
 //! plane and the stream interceptor ([`StreamArgs`], [`PeekableClientStream`],
@@ -276,16 +280,22 @@ impl<S: AsyncRead + Unpin> Peekable<S> {
     /// The caller must bound `want` (e.g. to one maximum TLS record) so a slow or
     /// oversized first message cannot grow the buffer without limit.
     pub async fn peek(&mut self, want: usize) -> io::Result<&[u8]> {
+        // Reclaim any already-consumed prefix so an interleaved read/peek pattern
+        // does not accumulate dead bytes ahead of the pending region.
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
         let mut chunk = [0u8; 4096];
-        while self.buf.len() - self.pos < want {
+        while self.buf.len() < want {
             let n = self.inner.read(&mut chunk).await?;
             if n == 0 {
                 break; // end of stream
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
-        let end = (self.pos + want).min(self.buf.len());
-        Ok(&self.buf[self.pos..end])
+        let end = want.min(self.buf.len());
+        Ok(&self.buf[..end])
     }
 }
 
@@ -422,8 +432,10 @@ pub struct DatagramCtx<'a> {
 /// `Arc<dyn Plugin>` and invoked at the connection seams.
 ///
 /// Every hook has a default no-op body, so a plugin implements only the ones it
-/// needs. The SDK docs' cardinal rule for implementors: **return errors, do not
-/// `unwrap` on wire input** — see the panic-isolation notes in the design.
+/// needs. Cardinal rule for implementors: **return errors, do not `unwrap` on
+/// wire input.** A plugin runs in-process with the proxy, and the default release
+/// profile is `panic = "abort"`, so a panic on malformed input takes the whole
+/// process down; treat all client/target bytes as untrusted.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// A short, stable name for logs, metrics, and config selection.
@@ -765,7 +777,9 @@ mod tests {
         ]);
         let ctx = flow_ctx(TagSet::new());
 
-        let interceptor = host.intercept(&ctx).expect("an owner should claim the flow");
+        let interceptor = host
+            .intercept(&ctx)
+            .expect("an owner should claim the flow");
         let stats = interceptor.run(loopback_stream_args().await).await.unwrap();
         assert_eq!(stats.to_target, 1, "the first owner (id 1) wins the race");
 
@@ -781,7 +795,8 @@ mod tests {
         let tags = TagSet::new();
         let dctx = datagram_ctx(&tags, b"payload");
 
-        let forward_only = PluginHost::new(vec![Arc::new(DatagramPlugin(DatagramVerdict::Forward))]);
+        let forward_only =
+            PluginHost::new(vec![Arc::new(DatagramPlugin(DatagramVerdict::Forward))]);
         assert_eq!(forward_only.on_datagram(&dctx), DatagramVerdict::Forward);
 
         let with_drop = PluginHost::new(vec![

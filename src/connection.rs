@@ -348,7 +348,8 @@ impl Connection {
             "connect established"
         );
 
-        self.finish_connect(target, remote, req_host, decision).await
+        self.finish_connect(target, remote, req_host, decision)
+            .await
     }
 
     /// Runs the CONNECT relay to completion. Without the `plugins` feature (or with
@@ -428,9 +429,7 @@ impl Connection {
                 let stats = interceptor.run(args).await?;
                 (stats.to_target, stats.to_client)
             }
-            None => {
-                relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?
-            }
+            None => relay::relay_tcp(self.stream, remote, self.config.io_timeout, throttle).await?,
         };
 
         self.plugins
