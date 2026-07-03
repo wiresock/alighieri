@@ -413,6 +413,10 @@ impl Connection {
         // pin a connection permit and the connected target indefinitely. A deny (or
         // timeout) after the SOCKS success reply can only close the connection; the
         // client sees `Succeeded` then an immediate close.
+        //
+        // A deny or timeout is still an end-of-flow: earlier plugins ran `on_flow`
+        // and returned `Continue` (allocating per-flow state), so `on_flow_end` must
+        // still fire to pair with them.
         let decision = match tokio::time::timeout(
             self.config.handshake_timeout,
             self.plugins.on_flow(&mut ctx),
@@ -422,11 +426,13 @@ impl Connection {
             Ok(decision) => decision,
             Err(_) => {
                 info!(peer = %self.peer, dest = %target, "on_flow timed out; closing");
+                self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
                 return Ok(());
             }
         };
         if let FlowDecision::Deny(reason) = decision {
             info!(peer = %self.peer, dest = %target, reason, "flow denied by plugin");
+            self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
             return Ok(());
         }
 

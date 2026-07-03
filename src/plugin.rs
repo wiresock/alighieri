@@ -374,12 +374,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Peekable<S> {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A zero-capacity read is a successful no-op, not EOF, and must not depend on
+        // the inner stream's readiness — handle it up front so neither the buffered
+        // branch nor the inner poll can misreport it while peeked bytes are pending.
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = &mut *self;
         // Drain any peeked bytes first, then fall through to the underlying stream.
-        // Guard on remaining capacity: with a zero-capacity ReadBuf, returning
-        // Ready here without filling anything would falsely signal EOF while peeked
-        // bytes are still pending.
-        if this.pos < this.buf.len() && out.remaining() > 0 {
+        if this.pos < this.buf.len() {
             let pending = &this.buf[this.pos..];
             let n = pending.len().min(out.remaining());
             out.put_slice(&pending[..n]);

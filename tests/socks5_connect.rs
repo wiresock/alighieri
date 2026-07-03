@@ -2168,9 +2168,12 @@ mod plugin_intercept {
         drop(client);
     }
 
-    /// Denies a flow in `on_flow`, and records whether `intercept` was (wrongly)
-    /// reached afterward.
-    struct DenyPlugin(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    /// Denies a flow in `on_flow`; records whether `intercept` was (wrongly) reached
+    /// and whether the paired `on_flow_end` fired.
+    struct DenyPlugin {
+        intercepted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
     #[async_trait]
     impl Plugin for DenyPlugin {
         fn name(&self) -> &str {
@@ -2180,16 +2183,24 @@ mod plugin_intercept {
             FlowDecision::Deny("test-deny")
         }
         fn intercept(&self, _ctx: &FlowCtx<'_>) -> Option<Box<dyn StreamInterceptor>> {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.intercepted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             None
+        }
+        async fn on_flow_end(&self, _ctx: &FlowCtx<'_>, _stats: &FlowStats) {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     #[tokio::test]
-    async fn on_flow_deny_closes_after_success_reply_and_skips_intercept() {
+    async fn on_flow_deny_closes_after_success_reply_pairs_on_flow_end_and_skips_intercept() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let intercepted = std::sync::Arc::new(AtomicBool::new(false));
-        let host = PluginHost::new(vec![std::sync::Arc::new(DenyPlugin(intercepted.clone()))]);
+        let ended = std::sync::Arc::new(AtomicBool::new(false));
+        let host = PluginHost::new(vec![std::sync::Arc::new(DenyPlugin {
+            intercepted: intercepted.clone(),
+            ended: ended.clone(),
+        })]);
         let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
         let echo = start_echo_server().await;
 
@@ -2202,9 +2213,21 @@ mod plugin_intercept {
         let mut buf = [0u8; 1];
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "a denied flow must close after the success reply");
+
+        // Give the server task a moment to run on_flow_end after closing.
+        for _ in 0..50 {
+            if ended.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
             !intercepted.load(Ordering::SeqCst),
             "intercept must not run once on_flow returned Deny"
+        );
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "on_flow_end must still fire on a deny, to pair with on_flow"
         );
     }
 }
