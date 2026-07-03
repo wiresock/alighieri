@@ -117,6 +117,17 @@ pub struct RuleInfo {
 }
 
 impl RuleInfo {
+    /// Builds a `RuleInfo` from its parts. Mainly for plugin authors constructing a
+    /// [`FlowCtx`] in their own unit tests; the engine builds one from the ACL
+    /// decision via the crate-internal `From<&RuleDecision>` impl.
+    pub fn new(verdict: Verdict, source_line: Option<usize>, rule_name: Option<Arc<str>>) -> Self {
+        RuleInfo {
+            verdict,
+            source_line,
+            rule_name,
+        }
+    }
+
     /// The verdict of the matching rule (`Pass`, or `Block` for deny-by-default).
     pub fn verdict(&self) -> Verdict {
         self.verdict
@@ -167,6 +178,34 @@ pub struct FlowCtx<'a> {
     pub rule: RuleInfo,
     /// Tags attached to the flow; accumulate across plugins.
     pub tags: TagSet,
+}
+
+impl<'a> FlowCtx<'a> {
+    /// Builds a `FlowCtx` from its parts. The engine constructs one internally; this
+    /// lets plugin authors build one in their own unit tests (the type is
+    /// `#[non_exhaustive]`, so struct-literal construction is not available to them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: SocketAddr,
+        proxy: SocketAddr,
+        command: Command,
+        protocol: Protocol,
+        dest_host: Option<&'a str>,
+        dest: SocketAddr,
+        rule: RuleInfo,
+        tags: TagSet,
+    ) -> Self {
+        FlowCtx {
+            client,
+            proxy,
+            command,
+            protocol,
+            dest_host,
+            dest,
+            rule,
+            tags,
+        }
+    }
 }
 
 /// The control-plane verdict returned by [`Plugin::on_flow`].
@@ -247,6 +286,27 @@ pub struct StreamArgs {
     pub throttle: Option<Throttle>,
 }
 
+impl StreamArgs {
+    /// Builds a `StreamArgs` from its parts — for plugin authors constructing one in
+    /// their own tests (the type is `#[non_exhaustive]`). The engine builds it at the
+    /// relay handoff.
+    pub fn new(
+        client: PeekableClientStream,
+        target: TcpStream,
+        dst: SocketAddr,
+        io_timeout: Duration,
+        throttle: Option<Throttle>,
+    ) -> Self {
+        StreamArgs {
+            client,
+            target,
+            dst,
+            io_timeout,
+            throttle,
+        }
+    }
+}
+
 /// The client side of an intercepted flow: a [`ClientStream`] with a peek buffer
 /// so an interceptor can inspect the first bytes without consuming them.
 pub type PeekableClientStream = Peekable<ClientStream>;
@@ -272,14 +332,23 @@ impl<S> Peekable<S> {
     }
 }
 
+/// The largest prefix [`Peekable::peek`] will buffer: one maximum TLS record
+/// (16 KiB), which holds any realistic ClientHello / QUIC Initial. `peek` clamps
+/// `want` to this, so the primitive cannot be driven to unbounded allocation
+/// regardless of caller discipline.
+pub const MAX_PEEK: usize = 16 * 1024;
+
 impl<S: AsyncRead + Unpin> Peekable<S> {
-    /// Buffers up to `want` bytes from the stream *without consuming them* and
-    /// returns the buffered prefix. Subsequent reads (and `peek`s) still see these
-    /// bytes. Returns fewer than `want` bytes only at end of stream.
+    /// Buffers the stream's first bytes *without consuming them* and returns the
+    /// buffered prefix; subsequent reads (and `peek`s) still see these bytes.
     ///
-    /// The caller must bound `want` (e.g. to one maximum TLS record) so a slow or
-    /// oversized first message cannot grow the buffer without limit.
+    /// `want` is capped at [`MAX_PEEK`], so the effective request is
+    /// `want.min(MAX_PEEK)`. `peek` returns fewer bytes than that effective request
+    /// only at end of stream; otherwise it blocks until that many bytes arrive, so a
+    /// caller must impose its own deadline if the peer may stall (e.g. wrap the call
+    /// in a timeout).
     pub async fn peek(&mut self, want: usize) -> io::Result<&[u8]> {
+        let want = want.min(MAX_PEEK);
         // Reclaim any already-consumed prefix so an interleaved read/peek pattern
         // does not accumulate dead bytes ahead of the pending region.
         if self.pos > 0 {
@@ -288,7 +357,11 @@ impl<S: AsyncRead + Unpin> Peekable<S> {
         }
         let mut chunk = [0u8; 4096];
         while self.buf.len() < want {
-            let n = self.inner.read(&mut chunk).await?;
+            // Read only the bytes still needed to reach `want`, so the buffer is
+            // capped exactly at `want` (<= MAX_PEEK); over-reading here would leave
+            // `self.buf` up to a chunk larger than the advertised cap.
+            let cap = (want - self.buf.len()).min(chunk.len());
+            let n = self.inner.read(&mut chunk[..cap]).await?;
             if n == 0 {
                 break; // end of stream
             }
@@ -305,6 +378,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Peekable<S> {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // A zero-capacity read is a successful no-op, not EOF, and must not depend on
+        // the inner stream's readiness — handle it up front so neither the buffered
+        // branch nor the inner poll can misreport it while peeked bytes are pending.
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = &mut *self;
         // Drain any peeked bytes first, then fall through to the underlying stream.
         if this.pos < this.buf.len() {
@@ -422,6 +501,20 @@ pub struct DatagramCtx<'a> {
     /// [`Plugin::on_flow`] yet (see its docs), so nothing populates them. The field
     /// is present for when a UDP association-level control plane lands.
     pub tags: &'a TagSet,
+}
+
+impl<'a> DatagramCtx<'a> {
+    /// Builds a `DatagramCtx` from its parts — for plugin authors constructing one in
+    /// their own tests (the type is `#[non_exhaustive]`). The engine builds it in the
+    /// UDP relay loop.
+    pub fn new(dir: Direction, dst: SocketAddr, payload: &'a [u8], tags: &'a TagSet) -> Self {
+        DatagramCtx {
+            dir,
+            dst,
+            payload,
+            tags,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +811,16 @@ mod tests {
         let mut out = vec![0u8; 11];
         peekable.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn peek_is_capped_at_max_peek() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(MAX_PEEK * 2);
+        writer.write_all(&vec![0u8; MAX_PEEK + 100]).await.unwrap();
+        let mut peekable = Peekable::new(reader);
+        // An over-large `want` is clamped so the buffer cannot grow without limit.
+        assert_eq!(peekable.peek(usize::MAX).await.unwrap().len(), MAX_PEEK);
     }
 
     #[tokio::test]
