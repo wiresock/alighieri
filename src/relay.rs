@@ -135,8 +135,11 @@ pub(crate) async fn recv_resilient(
 /// compared canonically, so a `::ffff:`-mapped source matches a plain-IPv4 lock
 /// and vice versa — and, once the client endpoint is `locked`, its full
 /// `ip:port` must match the lock (any other port of the client is rejected).
-/// `client_ip` must already be canonical (`IpAddr::to_canonical`); the source is
-/// canonicalised here once for both checks, which is the per-datagram hot path.
+///
+/// Both `src` and `client_ip` are canonicalised internally, so a caller may pass
+/// either form without silently rejecting legitimate traffic — this is a shared
+/// utility and must not depend on a caller precondition. Canonicalisation is a
+/// cheap branch (a no-op for a plain IPv4 address).
 ///
 /// This is the single source of truth for the client-leg source/lock invariant,
 /// shared between the core relay loop and the plugin datagram facade.
@@ -145,6 +148,7 @@ pub(crate) fn client_source_accepted(
     client_ip: IpAddr,
     locked: Option<SocketAddr>,
 ) -> bool {
+    let client_ip = client_ip.to_canonical();
     let src_canon_ip = src.ip().to_canonical();
     if src_canon_ip != client_ip {
         return false; // spoofed / unrelated source
@@ -165,10 +169,15 @@ pub(crate) fn client_source_accepted(
 /// The single source of truth for the client-leg framing invariant, shared
 /// between the core relay loop and the plugin datagram facade.
 pub(crate) fn parse_client_header(buf: &[u8]) -> Option<socks5::UdpHeader> {
-    let header = socks5::parse_udp_header(buf).ok()?;
-    if header.frag != 0 {
+    // FRAG is the third header byte (`RSV(2) FRAG(1) ...`). Reject a fragment on
+    // the raw byte before the full parse — which may allocate for a domain ATYP —
+    // so a fragment flood cannot make us do that work. Same drop outcome either
+    // way: any fragmented or malformed datagram is dropped regardless of order.
+    if buf.get(2).is_some_and(|&frag| frag != 0) {
         return None; // drop fragments
     }
+    let header = socks5::parse_udp_header(buf).ok()?;
+    debug_assert_eq!(header.frag, 0, "FRAG must be zero after the raw pre-check");
     Some(header)
 }
 
@@ -670,16 +679,13 @@ where
 {
     let mut buf = vec![0u8; UDP_BUF];
     let mut recv_errors = 0u32;
-    // Canonicalise the client's address once so the source check compares on the
-    // real family: a dual-stack socket reports an IPv4 client as `::ffff:a.b.c.d`.
-    let client_ip = client_ip.to_canonical();
     loop {
         let (n, src) = recv_resilient(&relay_socket, &mut buf, &mut recv_errors).await?;
         // Accept only datagrams from the legitimate client. `src` is kept in the
         // socket's own family (it is stored as the reply target below and must
-        // stay sendable on this socket); the check canonicalises internally. The
-        // predeclared lock is stored in the client's family by
-        // `requested_udp_endpoint`.
+        // stay sendable on this socket); `client_source_accepted` canonicalises
+        // both addresses internally. The predeclared lock is stored in the
+        // client's family by `requested_udp_endpoint`.
         if !client_source_accepted(src, client_ip, client_endpoint.get().copied()) {
             continue; // spoofed / unrelated / off-lock source
         }
@@ -1557,17 +1563,19 @@ mod tests {
     #[test]
     fn client_source_matches_across_v4_mapped_v6() {
         // A dual-stack relay socket reports an IPv4 client as `::ffff:a.b.c.d`;
-        // it must match a plain-IPv4 lock, and vice versa.
+        // it must match a plain-IPv4 client, and vice versa.
         let client_ip = sa("203.0.113.7:0").ip().to_canonical();
         assert!(client_source_accepted(
             sa("[::ffff:203.0.113.7]:5000"),
             client_ip,
             None
         ));
-        let mapped_ip = sa("[::ffff:203.0.113.7]:0").ip().to_canonical();
+        // A non-canonical (v4-mapped-v6) client_ip is canonicalised internally,
+        // so a caller need not pre-canonicalise: a plain-v4 source still matches.
+        let mapped_client = sa("[::ffff:203.0.113.7]:0").ip(); // deliberately not canonicalised
         assert!(client_source_accepted(
             sa("203.0.113.7:5000"),
-            mapped_ip,
+            mapped_client,
             None
         ));
     }
