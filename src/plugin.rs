@@ -57,6 +57,11 @@ pub use crate::acl::Verdict;
 pub use crate::config::Protocol;
 pub use crate::socks5::Command;
 pub use crate::throttle::Throttle;
+// The core-owned datagram facades a UDP/QUIC association-takeover interceptor
+// drives: the client leg (framed, invariant-enforcing) and the origin leg
+// (DNS-deny/ACL-gated). Defined next to the relay internals they wrap; the
+// takeover seam that hands them to a plugin lands with `AssociationArgs`.
+pub use crate::relay::{ClientDatagrams, UpstreamOriginator, UpstreamTarget};
 
 // ---------------------------------------------------------------------------
 // Control-plane context and facades

@@ -172,7 +172,7 @@ impl fmt::Display for TargetAddr {
 }
 
 const ATYP_V4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x03;
+pub(crate) const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
 /// Reads an `ATYP`-prefixed address followed by a 2-byte big-endian port.
