@@ -7,11 +7,13 @@
 //!
 //! The surface splits into a transport-agnostic **control plane** — the
 //! [`Plugin`] hooks that observe / allow / deny / tag a flow — and a
-//! transport-typed **data plane**: a [`StreamInterceptor`] that owns a TCP relay
-//! (where TLS-MITM will live), and a per-datagram [`DatagramVerdict`] returned
-//! from [`Plugin::on_datagram`] (where the core keeps the UDP loop and all its
-//! association invariants). [`PluginHost`] holds the registered plugins and
-//! defines how their results combine.
+//! transport-typed **data plane** with three paths: a [`StreamInterceptor`] that
+//! owns a TCP relay (where TLS-MITM lives), a per-datagram [`DatagramVerdict`]
+//! returned from [`Plugin::on_datagram`] (where the core keeps the UDP loop and
+//! all its association invariants), and a [`DatagramInterceptor`] that takes over a
+//! whole UDP association (where native QUIC/HTTP-3 MITM lives, driving the
+//! core-owned [`ClientDatagrams`]/[`UpstreamOriginator`] facades). [`PluginHost`]
+//! holds the registered plugins and defines how their results combine.
 //!
 //! Two design rules keep the interface durable:
 //!
@@ -21,23 +23,26 @@
 //!   refactor its guts without breaking private plugin crates.
 //! - **Evolvable types.** Every public type with public fields or variants (the
 //!   argument/context types — [`FlowCtx`], [`StreamArgs`], [`DatagramCtx`],
-//!   [`FlowDecision`], [`DatagramVerdict`], [`Direction`], …) is
+//!   [`AssociateCtx`], [`AssociationArgs`], [`FlowDecision`], [`DatagramVerdict`],
+//!   [`Direction`], …) is
 //!   `#[non_exhaustive]`; types with private fields ([`TagSet`], [`RuleInfo`],
 //!   [`PluginHost`], [`Peekable`]) evolve through their methods. Either way, fields
 //!   and variants can be added without a breaking release.
 //!
-//! All three data-plane paths are wired into the connection path: the control
-//! plane and the stream interceptor ([`StreamArgs`], [`PeekableClientStream`],
-//! [`splice`]/[`relay`]) at the TCP CONNECT handoff, and the per-datagram
-//! [`DatagramVerdict`] on both directions of the UDP relay — where the core keeps
-//! the loop and its association invariants, acting on the verdict itself. Every
-//! argument type is `#[non_exhaustive]`, so growing it (e.g. an explicit
-//! throttle-wrapped target, or a UDP association-level control plane) is not a
-//! breaking change for plugins, which only *receive* these types.
+//! All three data-plane paths are wired into the connection path: the stream
+//! interceptor ([`StreamArgs`], [`PeekableClientStream`], [`splice`]/[`relay`]) at
+//! the TCP CONNECT handoff; the per-datagram [`DatagramVerdict`] on both directions
+//! of the UDP relay — where the core keeps the loop and its association invariants,
+//! acting on the verdict itself; and the association-takeover [`DatagramInterceptor`]
+//! ([`AssociateCtx`], [`AssociationArgs`], [`splice_association`]) at the UDP
+//! ASSOCIATE handoff. Every argument type is `#[non_exhaustive]`, so growing it
+//! (e.g. an explicit throttle-wrapped target, or a UDP association-level control
+//! plane) is not a breaking change for plugins, which only *receive* these types.
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -523,6 +528,187 @@ impl<'a> DatagramCtx<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Data plane: association takeover (UDP / QUIC)
+// ---------------------------------------------------------------------------
+
+/// The association-level control-plane context passed to
+/// [`Plugin::intercept_association`], built once from the UDP ASSOCIATE request.
+///
+/// A UDP association has no single destination (datagrams may target many
+/// remotes), so unlike [`FlowCtx`] it carries no `dest`: the decision to take an
+/// association over is made from the client identity and the request, and the
+/// per-destination DNS-deny/ACL is enforced afterward by [`UpstreamOriginator`].
+#[non_exhaustive]
+pub struct AssociateCtx<'a> {
+    /// The connecting client's control-connection address.
+    pub client: SocketAddr,
+    /// The proxy's own accepting address.
+    pub proxy: SocketAddr,
+    /// The SOCKS command (always [`Command::UdpAssociate`] in v1).
+    pub command: Command,
+    /// The transport (always [`Protocol::Udp`] in v1).
+    pub protocol: Protocol,
+    /// The relay address advertised to the client (BND.ADDR/PORT), already sent.
+    pub relay_addr: SocketAddr,
+    /// The ASSOCIATE request DST host, if the client sent a hostname (rare — the
+    /// DST is usually unspecified so the proxy picks the relay address).
+    pub requested_host: Option<&'a str>,
+    /// The client UDP endpoint pinned by the request, if any; otherwise the
+    /// association locks to the first validated datagram's source.
+    pub requested_endpoint: Option<SocketAddr>,
+    /// Tags attached to the association. **Empty in v1** (no association-level
+    /// control-plane hook yet); present for when one lands.
+    pub tags: TagSet,
+}
+
+impl<'a> AssociateCtx<'a> {
+    /// Builds an `AssociateCtx` from its parts — for plugin authors constructing one
+    /// in their own tests (the type is `#[non_exhaustive]`). The engine builds it at
+    /// the UDP ASSOCIATE handoff.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: SocketAddr,
+        proxy: SocketAddr,
+        command: Command,
+        protocol: Protocol,
+        relay_addr: SocketAddr,
+        requested_host: Option<&'a str>,
+        requested_endpoint: Option<SocketAddr>,
+        tags: TagSet,
+    ) -> Self {
+        AssociateCtx {
+            client,
+            proxy,
+            command,
+            protocol,
+            relay_addr,
+            requested_host,
+            requested_endpoint,
+            tags,
+        }
+    }
+}
+
+/// Owns a whole UDP association after a plugin opts in via
+/// [`Plugin::intercept_association`]. This is where native QUIC/HTTP-3 MITM lives:
+/// the interceptor drives its own datagram stack over the [`AssociationArgs`]
+/// facades and returns [`FlowStats`].
+///
+/// For the pass-through decision — peek, decide "not this one", relay
+/// transparently — call [`splice_association`].
+#[async_trait]
+pub trait DatagramInterceptor: Send {
+    /// Takes over one UDP association and runs it to completion.
+    async fn run(self: Box<Self>, args: AssociationArgs) -> io::Result<FlowStats>;
+}
+
+/// Everything a [`DatagramInterceptor`] needs, with the client-leg SOCKS5 framing
+/// and every association invariant already enforced by the two core-owned facades.
+///
+/// The interceptor drives [`ClientDatagrams`] (validated, header-stripped client
+/// datagrams in; re-framed replies out) and [`UpstreamOriginator`] (DNS-deny/ACL
+/// gated origin sends; contacted-reply gating). It never sees a raw socket or a
+/// SOCKS header, so it cannot weaken the guarantees the core relay gives. Shaping
+/// is applied inside the facades; the idle timeout is enforced by the core, which
+/// aborts the interceptor when the association goes idle or the control connection
+/// closes.
+///
+/// A taken-over association handles **IP-addressed** datagrams only: unlike the
+/// core relay, [`ClientDatagrams`] drops a datagram whose SOCKS header names a
+/// hostname (proxy-side DNS is not run on takeover), since a QUIC/UDP client
+/// addresses an IP endpoint directly.
+#[non_exhaustive]
+pub struct AssociationArgs {
+    /// The client leg: validated, header-stripped datagrams in, re-framed replies out.
+    pub client: ClientDatagrams,
+    /// The origin leg: DNS-deny/ACL-gated sends, contacted-reply gating.
+    pub upstream: UpstreamOriginator,
+    /// The association's idle timeout, for an interceptor that wants to align its
+    /// own timers (e.g. a QUIC max-idle). The core enforces idle regardless.
+    pub io_timeout: Duration,
+}
+
+impl AssociationArgs {
+    /// Builds an `AssociationArgs` from its parts. The engine builds it at the
+    /// association handoff. It is `pub(crate)` for now because the facade
+    /// constructors it needs are not yet public; a public constructor lands with
+    /// the public [`ClientDatagrams`]/[`UpstreamOriginator`] constructors so plugin
+    /// authors can build one in their own tests.
+    pub(crate) fn new(
+        client: ClientDatagrams,
+        upstream: UpstreamOriginator,
+        io_timeout: Duration,
+    ) -> Self {
+        AssociationArgs {
+            client,
+            upstream,
+            io_timeout,
+        }
+    }
+}
+
+/// A read buffer sized for a whole UDP datagram (max 65535 bytes).
+const ASSOCIATION_BUF: usize = 64 * 1024;
+
+/// The opaque pass-through for a taken-over association: an interceptor that peeks
+/// and decides "not this one" relays the association transparently with this,
+/// using the same validated facades — so it is equivalent to the core UDP relay.
+///
+/// Runs until a socket error or until the core tears the association down (idle or
+/// control-connection close), whichever comes first. The two directions run as
+/// **in-future** halves under one `select!` — structured concurrency, not detached
+/// tasks — so when the core aborts the interceptor this future is dropped and both
+/// directions (and the sockets they own) drop with it, leaving no orphans. Byte
+/// counts are best-effort: a core-driven teardown discards the returned
+/// [`FlowStats`], but the facades increment the UDP relay metrics regardless.
+pub async fn splice_association(args: AssociationArgs) -> io::Result<FlowStats> {
+    let AssociationArgs {
+        client, upstream, ..
+    } = args;
+    let to_target = AtomicU64::new(0);
+    let to_client = AtomicU64::new(0);
+
+    // client -> origin: validate, authorize the addressed origin, forward. Borrows
+    // the facades by shared ref (all their methods take `&self`), so no spawn is
+    // needed and dropping this future closes the sockets.
+    let c2o = async {
+        let mut buf = vec![0u8; ASSOCIATION_BUF];
+        loop {
+            let (n, origin) = client.recv(&mut buf).await?;
+            if let Some(target) = upstream.authorize(None, origin) {
+                upstream.send_to(&target, &buf[..n]).await?;
+                to_target.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+    // origin -> client: accept only contacted replies, re-frame to the client.
+    let o2c = async {
+        let mut buf = vec![0u8; ASSOCIATION_BUF];
+        loop {
+            let (n, origin) = upstream.recv(&mut buf).await?;
+            client.send(origin, &buf[..n]).await?;
+            to_client.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    };
+
+    // Either direction ending (only ever via a socket error) tears down the other.
+    tokio::pin!(c2o, o2c);
+    let outcome = tokio::select! {
+        r = &mut c2o => r,
+        r = &mut o2c => r,
+    };
+    let stats = FlowStats::new(
+        to_target.load(Ordering::Relaxed),
+        to_client.load(Ordering::Relaxed),
+    );
+    outcome.map(|()| stats)
+}
+
+// ---------------------------------------------------------------------------
 // The Plugin trait
 // ---------------------------------------------------------------------------
 
@@ -554,6 +740,19 @@ pub trait Plugin: Send + Sync {
     /// TCP stream takeover (where TLS-MITM lives). The first plugin to return
     /// `Some` owns the relay for that flow; `None` leaves it untouched.
     fn intercept(&self, _ctx: &FlowCtx<'_>) -> Option<Box<dyn StreamInterceptor>> {
+        None
+    }
+
+    /// UDP association takeover (where native QUIC/HTTP-3 MITM lives). The first
+    /// plugin to return `Some` owns the whole association: the core stops running
+    /// its datagram loop for it and the interceptor drives both directions over the
+    /// [`AssociationArgs`] facades. `None` leaves the association on the core relay
+    /// (subject to [`Plugin::on_datagram`] verdicts). A taken-over association never
+    /// calls `on_datagram`. v1 fires only for UDP ASSOCIATE.
+    fn intercept_association(
+        &self,
+        _ctx: &AssociateCtx<'_>,
+    ) -> Option<Box<dyn DatagramInterceptor>> {
         None
     }
 
@@ -621,6 +820,18 @@ impl PluginHost {
     /// once.
     pub fn intercept(&self, ctx: &FlowCtx<'_>) -> Option<Box<dyn StreamInterceptor>> {
         self.plugins.iter().find_map(|plugin| plugin.intercept(ctx))
+    }
+
+    /// Offers the association to each plugin's [`Plugin::intercept_association`] in
+    /// order; the first plugin to return `Some` owns the whole association. An
+    /// association can only be owned once.
+    pub fn intercept_association(
+        &self,
+        ctx: &AssociateCtx<'_>,
+    ) -> Option<Box<dyn DatagramInterceptor>> {
+        self.plugins
+            .iter()
+            .find_map(|plugin| plugin.intercept_association(ctx))
     }
 
     /// Runs [`Plugin::on_datagram`] across all plugins. If any plugin returns
@@ -787,6 +998,45 @@ mod tests {
         }
     }
 
+    /// A no-op association interceptor; the composition test never runs it.
+    struct NoopDatagramInterceptor;
+    #[async_trait]
+    impl DatagramInterceptor for NoopDatagramInterceptor {
+        async fn run(self: Box<Self>, _args: AssociationArgs) -> io::Result<FlowStats> {
+            Ok(FlowStats::default())
+        }
+    }
+
+    /// Claims every association, counting how often its hook was consulted so a
+    /// test can assert `find_map` short-circuits at the first owner.
+    struct AssocOwner(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Plugin for AssocOwner {
+        fn name(&self) -> &str {
+            "assoc-owner"
+        }
+        fn intercept_association(
+            &self,
+            _ctx: &AssociateCtx<'_>,
+        ) -> Option<Box<dyn DatagramInterceptor>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(NoopDatagramInterceptor))
+        }
+    }
+
+    fn associate_ctx() -> AssociateCtx<'static> {
+        AssociateCtx::new(
+            "127.0.0.1:5000".parse().unwrap(),
+            "127.0.0.1:1080".parse().unwrap(),
+            Command::UdpAssociate,
+            Protocol::Udp,
+            "127.0.0.1:40000".parse().unwrap(),
+            None,
+            None,
+            TagSet::new(),
+        )
+    }
+
     // --- tests ------------------------------------------------------------
 
     #[test]
@@ -895,6 +1145,31 @@ mod tests {
         assert!(
             none.intercept(&ctx).is_none(),
             "no owner means the relay is left untouched"
+        );
+    }
+
+    #[test]
+    fn intercept_association_first_some_wins() {
+        let called = Arc::new(AtomicUsize::new(0));
+        let host = PluginHost::new(vec![
+            Arc::new(Passer),
+            Arc::new(AssocOwner(called.clone())),
+            Arc::new(AssocOwner(called.clone())),
+        ]);
+        assert!(
+            host.intercept_association(&associate_ctx()).is_some(),
+            "an owner should claim the association"
+        );
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            1,
+            "find_map short-circuits at the first owner; later plugins are not consulted"
+        );
+
+        let none = PluginHost::new(vec![Arc::new(Passer)]);
+        assert!(
+            none.intercept_association(&associate_ctx()).is_none(),
+            "no owner leaves the association on the core relay"
         );
     }
 

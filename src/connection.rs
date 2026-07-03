@@ -708,33 +708,68 @@ impl Connection {
             )
             .await
         } else {
-            let host = self.plugins.clone();
-            // v1 UDP has no association-level control plane yet, so datagram tags
-            // are empty; a plugin's on_datagram keys on direction/dst/payload.
-            let tags = crate::plugin::TagSet::new();
-            let on_datagram = move |is_reply: bool, dst: SocketAddr, payload: &[u8]| -> bool {
-                use crate::plugin::{DatagramCtx, DatagramVerdict, Direction};
-                let dir = if is_reply {
-                    Direction::TargetToClient
-                } else {
-                    Direction::ClientToTarget
-                };
-                host.on_datagram(&DatagramCtx {
-                    dir,
-                    dst,
-                    payload,
-                    tags: &tags,
-                }) != DatagramVerdict::Drop
+            // Offer the association for takeover (native QUIC/HTTP-3 MITM) before
+            // the per-datagram verdict path. The first plugin to claim it owns the
+            // whole association; a taken-over association never runs on_datagram.
+            let requested_host = match &request.dest {
+                TargetAddr::Domain(d, _) => Some(d.as_str()),
+                TargetAddr::Ip(_) => None,
             };
-            relay::run_udp_associate(
-                self.stream,
-                relay_socket,
-                outbound,
-                options,
-                authorize,
-                on_datagram,
-            )
-            .await
+            let actx = crate::plugin::AssociateCtx::new(
+                self.peer,
+                self.local,
+                Command::UdpAssociate,
+                Protocol::Udp,
+                relay_addr,
+                requested_host,
+                client_endpoint,
+                crate::plugin::TagSet::new(),
+            );
+            match self.plugins.intercept_association(&actx) {
+                Some(interceptor) => {
+                    let authorizer: crate::relay::DatagramAuthorizer = Arc::new(authorize);
+                    relay::drive_owned_association(
+                        self.stream,
+                        relay_socket,
+                        outbound,
+                        options,
+                        authorizer,
+                        interceptor,
+                    )
+                    .await
+                }
+                None => {
+                    let host = self.plugins.clone();
+                    // v1 UDP has no association-level control plane yet, so datagram
+                    // tags are empty; a plugin's on_datagram keys on
+                    // direction/dst/payload.
+                    let tags = crate::plugin::TagSet::new();
+                    let on_datagram =
+                        move |is_reply: bool, dst: SocketAddr, payload: &[u8]| -> bool {
+                            use crate::plugin::{DatagramCtx, DatagramVerdict, Direction};
+                            let dir = if is_reply {
+                                Direction::TargetToClient
+                            } else {
+                                Direction::ClientToTarget
+                            };
+                            host.on_datagram(&DatagramCtx {
+                                dir,
+                                dst,
+                                payload,
+                                tags: &tags,
+                            }) != DatagramVerdict::Drop
+                        };
+                    relay::run_udp_associate(
+                        self.stream,
+                        relay_socket,
+                        outbound,
+                        options,
+                        authorize,
+                        on_datagram,
+                    )
+                    .await
+                }
+            }
         };
 
         #[cfg(not(feature = "plugins"))]
