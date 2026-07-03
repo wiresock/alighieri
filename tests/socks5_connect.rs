@@ -2023,8 +2023,8 @@ mod plugin_intercept {
     use std::sync::Mutex;
 
     use alighieri::plugin::{
-        self, DatagramCtx, DatagramVerdict, FlowCtx, FlowDecision, FlowStats, Plugin, PluginHost,
-        StreamArgs, StreamInterceptor,
+        self, AssociateCtx, AssociationArgs, DatagramCtx, DatagramInterceptor, DatagramVerdict,
+        FlowCtx, FlowDecision, FlowStats, Plugin, PluginHost, StreamArgs, StreamInterceptor,
     };
     use async_trait::async_trait;
 
@@ -2166,6 +2166,130 @@ mod plugin_intercept {
         );
 
         drop(client);
+    }
+
+    /// Shared state for the association-takeover test.
+    #[derive(Default)]
+    struct AssocRecorder {
+        took_over: AtomicBool,
+        on_datagram_calls: AtomicU64,
+    }
+
+    /// Relays the whole association transparently via `splice_association` — the
+    /// UDP analogue of `PeekSpliceInterceptor`.
+    struct SpliceAssociationInterceptor;
+    #[async_trait]
+    impl DatagramInterceptor for SpliceAssociationInterceptor {
+        async fn run(self: Box<Self>, args: AssociationArgs) -> std::io::Result<FlowStats> {
+            plugin::splice_association(args).await
+        }
+    }
+
+    struct AssociationSplicePlugin(Arc<AssocRecorder>);
+    #[async_trait]
+    impl Plugin for AssociationSplicePlugin {
+        fn name(&self) -> &str {
+            "assoc-splice"
+        }
+        fn intercept_association(
+            &self,
+            _ctx: &AssociateCtx<'_>,
+        ) -> Option<Box<dyn DatagramInterceptor>> {
+            self.0.took_over.store(true, Ordering::SeqCst);
+            Some(Box::new(SpliceAssociationInterceptor))
+        }
+        fn on_datagram(&self, _ctx: &DatagramCtx<'_>) -> DatagramVerdict {
+            self.0.on_datagram_calls.fetch_add(1, Ordering::SeqCst);
+            DatagramVerdict::Forward
+        }
+    }
+
+    /// A taken-over association relayed via `splice_association` moves datagrams
+    /// byte-for-byte like the core relay, and the per-datagram verdict path is
+    /// bypassed for it (`on_datagram` never fires).
+    #[tokio::test]
+    async fn association_takeover_splices_datagrams() {
+        let recorder = Arc::new(AssocRecorder::default());
+        let host = PluginHost::new(vec![Arc::new(AssociationSplicePlugin(recorder.clone()))]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_udp_echo_server().await;
+
+        let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut control).await;
+        let relay_addr = request_udp_associate(&mut control).await;
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+        datagram.extend_from_slice(b"udp ping");
+        udp.send_to(&datagram, relay_addr).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+            .await
+            .expect("a spliced association must relay the datagram back")
+            .unwrap();
+        let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+        assert_eq!(header.dest, TargetAddr::Ip(echo));
+        assert_eq!(
+            &buf[header.payload_offset..n],
+            b"udp ping",
+            "splice_association relays datagrams byte-for-byte, like the core relay"
+        );
+
+        assert!(
+            recorder.took_over.load(Ordering::SeqCst),
+            "intercept_association should have claimed the association"
+        );
+        assert_eq!(
+            recorder.on_datagram_calls.load(Ordering::SeqCst),
+            0,
+            "a taken-over association must not run the on_datagram verdict path"
+        );
+
+        drop(control);
+    }
+
+    /// Closing the control connection must tear a taken-over association down: the
+    /// core aborts the interceptor, which (via structured concurrency in
+    /// `splice_association`) drops both relay directions and the sockets they own.
+    /// A regression guard against orphaning the pump tasks — an orphan would keep
+    /// the relay socket alive and still relay this second datagram.
+    #[tokio::test]
+    async fn association_takeover_tears_down_on_control_close() {
+        let recorder = Arc::new(AssocRecorder::default());
+        let host = PluginHost::new(vec![Arc::new(AssociationSplicePlugin(recorder.clone()))]);
+        let (_proxy, proxy_addr) = start_proxy_with_plugins(host).await;
+        let echo = start_udp_echo_server().await;
+
+        let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut control).await;
+        let relay_addr = request_udp_associate(&mut control).await;
+
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+        datagram.extend_from_slice(b"ping");
+        // First datagram establishes the pump (both directions parked on live sockets).
+        udp.send_to(&datagram, relay_addr).await.unwrap();
+        let mut buf = [0u8; 1024];
+        tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+            .await
+            .expect("the association should relay the first datagram")
+            .unwrap();
+
+        // Close the control connection and let the core tear the association down.
+        drop(control);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The relay socket is now closed, so a further datagram is not relayed back.
+        udp.send_to(&datagram, relay_addr).await.unwrap();
+        let relayed = matches!(
+            tokio::time::timeout(Duration::from_millis(500), udp.recv_from(&mut buf)).await,
+            Ok(Ok(_))
+        );
+        assert!(
+            !relayed,
+            "after control close the association (and its relay socket) must be gone"
+        );
     }
 
     /// Denies a flow in `on_flow`; records whether `intercept` was (wrongly) reached

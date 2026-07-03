@@ -549,6 +549,106 @@ fn flatten_direction(
     }
 }
 
+/// Runs a UDP association that a plugin has taken over: builds the two core-owned
+/// facades and hands them to the interceptor, which drives both directions itself.
+///
+/// The core keeps ownership of the association *lifetime*: this function retains
+/// the control connection and the shared idle clock and runs the same parent
+/// `select!` as [`run_udp_associate`], aborting the interceptor when the control
+/// connection closes or the association goes idle. The interceptor never touches
+/// the control stream, so teardown stays deterministic even for an in-process
+/// QUIC event loop.
+#[cfg(feature = "plugins")]
+pub(crate) async fn drive_owned_association<C>(
+    mut control: C,
+    relay_socket: UdpSocket,
+    outbound: UdpSocket,
+    options: UdpAssociateOptions,
+    authorize: DatagramAuthorizer,
+    interceptor: Box<dyn crate::plugin::DatagramInterceptor>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    // Build the shared association state, then the two facades over it. The idle
+    // clock is shared so both legs' accepted datagrams refresh it and the parent
+    // select below can enforce the idle timeout — without trusting the plugin.
+    let client_endpoint = Arc::new(OnceLock::new());
+    if let Some(endpoint) = options.client_endpoint {
+        let _ = client_endpoint.set(endpoint);
+    }
+    let activity = Arc::new(ActivityClock::new());
+    let contacted = Arc::new(Mutex::new(ContactedRemotes::new(options.strict_reply)));
+    let client = ClientDatagrams::new(
+        Arc::new(relay_socket),
+        options.client_ip,
+        client_endpoint,
+        activity.clone(),
+        options.throttle.clone(),
+        options.metrics.clone(),
+    );
+    let upstream = UpstreamOriginator::new(
+        Arc::new(outbound),
+        options.outbound_dual,
+        options.dns_policy.clone(),
+        authorize,
+        contacted,
+        activity.clone(),
+        options.throttle.clone(),
+        options.metrics.clone(),
+    );
+    let args = crate::plugin::AssociationArgs::new(client, upstream, options.idle);
+
+    // Drive the interceptor in-future (not a detached `tokio::spawn`): if this
+    // function is itself cancelled — e.g. the connection task is aborted on
+    // shutdown drain (`JoinSet::shutdown`) — dropping this future drops the pinned
+    // interceptor with it, so the interceptor and the sockets it owns are torn
+    // down rather than orphaned. On the normal teardown paths (control-close or
+    // idle) the loop breaks and the interceptor is likewise dropped at return.
+    let interceptor = interceptor.run(args);
+    tokio::pin!(interceptor);
+
+    let idle_enabled = !options.idle.is_zero();
+    let tick_period = if idle_enabled {
+        idle_tick_period(options.idle)
+    } else {
+        Duration::from_secs(3600)
+    };
+    let mut idle_tick = tokio::time::interval(tick_period);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ctrl_buf = [0u8; 512];
+
+    loop {
+        tokio::select! {
+            // The control connection is only a teardown signal (its closing ends
+            // the association); data on it must not refresh the UDP idle timer.
+            res = control.read(&mut ctrl_buf) => {
+                match res {
+                    Ok(0) | Err(_) => break Ok(()),
+                    Ok(_) => continue,
+                }
+            }
+            res = &mut interceptor => break flatten_interceptor(res),
+            _ = idle_tick.tick() => {
+                if idle_enabled && activity.idle_for() >= options.idle {
+                    break Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Flattens the interceptor's result. The interceptor's [`FlowStats`] are
+/// discarded here (the facades already record the UDP relay byte metrics); only
+/// success/failure of the association matters to the caller.
+#[cfg(feature = "plugins")]
+fn flatten_interceptor(res: io::Result<crate::plugin::FlowStats>) -> Result<()> {
+    match res {
+        Ok(_stats) => Ok(()),
+        Err(e) => Err(crate::errors::Error::Io(e)),
+    }
+}
+
 /// Cap on remembered remote destinations per UDP association. The set is
 /// consulted on every reply, and the least-recently-recorded IP is evicted at
 /// the cap, which only a client contacting a very large number of distinct
@@ -908,10 +1008,10 @@ pub struct ClientDatagrams {
 
 #[cfg(feature = "plugins")]
 impl ClientDatagrams {
-    // The core builds this when it hands an association to an interceptor; that
-    // call site lands with the `AssociationArgs` takeover seam, so until then it
-    // is exercised only by tests.
-    #[allow(dead_code)]
+    // The core builds this when it hands an association to an interceptor
+    // (`drive_owned_association`); the shared client-endpoint lock, idle clock,
+    // throttle, and metrics are injected so the facade enforces the same
+    // invariants as the core relay.
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
         client_ip: IpAddr,
@@ -1077,9 +1177,8 @@ pub struct UpstreamOriginator {
 
 #[cfg(feature = "plugins")]
 impl UpstreamOriginator {
-    // Built by the core at association takeover (with the wiring PR); until then
-    // it is exercised only by tests.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    // Built by the core at association takeover (`drive_owned_association`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         outbound: Arc<UdpSocket>,
         outbound_dual: bool,
