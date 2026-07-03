@@ -22,14 +22,14 @@
 //! - **`#[non_exhaustive]` everywhere.** New fields/variants can be added without
 //!   a breaking release.
 //!
-//! The control plane, the stream data plane ([`StreamArgs`],
-//! [`PeekableClientStream`], [`splice`]/[`relay`]), and the per-datagram verdict
-//! are wired into the connection path. The datagram data plane is a
-//! [`DatagramVerdict`] the core acts on while keeping the UDP loop; the datagram
-//! hook itself is invoked from the UDP relay in a later increment. Every argument
-//! type is `#[non_exhaustive]`, so growing them (e.g. an explicit
-//! throttle-wrapped target) is not a breaking change for plugins, which only
-//! *receive* them.
+//! All three data-plane paths are wired into the connection path: the control
+//! plane and the stream interceptor ([`StreamArgs`], [`PeekableClientStream`],
+//! [`splice`]/[`relay`]) at the TCP CONNECT handoff, and the per-datagram
+//! [`DatagramVerdict`] on both directions of the UDP relay — where the core keeps
+//! the loop and its association invariants, acting on the verdict itself. Every
+//! argument type is `#[non_exhaustive]`, so growing it (e.g. an explicit
+//! throttle-wrapped target, or a UDP association-level control plane) is not a
+//! breaking change for plugins, which only *receive* these types.
 
 use std::io;
 use std::net::SocketAddr;
@@ -405,7 +405,9 @@ pub struct DatagramCtx<'a> {
     pub dst: SocketAddr,
     /// The UDP payload (e.g. a QUIC Initial).
     pub payload: &'a [u8],
-    /// Read-only view of the flow tags set by [`Plugin::on_flow`].
+    /// Read-only view of the flow tags. **Empty in v1**: UDP has no
+    /// [`Plugin::on_flow`] yet (see its docs), so nothing populates them. The field
+    /// is present for when a UDP association-level control plane lands.
     pub tags: &'a TagSet,
 }
 
@@ -424,9 +426,14 @@ pub trait Plugin: Send + Sync {
     /// A short, stable name for logs, metrics, and config selection.
     fn name(&self) -> &str;
 
-    /// Control-plane hook, once per flow (TCP and UDP), after ACL/DNS admission
-    /// and after the target is connected. Across plugins the first
-    /// [`FlowDecision::Deny`] wins; tags accumulate. Default: `Continue`.
+    /// Control-plane hook run once per flow, after ACL/DNS admission and after the
+    /// target is connected. Across plugins the first [`FlowDecision::Deny`] wins;
+    /// tags accumulate. Default: `Continue`.
+    ///
+    /// v1 invokes this for **TCP CONNECT** flows only. A UDP ASSOCIATE has no
+    /// single target and so no association-level control plane yet, so `on_flow`
+    /// does not fire for UDP; per-datagram UDP decisions use
+    /// [`Plugin::on_datagram`].
     async fn on_flow(&self, _ctx: &mut FlowCtx<'_>) -> FlowDecision {
         FlowDecision::Continue
     }
@@ -446,8 +453,9 @@ pub trait Plugin: Send + Sync {
         DatagramVerdict::Forward
     }
 
-    /// Best-effort end-of-flow notification. NOT guaranteed on abort/panic, so
-    /// durable audit must be written at flow *start*, not here.
+    /// Best-effort end-of-flow notification (TCP CONNECT flows in v1, paired with
+    /// [`Plugin::on_flow`]). NOT guaranteed on abort/panic, so durable audit must be
+    /// written at flow *start*, not here.
     async fn on_flow_end(&self, _ctx: &FlowCtx<'_>, _stats: &FlowStats) {}
 }
 
