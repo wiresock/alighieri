@@ -53,8 +53,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Shared UDP client validation was factored into reusable primitives without
   changing the stock relay's endpoint locking, SOCKS framing, fragment,
   destination-policy, contacted-remote, shaping, or idle-timeout guarantees.
-- Build dependencies were refreshed, including the Rust container image,
-  `taiki-e/install-action`, `anyhow`, and `rustls-pki-types`.
+- Dependencies and pinned CI/container inputs were refreshed, including
+  `anyhow`, `rustls-pki-types`, `socket2`, the Rust and distroless images,
+  `taiki-e/install-action`, and the Docker build/metadata actions.
 
 ## [0.3.1] - 2026-06-28
 
