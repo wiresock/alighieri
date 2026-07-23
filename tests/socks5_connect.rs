@@ -2023,10 +2023,10 @@ mod plugin_intercept {
     use std::sync::Mutex;
 
     use alighieri::plugin::{
-        self, AssociateCtx, AssociationArgs, DatagramCtx, DatagramInterceptor, DatagramVerdict,
-        FlowCtx, FlowDecision, FlowStats, Plugin, PluginHost, StreamArgs, StreamInterceptor,
+        self, async_trait, AssociateCtx, AssociationArgs, DatagramCtx, DatagramInterceptor,
+        DatagramVerdict, FlowCtx, FlowDecision, FlowStats, Plugin, PluginHost, StreamArgs,
+        StreamInterceptor,
     };
-    use async_trait::async_trait;
 
     /// Shared state a test can inspect after the flow completes.
     #[derive(Default)]

@@ -4,6 +4,7 @@ use crate::socks5::Reply;
 
 /// Top-level error type for the Alighieri proxy.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A configuration file could not be parsed or failed validation. The
     /// inner string carries a human-readable explanation (often with a line
@@ -43,7 +44,7 @@ impl Error {
     /// Errors that occur before a request reply is meaningful (for example a
     /// handshake protocol error) still map to a sane default of
     /// [`Reply::GeneralFailure`].
-    pub fn to_reply(&self) -> Reply {
+    pub(crate) fn to_reply(&self) -> Reply {
         match self {
             Error::AccessDenied | Error::AuthFailed => Reply::ConnectionNotAllowed,
             Error::CommandNotSupported => Reply::CommandNotSupported,

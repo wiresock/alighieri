@@ -1,21 +1,104 @@
 name: Release
 
-# Build release binaries when a version tag (e.g. v0.1.0) is pushed and attach
-# them to a GitHub release. The build jobs run in parallel and only upload
-# artifacts; a single release job then publishes them once, so the matrix
-# cannot race on creating the release or regenerating its notes. The release
-# is created as a draft for review before publishing.
+# Validate and build release binaries when a version tag (e.g. v0.4.0) is
+# pushed, then attach them to a draft GitHub release. Starting after the manual
+# first crates.io release (v0.4.0), a protected environment gates OIDC-based
+# publication with a short-lived crates.io token.
 on:
   push:
     tags:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  # This is deliberately the only prerequisite for every release build. A tag
+  # cannot produce artifacts unless its version agrees with both Cargo files
+  # and a dated changelog heading, and the publishable archive builds cleanly.
+  validate-release:
+    name: validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      trusted-publish: ${{ steps.release.outputs.trusted-publish }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Validate tag, manifest, lockfile, and changelog
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(
+              r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+              tag,
+          )
+          if match is None:
+              raise SystemExit(f"release tag is not strict vMAJOR.MINOR.PATCH: {tag}")
+
+          version = tag[1:]
+          version_tuple = tuple(int(part) for part in match.groups())
+
+          with open("Cargo.toml", "rb") as file:
+              manifest = tomllib.load(file)
+          manifest_version = str(manifest["package"]["version"])
+          if manifest_version != version:
+              raise SystemExit(
+                  f"tag {tag} does not match Cargo.toml version {manifest_version}"
+              )
+
+          with open("Cargo.lock", "rb") as file:
+              lockfile = tomllib.load(file)
+          root_versions = [
+              str(package["version"])
+              for package in lockfile["package"]
+              if package["name"] == "alighieri" and "source" not in package
+          ]
+          if root_versions != [version]:
+              raise SystemExit(
+                  f"tag {tag} does not match the root Cargo.lock package: "
+                  f"{root_versions!r}"
+              )
+
+          with open("CHANGELOG.md", encoding="utf-8") as file:
+              changelog = file.read()
+          dates = re.findall(
+              rf"(?m)^## \[{re.escape(version)}\] - "
+              r"([0-9]{4}-[0-9]{2}-[0-9]{2})\s*$",
+              changelog,
+          )
+          if len(dates) != 1:
+              raise SystemExit(
+                  f"CHANGELOG.md must contain exactly one dated [{version}] heading"
+              )
+          datetime.date.fromisoformat(dates[0])
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
+              print(
+                  f"trusted-publish={'true' if version_tuple > (0, 4, 0) else 'false'}",
+                  file=output,
+              )
+          PY
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Verify crates.io package
+        run: cargo package --locked
+
   build:
     name: build ${{ matrix.target }}
+    needs: validate-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -83,6 +166,8 @@ jobs:
     name: draft release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -97,3 +182,66 @@ jobs:
           draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # v0.4.0 remains a manual `cargo publish` so the crate can be claimed and its
+  # GitHub trusted publisher configured. Only strictly later versions reach
+  # this job. Configure the `crates-io` environment with required reviewers.
+  publish-crate:
+    name: publish crate
+    if: needs.validate-release.outputs.trusted-publish == 'true'
+    needs: [validate-release, release]
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      # Rebuild the exact publishable archive after environment approval but
+      # before requesting any OIDC credential.
+      - name: Re-verify crates.io package
+        run: cargo package --locked
+      - name: Check whether this exact version is already published
+        id: registry
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/crates-io-version.json"
+          status="$(
+            curl --silent --show-error --location \
+              --retry 3 --retry-all-errors \
+              --header "User-Agent: Wiresock-Foundation/alighieri release workflow" \
+              --output "$response" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/alighieri/$VERSION"
+          )"
+          case "$status" in
+            200)
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "alighieri $VERSION is already published; nothing to do"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              cat "$response"
+              echo "::error::crates.io returned HTTP $status for alighieri $VERSION"
+              exit 1
+              ;;
+          esac
+      - name: Authenticate to crates.io with OIDC
+        if: steps.registry.outputs.published == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
+      - name: Publish to crates.io
+        if: steps.registry.outputs.published == 'false'
+        # The exact archive was already built and verified before OIDC. Avoid
+        # running package build scripts or proc macros while the short-lived
+        # publication credential is present.
+        run: cargo publish --locked --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

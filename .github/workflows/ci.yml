@@ -139,3 +139,132 @@ jobs:
       # async-trait) also builds on the MSRV toolchain.
       - name: Build with the plugins feature on the MSRV toolchain
         run: cargo build --all-targets --locked --features plugins
+
+  # Exercise the exact source archive that crates.io will receive. This catches
+  # allowlist mistakes, missing docs/examples, and dependencies on repository
+  # files that are not present after Cargo extracts the `.crate` archive.
+  package:
+    name: crates.io package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build all-feature documentation (warnings denied)
+        run: cargo doc --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Check package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_list="$RUNNER_TEMP/alighieri-package-files.txt"
+          cargo package --list --locked > "$package_list"
+
+          required=(
+            Cargo.toml
+            Cargo.lock
+            src/lib.rs
+            src/main.rs
+            README.md
+            CHANGELOG.md
+            LICENSE
+            LICENSING.md
+            doc/alighieri.conf
+            doc/plugin-sdk.md
+            scripts/alighieri.sh
+            scripts/install-linux.sh
+          )
+          for path in "${required[@]}"; do
+            if ! grep -Fqx "$path" "$package_list"; then
+              echo "::error::Required package file is missing: $path"
+              exit 1
+            fi
+          done
+
+          forbidden='^(\.github|\.agents|\.codex|target)/|^(\.dockerignore|Dockerfile)$'
+          if grep -En "$forbidden" "$package_list"; then
+            echo "::error::The package contains repository-only files"
+            exit 1
+          fi
+      - name: Build and extract package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          package_version="$(
+            python3 -c \
+              'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])'
+          )"
+          crate_file="target/package/alighieri-$package_version.crate"
+          if [[ ! -f "$crate_file" ]]; then
+            echo "::error::cargo package did not produce $crate_file"
+            exit 1
+          fi
+
+          extract_root="$RUNNER_TEMP/alighieri-package"
+          mkdir -p "$extract_root"
+          tar -xzf "$crate_file" -C "$extract_root"
+          crate_dir="$(find "$extract_root" -mindepth 1 -maxdepth 1 -type d -name 'alighieri-*' -print -quit)"
+          if [[ -z "$crate_dir" ]]; then
+            echo "::error::Could not locate the extracted alighieri package"
+            exit 1
+          fi
+          echo "CRATE_DIR=$crate_dir" >> "$GITHUB_ENV"
+      - name: Test extracted package (default features)
+        run: cargo test --manifest-path "$CRATE_DIR/Cargo.toml" --all-targets --locked
+      - name: Test extracted package (all features)
+        run: cargo test --manifest-path "$CRATE_DIR/Cargo.toml" --all-targets --all-features --locked
+      - name: Install and smoke-test extracted binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/alighieri-install"
+          cargo install --path "$CRATE_DIR" --locked --root "$install_root"
+          "$install_root/bin/alighieri" --version
+          "$install_root/bin/alighieri" --help
+          "$install_root/bin/alighieri" --check "$CRATE_DIR/doc/alighieri.conf"
+
+  # There is no registry baseline until the manual 0.4.0 publication. Probe for
+  # that exact version so this job is harmless before the first release and
+  # automatically becomes a required compatibility check afterwards.
+  semver:
+    name: public API semver
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check whether the 0.4.0 registry baseline exists
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/alighieri-0.4.0.json"
+          status="$(
+            curl --silent --show-error --location \
+              --retry 3 --retry-all-errors \
+              --header "User-Agent: Wiresock-Foundation/alighieri CI" \
+              --output "$response" --write-out '%{http_code}' \
+              https://crates.io/api/v1/crates/alighieri/0.4.0
+          )"
+          case "$status" in
+            200)
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "alighieri 0.4.0 is not published yet; skipping the semver baseline check"
+              ;;
+            *)
+              cat "$response"
+              echo "::error::crates.io returned HTTP $status while checking the semver baseline"
+              exit 1
+              ;;
+          esac
+      - name: Check public API compatibility
+        if: steps.baseline.outputs.available == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          package: alighieri
+          feature-group: all-features

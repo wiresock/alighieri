@@ -33,6 +33,7 @@ pub enum Verdict {
 
 /// The phase at which a rule applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Scope {
     /// `client` rules — connection admission.
     Client,
@@ -45,6 +46,7 @@ pub enum Scope {
 /// Optional selector fields (`commands`, `protocols`, `methods`) act as "any"
 /// when empty: an empty `commands` list matches every command.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Rule {
     /// Optional operator-provided rule name for logs and metrics.
     pub name: Option<Arc<str>>,
@@ -70,7 +72,7 @@ pub struct Rule {
 
 /// Context for evaluating a [`Scope::Client`] rule (connection admission).
 #[derive(Debug, Clone, Copy)]
-pub struct ClientContext {
+pub(crate) struct ClientContext {
     pub client_ip: IpAddr,
     pub client_port: u16,
     pub proxy_ip: IpAddr,
@@ -79,7 +81,7 @@ pub struct ClientContext {
 
 /// Context for evaluating a [`Scope::Socks`] rule (request authorisation).
 #[derive(Debug, Clone, Copy)]
-pub struct SocksContext<'a> {
+pub(crate) struct SocksContext<'a> {
     pub client_ip: IpAddr,
     pub client_port: u16,
     /// The hostname the client requested, if it sent a domain rather than an IP
@@ -96,7 +98,7 @@ pub struct SocksContext<'a> {
 /// matching rule. A missing source line means deny-by-default; a missing name
 /// can also mean the matching rule was simply unnamed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuleDecision {
+pub(crate) struct RuleDecision {
     pub verdict: Verdict,
     pub source_line: Option<usize>,
     pub rule_name: Option<Arc<str>>,
@@ -126,6 +128,7 @@ impl Rule {
 /// An ordered collection of rules with first-match-wins, deny-by-default
 /// evaluation.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RuleSet {
     pub rules: Vec<Rule>,
 }
@@ -138,12 +141,13 @@ impl RuleSet {
 
     /// Evaluates connection admission. Returns the matching rule's verdict, or
     /// `Block` if no `client` rule matches.
-    pub fn evaluate_client(&self, ctx: &ClientContext) -> Verdict {
+    #[cfg(test)]
+    pub(crate) fn evaluate_client(&self, ctx: &ClientContext) -> Verdict {
         self.evaluate_client_detail(ctx).verdict
     }
 
     /// Evaluates connection admission and includes the matching rule line.
-    pub fn evaluate_client_detail(&self, ctx: &ClientContext) -> RuleDecision {
+    pub(crate) fn evaluate_client_detail(&self, ctx: &ClientContext) -> RuleDecision {
         for rule in &self.rules {
             if rule.matches_client(ctx) {
                 return RuleDecision {
@@ -165,7 +169,8 @@ impl RuleSet {
 
     /// Evaluates request authorisation. Returns the matching rule's verdict, or
     /// `Block` if no `socks` rule matches.
-    pub fn evaluate_socks(&self, ctx: &SocksContext<'_>) -> Verdict {
+    #[cfg(test)]
+    pub(crate) fn evaluate_socks(&self, ctx: &SocksContext<'_>) -> Verdict {
         self.evaluate_socks_detail(ctx).verdict
     }
 
@@ -193,7 +198,7 @@ impl RuleSet {
     /// The match-all check is conservative (single-family or port-restricted
     /// blocks are not treated as categorical), so this never falsely rejects a
     /// client that the per-datagram checks would have allowed.
-    pub fn udp_associate_reachable(
+    pub(crate) fn udp_associate_reachable(
         &self,
         client_ip: IpAddr,
         client_port: u16,
@@ -218,7 +223,7 @@ impl RuleSet {
     }
 
     /// Evaluates request authorisation and includes the matching rule line.
-    pub fn evaluate_socks_detail(&self, ctx: &SocksContext<'_>) -> RuleDecision {
+    pub(crate) fn evaluate_socks_detail(&self, ctx: &SocksContext<'_>) -> RuleDecision {
         for rule in &self.rules {
             if rule.matches_socks(ctx) {
                 return RuleDecision {
@@ -239,7 +244,7 @@ impl RuleSet {
 
     /// Returns `true` if the rule set contains at least one rule of the given
     /// scope. Used to warn operators about configs that would deny everything.
-    pub fn has_scope(&self, scope: Scope) -> bool {
+    pub(crate) fn has_scope(&self, scope: Scope) -> bool {
         self.rules.iter().any(|r| r.scope == scope)
     }
 }

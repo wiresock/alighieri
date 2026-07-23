@@ -211,6 +211,7 @@ fn spawn_reload_signal_task(_tx: mpsc::UnboundedSender<()>) {}
 /// Initialises console logging using all configured sinks. The returned
 /// guard must be held for the life of the process; dropping it flushes the
 /// background log writer.
+#[doc(hidden)]
 pub fn init_console_logging(config: &Config) -> io::Result<LogGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let writer = LogWriters::from_config(config)?;
@@ -258,6 +259,7 @@ fn init_logging(
 /// Initialises file logging for service mode and returns the active log file
 /// together with the guard that flushes the writer on drop.
 #[cfg(windows)]
+#[doc(hidden)]
 pub fn init_file_logging(log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
     std::fs::create_dir_all(log_dir)?;
     let log_path = log_dir.join("alighieri.log");
@@ -274,6 +276,7 @@ pub fn init_file_logging(log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
 }
 
 #[cfg(windows)]
+#[doc(hidden)]
 pub fn init_service_logging(config: &Config, log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
     std::fs::create_dir_all(log_dir)?;
     let log_path = log_dir.join("alighieri.log");
@@ -439,6 +442,7 @@ impl<'a> MakeWriter<'a> for AsyncLogWriters {
 
 /// Flushes the background log writer when dropped. Hold it in `main` (or the
 /// service entry point) for the lifetime of the process.
+#[doc(hidden)]
 pub struct LogGuard {
     tx: std_mpsc::SyncSender<LogCommand>,
 }

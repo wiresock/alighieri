@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alighieri::acl::{RuleSet, Scope, Verdict};
-use alighieri::config::{AuthKind, Config, LogOutput};
-use alighieri::net::Cidr;
+use alighieri::config::{AuthKind, Cidr, Config, LogOutput, RuleSet, Scope, Verdict};
 use alighieri::util::constant_time_eq;
 use password_hash::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

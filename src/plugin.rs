@@ -47,21 +47,24 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::acl::RuleDecision;
-use crate::client_stream::ClientStream;
 
-// Small, stable engine types that are part of the SDK's vocabulary. Unlike
+/// Re-export of the attribute macro used to implement the SDK's async traits.
+///
+/// Plugin crates can depend only on `alighieri` and write
+/// `#[alighieri::plugin::async_trait]` rather than adding a matching
+/// `async-trait` dependency of their own.
+pub use async_trait::async_trait;
+
+// Small, stable primitives that are part of the SDK's vocabulary. Unlike
 // `RuleDecision` (hidden behind the `RuleInfo` facade), these are safe to expose
-// directly: they are the SOCKS/rule primitives a plugin reasons about, and — for
-// `Throttle` — an opaque handle the interceptor only forwards to `splice`/`relay`.
+// directly as curated plugin concepts.
 pub use crate::acl::Verdict;
 pub use crate::config::Protocol;
 pub use crate::socks5::Command;
-pub use crate::throttle::Throttle;
 // The core-owned datagram facades a UDP/QUIC association-takeover interceptor
 // drives: the client leg (framed, invariant-enforcing) and the origin leg
 // (DNS-deny/ACL-gated). Defined next to the relay internals they wrap; the
@@ -128,8 +131,8 @@ pub struct RuleInfo {
 
 impl RuleInfo {
     /// Builds a `RuleInfo` from its parts. Mainly for plugin authors constructing a
-    /// [`FlowCtx`] in their own unit tests; the engine builds one from the ACL
-    /// decision via the crate-internal `From<&RuleDecision>` impl.
+    /// [`FlowCtx`] in their own unit tests; the engine converts its ACL decision
+    /// through a private adapter.
     pub fn new(verdict: Verdict, source_line: Option<usize>, rule_name: Option<Arc<str>>) -> Self {
         RuleInfo {
             verdict,
@@ -154,8 +157,10 @@ impl RuleInfo {
     }
 }
 
-impl From<&RuleDecision> for RuleInfo {
-    fn from(d: &RuleDecision) -> Self {
+impl RuleInfo {
+    /// Builds the SDK facade from the engine decision without exposing that
+    /// implementation type in the public API.
+    pub(crate) fn from_decision(d: &RuleDecision) -> Self {
         RuleInfo {
             verdict: d.verdict,
             source_line: d.source_line,
@@ -261,6 +266,90 @@ impl FlowStats {
 // Data plane: stream interception (TCP)
 // ---------------------------------------------------------------------------
 
+/// The accepted client transport handed to a stream interceptor.
+///
+/// This SDK-owned wrapper deliberately hides whether the core accepted the
+/// connection as plaintext TCP or as a TLS-wrapped listener stream. It behaves
+/// as a regular asynchronous byte stream, so interceptors do not need access to
+/// the engine's transport enum.
+pub struct ClientStream {
+    inner: crate::client_stream::ClientStream,
+}
+
+impl ClientStream {
+    /// Wraps a TCP stream for an interceptor's out-of-crate tests.
+    ///
+    /// Production streams are created by the server and may represent either a
+    /// plaintext or TLS listener; that distinction remains private.
+    pub fn from_tcp(stream: TcpStream) -> Self {
+        Self {
+            inner: crate::client_stream::ClientStream::Tcp(stream),
+        }
+    }
+
+    pub(crate) fn from_engine(inner: crate::client_stream::ClientStream) -> Self {
+        Self { inner }
+    }
+}
+
+impl AsyncRead for ClientStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ClientStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Opaque handle to the core's shaping state for one intercepted flow.
+///
+/// Plugins normally forward this handle to [`relay`] (or pass the entire
+/// [`StreamArgs`] to [`splice`]). Its buckets and accounting remain private so
+/// engine changes cannot break plugin crates.
+#[derive(Clone, Default)]
+pub struct Throttle {
+    inner: crate::throttle::Throttle,
+}
+
+impl Throttle {
+    /// Creates an unlimited handle for out-of-crate interceptor tests.
+    pub fn unlimited() -> Self {
+        Self::default()
+    }
+
+    /// Reports whether this handle applies no shaping.
+    pub fn is_unlimited(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    pub(crate) fn from_engine(inner: crate::throttle::Throttle) -> Self {
+        Self { inner }
+    }
+
+    fn into_engine(self) -> crate::throttle::Throttle {
+        self.inner
+    }
+}
+
 /// Owns a TCP relay after a plugin opts in via [`Plugin::intercept`]. This is
 /// where TLS-MITM lives: the interceptor consumes the flow, relays (or terminates
 /// and re-originates) it, and returns [`FlowStats`].
@@ -315,9 +404,25 @@ impl StreamArgs {
             throttle,
         }
     }
+
+    pub(crate) fn from_engine(
+        client: crate::client_stream::ClientStream,
+        target: TcpStream,
+        dst: SocketAddr,
+        io_timeout: Duration,
+        throttle: Option<crate::throttle::Throttle>,
+    ) -> Self {
+        Self::new(
+            PeekableClientStream::new(ClientStream::from_engine(client)),
+            target,
+            dst,
+            io_timeout,
+            throttle.map(Throttle::from_engine),
+        )
+    }
 }
 
-/// The client side of an intercepted flow: a [`ClientStream`] with a peek buffer
+/// The client side of an intercepted flow: an opaque [`ClientStream`] with a peek buffer
 /// so an interceptor can inspect the first bytes without consuming them.
 pub type PeekableClientStream = Peekable<ClientStream>;
 
@@ -441,6 +546,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + AsyncWrite + Unpin,
 {
+    let throttle = throttle.map(Throttle::into_engine);
     let (up, down) = crate::relay::relay_generic(client, target, io_timeout, throttle).await?;
     Ok(FlowStats::new(up, down))
 }
@@ -893,13 +999,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).await.unwrap();
         let (target, _) = listener.accept().await.unwrap();
-        StreamArgs {
-            client: PeekableClientStream::new(ClientStream::Tcp(client)),
+        StreamArgs::new(
+            PeekableClientStream::new(ClientStream::from_tcp(client)),
             target,
-            dst: addr,
-            io_timeout: Duration::from_secs(30),
-            throttle: None,
-        }
+            addr,
+            Duration::from_secs(30),
+            None,
+        )
     }
 
     fn decision() -> RuleDecision {
@@ -919,7 +1025,7 @@ mod tests {
             protocol: Protocol::Tcp,
             dest_host: Some("example.com"),
             dest: "93.184.216.34:443".parse().unwrap(),
-            rule: RuleInfo::from(&decision()),
+            rule: RuleInfo::from_decision(&decision()),
             tags,
         }
     }
@@ -1052,7 +1158,7 @@ mod tests {
 
     #[test]
     fn rule_info_is_a_facade_over_the_decision() {
-        let info = RuleInfo::from(&decision());
+        let info = RuleInfo::from_decision(&decision());
         assert_eq!(info.verdict(), Verdict::Pass);
         assert_eq!(info.source_line(), Some(7));
         assert_eq!(info.rule_name(), Some("test-rule"));
