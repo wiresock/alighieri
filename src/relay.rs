@@ -1232,21 +1232,20 @@ impl UpstreamOriginator {
     /// out-of-crate [`DatagramInterceptor`](crate::plugin::DatagramInterceptor) and
     /// its tests. `strict_reply` matches the `udp.strictreply` option: when `true`
     /// a reply must come from the exact remote `host:port` contacted, otherwise
-    /// host-only. `dns_policy` and `authorize` are the same DNS-deny and SOCKS-ACL
-    /// gates the core would apply (use an allow-all `dns_policy` and
-    /// `Arc::new(|_, _, _| true)` in tests). The idle clock and metrics are private
-    /// no-ops and no shaping is applied.
+    /// host-only. `authorize` supplies the SOCKS-ACL gate; this test-only facade
+    /// uses a permissive destination-category policy, while the private production
+    /// constructor always injects the configured DNS-deny policy. The idle clock
+    /// and metrics are private no-ops and no shaping is applied.
     pub fn for_interceptor(
         outbound: Arc<UdpSocket>,
         outbound_dual: bool,
         strict_reply: bool,
-        dns_policy: DnsPolicy,
         authorize: DatagramAuthorizer,
     ) -> Self {
         UpstreamOriginator::new(
             outbound,
             outbound_dual,
-            dns_policy,
+            interceptor_dns_policy(),
             authorize,
             Arc::new(Mutex::new(ContactedRemotes::new(strict_reply))),
             Arc::new(ActivityClock::new()),
@@ -1326,6 +1325,17 @@ impl UpstreamOriginator {
     /// Whether the outbound socket is dual-stack (IPv4 sent `::ffff:`-mapped).
     pub fn is_dual_stack(&self) -> bool {
         self.outbound_dual
+    }
+}
+
+#[cfg(feature = "plugins")]
+fn interceptor_dns_policy() -> DnsPolicy {
+    DnsPolicy {
+        preference: crate::config::DnsPreference::System,
+        try_all: false,
+        deny: Vec::new(),
+        cache_ttl: None,
+        timeout: Duration::from_secs(5),
     }
 }
 
@@ -2480,13 +2490,7 @@ mod facade_tests {
         let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
         let client = ClientDatagrams::for_interceptor(relay, IpAddr::from([127, 0, 0, 1]), None);
-        let upstream = UpstreamOriginator::for_interceptor(
-            outbound,
-            false,
-            true,
-            permissive_policy(),
-            acl_allow_all(),
-        );
+        let upstream = UpstreamOriginator::for_interceptor(outbound, false, true, acl_allow_all());
         let args = crate::plugin::AssociationArgs::for_interceptor(
             client,
             upstream,

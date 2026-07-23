@@ -1,6 +1,6 @@
 [package]
 name = "alighieri"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 # Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009
 # patched `time` (>=0.3.47) requires rustc 1.88.
@@ -8,12 +8,36 @@ rust-version = "1.88"
 description = "Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server with Dante-inspired configuration"
 repository = "https://github.com/wiresock/alighieri"
 homepage = "https://github.com/wiresock/alighieri"
+documentation = "https://docs.rs/alighieri"
+publish = ["crates-io"]
 # Open-source license. Alighieri is dual-licensed: a commercial license is also
 # available for proprietary use — see LICENSING.md.
 license = "AGPL-3.0-or-later"
 keywords = ["socks5", "proxy", "network", "dante", "async"]
 categories = ["network-programming", "command-line-utilities"]
 readme = "README.md"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/scripts/alighieri.sh",
+    "/scripts/install-linux.sh",
+    "/doc/alighieri.conf",
+    "/doc/acme-tls-test.md",
+    "/doc/benchmarks.md",
+    "/doc/plugin-sdk.md",
+    "/doc/roadmap.md",
+    "/doc/windows-service.md",
+    "/doc/windows-service-smoke-test.ps1",
+    "/doc/templates/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/LICENSING.md",
+]
+
+[package.metadata.docs.rs]
+features = ["plugins"]
 
 [[bin]]
 name = "alighieri"
@@ -51,6 +75,7 @@ tokio-stream = "0.1"
 async-trait = { version = "0.1", optional = true }
 
 [features]
+default = []
 # The plugin SDK (`alighieri::plugin`). Off by default: a stock build carries no
 # plugin code, no extra dependencies, and no added attack surface.
 plugins = ["dep:async-trait"]
@@ -65,9 +90,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
-# For the plugin-interception integration test (feature-gated); implementing the
-# `Plugin`/`StreamInterceptor` traits needs the same `#[async_trait]` macro.
-async-trait = "0.1"
 
 [profile.release]
 opt-level = 3

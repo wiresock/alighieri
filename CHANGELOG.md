@@ -6,6 +6,56 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
+### Added
+
+- Alighieri is now packaged for crates.io, so the stock server can be installed
+  with `cargo install alighieri --locked` and custom hosts can depend on the
+  library through Cargo.
+- A feature-gated plugin SDK (`plugins`, off by default) now provides an
+  in-process control plane and typed TCP/UDP data-plane hooks. Plugins can
+  allow, deny, and tag admitted TCP flows; claim a TCP relay; inspect or drop
+  individual UDP datagrams; receive best-effort TCP flow-completion statistics;
+  or take over a complete UDP association through invariant-preserving facades.
+- `PluginHost` supplies deterministic composition: the first flow denial, first
+  TCP or UDP-association owner, and any UDP datagram drop win, while tags and
+  end-of-flow notifications are accumulated in registration order.
+- `Server::with_plugins` registers an ordered, statically linked plugin set
+  before the server starts. The stock Alighieri binary does not load dynamic
+  plugins, and builds without the `plugins` feature retain the existing fast
+  path and dependency set.
+- Plugin relay helpers now include bounded, non-destructive TCP peeking,
+  pass-through TCP splicing, generic inspected-stream relaying, and transparent
+  UDP-association splicing. Public constructors let external plugin crates build
+  SDK contexts and loopback-backed data-plane facades in their own tests.
+- CI now builds, lints, and tests the plugin-enabled configuration on Linux,
+  Windows, and the declared minimum Rust version, in addition to the default
+  feature set.
+
+### Changed
+
+- The supported Rust library surface is now deliberately limited to
+  configuration, crate errors, server lifecycle/runtime helpers, and the
+  feature-gated plugin SDK. Engine, protocol, relay, platform, and CLI support
+  internals are no longer part of the documented compatibility contract.
+- Public configuration and SDK vocabulary is additive-safe through
+  non-exhaustive or opaque types. Plugin-facing client streams, throttling, and
+  UDP association capabilities use SDK-owned wrappers rather than exposing
+  engine implementation types.
+- Plugin lifecycle pairing is hardened: once a TCP flow reaches `on_flow`,
+  `on_flow_end` is attempted for denials, timeouts, relay/interceptor failures,
+  and target/setup failures. Control-plane hooks are bounded by the handshake
+  timeout and fail closed.
+- TCP peeking is capped at 16 KiB, handles zero-capacity reads correctly, and
+  reclaims consumed prefix storage. UDP association takeover uses structured
+  concurrency so cancellation closes both relay legs without orphaned tasks.
+- Shared UDP client validation was factored into reusable primitives without
+  changing the stock relay's endpoint locking, SOCKS framing, fragment,
+  destination-policy, contacted-remote, shaping, or idle-timeout guarantees.
+- Build dependencies were refreshed, including the Rust container image,
+  `taiki-e/install-action`, `anyhow`, and `rustls-pki-types`.
+
 ## [0.3.1] - 2026-06-28
 
 ### Added
@@ -625,7 +675,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wiresock/alighieri/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/wiresock/alighieri/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wiresock/alighieri/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wiresock/alighieri/compare/v0.1.1...v0.2.0

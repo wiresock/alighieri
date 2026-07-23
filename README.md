@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/wiresock/alighieri/actions/workflows/ci.yml/badge.svg)](https://github.com/wiresock/alighieri/actions/workflows/ci.yml)
 [![Security audit](https://github.com/wiresock/alighieri/actions/workflows/audit.yml/badge.svg)](https://github.com/wiresock/alighieri/actions/workflows/audit.yml)
+[![crates.io](https://img.shields.io/crates/v/alighieri.svg)](https://crates.io/crates/alighieri)
+[![docs.rs](https://docs.rs/alighieri/badge.svg)](https://docs.rs/alighieri)
 [![License: AGPL-3.0+ or Commercial](https://img.shields.io/badge/license-AGPL--3.0%2B%20or%20Commercial-blue.svg)](LICENSING.md)
 
 **A** **LIGH**tweight, **I**ntuitive, **E**fficient **R**ust **I**mplementation for secure asynchronous SOCKS5 proxying.
@@ -30,6 +32,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - [Linux service (systemd)](#linux-service-systemd)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
+- [Rust API and plugin SDK](#rust-api-and-plugin-sdk)
 - [Benchmarks](#benchmarks)
 - [Comparison with Dante](#comparison-with-dante)
 - [Security considerations](#security-considerations)
@@ -52,6 +55,8 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Windows Event Log** service lifecycle and startup failure events
 - **Hot reload** for policy, DNS, timeout, auth, and userlist changes
 - **Configuration wizard** — generate or edit a config from a short-lived, loopback-only web UI
+- **Optional plugin SDK** — statically link custom control-plane, TCP, and UDP
+  behavior into a private host binary
 - **Async** — built on [Tokio](https://tokio.rs) for high-performance I/O
 - **Portable** — first-class on Windows and Linux; macOS and *BSD are not yet
   officially supported (no CI coverage)
@@ -59,9 +64,17 @@ New to it? Jump to [Quick start](#quick-start), or let the
 
 ## Quick start
 
-Prebuilt Linux and Windows binaries are attached to each
-[release](https://github.com/wiresock/alighieri/releases). To build
-from source instead, you need a stable Rust toolchain (1.88 or newer):
+Install the stock server from crates.io with a stable Rust toolchain (1.88 or
+newer):
+
+```sh
+cargo install alighieri --locked
+alighieri --version
+```
+
+Prebuilt Linux and Windows binaries are also attached to each
+[release](https://github.com/wiresock/alighieri/releases). To build from a
+source checkout:
 
 ```sh
 cargo build --release
@@ -795,11 +808,92 @@ inspection, stop, and uninstall, see
  ├── auth.rs           # Username/password database with constant-time verification
  ├── socks5.rs        # RFC 1928/1929 wire-format helpers
  ├── connection.rs    # Per-client SOCKS5 state machine
+ ├── plugin.rs        # Optional, feature-gated plugin SDK
  ├── platform/         # Platform-specific integrations such as Windows Service
  ├── runtime.rs        # Shared console/service runtime helpers
  ├── server.rs        # Accept loop with semaphore-based connection limit
  └── relay.rs         # TCP bidirectional relay + UDP associate relay
 ```
+
+## Rust API and plugin SDK
+
+Version 0.4 supports the configuration model and parser, crate-wide
+`Error`/`Result`, `Server` lifecycle, runtime shutdown/reload drivers, and the
+feature-gated plugin SDK as its public Rust API. Patch releases in the `0.4.x`
+line preserve compatibility for those documented interfaces; an intentional
+breaking API or SDK change requires `0.5.0`. Engine, wire-protocol, relay,
+platform, and CLI-support internals are not part of that compatibility
+contract. See the complete [API documentation](https://docs.rs/alighieri).
+
+The `plugins` feature adds an in-process SDK:
+
+```toml
+[dependencies]
+alighieri = { version = "0.4", features = ["plugins"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+```
+
+Plugins are Rust code statically linked into a custom host binary. The stock
+`alighieri` binary does **not** discover or dynamically load plugin files. A
+minimal control-plane plugin can tag admitted flows:
+
+```rust
+use alighieri::plugin::{async_trait, FlowCtx, FlowDecision, Plugin};
+
+struct Audit;
+
+#[async_trait]
+impl Plugin for Audit {
+    fn name(&self) -> &str {
+        "audit"
+    }
+
+    async fn on_flow(&self, ctx: &mut FlowCtx<'_>) -> FlowDecision {
+        ctx.tags.insert("observed");
+        FlowDecision::Continue
+    }
+}
+```
+
+Register the compiled-in set after binding and before running the server:
+
+```rust
+use std::{path::PathBuf, sync::Arc};
+
+use alighieri::{
+    config::Config,
+    errors::Result,
+    plugin::PluginHost,
+    runtime::{
+        reload_signal_channel, run_bound_server_reloading_until_shutdown,
+        shutdown_signal,
+    },
+    server::Server,
+};
+
+// `Audit` is the plugin defined in the preceding example.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_path = PathBuf::from("alighieri.conf");
+    let config = Config::load(&config_path)?;
+    let plugins = PluginHost::new(vec![Arc::new(Audit)]);
+    let server = Server::bind(config).await?.with_plugins(plugins);
+
+    run_bound_server_reloading_until_shutdown(
+        server,
+        config_path,
+        shutdown_signal(),
+        reload_signal_channel(),
+    )
+    .await
+}
+```
+
+The dedicated [plugin SDK guide](doc/plugin-sdk.md) covers TCP interception,
+UDP datagram verdicts, association takeover, composition, and testing. A custom
+host is a modified/combined Alighieri build, so review the
+[AGPL and commercial licensing options](LICENSING.md) before distributing or
+deploying one.
 
 ## Benchmarks
 
@@ -890,7 +984,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | new (current release v0.1.0) | decades in production |
+| Maturity | developing (current release v0.4.0) | decades in production |
 
 **Which to choose**
 

@@ -143,7 +143,8 @@ impl Throttle {
     }
 
     /// True when no bucket limits the flow.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(any(feature = "plugins", test))]
+    pub(crate) fn is_empty(&self) -> bool {
         self.buckets.is_empty()
     }
 

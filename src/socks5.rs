@@ -81,7 +81,7 @@ pub enum Command {
 
 impl Command {
     /// Decodes a command byte, returning a protocol error for unknown values.
-    pub fn from_u8(b: u8) -> Result<Command> {
+    pub(crate) fn from_u8(b: u8) -> Result<Command> {
         match b {
             0x01 => Ok(Command::Connect),
             0x02 => Ok(Command::Bind),

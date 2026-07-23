@@ -393,9 +393,7 @@ impl Connection {
         decision: crate::acl::RuleDecision,
         throttle: Option<Throttle>,
     ) -> Result<()> {
-        use crate::plugin::{
-            FlowCtx, FlowDecision, FlowStats, PeekableClientStream, RuleInfo, StreamArgs, TagSet,
-        };
+        use crate::plugin::{FlowCtx, FlowDecision, FlowStats, RuleInfo, StreamArgs, TagSet};
 
         let mut ctx = FlowCtx {
             client: self.peer,
@@ -404,7 +402,7 @@ impl Connection {
             protocol: Protocol::Tcp,
             dest_host: req_host,
             dest: target,
-            rule: RuleInfo::from(&decision),
+            rule: RuleInfo::from_decision(&decision),
             tags: TagSet::new(),
         };
 
@@ -440,13 +438,13 @@ impl Connection {
         // the opaque relay runs.
         let result = match self.plugins.intercept(&ctx) {
             Some(interceptor) => {
-                let args = StreamArgs {
-                    client: PeekableClientStream::new(self.stream),
-                    target: remote,
-                    dst: target,
-                    io_timeout: self.config.io_timeout,
+                let args = StreamArgs::from_engine(
+                    self.stream,
+                    remote,
+                    target,
+                    self.config.io_timeout,
                     throttle,
-                };
+                );
                 interceptor
                     .run(args)
                     .await

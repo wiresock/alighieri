@@ -125,6 +125,7 @@ impl fmt::Display for Cidr {
 
 /// An inclusive TCP/UDP port range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PortRange {
     pub min: u16,
     pub max: u16,
@@ -294,6 +295,7 @@ pub(crate) fn validate_acme_domain(name: &str) -> Result<(), String> {
 /// resolves to (resistant to DNS rebinding). Patterns are stored lowercased and
 /// matching is case-insensitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostPattern {
     /// Matches exactly this hostname (e.g. `example.com`).
     Exact(String),
@@ -370,6 +372,7 @@ impl HostPattern {
 /// `socks` rule `to:`) a destination hostname pattern matches. A `None` port
 /// range matches every port.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AddrSpec {
     pub cidrs: Vec<Cidr>,
     /// Destination hostname patterns; only populated for a `socks` rule `to:`.

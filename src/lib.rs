@@ -1,43 +1,39 @@
 //! Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server.
 //!
-//! The crate is organised into focused modules:
+//! The supported library surface is intentionally small:
 //!
 //! - [`errors`]: the crate-wide error type.
-//! - [`abuse`]: optional per-client rate limits and abuse controls.
-//! - [`client_stream`]: accepted plaintext/TLS client stream wrapper.
-//! - [`net`]: CIDR / address-spec primitives used by the access-control engine.
 //! - [`config`]: the Dante-inspired configuration model and parser.
-//! - [`dns`]: DNS result ordering and post-resolution safety policy.
-//! - [`metrics`]: optional Prometheus-style runtime counters.
-//! - [`acl`]: rule evaluation (the access-control engine).
-//! - [`auth`]: username/password credential storage and verification.
-//! - [`socks5`]: SOCKS5 (RFC 1928) and username/password auth (RFC 1929) wire
-//!   primitives.
 //! - [`server`]: the listener/accept loop.
-//! - [`connection`]: the per-client SOCKS5 state machine.
-//! - [`relay`]: TCP bidirectional relay and the UDP associate relay.
 //! - [`runtime`]: shared process/service runtime helpers.
-//! - [`tls`]: optional TLS listener setup.
 //! - `plugin` (feature `plugins`, off by default): the plugin SDK interface.
+//!
+//! Other public-but-hidden modules are implementation or binary-support shims,
+//! not part of the compatibility contract.
 
-pub mod abuse;
-pub mod acl;
+mod abuse;
+mod acl;
+#[doc(hidden)]
 pub mod auth;
-pub mod client_stream;
+mod client_stream;
 pub mod config;
-pub mod connection;
-pub mod dns;
+mod connection;
+mod dns;
 pub mod errors;
-pub mod metrics;
-pub mod net;
+mod metrics;
+mod net;
+#[doc(hidden)]
 pub mod platform;
 #[cfg(feature = "plugins")]
 pub mod plugin;
-pub mod proxy_protocol;
-pub mod relay;
+mod proxy_protocol;
+mod relay;
 pub mod runtime;
 pub mod server;
+#[doc(hidden)]
 pub mod socks5;
-pub mod throttle;
+mod throttle;
+#[doc(hidden)]
 pub mod tls;
+#[doc(hidden)]
 pub mod util;

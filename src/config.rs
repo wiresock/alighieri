@@ -55,14 +55,20 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::acl::{Rule, RuleSet, Scope, Verdict};
 use crate::errors::{Error, Result};
-use crate::net::{AddrSpec, Cidr, HostPattern, PortRange};
-use crate::socks5::{Command, Method};
+use crate::socks5::Method;
+
+// These are part of the supported configuration vocabulary. Re-export them
+// through `config` so `Config` and `Rule` never force consumers through the
+// doc-hidden engine modules where the implementations live.
+pub use crate::acl::{Rule, RuleSet, Scope, Verdict};
+pub use crate::net::{AddrSpec, Cidr, HostPattern, PortRange};
+pub use crate::socks5::Command;
 
 /// An authentication kind usable both as a server-offered method and as a
 /// per-rule selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthKind {
     /// No authentication (`socksmethod: none`).
     None,
@@ -72,7 +78,7 @@ pub enum AuthKind {
 
 impl AuthKind {
     /// Maps to the corresponding SOCKS5 method byte.
-    pub fn to_method(self) -> Method {
+    pub(crate) fn to_method(self) -> Method {
         match self {
             AuthKind::None => Method::NoAuth,
             AuthKind::Username => Method::UserPass,
@@ -92,6 +98,7 @@ pub enum Protocol {
 
 /// Where log lines are emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogOutput {
     Stdout,
     Stderr,
@@ -100,6 +107,7 @@ pub enum LogOutput {
 
 /// Log record encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogFormat {
     Text,
     Json,
@@ -107,6 +115,7 @@ pub enum LogFormat {
 
 /// Address-family ordering for DNS results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DnsPreference {
     System,
     Ipv4,
@@ -115,6 +124,7 @@ pub enum DnsPreference {
 
 /// Destination IP categories that may be denied after DNS resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DnsDenyCategory {
     Private,
     LinkLocal,
@@ -127,6 +137,7 @@ pub enum DnsDenyCategory {
 
 /// DNS resolution policy used by TCP CONNECT and UDP ASSOCIATE.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DnsPolicy {
     pub preference: DnsPreference,
     pub try_all: bool,
@@ -146,6 +157,7 @@ pub struct DnsPolicy {
 /// upgraded to TLS before the SOCKS5 greeting is read. The certificate is
 /// either operator-provided files or obtained automatically over ACME.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsConfig {
     /// Operator-provided certificate and private key (PEM).
     Files {
@@ -160,6 +172,7 @@ pub enum TlsConfig {
 /// ACME (Let's Encrypt) settings for automatic TLS certificates. Validation uses
 /// TLS-ALPN-01, so the listener must be reachable at each domain on port 443.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AcmeConfig {
     /// Domains the certificate covers (the SANs).
     pub domains: Vec<String>,
@@ -175,6 +188,7 @@ pub struct AcmeConfig {
 
 /// A fixed-window rate limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RateLimit {
     pub limit: u64,
     pub window: Duration,
@@ -182,6 +196,7 @@ pub struct RateLimit {
 
 /// Optional per-client abuse controls.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RateLimits {
     pub connection_rate: Option<RateLimit>,
     pub auth_failure_rate: Option<RateLimit>,
@@ -191,6 +206,7 @@ pub struct RateLimits {
 
 /// The fully validated runtime configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Address the proxy listens on for clients (Dante `internal`).
     pub internal: SocketAddr,
@@ -1037,6 +1053,7 @@ fn parse_ip(vals: &[String], lineno: usize) -> Result<IpAddr> {
 /// and a wedged resolver can neither hang the load nor leak abandoned threads. The
 /// address matching the client's connection family is chosen at that point.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UdpAdvertise {
     /// A literal IP address, advertised as-is (family-matched per association).
     Ip(IpAddr),
