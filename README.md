@@ -199,7 +199,9 @@ does not ask for, generate, display, or store a plaintext password.
 
 Before starting the service:
 
-- point the selected domain at the VPS and wait for DNS to resolve there;
+- create a DNS A record pointing the selected domain at the VPS and wait for it
+  to resolve; publish an AAAA record only if IPv6 TCP 443 is actually forwarded
+  to this IPv4 listener;
 - allow inbound TCP 443 in the host firewall and cloud security group, allow
   outbound TCP 443 for ACME, and ensure no other service occupies TCP 443;
 - if UDP ASSOCIATE is enabled, allow its selected inbound UDP range (the default
@@ -212,24 +214,28 @@ port 80. The reviewed
 shows the same defaults, and the [ACME test guide](doc/acme-tls-test.md) covers
 issuance and troubleshooting in detail.
 
-On a fresh Linux VPS, run the supported installer once with its starter
-configuration before generating the public profile; this creates the
-`alighieri` account and service directories. Existing installations can skip
-that first command. Generate directly to the service's configuration path,
-then create the first user and make the resulting file service-readable before
-re-running the installer. Re-running is important after switching to port 443
-or ACME because it gives the unit only the required `CAP_NET_BIND_SERVICE`
-capability:
+On a fresh Linux VPS, prepare the supported installation with `--no-start`;
+this creates the `alighieri` account, directories, binary, and systemd unit but
+does not enable or start it before credentials exist. Existing installations
+can skip that first command. Generate directly to the service's configuration
+path, then create the first user and make the resulting file service-readable
+before running the normal installer. That final run derives the port-443
+`CAP_NET_BIND_SERVICE` capability and starts the service:
+
+The commands below use the helper from a source checkout. Release archives do
+not bundle that script; when using a prebuilt release, first follow the
+[standalone helper download](#linux-service-systemd), use `./alighieri.sh` in
+place of `./scripts/alighieri.sh`, and pass `--binary /path/to/extracted/alighieri`
+to both installer invocations.
 
 ```sh
-sudo ./scripts/alighieri.sh install  # fresh VPS only
+sudo ./scripts/alighieri.sh install --no-start  # fresh VPS only
 sudo alighieri config wizard --output /etc/alighieri/alighieri.conf
 sudo alighieri user add proxyuser --userlist /etc/alighieri/users
 sudo chown root:alighieri -- /etc/alighieri/users
 sudo chmod 640 -- /etc/alighieri/users
 sudo alighieri --check --config /etc/alighieri/alighieri.conf
 sudo ./scripts/alighieri.sh install  # install/regenerate the port-443 unit
-sudo systemctl restart alighieri
 systemctl status alighieri
 journalctl -u alighieri -f
 ```
@@ -239,20 +245,43 @@ The public profile requires absolute userlist and ACME-cache paths so the
 operator shell and service cannot resolve the same text to different files.
 On Windows those defaults are under `%ProgramData%\Alighieri`; the completion
 page provides an elevated-PowerShell bootstrap that hardens this directory,
-moves the generated configuration to its canonical service path, creates the
-user, and only then installs and starts the service.
+atomically installs the generated configuration at its canonical service path
+with a backup, creates the user, and only then installs and starts the service.
 
-Configure ProxiFyre with these values:
+Use [ProxiFyre 2.4.0 or later](https://github.com/wiresock/proxifyre/releases/tag/v2.4.0);
+earlier versions do not support native SOCKS5-over-TLS. Its
+[configuration](https://github.com/wiresock/proxifyre/blob/main/docs/configuration.md#socks5-over-tls)
+defaults to plaintext SOCKS5, so the
+`socks5Transport` field must explicitly be `TLS`. For example, save the
+following as `app-config.json` next to `ProxiFyre.exe`, replace the application
+names and credentials, and remove `UDP` from `supportedProtocols` when the
+wizard's UDP option is disabled:
 
-| ProxiFyre setting | Value |
-|-------------------|-------|
-| Proxy type | SOCKS5 |
-| Server | the selected ACME domain |
-| Port | `443` |
-| TLS | enabled |
-| Username | the initial username shown by the wizard, if supplied |
-| Password | the password entered at the `alighieri user add` prompt |
-| UDP | enabled only when UDP ASSOCIATE was selected |
+```json
+{
+  "logLevel": "Error",
+  "proxies": [
+    {
+      "appNames": ["chrome"],
+      "socks5ProxyEndpoint": "proxy.example.com:443",
+      "username": "proxyuser",
+      "password": "REPLACE_WITH_USER_ADD_PASSWORD",
+      "socks5Transport": "TLS",
+      "tlsServerName": "proxy.example.com",
+      "tlsAllowInvalidCertificate": false,
+      "supportedProtocols": ["TCP", "UDP"],
+      "supportedAddressFamilies": ["IPv4"]
+    }
+  ],
+  "excludes": []
+}
+```
+
+The explicit `IPv4` destination family matches this profile's
+`to: 0.0.0.0/0` ACL; the upstream endpoint separately uses the domain's A
+record. Keep normal certificate validation enabled: the production ACME
+certificate is publicly trusted, so neither a fingerprint pin nor
+`tlsAllowInvalidCertificate: true` is appropriate.
 
 The endpoint is an application proxy, not a full IP-level VPN. TLS protects the
 SOCKS5 control connection and authentication, but UDP relay datagrams use
@@ -757,6 +786,7 @@ build if present, otherwise builds one, or takes a binary extracted from a
 ```sh
 sudo ./scripts/alighieri.sh                        # install, or manage if already installed
 sudo ./scripts/alighieri.sh install --binary ./alighieri  # install a prebuilt binary
+sudo ./scripts/alighieri.sh install --no-start     # prepare unit/files without first start
 sudo ./scripts/alighieri.sh upgrade                # rebuild/replace the binary and restart
 sudo ./scripts/alighieri.sh status                 # show binary, service, and config state
 sudo ./scripts/alighieri.sh uninstall              # remove the service and binary
@@ -775,7 +805,10 @@ The installer puts the binary at `/usr/local/bin/alighieri`, creates a
 dedicated unprivileged `alighieri` system user, installs a default config to
 `/etc/alighieri/alighieri.conf` (kept if it already exists; either way set to
 `root:alighieri` mode `640`, readable only by the service user), and writes
-`/etc/systemd/system/alighieri.service` before enabling and starting it.
+`/etc/systemd/system/alighieri.service` before enabling and starting it. With
+`install --no-start`, it finishes after writing and daemon-reloading the unit;
+it neither enables nor starts a fresh service, which lets you create a required
+userlist before the first authenticated launch.
 
 The unit runs as the `alighieri` user with `NoNewPrivileges`,
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a capability set restricted

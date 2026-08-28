@@ -88,11 +88,8 @@ pub fn parse_service_command(args: Vec<String>) -> ServiceCliResult<ServiceComma
     // Keep subcommand help convenient without stealing a quoted config path
     // whose complete positional role is unambiguous (for example a file named
     // `--help` supplied after `--config`).
-    if args
-        .first()
-        .is_some_and(|arg| arg == "-h" || arg == "--help")
-        || (args.len() == 2 && args[1] == "-h")
-        || (args.len() == 2 && args[1] == "--help")
+    if args.first().is_some_and(|arg| is_help_arg(arg))
+        || args.get(1..).is_some_and(has_unconsumed_help_arg)
     {
         return Ok(ServiceCommand::Help);
     }
@@ -105,17 +102,41 @@ pub fn parse_service_command(args: Vec<String>) -> ServiceCliResult<ServiceComma
             let config_path = parse_config_arg(&args[1..])?.unwrap_or_else(default_config_path);
             Ok(ServiceCommand::Install { config_path })
         }
-        "uninstall" => Ok(ServiceCommand::Uninstall),
-        "start" => Ok(ServiceCommand::Start),
-        "stop" => Ok(ServiceCommand::Stop),
-        "reload" => Ok(ServiceCommand::Reload),
-        "status" => Ok(ServiceCommand::Status),
+        "uninstall" if args.len() == 1 => Ok(ServiceCommand::Uninstall),
+        "start" if args.len() == 1 => Ok(ServiceCommand::Start),
+        "stop" if args.len() == 1 => Ok(ServiceCommand::Stop),
+        "reload" if args.len() == 1 => Ok(ServiceCommand::Reload),
+        "status" if args.len() == 1 => Ok(ServiceCommand::Status),
+        "uninstall" | "start" | "stop" | "reload" | "status" => {
+            Err(ServiceCliError::Usage(service_usage()))
+        }
         "run" => {
             let config_path = parse_config_arg(&args[1..])?;
             Ok(ServiceCommand::Run { config_path })
         }
         _ => Err(ServiceCliError::Usage(service_usage())),
     }
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
+}
+
+/// Finds help switches that are options rather than the value consumed by
+/// `--config`. Lifecycle commands still reject `--config --help` as an invalid
+/// extra argument; they must never turn malformed input into a state change.
+fn has_unconsumed_help_arg(args: &[String]) -> bool {
+    let mut consume_as_config_path = false;
+    for arg in args {
+        if consume_as_config_path {
+            consume_as_config_path = false;
+        } else if arg == "--config" {
+            consume_as_config_path = true;
+        } else if is_help_arg(arg) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn execute_service_command<C: ServiceController>(
@@ -1244,6 +1265,24 @@ mod tests {
                 config_path: PathBuf::from("--help"),
             }
         );
+    }
+
+    #[test]
+    fn lifecycle_commands_reject_extras_and_unconsumed_help_wins() {
+        for command in ["uninstall", "start", "stop", "reload", "status"] {
+            assert!(parse_service_command(vec![command.into(), "junk".into()]).is_err());
+            assert_eq!(
+                parse_service_command(vec![command.into(), "junk".into(), "--help".into(),])
+                    .unwrap(),
+                ServiceCommand::Help
+            );
+            assert!(parse_service_command(vec![
+                command.into(),
+                "--config".into(),
+                "--help".into(),
+            ])
+            .is_err());
+        }
     }
 
     #[test]

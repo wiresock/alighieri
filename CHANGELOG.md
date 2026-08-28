@@ -13,6 +13,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   certificates, optional fixed-range UDP relay support, loss-aware import, and
   deployment guidance. A matching reviewed configuration is available under
   `doc/templates/`.
+- The Linux service installer accepts `--no-start` to prepare a hardened
+  installation without enabling or starting it, allowing authenticated public
+  profiles to create their userlist before first launch.
 
 ## [0.4.0] - 2026-07-23
 

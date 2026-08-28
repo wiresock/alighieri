@@ -20,6 +20,7 @@ const DEFAULT_OUTPUT_PATH: &str = "alighieri.conf";
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_FORM_BYTES: usize = 32 * 1024;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
+#[cfg(test)]
 const PUBLIC_DOMAIN_EXAMPLE: &str = "proxy.example.com";
 const PUBLIC_UDP_RANGE: &str = "40000-40099";
 
@@ -580,6 +581,13 @@ fn wizard_form_from_fields(
                 .into(),
         );
     }
+    if template == WizardTemplate::PublicTls {
+        validate_public_userlist_path(
+            userlist_path
+                .as_deref()
+                .expect("public userlist presence was checked above"),
+        )?;
+    }
     if template == WizardTemplate::PublicTls && trusted_client != "0.0.0.0/0" {
         return Err("public TLS profile client range must be 0.0.0.0/0".into());
     }
@@ -594,6 +602,10 @@ fn wizard_form_from_fields(
         udp_port_range,
         udp_advertise,
     ) = if template == WizardTemplate::PublicTls {
+        let raw_domain = fields.get("public_domain").map_or("", String::as_str);
+        if raw_domain != raw_domain.trim() {
+            return Err("public domain must not have surrounding whitespace".into());
+        }
         let domain = required_text_field(fields, "public_domain", "public domain")?;
         let domain = validate_public_domain(&domain)?;
 
@@ -636,6 +648,7 @@ fn wizard_form_from_fields(
                 "ACME cache path must be absolute so the service can write it reliably".into(),
             );
         }
+        validate_public_acme_cache_path(&cache_path)?;
 
         let staging = parse_checkbox(fields, "acme_staging", false)?;
         let udp_enabled = parse_checkbox(fields, "udp_enabled", true)?;
@@ -765,6 +778,39 @@ fn validate_public_domain(value: &str) -> Result<String, String> {
         },
         _ => Err("public domain is not a valid ACME hostname".into()),
     }
+}
+
+fn validate_public_userlist_path(path: &Path) -> Result<(), String> {
+    let text = path.display().to_string();
+    let probe = format!("internal: 0.0.0.0 port = 443\nsocksmethod: username\nuserlist: {text}\n");
+    let parsed = Config::parse(&probe)
+        .map_err(|e| format!("public profile userlist path is invalid: {e}"))?;
+    if parsed.userlist.as_deref() != Some(path) {
+        return Err(
+            "public profile userlist path changes when parsed as configuration; replace tabs or repeated whitespace with a single space"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_public_acme_cache_path(path: &Path) -> Result<(), String> {
+    let text = path.display().to_string();
+    let probe = format!(
+        "internal: 0.0.0.0 port = 443\ntls.acme.domains: proxy.example.com\ntls.acme.cache: {text}\n"
+    );
+    let parsed = Config::parse(&probe).map_err(|e| format!("ACME cache path is invalid: {e}"))?;
+    let parsed_path = match &parsed.tls {
+        Some(TlsConfig::Acme(acme)) => acme.cache_dir.as_path(),
+        _ => return Err("ACME cache path did not produce an ACME configuration".into()),
+    };
+    if parsed_path != path {
+        return Err(
+            "ACME cache path changes when parsed as configuration; replace tabs or repeated whitespace with a single space"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_udp_port_range(value: &str) -> Result<String, String> {
@@ -1198,13 +1244,13 @@ fn wizard_form_from_config(config: &Config, output_path: &Path) -> WizardForm {
     } else {
         WizardTemplate::LocalNoAuth
     };
-    let userlist_path = if matches!(
-        template,
-        WizardTemplate::LanUsername | WizardTemplate::PublicTls
-    ) {
-        config.userlist.clone()
-    } else {
-        None
+    let userlist_path = match template {
+        WizardTemplate::LocalNoAuth => None,
+        WizardTemplate::LanUsername => config
+            .userlist
+            .clone()
+            .or_else(|| Some(PathBuf::from(default_userlist_path(output_path)))),
+        WizardTemplate::PublicTls => config.userlist.clone(),
     };
     let log_file = if config.log_outputs.contains(&LogOutput::File) {
         config.log_file.clone()
@@ -1888,7 +1934,7 @@ fn render_wizard_form(
     let trusted_attr = html_escape(&trusted_client);
     let public_domain_value = prefill
         .and_then(|p| p.form.public_domain.as_deref())
-        .unwrap_or(PUBLIC_DOMAIN_EXAMPLE);
+        .unwrap_or("");
     let acme_email_value = prefill
         .and_then(|p| p.form.acme_email.as_deref())
         .unwrap_or("");
@@ -1997,7 +2043,7 @@ fn render_wizard_form(
 </section>
 <section id="public-profile"{public_hidden}>
 <h2>Public TLS endpoint</h2>
-<label>Public domain <input class="public-only" name="public_domain" value="{public_domain}" placeholder="proxy.example.com" autocomplete="off"{public_required}{public_disabled}><span class="help">Exactly one DNS hostname. It must resolve to this VPS before ACME issuance can succeed; do not include a scheme, path, wildcard, or IP address.</span></label>
+<label>Public domain <input class="public-only" name="public_domain" value="{public_domain}" placeholder="proxy.example.com" autocomplete="off"{public_required}{public_disabled}><span class="help">Exactly one DNS hostname with an A record for this VPS. This profile is IPv4-only; publish AAAA only when IPv6 TCP 443 is forwarded to Alighieri. Do not include a scheme, path, wildcard, or IP address.</span></label>
 <label>ACME account email (optional) <input class="public-only" name="acme_email" value="{acme_email}" placeholder="admin@example.com" autocomplete="off"{public_disabled}></label>
 <label>Initial username (optional) <input class="public-only" name="initial_username" value="{initial_username}" placeholder="proxyuser" autocomplete="off"{public_disabled}><span class="help">Used only in the completion-page command. The wizard never asks for or stores a password.</span></label>
 <label>ACME cache path <input class="public-only" name="acme_cache" value="{acme_cache}" autocomplete="off"{public_required}{public_disabled}><span class="help">Absolute path for persisted certificates and account state. The default is writable by the supported service installation.</span></label>
@@ -2173,6 +2219,69 @@ fn render_success(report: &WriteReport, form: &WizardForm) -> String {
     )
 }
 
+fn windows_atomic_config_install(source_arg: &str, destination_arg: &str) -> String {
+    let mut command = format!("$source = {source_arg}\n$destination = {destination_arg}");
+    command.push_str(
+        r#"
+$backup = "$destination.bak"
+$staged = Join-Path (Split-Path -Parent $destination) ([IO.Path]::GetRandomFileName())
+try {
+    Copy-Item -LiteralPath $source -Destination $staged -ErrorAction Stop
+    $checker = (Get-Command alighieri -CommandType Application -ErrorAction Stop).Source
+    & $checker --check --config $staged
+    if (-not $? -or $LASTEXITCODE -ne 0) {
+        throw "staged service configuration failed validation"
+    }
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        if (Test-Path -LiteralPath $backup) {
+            if (-not (Test-Path -LiteralPath $backup -PathType Leaf)) {
+                throw "service config backup path is not a regular file: $backup"
+            }
+        }
+        [IO.File]::Replace($staged, $destination, $backup, $true)
+    } elseif (Test-Path -LiteralPath $destination) {
+        throw "service config destination is not a regular file: $destination"
+    } else {
+        [IO.File]::Move($staged, $destination)
+    }
+} finally {
+    if (Test-Path -LiteralPath $staged) {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
+}"#,
+    );
+    command
+}
+
+fn unix_atomic_config_install(source_arg: &str, destination_arg: &str) -> String {
+    let script = r#"sudo sh -eu -c '
+source_path=$1
+destination_path=$2
+staged=$(mktemp "${destination_path}.tmp.XXXXXX")
+backup_staged=
+cleanup() {
+    [ -z "${staged:-}" ] || rm -f -- "$staged"
+    [ -z "${backup_staged:-}" ] || rm -f -- "$backup_staged"
+}
+trap cleanup EXIT HUP INT TERM
+install -m 640 -o root -g alighieri -- "$source_path" "$staged"
+alighieri --check --config "$staged"
+if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
+    if [ ! -f "$destination_path" ] || [ -L "$destination_path" ]; then
+        echo "refusing to replace non-regular service config: $destination_path" >&2
+        exit 1
+    fi
+    backup_staged=$(mktemp "${destination_path}.bak.tmp.XXXXXX")
+    cp -p -- "$destination_path" "$backup_staged"
+    mv -fT -- "$backup_staged" "$destination_path.bak"
+    backup_staged=
+fi
+mv -fT -- "$staged" "$destination_path"
+staged=
+' sh"#;
+    format!("{script} {source_arg} {destination_arg}")
+}
+
 fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
     let output_text = report.output_path.display().to_string();
     let output = html_escape(&output_text);
@@ -2206,6 +2315,34 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
                 html_escape(value)
             )
         });
+    let proxifyre_config = format!(
+        r#"{{
+  "logLevel": "Error",
+  "proxies": [
+    {{
+      "appNames": ["chrome"],
+      "socks5ProxyEndpoint": "{}:443",
+      "username": "{}",
+      "password": "REPLACE_WITH_USER_ADD_PASSWORD",
+      "socks5Transport": "TLS",
+      "tlsServerName": "{}",
+      "tlsAllowInvalidCertificate": false,
+      "supportedProtocols": [{}],
+      "supportedAddressFamilies": ["IPv4"]
+    }}
+  ],
+  "excludes": []
+}}"#,
+        json_escape(domain_text),
+        json_escape(username_text),
+        json_escape(domain_text),
+        if form.udp_enabled {
+            r#""TCP", "UDP""#
+        } else {
+            r#""TCP""#
+        }
+    );
+    let proxifyre_config = html_escape(&proxifyre_config);
     let add_command = format!(
         "{}alighieri user add {} --userlist {}",
         if cfg!(windows) { "" } else { "sudo " },
@@ -2243,11 +2380,13 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
                 html_escape(&service_config_text)
             )
         } else {
-            let copy_command = html_escape(&format!(
-                "Copy-Item -LiteralPath {output_arg} -Destination {service_config_arg} -Force"
+            let copy_command = html_escape(&windows_atomic_config_install(
+                &output_arg,
+                &service_config_arg,
             ));
             format!(
-                "<p>After either preparation branch, copy the generated file into the hardened service-data directory:</p><pre>{copy_command}</pre>"
+                "<p>After either preparation branch, atomically install the generated file into the hardened service-data directory. If a service configuration already exists, PowerShell preserves it as <code>{}.bak</code>:</p><pre>{copy_command}</pre>",
+                html_escape(&service_config_text)
             )
         };
         let fresh_commands = html_escape(&format!(
@@ -2262,7 +2401,7 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
              {copy_config}</section>"
         )
     } else {
-        "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run <code>sudo ./scripts/alighieri.sh install</code> once with its starter configuration before the steps below. That creates the <code>alighieri</code> account and service directories. Then create the userlist, install this generated configuration, and rerun the installer as shown below.</section>".to_string()
+        "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run <code>sudo ./scripts/alighieri.sh install --no-start</code> before the steps below. It creates the <code>alighieri</code> account, service directories, binary, and unit without enabling or starting the service. This is safe even when the wizard wrote directly to <code>/etc/alighieri/alighieri.conf</code>. Create the userlist next, then run the normal installer command shown below to enable and start Alighieri.<p>Release archives do not bundle the lifecycle script. Outside a source checkout, download the standalone helper below, use <code>./alighieri.sh</code> wherever the commands show <code>./scripts/alighieri.sh</code>, and pass <code>--binary /path/to/extracted/alighieri</code> when installing a prebuilt binary.</p><pre>curl -fsSLo alighieri.sh https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh\nchmod +x alighieri.sh</pre></section>".to_string()
     };
     let service_commands = if cfg!(windows) {
         html_escape(&format!(
@@ -2276,11 +2415,12 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
             String::new()
         } else {
             format!(
-                "sudo install -m 640 -o root -g alighieri -- {output_arg} /etc/alighieri/alighieri.conf\n"
+                "{}\n",
+                unix_atomic_config_install(&output_arg, &service_config_arg)
             )
         };
         html_escape(&format!(
-            "sudo alighieri --check --config {output_arg}\n{install_config}sudo ./scripts/alighieri.sh install\nsudo systemctl restart alighieri\nsudo systemctl status alighieri\nsudo journalctl -u alighieri -f"
+            "sudo alighieri --check --config {output_arg}\n{install_config}sudo ./scripts/alighieri.sh install\nsudo systemctl status alighieri\nsudo journalctl -u alighieri -f"
         ))
     };
     let service_note = if cfg!(windows) {
@@ -2302,6 +2442,11 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
     };
     let staging_warning = if form.acme_staging {
         "<section class=\"warning\"><strong>ACME staging is enabled.</strong> The issued certificate will not be trusted by normal clients. Switch staging off and obtain a production certificate before normal use.</section>"
+    } else {
+        ""
+    };
+    let proxifyre_staging_note = if form.acme_staging {
+        "<p><strong>Staging note:</strong> the validation-safe ProxiFyre configuration below will connect only after you switch to a production certificate. Do not disable certificate validation to make staging permanent.</p>"
     } else {
         ""
     };
@@ -2328,7 +2473,7 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
 <section>
 <h2>VPS prerequisites</h2>
 <ul>
-<li><code>{domain}</code> resolves to this VPS.</li>
+<li><code>{domain}</code> has a DNS A record for this VPS. Because this profile listens on IPv4, publish an AAAA record only when IPv6 TCP 443 is forwarded to this listener.</li>
 <li>Inbound TCP 443 is allowed, and no other service occupies TCP 443.</li>
 <li>Outbound TCP 443 is allowed for ACME communication.</li>
 {udp_firewall}
@@ -2351,6 +2496,10 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
 {proxifyre_username}<dt>Password</dt><dd>the password entered through <code>alighieri user add</code></dd>
 <dt>UDP</dt><dd>{udp_value}</dd>
 </dl>
+<p>Use ProxiFyre 2.4.0 or later. Save a configuration like this as <code>app-config.json</code> next to <code>ProxiFyre.exe</code>, replacing <code>appNames</code> and the password placeholder. The explicit TLS transport is required because ProxiFyre otherwise defaults to plaintext SOCKS5:</p>
+<pre>{proxifyre_config}</pre>
+{proxifyre_staging_note}
+<p>Normal certificate and hostname validation remains enabled. This IPv4-only destination-family setting matches the generated <code>to: 0.0.0.0/0</code> access policy; the upstream endpoint separately uses the domain's A record.</p>
 <p>This endpoint is an application proxy, not a full IP-level VPN.</p>
 </section>
 </main>"#,
@@ -2419,6 +2568,22 @@ fn html_escape(value: &str) -> String {
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&quot;"),
             '\'' => escaped.push_str("&#39;"),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => write!(escaped, "\\u{:04x}", ch as u32).unwrap(),
             ch => escaped.push(ch),
         }
     }
@@ -2663,6 +2828,8 @@ mod tests {
 
         for bad in [
             "",
+            " proxy.example.com",
+            "proxy.example.com ",
             "https://proxy.example.com",
             "proxy.example.com/path",
             "*.example.com",
@@ -2690,6 +2857,52 @@ mod tests {
         relative_cache.insert("acme_cache".into(), "acme".into());
         let err = wizard_form_from_fields(&relative_cache, Path::new("public.conf")).unwrap_err();
         assert!(err.contains("ACME cache path must be absolute"), "{err}");
+
+        let whitespace_paths = if cfg!(windows) {
+            [
+                ("userlist", r"C:\ProgramData\Alighieri\user  db"),
+                ("userlist", "C:\\ProgramData\\Alighieri\\user\tdb"),
+                ("acme_cache", r"C:\ProgramData\Alighieri\acme  cache"),
+                ("acme_cache", "C:\\ProgramData\\Alighieri\\acme\tcache"),
+            ]
+        } else {
+            [
+                ("userlist", "/etc/alighieri/user  db"),
+                ("userlist", "/etc/alighieri/user\tdb"),
+                ("acme_cache", "/var/lib/alighieri/acme  cache"),
+                ("acme_cache", "/var/lib/alighieri/acme\tcache"),
+            ]
+        };
+        for (field, value) in whitespace_paths {
+            let mut fields = public_tls_fields();
+            fields.insert(field.into(), value.into());
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+            assert!(
+                err.contains("changes when parsed as configuration"),
+                "{field}: {err}"
+            );
+        }
+
+        let (userlist, cache) = if cfg!(windows) {
+            (
+                r"C:\ProgramData\Alighieri Data\users",
+                r"C:\ProgramData\Alighieri Data\acme",
+            )
+        } else {
+            ("/etc/alighieri data/users", "/var/lib/alighieri data/acme")
+        };
+        let mut single_spaces = public_tls_fields();
+        single_spaces.insert("userlist".into(), userlist.into());
+        single_spaces.insert("acme_cache".into(), cache.into());
+        let form = wizard_form_from_fields(&single_spaces, Path::new("public.conf")).unwrap();
+        assert_eq!(form.userlist_path, Some(PathBuf::from(userlist)));
+        assert_eq!(form.acme_cache_path, Some(PathBuf::from(cache)));
+        let parsed = Config::parse(&render_config(&form)).unwrap();
+        assert_eq!(parsed.userlist, Some(PathBuf::from(userlist)));
+        let Some(TlsConfig::Acme(acme)) = parsed.tls else {
+            panic!("expected ACME configuration");
+        };
+        assert_eq!(acme.cache_dir, PathBuf::from(cache));
     }
 
     #[test]
@@ -3065,11 +3278,130 @@ mod tests {
     }
 
     #[test]
+    fn browser_script_executes_three_profile_state_transitions() {
+        let node = std::process::Command::new("node").arg("--version").output();
+        if !node.is_ok_and(|output| output.status.success()) {
+            assert!(
+                std::env::var_os("ALIGHIERI_REQUIRE_NODE_TESTS").is_none(),
+                "node is required for executable wizard browser-state tests in CI"
+            );
+            eprintln!("skipping executable wizard browser-state test: node is unavailable");
+            return;
+        }
+
+        let html = render_wizard_form("token", Path::new("alighieri.conf"), None);
+        let script = html
+            .split_once("<script>")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(script, _)| script)
+            .unwrap();
+        let prelude = r##"
+function control(value = "") {
+  return {
+    value, checked: false, disabled: false, required: false, readOnly: false,
+    hidden: false, dataset: {}, listeners: {},
+    addEventListener(kind, callback) { this.listeners[kind] = callback; }
+  };
+}
+const listenControl = control("127.0.0.1");
+const portControl = control("1080");
+const trustedControl = control("127.0.0.1");
+const userlistControl = control("users");
+userlistControl.dataset.standardDefault = "users";
+userlistControl.dataset.publicDefault = "/etc/alighieri/users";
+const publicSectionControl = control();
+const publicNoteControl = control();
+const udpEnabledControl = control();
+udpEnabledControl.checked = true;
+const udpFieldsControl = control();
+const domainControl = control("");
+const advertiseControl = control("");
+const cacheControl = control("/var/lib/alighieri/acme");
+const rangeControl = control("40000-40099");
+const radios = ["local-no-auth", "lan-username", "public-tls"].map(control);
+const bySelector = {
+  "[name=listen_host]": listenControl,
+  "[name=listen_port]": portControl,
+  "[name=trusted_client]": trustedControl,
+  "[name=userlist]": userlistControl,
+  "#public-profile": publicSectionControl,
+  "#public-listener-note": publicNoteControl,
+  "#udp-enabled": udpEnabledControl,
+  "#udp-fields": udpFieldsControl,
+  "[name=public_domain]": domainControl,
+  "[name=udp_advertise]": advertiseControl,
+  "[name=acme_cache]": cacheControl,
+  "[name=udp_port_range]": rangeControl
+};
+const document = {
+  querySelector(selector) { return bySelector[selector]; },
+  querySelectorAll(selector) {
+    if (selector === "[name=template]") return radios;
+    if (selector === ".public-only") return [domainControl, cacheControl, udpEnabledControl];
+    if (selector === ".public-udp-only") return [rangeControl, advertiseControl];
+    throw new Error(`unexpected selector: ${selector}`);
+  }
+};
+"##;
+        let assertions = r#"
+function check(value, message) { if (!value) throw new Error(message); }
+const localRadio = radios.find((radio) => radio.value === "local-no-auth");
+const lanRadio = radios.find((radio) => radio.value === "lan-username");
+const publicRadio = radios.find((radio) => radio.value === "public-tls");
+check(domainControl.value === "", "example domain must not be a submitted default");
+listenControl.value = "127.0.0.9";
+userlistControl.value = "local-edit";
+publicRadio.listeners.change();
+check(listenControl.value === "0.0.0.0" && portControl.value === "443", "public preset");
+check(userlistControl.value === userlistControl.dataset.publicDefault, "public userlist preset");
+check(!publicSectionControl.hidden && domainControl.required && !domainControl.disabled, "public visibility");
+domainControl.value = "edge.example.net";
+domainControl.listeners.input();
+check(advertiseControl.value === "edge.example.net", "domain should seed UDP advertise");
+advertiseControl.value = "relay.example.net";
+advertiseControl.listeners.input();
+domainControl.value = "other.example.net";
+domainControl.listeners.input();
+check(advertiseControl.value === "relay.example.net", "manual UDP advertise must survive domain edits");
+userlistControl.value = "/etc/alighieri/public-users";
+lanRadio.listeners.change();
+check(portControl.value === "1080" && userlistControl.value === userlistControl.dataset.standardDefault, "LAN preset");
+portControl.value = "2080";
+localRadio.listeners.change();
+check(listenControl.value === "127.0.0.9" && userlistControl.value === "local-edit", "local edit preservation");
+publicRadio.listeners.change();
+check(userlistControl.value === "/etc/alighieri/public-users", "public edit preservation");
+check(domainControl.value === "other.example.net" && advertiseControl.value === "relay.example.net", "public-only edit preservation");
+lanRadio.listeners.change();
+check(portControl.value === "2080", "LAN edit preservation");
+publicRadio.listeners.change();
+udpEnabledControl.checked = false;
+udpEnabledControl.listeners.change();
+check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disabled, "UDP disabled state");
+"#;
+        let harness = format!("{prelude}\n{script}\n{assertions}");
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "browser state script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn rendered_form_offers_public_profile_and_controls_visibility_server_side() {
         let local_html = render_wizard_form("token", Path::new("alighieri.conf"), None);
         assert!(local_html.contains(r#"value="public-tls""#));
         assert!(local_html.contains("Public SOCKS5-over-TLS (ProxiFyre)"));
         assert!(local_html.contains(r#"<section id="public-profile" hidden>"#));
+        assert!(input_tag(&local_html, "public_domain").contains(r#"value="""#));
+        assert!(
+            input_tag(&local_html, "public_domain").contains(r#"placeholder="proxy.example.com""#)
+        );
         assert!(input_tag(&local_html, "public_domain").contains("disabled"));
         assert!(!input_tag(&local_html, "public_domain").contains("required"));
         assert!(!local_html.contains(r#"name="password""#));
@@ -3188,6 +3520,43 @@ mod tests {
         assert_eq!(form.trusted_client, "192.168.0.0/16");
         assert_eq!(form.userlist_path, Some(PathBuf::from("creds/users")));
         assert_eq!(form.log_file, Some(PathBuf::from("logs/app.log")));
+    }
+
+    #[test]
+    fn auth_command_only_import_gets_a_valid_modelled_userlist_and_warning() {
+        for tls in [
+            "",
+            "tls.acme.domains: proxy.example.com\ntls.acme.cache: /var/lib/alighieri/acme\n",
+        ] {
+            let config = Config::parse(&format!(
+                "internal: 0.0.0.0 port = 443\n\
+                 external: 0.0.0.0\n\
+                 socksmethod: username\n\
+                 auth.command: /usr/local/bin/verify-user\n\
+                 {tls}\
+                 client pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 }}\n\
+                 socks pass {{ from: 0.0.0.0/0 to: 0.0.0.0/0 command: connect method: username }}\n"
+            ))
+            .unwrap();
+
+            let form = wizard_form_from_config(&config, Path::new("imported.conf"));
+            assert_eq!(form.template, WizardTemplate::LanUsername);
+            assert_eq!(form.userlist_path, Some(PathBuf::from("users")));
+            Config::parse(&render_config(&form)).unwrap();
+            let warnings = import_loss_warnings(&config, &form).unwrap();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("auth.command")),
+                "{warnings:?}"
+            );
+            if !tls.is_empty() {
+                assert!(
+                    warnings.iter().any(|warning| warning.contains("TLS")),
+                    "{warnings:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3642,13 +4011,29 @@ mod tests {
         assert!(html.contains("prompts for the password securely"));
         assert!(html.contains("Inbound TCP 443"));
         assert!(html.contains("Outbound TCP 443"));
+        assert!(html.contains("DNS A record"));
+        assert!(html.contains("AAAA record only when IPv6 TCP 443"));
         assert!(html.contains("inbound UDP <code>40000-40099</code>"));
         assert!(html.contains("alighieri --check"));
+        #[cfg(not(windows))]
+        {
+            assert!(html.contains("scripts/alighieri.sh install --no-start"));
+            assert!(html.contains("Release archives do not bundle the lifecycle script"));
+            assert!(html.contains(
+                "raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh"
+            ));
+            assert!(html.contains("--binary /path/to/extracted/alighieri"));
+        }
         assert!(html.contains("ProxiFyre settings"));
         assert!(html.contains("<dt>Server</dt><dd><code>proxy.example.com</code>"));
         assert!(html.contains("<dt>Port</dt><dd>443</dd>"));
         assert!(html.contains("<dt>TLS</dt><dd>enabled</dd>"));
         assert!(html.contains("<dt>UDP</dt><dd>enabled</dd>"));
+        assert!(html.contains("ProxiFyre 2.4.0 or later"));
+        assert!(html.contains("&quot;socks5Transport&quot;: &quot;TLS&quot;"));
+        assert!(html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;, &quot;UDP&quot;]"));
+        assert!(html.contains("&quot;supportedAddressFamilies&quot;: [&quot;IPv4&quot;]"));
+        assert!(html.contains("&quot;tlsAllowInvalidCertificate&quot;: false"));
         assert!(html.contains("not a full IP-level VPN"));
         assert!(html.contains("alighieri.conf.bak"));
         assert!(!html.contains("ACME staging is enabled"));
@@ -3676,7 +4061,13 @@ mod tests {
 
         assert!(html.contains("ACME staging is enabled"));
         assert!(html.contains("will not be trusted by normal clients"));
+        assert!(html.contains("will connect only after you switch to a production certificate"));
+        assert!(html.contains("Do not disable certificate validation"));
         assert!(html.contains("<dt>UDP</dt><dd>disabled</dd>"));
+        assert!(html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;]"));
+        assert!(
+            !html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;, &quot;UDP&quot;]")
+        );
         assert!(!html.contains("inbound UDP"));
         assert!(!html.contains(PUBLIC_UDP_RANGE));
         assert!(!html.contains("<dt>Username</dt>"));
@@ -3685,11 +4076,11 @@ mod tests {
     #[test]
     fn public_success_command_quotes_injected_username_and_path() {
         let mut fields = public_tls_fields();
-        fields.insert("initial_username".into(), "proxyuser; echo owned".into());
+        fields.insert("initial_username".into(), "proxyuser;echo-owned".into());
         let injected_userlist = if cfg!(windows) {
-            r"C:\ProgramData\Alighieri\users; echo owned"
+            r"C:\ProgramData\Alighieri\users;echo-owned"
         } else {
-            "/etc/alighieri/users; echo owned"
+            "/etc/alighieri/users;echo-owned"
         };
         fields.insert("userlist".into(), injected_userlist.into());
         let form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
@@ -3697,11 +4088,11 @@ mod tests {
 
         let expected = html_escape(&format!(
             "alighieri user add {} --userlist {}",
-            shell_quote_command_argument("proxyuser; echo owned"),
+            shell_quote_command_argument("proxyuser;echo-owned"),
             shell_quote_command_argument(injected_userlist)
         ));
         assert!(html.contains(&expected));
-        assert!(!html.contains("user add proxyuser; echo owned"));
+        assert!(!html.contains("user add proxyuser;echo-owned"));
 
         let mut markup = form;
         markup.initial_username = Some("<img src=x onerror=alert(1)>".into());
@@ -3729,6 +4120,36 @@ mod tests {
             assert!(html.contains("chown root:alighieri -- --user-list"));
             assert!(html.contains("chmod 640 -- --user-list"));
             assert!(html.contains("install -m 640 -o root -g alighieri -- "));
+        }
+    }
+
+    #[test]
+    fn public_success_stages_canonical_config_and_preserves_a_backup() {
+        let report = WriteReport {
+            output_path: PathBuf::from("generated-public.conf"),
+            backup_path: None,
+        };
+        let html = render_success(&report, &public_tls_form());
+        assert!(html.contains("--check --config $staged"));
+
+        #[cfg(windows)]
+        {
+            assert!(html.contains("[IO.File]::Replace"));
+            assert!(html.contains("[IO.File]::Move"));
+            assert!(html.contains("Get-Command alighieri -CommandType Application"));
+            assert!(html.contains("-not $?"));
+            assert!(!html.contains("[IO.File]::Delete"));
+            assert!(html.contains("$destination.bak"));
+            assert!(html.contains("GetRandomFileName"));
+            assert!(html.contains("finally"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(html.contains("mktemp"));
+            assert!(html.contains("destination_path}.bak.tmp.XXXXXX"));
+            assert!(html.contains("mv -fT"));
+            assert!(html.contains("$destination_path.bak"));
+            assert!(html.contains("trap cleanup"));
         }
     }
 

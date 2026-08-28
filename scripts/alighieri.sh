@@ -49,6 +49,7 @@ PREFIX="/usr/local"
 PREFIX_EXPLICIT=0
 BINARY=""
 RESTART_ON_UPGRADE=1
+START_ON_INSTALL=1
 PURGE_CONFIG=0
 PURGE_LOGS=0
 PURGE_STATE=0
@@ -102,6 +103,8 @@ Options:
   --binary PATH      Use this prebuilt alighieri binary instead of building.
   --prefix DIR       Install prefix for the binary (default: ${PREFIX}).
   --no-restart       (upgrade) Replace the binary but do not restart the service.
+  --no-start         (install) Prepare files and the unit without enabling or
+                     starting it. Re-run install after creating credentials.
   --purge-config     (uninstall) Also remove ${CONFIG_DIR} (userlist, TLS keys!).
   --purge-logs       (uninstall) Also remove ${LOG_DIR}.
   --purge-state      (uninstall) Also remove ${STATE_DIR} (ACME certs/account!).
@@ -130,6 +133,7 @@ while [ $# -gt 0 ]; do
         --binary) shift; [ $# -gt 0 ] || die "--binary requires a path"; BINARY="$1" ;;
         --prefix) shift; [ $# -gt 0 ] || die "--prefix requires a path"; PREFIX="$1"; PREFIX_EXPLICIT=1 ;;
         --no-restart) RESTART_ON_UPGRADE=0 ;;
+        --no-start) START_ON_INSTALL=0 ;;
         --purge-config) PURGE_CONFIG=1 ;;
         --purge-logs) PURGE_LOGS=1 ;;
         --purge-state) PURGE_STATE=1 ;;
@@ -765,6 +769,30 @@ run_selftest() {
     _check_bool "escaped key:true in a value with real false" \
         '{"path":"\"acme\":true","acme":false}' acme no
 
+    _check_install_activation() { # start-mode expected-systemctl-calls
+        local start_mode="$1" expected="$2" calls="" saved_start="$START_ON_INSTALL"
+        systemctl() {
+            calls="${calls}${calls:+|}$*"
+        }
+        START_ON_INSTALL="$start_mode"
+        activate_installed_service >/dev/null 2>&1
+        START_ON_INSTALL="$saved_start"
+        unset -f systemctl
+        if [ "$calls" = "$expected" ]; then
+            printf 'ok   install activation mode %s -> %s\n' "$start_mode" "$calls"
+        else
+            printf 'FAIL install activation mode %s: got [%s] want [%s]\n' \
+                "$start_mode" "$calls" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # A prepared authenticated deployment must reload the unit but neither
+    # enable nor start it. The ordinary second install performs all three.
+    _check_install_activation 0 "daemon-reload"
+    _check_install_activation 1 \
+        "daemon-reload|enable ${SERVICE_NAME}.service|restart ${SERVICE_NAME}.service"
+
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
         return 1
@@ -828,6 +856,19 @@ UNIT
 }
 
 # ── Actions ───────────────────────────────────────────────────────────────────
+activate_installed_service() {
+    systemctl daemon-reload
+    if [ "$START_ON_INSTALL" -eq 1 ]; then
+        systemctl enable "${SERVICE_NAME}.service"
+        # restart, not just start, so re-running install applies an updated binary
+        # or unit (start is a no-op when the service is already running).
+        systemctl restart "${SERVICE_NAME}.service"
+        ok "Alighieri is installed and running."
+    else
+        ok "Alighieri is installed but was not enabled or started (--no-start)."
+    fi
+}
+
 do_install() {
     # Reconfiguring an existing install without an explicit --prefix (e.g. the
     # menu's "reconfigure") should reuse the prefix the unit already points at,
@@ -956,13 +997,7 @@ do_install() {
     info "writing systemd unit $UNIT_FILE"
     write_unit "$install_bin" "$config_file" "$check_summary"
 
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}.service"
-    # restart, not just start, so re-running install applies an updated binary
-    # or unit (start is a no-op when the service is already running).
-    systemctl restart "${SERVICE_NAME}.service"
-
-    ok "Alighieri is installed and running."
+    activate_installed_service
     cat <<DONE >&2
   Config:   $config_file   (edit, then: systemctl reload $SERVICE_NAME)
   Logs:     journalctl -u $SERVICE_NAME -f
@@ -973,7 +1008,7 @@ do_install() {
 If the config uses username authentication, create the userlist now, e.g.:
   $install_bin user add alice --userlist $config_dir/users
   chown root:$SERVICE_USER $config_dir/users && chmod 640 $config_dir/users
-  systemctl restart $SERVICE_NAME
+  $0 install
 DONE
 }
 
