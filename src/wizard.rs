@@ -4130,10 +4130,10 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             backup_path: None,
         };
         let html = render_success(&report, &public_tls_form());
-        assert!(html.contains("--check --config $staged"));
 
         #[cfg(windows)]
         {
+            assert!(html.contains("--check --config $staged"));
             assert!(html.contains("[IO.File]::Replace"));
             assert!(html.contains("[IO.File]::Move"));
             assert!(html.contains("Get-Command alighieri -CommandType Application"));
@@ -4145,6 +4145,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         }
         #[cfg(not(windows))]
         {
+            assert!(html.contains("--check --config &quot;$staged&quot;"));
             assert!(html.contains("mktemp"));
             assert!(html.contains("destination_path}.bak.tmp.XXXXXX"));
             assert!(html.contains("mv -fT"));
