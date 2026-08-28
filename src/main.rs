@@ -701,7 +701,15 @@ enum UserCommand {
 }
 
 fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    // Preserve conventional `user --help` and `user add --help` handling while
+    // allowing those otherwise-valid strings as a username or userlist path
+    // when the complete command makes their positional role unambiguous.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+        || (args.len() == 2 && args[1] == "-h")
+        || (args.len() == 2 && args[1] == "--help")
+    {
         return Ok(UserCommand::Help);
     }
     let Some(command) = args.first().map(String::as_str) else {
@@ -1781,6 +1789,27 @@ mod tests {
                 username: "alice".into(),
                 userlist: PathBuf::from("users.txt")
             }
+        );
+    }
+
+    #[test]
+    fn user_help_tokens_are_valid_positional_values_in_a_complete_command() {
+        assert_eq!(
+            parse_user_command(vec![
+                "add".into(),
+                "--help".into(),
+                "--userlist".into(),
+                "-h".into(),
+            ])
+            .unwrap(),
+            UserCommand::Add {
+                username: "--help".into(),
+                userlist: PathBuf::from("-h"),
+            }
+        );
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "--help".into()]).unwrap(),
+            UserCommand::Help
         );
     }
 

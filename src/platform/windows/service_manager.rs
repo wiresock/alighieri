@@ -85,7 +85,15 @@ pub fn handle_service_cli(args: Vec<String>) -> ServiceCliResult<String> {
 }
 
 pub fn parse_service_command(args: Vec<String>) -> ServiceCliResult<ServiceCommand> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    // Keep subcommand help convenient without stealing a quoted config path
+    // whose complete positional role is unambiguous (for example a file named
+    // `--help` supplied after `--config`).
+    if args
+        .first()
+        .is_some_and(|arg| arg == "-h" || arg == "--help")
+        || (args.len() == 2 && args[1] == "-h")
+        || (args.len() == 2 && args[1] == "--help")
+    {
         return Ok(ServiceCommand::Help);
     }
     let Some(command) = args.first().map(String::as_str) else {
@@ -1228,6 +1236,13 @@ mod tests {
         assert_eq!(
             parse_service_command(vec!["install".into(), "--help".into()]).unwrap(),
             ServiceCommand::Help
+        );
+        assert_eq!(
+            parse_service_command(vec!["install".into(), "--config".into(), "--help".into(),])
+                .unwrap(),
+            ServiceCommand::Install {
+                config_path: PathBuf::from("--help"),
+            }
         );
     }
 

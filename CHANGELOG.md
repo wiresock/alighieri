@@ -6,6 +6,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- The configuration wizard now includes a **Public SOCKS5-over-TLS
+  (ProxiFyre)** profile with username-only authentication, automatic ACME
+  certificates, optional fixed-range UDP relay support, loss-aware import, and
+  deployment guidance. A matching reviewed configuration is available under
+  `doc/templates/`.
+
 ## [0.4.0] - 2026-07-23
 
 ### Added

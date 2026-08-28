@@ -175,27 +175,108 @@ token, and exits as soon as one configuration is saved. It is configuration
 - the URL carries a random per-run token, and requests without it are refused;
 - it never exposes runtime control, credential browsing, or service management.
 
-Two built-in templates seed the form:
+Three built-in templates seed the form:
 
 - **Local, no auth** — a loopback listener for apps on the same machine.
 - **LAN, username/password** — a `0.0.0.0` listener backed by an Argon2id
   userlist.
+- **Public SOCKS5-over-TLS (ProxiFyre)** — an authenticated public endpoint on
+  TCP 443 with automatic ACME certificates and optional fixed-range UDP relay,
+  intended for ProxiFyre or another TLS-capable SOCKS5 client.
 
 Whatever you choose, the result is validated with the real parser before it is
 written, saved atomically, and the previous file (if any) is preserved as
 `<name>.bak`.
 
+### Public SOCKS5-over-TLS deployment
+
+The public profile fixes the listener at `0.0.0.0:443`, offers only the
+`username` authentication method, enables TCP CONNECT, applies an
+authentication-failure rate limit, and keeps private, link-local, loopback, and
+reserved destinations blocked. It obtains and renews a standard publicly
+trusted certificate through the existing ACME TLS-ALPN-01 listener. The wizard
+does not ask for, generate, display, or store a plaintext password.
+
+Before starting the service:
+
+- point the selected domain at the VPS and wait for DNS to resolve there;
+- allow inbound TCP 443 in the host firewall and cloud security group, allow
+  outbound TCP 443 for ACME, and ensure no other service occupies TCP 443;
+- if UDP ASSOCIATE is enabled, allow its selected inbound UDP range (the default
+  is `40000-40099`); and
+- create the selected userlist before starting or restarting Alighieri.
+
+TLS-ALPN-01 requires public TCP port 443 but does **not** require opening HTTP
+port 80. The reviewed
+[`public-tls-proxifyre.conf`](doc/templates/public-tls-proxifyre.conf) template
+shows the same defaults, and the [ACME test guide](doc/acme-tls-test.md) covers
+issuance and troubleshooting in detail.
+
+On a fresh Linux VPS, run the supported installer once with its starter
+configuration before generating the public profile; this creates the
+`alighieri` account and service directories. Existing installations can skip
+that first command. Generate directly to the service's configuration path,
+then create the first user and make the resulting file service-readable before
+re-running the installer. Re-running is important after switching to port 443
+or ACME because it gives the unit only the required `CAP_NET_BIND_SERVICE`
+capability:
+
+```sh
+sudo ./scripts/alighieri.sh install  # fresh VPS only
+sudo alighieri config wizard --output /etc/alighieri/alighieri.conf
+sudo alighieri user add proxyuser --userlist /etc/alighieri/users
+sudo chown root:alighieri -- /etc/alighieri/users
+sudo chmod 640 -- /etc/alighieri/users
+sudo alighieri --check --config /etc/alighieri/alighieri.conf
+sudo ./scripts/alighieri.sh install  # install/regenerate the port-443 unit
+sudo systemctl restart alighieri
+systemctl status alighieri
+journalctl -u alighieri -f
+```
+
+`user add` prompts for the password securely and stores an Argon2id hash.
+The public profile requires absolute userlist and ACME-cache paths so the
+operator shell and service cannot resolve the same text to different files.
+On Windows those defaults are under `%ProgramData%\Alighieri`; the completion
+page provides an elevated-PowerShell bootstrap that hardens this directory,
+moves the generated configuration to its canonical service path, creates the
+user, and only then installs and starts the service.
+
+Configure ProxiFyre with these values:
+
+| ProxiFyre setting | Value |
+|-------------------|-------|
+| Proxy type | SOCKS5 |
+| Server | the selected ACME domain |
+| Port | `443` |
+| TLS | enabled |
+| Username | the initial username shown by the wizard, if supplied |
+| Password | the password entered at the `alighieri user add` prompt |
+| UDP | enabled only when UDP ASSOCIATE was selected |
+
+The endpoint is an application proxy, not a full IP-level VPN. TLS protects the
+SOCKS5 control connection and authentication, but UDP relay datagrams use
+separate sockets and are not encapsulated in the TLS stream. Applications such
+as QUIC, voice clients, and games may provide their own UDP payload encryption.
+Selecting ACME staging is useful for issuance testing, but its certificate is
+not trusted by normal clients.
+
 ### Editing an existing configuration
 
 `--import PATH` loads an existing file into the form and, unless `--output`
-overrides it, writes back to the same path. The form only models the fields the
-two templates expose — listener, trusted-client range, auth method, userlist,
-and log file — so importing a richer configuration is **loss-aware**: before you
-save, the wizard lists every setting it cannot reproduce, both on the console
-and in a banner above the form. Flagged areas include the TLS listener, the
-metrics endpoint, rate limits, custom timeouts or DNS policy, the auth cache
-TTL, and any extra or customised ACL rules. The original is still kept as
-`<name>.bak`, so a dropped setting can be restored.
+overrides it, writes back to the same path. Representable public configurations
+with an ACME-backed TLS listener, username-only authentication, and compatible
+TCP/UDP rules are recognised as the public profile; their modeled domain,
+e-mail, cache, staging, userlist, UDP range, and advertised host are pre-filled
+and preserved on regeneration. A LAN username configuration is still imported
+as the LAN profile rather than being mistaken for public TLS.
+
+Import remains **loss-aware**: before saving, the wizard lists every setting it
+cannot reproduce, both on the console and in a banner above the form.
+Certificate-file/key-file TLS, custom TLS or UDP behavior, metrics, unmodeled
+rate limits, custom timeouts or DNS policy, logging, and extra or customised ACL
+rules continue to produce warnings. The original is kept as `<name>.bak`, so a
+dropped setting can be restored.
 
 ## Configuration
 
@@ -362,6 +443,11 @@ which blocks a co-located attacker on the same host but a different port (notabl
 on shared hosts or loopback). Set `udp.strictreply: false` to relax the match to
 host-only (any source port on a contacted host) for servers that legitimately
 answer from a different port (e.g. TFTP) — at the cost of that protection.
+
+On a TLS listener, TLS protects the SOCKS5 control connection and authentication
+only. UDP relay datagrams travel through separate UDP sockets and are not
+encapsulated in the TLS stream; any payload confidentiality for UDP comes from
+the application protocol itself (for example QUIC).
 
 When `metrics.listen` is set, Alighieri serves Prometheus-style text metrics at
 `/metrics`. The endpoint is unauthenticated and exposes operational counters and

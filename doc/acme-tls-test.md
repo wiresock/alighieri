@@ -31,6 +31,12 @@ domain **on port 443**.
 
 Throughout, replace `proxy.example.com` and `you@example.com` with your own.
 
+For a production-oriented starting point, the configuration wizard offers the
+**Public SOCKS5-over-TLS (ProxiFyre)** profile. Its reviewed static counterpart
+is [`templates/public-tls-proxifyre.conf`](templates/public-tls-proxifyre.conf).
+The rest of this guide remains useful for exercising issuance and diagnosing
+ACME failures.
+
 ## Step 1 — Install Alighieri
 
 Copy the link to the `x86_64-unknown-linux-gnu` (or `aarch64-unknown-linux-gnu`)
@@ -145,8 +151,10 @@ If instead you see repeated `acme error: ...` lines, jump to Troubleshooting.
 
 ## Step 5 — Proxy a request through the TLS listener
 
-No mainstream SOCKS client speaks SOCKS5-over-TLS directly, so wrap it on the
-client with a local TLS terminator. With **stunnel** (on your client machine):
+A client with native SOCKS5-over-TLS support, including ProxiFyre, can connect
+directly to `proxy.example.com:443` with TLS and username/password enabled. For
+a SOCKS5 client without native TLS support, wrap it with a local TLS terminator.
+With **stunnel** (on your client machine):
 
 ```ini
 # stunnel.conf
@@ -172,6 +180,13 @@ curl --socks5-hostname 127.0.0.1:1080 -U testuser:YOURPASS https://ifconfig.me
 That should print the **VPS's IP**, proving the request was relayed through the
 proxy over TLS. (`socat TCP-LISTEN:1080,fork,reuseaddr OPENSSL:proxy.example.com:443,verify=0`
 is a quick one-liner alternative to stunnel.)
+
+This walkthrough exercises TCP CONNECT. SOCKS5 authentication and the control
+connection use TLS, but UDP ASSOCIATE relay datagrams travel through separate
+UDP sockets and are not encapsulated in the TLS stream. If you enable UDP for a
+public deployment, configure a fixed `udp.portrange`, open that inbound UDP
+range, and rely on the application protocol (for example QUIC) for any UDP
+payload encryption it requires.
 
 ## Step 6 — Switch to a real (trusted) certificate
 
