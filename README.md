@@ -249,7 +249,10 @@ journalctl -u alighieri -f
 
 `user add` prompts for the password securely and stores an Argon2id hash.
 The public profile requires absolute userlist and ACME-cache paths so the
-operator shell and service cannot resolve the same text to different files.
+operator shell and service cannot resolve the same text to different files. On
+Linux, its userlist must be a direct file in the installer-managed
+`/etc/alighieri` directory (for example `/etc/alighieri/users`), which remains
+reachable inside the hardened systemd sandbox.
 On Windows those defaults are under `%ProgramData%\Alighieri`; the completion
 page provides an elevated-PowerShell bootstrap that hardens this directory,
 atomically installs the generated configuration at its canonical service path
@@ -822,6 +825,15 @@ dedicated unprivileged `alighieri` system user, installs a default config to
 `install --no-start`, it finishes after writing and daemon-reloading the unit;
 it neither enables nor starts a fresh service, which lets you create a required
 userlist before the first authenticated launch.
+
+Before rewriting or restarting the managed unit, the installer validates the
+configuration inside a transient sandbox with the same service account,
+working directory, and path-hiding protections (including `ProtectHome`,
+`PrivateTmp`, and `PrivateDevices`). When starting an authenticated deployment,
+it also fully parses the effective userlist there. This rejects custom paths the
+root account can read but the service cannot traverse or see, as well as
+malformed credentials; `--no-start` still permits a not-yet-created userlist for
+first-time credential bootstrap.
 
 The unit runs as the `alighieri` user with `NoNewPrivileges`,
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a capability set restricted

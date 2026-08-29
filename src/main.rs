@@ -221,10 +221,11 @@ async fn main() -> ExitCode {
 
 /// Success JSON for `--check --json`. Beyond `ok`/`path`/`message` it reports
 /// the effective `listen` address (`internal:` is last-wins), whether `acme` is
-/// enabled, and the resolved `acme_cache` directory (empty when ACME is off), so
-/// tooling — e.g. the systemd installer deciding whether to grant
-/// `CAP_NET_BIND_SERVICE`, or checking the ACME cache against the unit's writable
-/// StateDirectory — can read the resolved facts without reparsing config.
+/// enabled, the resolved `acme_cache` directory (empty when ACME is off), and the
+/// effective `userlist` setting (empty when unset), so tooling — e.g. the systemd
+/// installer deciding whether to grant `CAP_NET_BIND_SERVICE`, or checking paths
+/// from included/last-wins settings as the service account — can read the parsed
+/// facts without reparsing config.
 fn check_ok_json(config_path: &Path, config: &Config) -> String {
     let acme = matches!(config.tls, Some(TlsConfig::Acme(_)));
     let acme_cache = match &config.tls {
@@ -240,13 +241,23 @@ fn check_ok_json(config_path: &Path, config: &Config) -> String {
         (true, Some(path)) => path.display().to_string(),
         _ => String::new(),
     };
+    // Keep the parser's effective value verbatim. Relative userlist paths are
+    // intentionally resolved by the process working directory at runtime (not
+    // relative to the config file), and the file may not exist yet during a
+    // `--no-start` deployment bootstrap, so canonicalising here would both alter
+    // semantics and reject a supported workflow.
+    let userlist = config
+        .userlist
+        .as_deref()
+        .map_or_else(String::new, |path| path.display().to_string());
     format!(
-        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\"}}",
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\",\"userlist\":\"{}\"}}",
         json_escape(&config_path.display().to_string()),
         json_escape(&config.internal.to_string()),
         acme,
         json_escape(&acme_cache),
-        json_escape(&log_file)
+        json_escape(&log_file),
+        json_escape(&userlist)
     )
 }
 
@@ -850,7 +861,14 @@ fn list_users(userlist: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for username in userlist_usernames(&text) {
+    let usernames = match userlist_usernames(&text) {
+        Ok(usernames) => usernames,
+        Err(e) => {
+            eprintln!("alighieri: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for username in usernames {
         println!("{username}");
     }
     ExitCode::SUCCESS
@@ -954,16 +972,21 @@ fn delete_userlist_entry(userlist: &Path, username: &str) -> std::io::Result<()>
     write_userlist(userlist, output.as_bytes(), true)
 }
 
-fn userlist_usernames(text: &str) -> Vec<String> {
+fn userlist_usernames(text: &str) -> alighieri::errors::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
+    // Parse with the same loader used at server startup before producing the
+    // friendly sorted view. In particular, do not let `user list` silently
+    // skip malformed plaintext lines or invalid Argon2 directives: lifecycle
+    // tooling uses this non-interactive command as its startup preflight.
+    UserDb::parse(text)?;
     let mut users = BTreeSet::new();
     for line in text.lines() {
         if let Some(username) = UserDb::entry_username(line) {
             users.insert(username);
         }
     }
-    users.into_iter().collect()
+    Ok(users.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -1675,9 +1698,9 @@ mod tests {
     }
 
     #[test]
-    fn check_json_reports_listen_and_acme() {
+    fn check_json_reports_effective_runtime_paths() {
         let config = Config::parse(
-            "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme",
+            "internal: 0.0.0.0:443\nsocksmethod: username\nuserlist: /etc/alighieri/users\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme",
         )
         .unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
@@ -1685,6 +1708,10 @@ mod tests {
         assert!(json.contains("\"acme\":true"), "{json}");
         assert!(json.contains("\"acme_cache\":\"/tmp/acme\""), "{json}");
         assert!(json.contains("\"log_file\":\"\""), "{json}");
+        assert!(
+            json.contains("\"userlist\":\"/etc/alighieri/users\""),
+            "{json}"
+        );
 
         let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
@@ -1692,6 +1719,7 @@ mod tests {
         assert!(json.contains("\"acme\":false"), "{json}");
         assert!(json.contains("\"acme_cache\":\"\""), "{json}");
         assert!(json.contains("\"log_file\":\"\""), "{json}");
+        assert!(json.contains("\"userlist\":\"\""), "{json}");
 
         // File logging reports the configured logfile path.
         let config = Config::parse(
@@ -1703,6 +1731,25 @@ mod tests {
             json.contains("\"log_file\":\"/var/log/alighieri/app.log\""),
             "{json}"
         );
+    }
+
+    #[test]
+    fn check_json_reports_last_userlist_from_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("conf.d");
+        std::fs::create_dir(&fragments).unwrap();
+        std::fs::write(
+            dir.path().join("alighieri.conf"),
+            "internal: 127.0.0.1:1080\ninclude: conf.d/*.conf\n",
+        )
+        .unwrap();
+        std::fs::write(fragments.join("10-users.conf"), "userlist: first-users\n").unwrap();
+        std::fs::write(fragments.join("20-users.conf"), "userlist: final-users\n").unwrap();
+
+        let config = Config::load(&dir.path().join("alighieri.conf")).unwrap();
+        let json = check_ok_json(Path::new("test.conf"), &config);
+
+        assert!(json.contains("\"userlist\":\"final-users\""), "{json}");
     }
 
     #[test]
@@ -2014,9 +2061,21 @@ mod tests {
     #[test]
     fn userlist_usernames_are_sorted_and_deduplicated() {
         let hashed = UserDb::hash_user_line("alice", "pw").unwrap();
-        let users = userlist_usernames(&format!("bob:pw\n{hashed}\nbob:other\n# comment\n"));
+        let users =
+            userlist_usernames(&format!("bob:pw\n{hashed}\nbob:other\n# comment\n")).unwrap();
 
         assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn userlist_usernames_reject_malformed_runtime_entries() {
+        for malformed in [
+            "missing-colon\n",
+            "# alighieri:user:argon2:616c696365:$argon2id$not-a-valid-phc\n",
+        ] {
+            let err = userlist_usernames(malformed).unwrap_err();
+            assert!(err.to_string().contains("userlist line 1"), "{err}");
+        }
     }
 
     #[cfg(unix)]

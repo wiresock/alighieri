@@ -194,6 +194,15 @@ require_systemd() {
         die "systemctl not found; this installer requires systemd"
 }
 
+require_service_sandbox() {
+    command -v systemd-run >/dev/null 2>&1 ||
+        die "systemd-run not found; this installer requires it for service-sandbox preflight"
+    command -v busctl >/dev/null 2>&1 ||
+        die "busctl not found; this installer requires it for effective service-sandbox checks"
+    command -v readlink >/dev/null 2>&1 ||
+        die "readlink not found; this installer requires it for canonical service-path preflight"
+}
+
 nologin_shell() {
     for candidate in /usr/sbin/nologin /sbin/nologin /bin/false; do
         if [ -x "$candidate" ]; then
@@ -214,13 +223,135 @@ unit_file_exec_start_payload() {
     return 0
 }
 
+# Resolve the D-Bus object for the manager-loaded service unit.
+service_unit_object_path() {
+    local response type object extra
+    response="$(busctl call \
+        org.freedesktop.systemd1 \
+        /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager \
+        GetUnit s "${SERVICE_NAME}.service" 2>/dev/null)" || return 1
+    read -r type object extra <<<"$response"
+    [ "$type" = "o" ] && [ -z "$extra" ] || return 1
+    object="${object#\"}"
+    object="${object%\"}"
+    case "$object" in
+        /org/freedesktop/systemd1/unit/*) printf '%s' "$object" ;;
+        *) return 1 ;;
+    esac
+}
+
+systemd_manager_version() {
+    local version
+    version="$(systemctl show --property=Version --value 2>/dev/null)" || return 1
+    version="${version%%[!0-9]*}"
+    case "$version" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$version"
+}
+
+decode_busctl_simple_string() {
+    local value="$1"
+    case "$value" in
+        \"*\")
+            value="${value#\"}"
+            value="${value%\"}"
+            ;;
+        *) return 1 ;;
+    esac
+    # Supported unit paths/arguments contain neither whitespace nor quoting
+    # escapes. Refuse a busctl-escaped value rather than decoding it differently
+    # from systemd. Dollar and percent markers are also unsafe here: systemd can
+    # expand them only when the service starts, after this manager-loaded value
+    # has been inspected, so preflighting the literal would validate a different
+    # path from the one used on restart.
+    case "$value" in
+        *\\* | *\"* | *'$'* | *%*) return 1 ;;
+    esac
+    printf '%s' "$value"
+}
+
+legacy_effective_exec_start_is_unmodified() {
+    # ExecStartEx (v243+) exposes every command prefix. The legacy D-Bus
+    # property exposes only `-`, so on older managers conservatively require
+    # each physical ExecStart assignment to be empty (a reset) or start with the
+    # managed unquoted absolute executable form. Reject includes, BOMs, and line
+    # continuations that could hide a privileged `+`/`!`/`:` prefix.
+    systemctl cat --no-pager -- "${SERVICE_NAME}.service" 2>/dev/null |
+        LC_ALL=C awk '
+    BEGIN { bom = "\357\273\277" }
+    /^[[:space:]]*[#;]/ { next }
+    index($0, bom) == 1 { exit 1 }
+    {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        if (line ~ /^\.include([[:space:]]|$)/) exit 1
+        if (line ~ /\\[[:space:]]*$/) exit 1
+        if (line !~ /^ExecStart[[:space:]]*=/) next
+        sub(/^ExecStart[[:space:]]*=[[:space:]]*/, "", line)
+        if (line != "" && substr(line, 1, 1) != "/") exit 1
+    }
+    '
+}
+
+# Canonical whitespace-delimited argv for the single manager-loaded ExecStart.
+# Reading D-Bus rather than `systemctl cat` includes legacy `.include` files,
+# continuations, and the exact post-daemon-reload command. The managed service
+# uses simple, whitespace-free arguments, so reject shapes that cannot be
+# represented by the installer's deliberately narrow parser.
+loaded_exec_start_payload() {
+    local object output command_count executable argc flags token value payload="" \
+          i version property
+    local -a fields=() argv=()
+    object="$(service_unit_object_path)" || return 1
+    version="$(systemd_manager_version)" || return 1
+    if [ "$version" -ge 243 ]; then
+        property="ExecStartEx"
+    else
+        property="ExecStart"
+        legacy_effective_exec_start_is_unmodified || return 1
+    fi
+    output="$(busctl get-property \
+        org.freedesktop.systemd1 "$object" \
+        org.freedesktop.systemd1.Service "$property" 2>/dev/null)" || return 1
+    read -ra fields <<<"$output"
+    [ "${#fields[@]}" -ge 6 ] || return 1
+    command_count="${fields[1]}"
+    executable="$(decode_busctl_simple_string "${fields[2]}")" || return 1
+    argc="${fields[3]}"
+    case "$argc" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$command_count" = "1" ] && [ "$argc" -ge 1 ] &&
+        [ "${#fields[@]}" -ge $((argc + 5)) ] || return 1
+    flags="${fields[$((argc + 4))]}"
+    if [ "$version" -ge 243 ]; then
+        [ "$flags" = "0" ] || return 1
+    else
+        [ "$flags" = "false" ] || return 1
+    fi
+    for ((i = 0; i < argc; i++)); do
+        token="${fields[$((i + 4))]}"
+        value="$(decode_busctl_simple_string "$token")" || return 1
+        argv+=("$value")
+        payload="${payload}${payload:+ }$value"
+    done
+    [ "${argv[0]}" = "$executable" ] || return 1
+    printf '%s' "$payload"
+}
+
 # Effective ExecStart payload (everything after its first '=') for the service.
-# Prefer the merged unit (base + drop-ins) via `systemctl cat`, so a
-# `systemctl edit` override of ExecStart is honoured; fall back to the on-disk
-# unit file when systemctl is unavailable or knows nothing about it. The last
-# ExecStart= wins, matching systemd's override semantics. Empty when none found.
+# Prefer the manager-loaded D-Bus argv so includes/continuations and drop-ins are
+# honoured; fall back to merged/on-disk text for non-mutating status/uninstall
+# lookups when the manager or busctl is unavailable. Empty when none is found.
 exec_start_payload() {
-    local line=""
+    local line="" loaded=""
+    if command -v busctl >/dev/null 2>&1 &&
+        loaded="$(loaded_exec_start_payload 2>/dev/null)"; then
+        printf '%s' "$loaded"
+        return 0
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         line="$(systemctl cat -- "${SERVICE_NAME}.service" 2>/dev/null |
             grep '^[[:space:]]*ExecStart=' | tail -n1 || true)"
@@ -304,8 +435,112 @@ effective_install_matches() {
     # surviving drop-in into the expected defaults and allow a stale service to
     # start. Paths accepted by the installer contain neither whitespace nor
     # systemd expansion/quoting characters, so this canonical form is exact.
-    effective="$(exec_start_payload)"
+    effective="$(loaded_exec_start_payload)" || return 1
     [ "$effective" = "$expected_binary $expected_config" ]
+}
+
+# Effective identity and filesystem-view properties after systemd merges the
+# managed unit with all surviving drop-ins. These must match the transient
+# preflight exactly: an overridden WorkingDirectory would resolve relative
+# userlists differently, while identity or namespace overrides could make paths
+# readable during validation but unavailable after restart (or vice versa).
+effective_service_sandbox_properties() {
+    systemctl show --no-pager \
+        --property=User \
+        --property=Group \
+        --property=WorkingDirectory \
+        --property=ProtectSystem \
+        --property=ProtectHome \
+        --property=PrivateTmp \
+        --property=PrivateDevices \
+        --property=ProtectKernelTunables \
+        --property=ProtectKernelModules \
+        --property=ProtectControlGroups \
+        --property=DynamicUser \
+        --property=PrivateUsers \
+        --property=SupplementaryGroups \
+        --property=RootDirectory \
+        --property=RootImage \
+        -- "${SERVICE_NAME}.service"
+}
+
+# True when the manager-loaded unit has no additive path-namespace directives.
+# systemctl before v247 renders some of these complex arrays as `[unprintable]`
+# even when empty. Read their stable raw D-Bus representation instead: its first
+# value after the type signature is the top-level element count. This also sees
+# legacy `.include` files, continuations, BOM-prefixed fragments, and the exact
+# state the next restart will use without reimplementing systemd's unit parser.
+effective_service_path_namespace_matches() {
+    local object version property output signature count value extra
+    local -a properties=(InaccessiblePaths BindPaths BindReadOnlyPaths)
+
+    object="$(service_unit_object_path)" || return 1
+
+    version="$(systemd_manager_version)" || return 1
+    if [ "$version" -ge 238 ]; then
+        properties+=(TemporaryFileSystem)
+    fi
+    if [ "$version" -ge 247 ]; then
+        properties+=(MountImages)
+    fi
+    if [ "$version" -ge 248 ]; then
+        properties+=(ExtensionImages NoExecPaths ExecPaths)
+    fi
+    if [ "$version" -ge 251 ]; then
+        properties+=(ExtensionDirectories)
+    fi
+
+    for property in "${properties[@]}"; do
+        output="$(busctl get-property \
+            org.freedesktop.systemd1 "$object" \
+            org.freedesktop.systemd1.Service "$property" 2>/dev/null)" || return 1
+        read -r signature count _ <<<"$output"
+        [ -n "$signature" ] && [ "$count" = "0" ] || return 1
+    done
+    # v260's RootMStack is another complete alternate root (overlay-backed),
+    # analogous to RootDirectory/RootImage, but is not present on older managers.
+    if [ "$version" -ge 260 ]; then
+        output="$(busctl get-property \
+            org.freedesktop.systemd1 "$object" \
+            org.freedesktop.systemd1.Service RootMStack 2>/dev/null)" || return 1
+        read -r signature value extra <<<"$output"
+        [ "$signature" = "s" ] && [ "$value" = '""' ] &&
+            [ -z "$extra" ] || return 1
+    fi
+}
+
+effective_service_sandbox_matches() {
+    local properties expected
+    properties="$(effective_service_sandbox_properties 2>/dev/null)" || return 1
+    for expected in \
+        "User=$SERVICE_USER" \
+        "Group=$SERVICE_USER" \
+        'ProtectSystem=strict' \
+        'ProtectHome=yes' \
+        'PrivateTmp=yes' \
+        'PrivateDevices=yes' \
+        'ProtectKernelTunables=yes' \
+        'ProtectKernelModules=yes' \
+        'ProtectControlGroups=yes' \
+        'DynamicUser=no' \
+        'PrivateUsers=no' \
+        'SupplementaryGroups=' \
+        'RootDirectory=' \
+        'RootImage='; do
+        printf '%s\n' "$properties" | grep -Fqx -- "$expected" || return 1
+    done
+    # An unset WorkingDirectory is systemd's system-service default `/`, so an
+    # older generated unit without the explicit directive is semantically equal.
+    printf '%s\n' "$properties" |
+        grep -Eq '^WorkingDirectory=(/)?$' || return 1
+
+    # Additive namespace directives can still shadow otherwise identical paths.
+    effective_service_path_namespace_matches || return 1
+}
+
+require_effective_service_sandbox() {
+    effective_service_sandbox_matches ||
+        die "effective systemd service identity, WorkingDirectory, or filesystem namespace differs from the managed unit; remove or update the overriding drop-in, then retry"
 }
 
 # Select the config for an install/reconfigure. Passing the installed unit's
@@ -421,6 +656,36 @@ ensure_user() {
         useradd --system --gid "$SERVICE_USER" --no-create-home \
             --shell "$(nologin_shell)" "$SERVICE_USER"
     fi
+}
+
+# Run a read-only preflight with the same identity and path-hiding controls as
+# the managed service. `runuser`/`su` would catch ordinary DAC traversal but not
+# ProtectHome, PrivateTmp, or PrivateDevices; a transient unit exercises the
+# real systemd mount namespace before the active unit is rewritten or restarted.
+# WorkingDirectory is explicit here and in the generated unit so relative config
+# values resolve identically.
+run_in_service_sandbox() {
+    local arg
+    local -a escaped_args=()
+    # systemd-run expands $VAR and ${VAR} in command arguments by default.
+    # Doubling every dollar is the portable escape (including on releases
+    # older than --expand-environment=no) and makes the transient process see
+    # the exact parser-reported path that the long-running service will use.
+    for arg in "$@"; do
+        escaped_args+=("${arg//\$/\$\$}")
+    done
+    systemd-run --quiet --wait --pipe --collect \
+        --property="User=$SERVICE_USER" \
+        --property="Group=$SERVICE_USER" \
+        --property=WorkingDirectory=/ \
+        --property=ProtectSystem=strict \
+        --property=ProtectHome=true \
+        --property=PrivateTmp=true \
+        --property=PrivateDevices=true \
+        --property=ProtectKernelTunables=true \
+        --property=ProtectKernelModules=true \
+        --property=ProtectControlGroups=true \
+        -- "${escaped_args[@]}"
 }
 
 # Whether the service needs CAP_NET_BIND_SERVICE to start, decided from a
@@ -624,6 +889,114 @@ json_bool_is_true() {
     '
 }
 
+# True when an already-normalised absolute path is hidden by the unit.
+normalized_service_path_is_hidden() {
+    case "$1" in
+        /home | /home/* | /root | /root/* | /run/user | /run/user/* | \
+        /tmp | /tmp/* | /var/tmp | /var/tmp/* | /dev | /dev/*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Resolve as much of an absolute path as currently exists, then append the
+# unresolved suffix. GNU `readlink -f` fails when a non-final component is
+# missing, which is normal during `--no-start` credential bootstrap; walking up
+# prevents an existing parent symlink into a hidden namespace from bypassing the
+# lexical prefix check merely because two later components do not exist yet.
+resolve_existing_service_path() {
+    local candidate="$1" suffix='' resolved base
+    while :; do
+        resolved="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then
+            normalize_path "$resolved$suffix"
+            return 0
+        fi
+        # `readlink -f` cannot canonicalise a symlink whose target itself has
+        # multiple missing components. Detect the symlink with plain readlink
+        # and fail closed instead of peeling past it and losing the redirect.
+        if readlink -- "$candidate" >/dev/null 2>&1; then
+            return 1
+        fi
+        [ "$candidate" != "/" ] || return 1
+        base="${candidate##*/}"
+        candidate="${candidate%/*}"
+        [ -n "$candidate" ] || candidate="/"
+        suffix="/$base$suffix"
+    done
+}
+
+# True when a path is hidden from the managed service even if root can access
+# it: ProtectHome masks /home, /root, and /run/user, PrivateTmp replaces the
+# host's /tmp and /var/tmp, and PrivateDevices replaces /dev. Relative service
+# paths resolve from `/`. Check a canonical form too when available so an existing
+# parent symlink cannot disguise a protected target (GNU/busybox readlink is
+# present on systemd Linux hosts; the transient-unit preflight remains
+# authoritative if it is unavailable).
+service_path_is_hidden() {
+    local path="$1" absolute normalized resolved=""
+    case "$path" in
+        /*) absolute="$path" ;;
+        *) absolute="/$path" ;;
+    esac
+    normalized="$(normalize_path "$absolute")"
+    normalized_service_path_is_hidden "$normalized" && return 0
+    if command -v readlink >/dev/null 2>&1; then
+        # Use the original spelling here rather than the lexically normalised
+        # one: `symlink/../file` follows the symlink before applying `..`.
+        if ! resolved="$(resolve_existing_service_path "$absolute")"; then
+            return 0 # unresolved/dangling symlink: reject the path fail-closed
+        fi
+        normalized_service_path_is_hidden "$resolved" && return 0
+    fi
+    return 1
+}
+
+reject_hidden_service_path() {
+    local label="$1" path="$2"
+    if service_path_is_hidden "$path"; then
+        die "$label $path is hidden by the service's filesystem sandbox; use a service-readable durable path (configuration and userlists normally belong under $CONFIG_DIR)"
+    fi
+}
+
+# Convert an effective config path to the spelling used by the generated unit,
+# whose WorkingDirectory is `/`. Keep absolute paths verbatim and only prefix a
+# relative value; lexical normalisation could change kernel path resolution when
+# a preceding component is a symlink.
+service_runtime_path() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '/%s\n' "$1" ;;
+    esac
+}
+
+# Load the parser-selected userlist as the service account when this install will
+# start the service. Merely testing `-r` would miss malformed credential data;
+# `user list` uses the same UserDb loader as startup. `--no-start` intentionally
+# permits a missing file for first-user bootstrap, but validates one that already
+# exists. An absent JSON field means an older binary cannot safely report an
+# include-aware/last-wins path, so fail closed rather than silently skip it.
+validate_service_userlist() {
+    local install_bin="$1" summary="$2" will_start="${3:-1}" userlist runtime_path
+    if ! printf '%s\n' "$summary" | json_has_field userlist; then
+        die "installed alighieri does not report the effective userlist in --check --json; use the helper with its matching current binary before installing the hardened service"
+    fi
+    userlist="$(printf '%s\n' "$summary" | json_string_field userlist)"
+    [ -n "$userlist" ] || return 0
+    reject_hidden_service_path "configured userlist path" "$userlist"
+
+    runtime_path="$(service_runtime_path "$userlist")"
+    if [ "$will_start" -eq 0 ] && [ ! -e "$runtime_path" ]; then
+        warn "configured userlist $userlist does not exist yet; --no-start leaves the service stopped so credentials can be created before the final install"
+        return 0
+    fi
+    if ! run_in_service_sandbox \
+        "$install_bin" user list --userlist "$userlist" >/dev/null; then
+        die "configured userlist $userlist cannot be loaded by $SERVICE_USER inside the hardened systemd sandbox; fix its contents and every parent directory's access, then re-run install"
+    fi
+}
+
 # Warn when the ACME cache is outside the unit's StateDirectory. The hardened
 # unit runs with ProtectSystem=strict, which leaves the filesystem read-only
 # except for StateDirectory (${STATE_DIR}); an ACME cache anywhere else cannot be
@@ -715,12 +1088,13 @@ followup_install_command() {
     fi
 }
 
-# Hidden, test-only entry point: exercise normalize_path and the two hardened-path
-# warnings against a fixed table of cases. Run by CI (`bash scripts/alighieri.sh
-# __selftest`) and intentionally kept off the operator-facing command surface.
+# Hidden, test-only entry point: exercise path normalization, hardened service
+# preflight helpers, and warnings against fixed cases. Run by CI (`bash
+# scripts/alighieri.sh __selftest`) and intentionally kept off the operator-facing
+# command surface.
 # Needs neither root nor systemd. Exits nonzero if any case is wrong.
 run_selftest() {
-    local failures=0
+    local failures=0 sandbox_call hidden_path visible_path expected_arg
 
     _check_norm() { # input expected
         local got
@@ -749,6 +1123,140 @@ run_selftest() {
     _check_norm "foo/../bar" "bar"
     _check_norm "../../x" "../../x"
     _check_norm ".." ".."
+
+    _check_hidden() { # path want(hidden|visible)
+        local got
+        if service_path_is_hidden "$1"; then got=hidden; else got=visible; fi
+        if [ "$got" = "$2" ]; then
+            printf 'ok   service sandbox path %-30s -> %s\n' "$1" "$got"
+        else
+            printf 'FAIL service sandbox path %-30s -> %s (want %s)\n' "$1" "$got" "$2"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # ProtectHome, PrivateTmp, and PrivateDevices paths are impossible durable
+    # service locations even when root can read them. Normalisation must catch
+    # traversal spellings but must not reject innocent near-prefixes.
+    for hidden_path in \
+        /home/alice/users /root/users /run/user/1000/users \
+        /tmp/users /var/tmp/users /dev/shm/users \
+        /opt/../home/alice/users tmp/users; do
+        _check_hidden "$hidden_path" hidden
+    done
+    for visible_path in \
+        /etc/alighieri/users /home2/users /rooted/users /run/users /var/tmp2/users; do
+        _check_hidden "$visible_path" visible
+    done
+
+    # A missing bootstrap tail must not hide the fact that an existing parent
+    # symlink redirects into ProtectHome. Mock only canonicalisation so this
+    # stays portable to Git Bash and so the lexical `/opt` spelling itself is
+    # definitely visible; the helper must walk up to the mocked existing prefix.
+    readlink() {
+        if [ "${1:-}" = "-f" ]; then
+            case "${3:-}" in
+                /opt/users-root/newdir/users | /opt/users-root/newdir) return 1 ;;
+                /opt/users-root) printf '%s\n' /home/alice; return 0 ;;
+                /opt/dangling-root/users | /opt/dangling-root) return 1 ;;
+            esac
+        elif [ "${1:-}" = "--" ] && [ "${2:-}" = "/opt/dangling-root" ]; then
+            printf '%s\n' /home/new1/new2
+            return 0
+        fi
+        return 1
+    }
+    _check_hidden /opt/users-root/newdir/users hidden
+    _check_hidden /opt/dangling-root/users hidden
+    unset -f readlink
+
+    # The transient command must carry every path-affecting property from the
+    # generated unit and preserve argv without a shell string.
+    systemd-run() { printf '%s' "$*"; }
+    sandbox_call="$(run_in_service_sandbox \
+        /usr/local/bin/alighieri --check --json /etc/alighieri/alighieri.conf)"
+    unset -f systemd-run
+    for expected_arg in \
+        '--property=User=alighieri' '--property=Group=alighieri' \
+        '--property=WorkingDirectory=/' '--property=ProtectSystem=strict' \
+        '--property=ProtectHome=true' '--property=PrivateTmp=true' \
+        '--property=PrivateDevices=true' '--property=ProtectKernelTunables=true' \
+        '--property=ProtectKernelModules=true' '--property=ProtectControlGroups=true' \
+        '/usr/local/bin/alighieri --check --json /etc/alighieri/alighieri.conf'; do
+        if [[ "$sandbox_call" == *"$expected_arg"* ]]; then
+            printf 'ok   service sandbox command includes %s\n' "$expected_arg"
+        else
+            printf 'FAIL service sandbox command missing %s: [%s]\n' \
+                "$expected_arg" "$sandbox_call"
+            failures=$((failures + 1))
+        fi
+    done
+
+    # systemd-run performs environment expansion in its ExecStart argv even
+    # without invoking a shell. The helper must escape every literal dollar so
+    # a config value such as `${SUDO_USER}/users-$$` is checked verbatim rather
+    # than against the transient service manager's environment/PID spelling.
+    systemd-run() { printf '%s' "$*"; }
+    sandbox_call="$(run_in_service_sandbox \
+        /usr/local/bin/alighieri user list --userlist \
+        "\${SUDO_USER}/users-\$\$")"
+    unset -f systemd-run
+    expected_arg="user list --userlist \$\${SUDO_USER}/users-\$\$\$\$"
+    if [[ "$sandbox_call" == *"$expected_arg"* ]]; then
+        printf 'ok   service sandbox command escapes literal dollar arguments\n'
+    else
+        printf 'FAIL service sandbox dollar escaping: got [%s], want [%s]\n' \
+            "$sandbox_call" "$expected_arg"
+        failures=$((failures + 1))
+    fi
+
+    if [ "$(service_runtime_path /srv/alighieri/users)" = "/srv/alighieri/users" ] &&
+        [ "$(service_runtime_path 'relative users')" = "/relative users" ]; then
+        printf 'ok   service runtime path preserves absolute and resolves relative values\n'
+    else
+        printf 'FAIL service runtime path resolution\n'
+        failures=$((failures + 1))
+    fi
+
+    _check_userlist_preflight() { # description summary will-start mock-status want expected [command]
+        local desc="$1" summary="$2" will_start="$3" mock_status="$4" \
+              want="$5" expected="$6" expected_command="${7:-}" out got
+        systemd-run() {
+            if [ -n "$expected_command" ] && [[ "$*" != *"$expected_command"* ]]; then
+                return 99
+            fi
+            return "$mock_status"
+        }
+        if out="$(validate_service_userlist \
+            /usr/local/bin/alighieri "$summary" "$will_start" 2>&1)"; then
+            got=ok
+        else
+            got=fail
+        fi
+        unset -f systemd-run
+        if [ "$got" = "$want" ] && [[ "$out" == *"$expected"* ]]; then
+            printf 'ok   service userlist preflight %s\n' "$desc"
+        else
+            printf 'FAIL service userlist preflight %s: got %s [%s], want %s containing [%s]\n' \
+                "$desc" "$got" "$out" "$want" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_userlist_preflight "rejects an older summary" \
+        '{"ok":true}' 1 0 fail "does not report the effective userlist"
+    _check_userlist_preflight "skips an unset userlist" \
+        '{"ok":true,"userlist":""}' 1 1 ok ""
+    _check_userlist_preflight "accepts a readable managed userlist" \
+        '{"ok":true,"userlist":"/etc/alighieri/users"}' 1 0 ok "" \
+        '/usr/local/bin/alighieri user list --userlist /etc/alighieri/users'
+    _check_userlist_preflight "rejects a sandbox-hidden userlist" \
+        '{"ok":true,"userlist":"/home/alice/users"}' 0 0 fail "hidden by the service"
+    _check_userlist_preflight "rejects a service load failure" \
+        '{"ok":true,"userlist":"/opt/private/users"}' 1 1 fail "cannot be loaded"
+    _check_userlist_preflight "allows a missing bootstrap userlist while stopped" \
+        "{\"ok\":true,\"userlist\":\"/opt/alighieri-selftest-missing-$$\"}" \
+        0 1 ok "does not exist yet"
 
     _check_warn() { # description want(warn|quiet) func summary
         local desc="$1" want="$2" func="$3" summary="$4" out got
@@ -871,7 +1379,10 @@ run_selftest() {
         "daemon-reload|enable ${SERVICE_NAME}.service|restart ${SERVICE_NAME}.service"
 
     _check_exec_start_dropin_guard() {
-        local saved_unit="$UNIT_FILE" mock_effective_payload=""
+        local saved_unit="$UNIT_FILE" mock_effective_payload="" \
+              mock_working_directory="/" mock_root_directory="" \
+              mock_namespace_property="" mock_systemd_version="255.4-test" \
+              mock_exec_start_flags=0 mock_source_exec_prefix=""
         UNIT_FILE="$(mktemp)"
         printf '%s\n' \
             '[Service]' \
@@ -887,9 +1398,85 @@ run_selftest() {
                         '# /etc/systemd/system/alighieri.service.d/override.conf' \
                         'ExecStart='
                     [ -z "$mock_effective_payload" ] ||
-                        printf 'ExecStart=%s\n' "$mock_effective_payload"
+                        printf 'ExecStart=%s%s\n' \
+                            "$mock_source_exec_prefix" "$mock_effective_payload"
+                    ;;
+                show)
+                    if [[ "$*" == *"--property=Version"* ]]; then
+                        printf '%s\n' "$mock_systemd_version"
+                    else
+                        printf '%s\n' \
+                            "User=$SERVICE_USER" \
+                            "Group=$SERVICE_USER" \
+                            "WorkingDirectory=$mock_working_directory" \
+                            'ProtectSystem=strict' \
+                            'ProtectHome=yes' \
+                            'PrivateTmp=yes' \
+                            'PrivateDevices=yes' \
+                            'ProtectKernelTunables=yes' \
+                            'ProtectKernelModules=yes' \
+                            'ProtectControlGroups=yes' \
+                            'DynamicUser=no' \
+                            'PrivateUsers=no' \
+                            'SupplementaryGroups=' \
+                            "RootDirectory=$mock_root_directory" \
+                            'RootImage='
+                    fi
                     ;;
                 enable | restart) printf 'CALL %s\n' "$*" >&2 ;;
+            esac
+        }
+        busctl() {
+            case "${1:-}" in
+                call)
+                    printf '%s\n' \
+                        'o "/org/freedesktop/systemd1/unit/alighieri_2eservice"'
+                    ;;
+                get-property)
+                    local property="${*: -1}"
+                    if [ "$property" = "ExecStart" ] ||
+                        [ "$property" = "ExecStartEx" ]; then
+                        local arg
+                        local -a mock_argv=()
+                        read -ra mock_argv <<<"$mock_effective_payload"
+                        if [ "${#mock_argv[@]}" -eq 0 ]; then
+                            if [ "$property" = "ExecStartEx" ]; then
+                                printf '%s\n' 'a(sasasttttuii) 0'
+                            else
+                                printf '%s\n' 'a(sasbttttuii) 0'
+                            fi
+                        else
+                            if [ "$property" = "ExecStartEx" ]; then
+                                printf 'a(sasasttttuii) 1 "%s" %d' \
+                                    "${mock_argv[0]}" "${#mock_argv[@]}"
+                            else
+                                printf 'a(sasbttttuii) 1 "%s" %d' \
+                                    "${mock_argv[0]}" "${#mock_argv[@]}"
+                            fi
+                            for arg in "${mock_argv[@]}"; do
+                                printf ' "%s"' "$arg"
+                            done
+                            if [ "$property" = "ExecStartEx" ]; then
+                                printf ' %d' "$mock_exec_start_flags"
+                                [ "$mock_exec_start_flags" -eq 0 ] ||
+                                    printf '%s' ' "fully-privileged"'
+                                printf '%s\n' ' 0 0 0 0 0 0 0'
+                            else
+                                printf '%s\n' ' false 0 0 0 0 0 0 0'
+                            fi
+                        fi
+                    elif [ "$property" = "RootMStack" ]; then
+                        if [ "$property" = "$mock_namespace_property" ]; then
+                            printf '%s\n' 's "/srv/alighieri.mstack"'
+                        else
+                            printf '%s\n' 's ""'
+                        fi
+                    elif [ "$property" = "$mock_namespace_property" ]; then
+                        printf '%s\n' 'a(ssbt) 1 "/srv/users" "/etc/alighieri" false true'
+                    else
+                        printf '%s\n' 'as 0'
+                    fi
+                    ;;
             esac
         }
 
@@ -930,8 +1517,151 @@ run_selftest() {
             "/opt/alighieri/alighieri /opt/alighieri/custom.conf"
         _check_rejected_effective_payload "an empty ExecStart reset" ""
         _check_rejected_effective_payload "a wrapper without a config" "/opt/wrapper"
+        _check_rejected_effective_payload "a variable-expanded ExecStart" \
+            "/usr/local/bin/alighieri /etc/\${SITE}/alighieri.conf"
+        _check_rejected_effective_payload "a specifier-expanded ExecStart" \
+            '/usr/local/bin/alighieri /etc/%n/alighieri.conf'
+
+        # ExecStart's `+`/`!` prefixes can leave its legacy argv unchanged while
+        # bypassing service credentials or sandboxing. ExecStartEx reports those
+        # flags explicitly; reject them before activation.
+        mock_effective_payload="/usr/local/bin/alighieri /etc/alighieri/alighieri.conf"
+        mock_exec_start_flags=1
+        local flags_out flags_accepted=0 flags_saved_start="$START_ON_INSTALL"
+        START_ON_INSTALL=1
+        if flags_out="$(
+            activate_installed_service \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+        )"; then
+            flags_accepted=1
+        fi
+        START_ON_INSTALL="$flags_saved_start"
+        if [ "$flags_accepted" -eq 0 ] &&
+            [[ "$flags_out" == *"execution flags"* &&
+                "$flags_out" != *"CALL restart"* &&
+                "$flags_out" != *"CALL enable"* ]]; then
+            printf 'ok   install activation refuses privileged ExecStart flags before start\n'
+        else
+            printf 'FAIL install activation ExecStart flag guard output: [%s]\n' "$flags_out"
+            failures=$((failures + 1))
+        fi
+        mock_exec_start_flags=0
+
+        # Before ExecStartEx, D-Bus omitted `+`/`!`/`:`. The legacy fallback
+        # must reject a privileged source prefix even though ExecStart reports
+        # the same executable and argv.
+        mock_systemd_version="242.9-test"
+        mock_source_exec_prefix="+"
+        if effective_install_matches \
+            "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf"; then
+            printf 'FAIL legacy ExecStart guard accepted a privileged prefix\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   legacy ExecStart guard rejects a privileged prefix\n'
+        fi
+        mock_source_exec_prefix=""
+        mock_systemd_version="255.4-test"
+
+        # Even with the expected command, a surviving WorkingDirectory drop-in
+        # would make `userlist: users` resolve as /srv/alighieri/users instead of
+        # the /users path checked by the transient WorkingDirectory=/ preflight.
+        # Refuse it after daemon-reload and before enable/restart.
+        mock_effective_payload="/usr/local/bin/alighieri /etc/alighieri/alighieri.conf"
+        mock_working_directory=""
+        if effective_service_sandbox_matches; then
+            printf 'ok   effective default WorkingDirectory matches explicit root\n'
+        else
+            printf 'FAIL effective default WorkingDirectory was not treated as root\n'
+            failures=$((failures + 1))
+        fi
+        mock_working_directory="/srv/alighieri"
+        local sandbox_out sandbox_accepted=0 saved_start="$START_ON_INSTALL"
+        START_ON_INSTALL=1
+        if sandbox_out="$(
+            activate_installed_service \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+        )"; then
+            sandbox_accepted=1
+        fi
+        START_ON_INSTALL="$saved_start"
+        if [ "$sandbox_accepted" -eq 0 ] &&
+            [[ "$sandbox_out" == *"WorkingDirectory"* &&
+                "$sandbox_out" != *"CALL restart"* &&
+                "$sandbox_out" != *"CALL enable"* ]]; then
+            printf 'ok   install activation refuses a WorkingDirectory override before start\n'
+        else
+            printf 'FAIL install activation WorkingDirectory guard output: [%s]\n' "$sandbox_out"
+            failures=$((failures + 1))
+        fi
+
+        # Namespace settings are additive, so comparing only scalar hardening
+        # properties does not detect a surviving chroot/mount drop-in. It must
+        # be rejected before activation even when ExecStart and every scalar
+        # property still match the managed unit.
+        mock_working_directory="/"
+        mock_root_directory="/srv/alighieri-chroot"
+        sandbox_accepted=0
+        START_ON_INSTALL=1
+        if sandbox_out="$(
+            activate_installed_service \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+        )"; then
+            sandbox_accepted=1
+        fi
+        START_ON_INSTALL="$saved_start"
+        if [ "$sandbox_accepted" -eq 0 ] &&
+            [[ "$sandbox_out" == *"filesystem namespace"* &&
+                "$sandbox_out" != *"CALL restart"* &&
+                "$sandbox_out" != *"CALL enable"* ]]; then
+            printf 'ok   install activation refuses a RootDirectory override before start\n'
+        else
+            printf 'FAIL install activation RootDirectory guard output: [%s]\n' "$sandbox_out"
+            failures=$((failures + 1))
+        fi
+
+        # List-valued namespace directives do not replace scalar properties and
+        # old systemctl releases cannot print their effective values. The raw
+        # D-Bus array count must still catch an additive bind mount.
+        mock_root_directory=""
+        mock_systemd_version="247.9-test"
+        mock_namespace_property="MountImages"
+        if effective_service_sandbox_matches; then
+            printf 'FAIL effective namespace guard accepted MountImages on systemd 247\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective namespace guard checks MountImages on systemd 247\n'
+        fi
+        mock_systemd_version="260.1-test"
+        mock_namespace_property="RootMStack"
+        if effective_service_sandbox_matches; then
+            printf 'FAIL effective namespace guard accepted RootMStack on systemd 260\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective namespace guard checks RootMStack on systemd 260\n'
+        fi
+        mock_systemd_version="255.4-test"
+        mock_namespace_property="BindPaths"
+        sandbox_accepted=0
+        START_ON_INSTALL=1
+        if sandbox_out="$(
+            activate_installed_service \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+        )"; then
+            sandbox_accepted=1
+        fi
+        START_ON_INSTALL="$saved_start"
+        if [ "$sandbox_accepted" -eq 0 ] &&
+            [[ "$sandbox_out" == *"filesystem namespace"* &&
+                "$sandbox_out" != *"CALL restart"* &&
+                "$sandbox_out" != *"CALL enable"* ]]; then
+            printf 'ok   install activation refuses an additive BindPaths override before start\n'
+        else
+            printf 'FAIL install activation BindPaths guard output: [%s]\n' "$sandbox_out"
+            failures=$((failures + 1))
+        fi
 
         unset -f _check_rejected_effective_payload
+        unset -f busctl
         unset -f systemctl
         rm -f -- "$UNIT_FILE"
         UNIT_FILE="$saved_unit"
@@ -1040,6 +1770,116 @@ run_selftest() {
     _check_cli_rejected "--config on upgrade" "--config is valid only with the install command" \
         upgrade --config /etc/alighieri/alighieri.conf
 
+    _check_upgrade_reload_order() {
+        local upgrade_tmp unit config source installed order got installed_contents \
+              expected='reload|guard|preflight|reload|guard|restart|' \
+              reload_count=0 change_exec_start=0 invalid_exec_start=0 succeeded=0
+        upgrade_tmp="$(mktemp -d)"
+        unit="$upgrade_tmp/alighieri.service"
+        config="$upgrade_tmp/alighieri.conf"
+        source="$upgrade_tmp/source-alighieri"
+        installed="$upgrade_tmp/installed-alighieri"
+        order="$upgrade_tmp/order"
+        printf '%s\n' '[Service]' >"$unit"
+        printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
+        printf '%s\n' source >"$source"
+        printf '%s\n' installed >"$installed"
+        : >"$order"
+
+        UNIT_FILE="$unit"
+        BINARY="$source"
+        RESTART_ON_UPGRADE=1
+        STAGED_BIN=""
+        require_service_sandbox() { :; }
+        require_effective_service_sandbox() { printf 'guard|' >>"$order"; }
+        loaded_exec_start_payload() {
+            [ "$invalid_exec_start" -eq 0 ] || return 1
+            if [ "$change_exec_start" -eq 1 ] && [ "$reload_count" -ge 2 ]; then
+                printf '%s' "/opt/replaced/alighieri /opt/replaced/alighieri.conf"
+            else
+                printf '%s' "$installed $config"
+            fi
+        }
+        installed_binary_path() { printf '%s' "$installed"; }
+        installed_config_path() { printf '%s' "$config"; }
+        reject_hidden_service_path() { :; }
+        resolve_source_binary() { :; }
+        run_in_service_sandbox() {
+            printf 'preflight|' >>"$order"
+            printf '%s\n' '{"ok":true,"userlist":""}'
+        }
+        systemctl() {
+            case "${1:-}" in
+                daemon-reload)
+                    reload_count=$((reload_count + 1))
+                    printf 'reload|' >>"$order"
+                    ;;
+                restart) printf 'restart|' >>"$order" ;;
+            esac
+        }
+
+        if do_upgrade >/dev/null 2>&1; then succeeded=1; fi
+        got="$(<"$order")"
+        if [ "$succeeded" -eq 1 ] && [ "$got" = "$expected" ]; then
+            printf 'ok   upgrade reloads and rechecks the namespace before preflight and restart\n'
+        else
+            printf 'FAIL upgrade sandbox guard order: got [%s], want [%s]\n' \
+                "$got" "$expected"
+            failures=$((failures + 1))
+        fi
+
+        # If the second reload changes ExecStart, abort before replacing the
+        # captured binary or restarting a command that was never preflighted.
+        printf '%s\n' installed >"$installed"
+        : >"$order"
+        reload_count=0
+        change_exec_start=1
+        succeeded=0
+        if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
+        got="$(<"$order")"
+        installed_contents="$(<"$installed")"
+        expected='reload|guard|preflight|reload|guard|'
+        if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
+            [ "$installed_contents" = "installed" ]; then
+            printf 'ok   upgrade refuses an ExecStart change before binary replacement\n'
+        else
+            printf 'FAIL upgrade ExecStart race guard: status %s, calls [%s], binary [%s]\n' \
+                "$succeeded" "$got" "$installed_contents"
+            failures=$((failures + 1))
+        fi
+
+        # Expansion markers are rejected by the real D-Bus decoder because the
+        # literal manager-loaded argv is not necessarily the path systemd opens
+        # on restart. An unsupported payload must abort before staging/moving the
+        # binary or touching the service.
+        printf '%s\n' installed >"$installed"
+        : >"$order"
+        reload_count=0
+        change_exec_start=0
+        invalid_exec_start=1
+        succeeded=0
+        if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
+        got="$(<"$order")"
+        installed_contents="$(<"$installed")"
+        expected='reload|guard|'
+        if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
+            [ "$installed_contents" = "installed" ]; then
+            printf 'ok   upgrade refuses an expandable ExecStart before binary replacement\n'
+        else
+            printf 'FAIL upgrade expandable ExecStart guard: status %s, calls [%s], binary [%s]\n' \
+                "$succeeded" "$got" "$installed_contents"
+            failures=$((failures + 1))
+        fi
+        rm -f -- "$unit" "$config" "$source" "$installed" "$order" \
+            "${installed}.new.$$"
+        rmdir -- "$upgrade_tmp"
+    }
+
+    # Upgrade must not compare loaded scalar state with newer on-disk list
+    # directives, and it must close the potentially long build/preflight window
+    # before restart.
+    _check_upgrade_reload_order
+
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
         return 1
@@ -1066,6 +1906,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
+WorkingDirectory=/
 ExecStart=$install_bin $config_file
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
@@ -1108,10 +1949,10 @@ activate_installed_service() {
     systemctl daemon-reload
     if [ -n "$expected_binary" ] &&
         ! effective_install_matches "$expected_binary" "$expected_config"; then
-        local effective
-        effective="$(exec_start_payload)"
-        [ -n "$effective" ] || effective="<empty>"
-        die "effective systemd ExecStart is $effective, not $expected_binary $expected_config; remove or update the overriding drop-in, then re-run install"
+        die "effective systemd ExecStart command or execution flags do not match $expected_binary $expected_config; remove or update the overriding drop-in, then re-run install"
+    fi
+    if [ -n "$expected_binary" ]; then
+        require_effective_service_sandbox
     fi
     if [ "$START_ON_INSTALL" -eq 1 ]; then
         systemctl enable "${SERVICE_NAME}.service"
@@ -1125,6 +1966,7 @@ activate_installed_service() {
 }
 
 do_install() {
+    require_service_sandbox
     # Rewriting the base unit cannot supersede an existing systemd ExecStart
     # drop-in. Refuse an explicit config switch before mutating the binary, and
     # verify again after daemon-reload below to close the race with new drop-ins.
@@ -1197,6 +2039,7 @@ do_install() {
             die "config path $config_file contains whitespace, which the space-delimited ExecStart cannot represent; use a whitespace-free path" ;;
     esac
     validate_exec_start_path "config path" "$config_file"
+    reject_hidden_service_path "config path" "$config_file"
 
     # Create and harden the config directory only when the config lives in the
     # dedicated default dir — even under a custom filename like custom.conf, so
@@ -1239,18 +2082,19 @@ do_install() {
     chown "root:$SERVICE_USER" "$config_file"
     chmod 640 "$config_file"
 
-    # Validate the config and capture the resolved facts in one `--check --json`,
-    # reused below for the warnings and write_unit's CAP_NET_BIND_SERVICE decision
-    # rather than each re-running the binary (`--check` only parses; it does no
-    # DNS). A config that fails to parse must abort the install — otherwise
-    # write_unit, deriving the capability from a failed check, would emit a unit
-    # that may lack the capability the config needs once fixed. On failure, re-run
-    # in text mode to surface the human-readable error before aborting.
+    # Validate inside the actual service sandbox and capture the resolved facts
+    # in one `--check --json`, reused below for path checks and write_unit's
+    # CAP_NET_BIND_SERVICE decision. This catches config/include/TLS paths root can
+    # read but the service user or the unit's path-hiding controls cannot reach.
+    # A config failure must abort before rewriting/restarting the active unit; on
+    # failure, re-run in text mode to surface the human-readable error first.
     local check_summary
-    if ! check_summary="$("$install_bin" --check --json "$config_file" 2>/dev/null)"; then
-        "$install_bin" --check "$config_file" || true
-        die "config $config_file failed validation; fix the errors above, then re-run install"
+    if ! check_summary="$(run_in_service_sandbox \
+        "$install_bin" --check --json "$config_file" 2>/dev/null)"; then
+        run_in_service_sandbox "$install_bin" --check "$config_file" || true
+        die "config $config_file is invalid or unreachable by $SERVICE_USER inside the hardened systemd sandbox; fix the errors above, then re-run install"
     fi
+    validate_service_userlist "$install_bin" "$check_summary" "$START_ON_INSTALL"
     warn_acme_cache_outside_state_dir "$check_summary"
     warn_logfile_outside_log_dir "$check_summary"
 
@@ -1268,29 +2112,50 @@ do_install() {
     write_unit "$install_bin" "$config_file" "$check_summary"
 
     activate_installed_service "$install_bin" "$config_file"
-    local elevation followup_install quoted_install_bin quoted_userlist
+    local elevation followup_install quoted_install_bin quoted_userlist \
+          effective_userlist runtime_userlist
     elevation="$(followup_elevation)"
     followup_install="$(followup_install_command)"
     printf -v quoted_install_bin '%q' "$install_bin"
-    printf -v quoted_userlist '%q' "$config_dir/users"
+    effective_userlist="$(printf '%s\n' "$check_summary" | json_string_field userlist)"
     cat <<DONE >&2
   Config:   $config_file   (edit, then: systemctl reload $SERVICE_NAME)
   Logs:     journalctl -u $SERVICE_NAME -f
   Status:   systemctl status $SERVICE_NAME   (or: $0 status)
   Upgrade:  $0 upgrade
   Stop:     systemctl stop $SERVICE_NAME
+DONE
 
+    # Only print credential bootstrap guidance when the parsed config actually
+    # has a userlist. Use its effective include-aware/last-wins value, and make a
+    # relative setting absolute exactly as the unit's WorkingDirectory=/ does,
+    # so a command copied from another shell directory cannot create the wrong
+    # file.
+    if [ -n "$effective_userlist" ]; then
+        runtime_userlist="$(service_runtime_path "$effective_userlist")"
+        printf -v quoted_userlist '%q' "$runtime_userlist"
+        cat <<DONE >&2
 If the config uses username authentication, create the userlist now, e.g.:
   ${elevation:+$elevation }$quoted_install_bin user add alice --userlist $quoted_userlist
   ${elevation:+$elevation }chown root:$SERVICE_USER $quoted_userlist && ${elevation:+$elevation }chmod 640 $quoted_userlist
   $followup_install
 DONE
+    fi
 }
 
 do_upgrade() {
+    require_service_sandbox
     [ -f "$UNIT_FILE" ] ||
         die "Alighieri is not installed (no $UNIT_FILE); run: sudo $0 install"
-    local install_bin config_file
+    # Synchronise the manager with the backing unit/drop-ins before querying its
+    # scalar and raw D-Bus namespace properties. Without this reload, an edited
+    # or removed BindPaths (for example) could look different on disk while
+    # restart still uses stale loaded state.
+    systemctl daemon-reload
+    require_effective_service_sandbox
+    local install_bin config_file expected_exec_start current_exec_start
+    expected_exec_start="$(loaded_exec_start_payload)" ||
+        die "effective systemd ExecStart is empty or unsupported; fix the unit before upgrading"
     install_bin="$(installed_binary_path)"
     config_file="$(installed_config_path)"
     # Upgrade replaces an existing binary. Require a regular file at that path so
@@ -1304,6 +2169,7 @@ do_upgrade() {
     # pre-flight below.
     [ -f "$config_file" ] ||
         die "the service's config $config_file does not exist; create it or fix the unit before upgrading"
+    reject_hidden_service_path "config path" "$config_file"
     resolve_source_binary
 
     # Stage the new binary beside the destination first. install -m 755 gives it
@@ -1315,10 +2181,25 @@ do_upgrade() {
     # avoids ETXTBSY from rewriting the binary the running service is executing.
     STAGED_BIN="${install_bin}.new.$$"
     install -m 755 -- "$BINARY" "$STAGED_BIN"
-    if ! "$STAGED_BIN" --check "$config_file" >/dev/null 2>&1; then
-        rm -f -- "$STAGED_BIN"
-        STAGED_BIN=""
-        die "new binary rejects $config_file; validate the config against the new release and fix it before upgrading"
+    local check_summary
+    if ! check_summary="$(run_in_service_sandbox \
+        "$STAGED_BIN" --check --json "$config_file" 2>/dev/null)"; then
+        run_in_service_sandbox "$STAGED_BIN" --check "$config_file" || true
+        die "new binary rejects $config_file or cannot read it inside the hardened service sandbox; fix the errors above before upgrading"
+    fi
+    validate_service_userlist "$STAGED_BIN" "$check_summary" 1
+
+    # Source builds and service-user preflights can take time. Reload and verify
+    # once more immediately before replacing/restarting so a drop-in changed
+    # during that window cannot silently invalidate the sandbox comparison.
+    if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then
+        systemctl daemon-reload
+        require_effective_service_sandbox
+        current_exec_start="$(loaded_exec_start_payload 2>/dev/null || true)"
+        if [ "$current_exec_start" != "$expected_exec_start" ]; then
+            [ -n "$current_exec_start" ] || current_exec_start="<empty>"
+            die "effective systemd ExecStart changed during upgrade (now $current_exec_start); no binary was replaced and the service was not restarted; review the unit/drop-ins, then retry"
+        fi
     fi
 
     info "upgrading binary at $install_bin"

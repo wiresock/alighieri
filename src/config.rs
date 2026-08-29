@@ -762,10 +762,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.shutdown_drain_timeout = Some(Duration::from_secs(secs));
         }
         "userlist" => {
-            if vals.is_empty() {
-                return Err(cfg_err(lineno, "userlist requires a path"));
-            }
-            b.userlist = Some(PathBuf::from(vals.join(" ")));
+            b.userlist = Some(parse_path(vals, lineno, "userlist")?);
         }
         "maxconnections" | "max.connections" => {
             let value = parse_usize_positive(vals, lineno, "maxconnections")?;
@@ -779,10 +776,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "logoutput" => b.log_outputs = Some(parse_log_outputs(vals, lineno)?),
         "logfile" | "log.file" => {
-            if vals.is_empty() {
-                return Err(cfg_err(lineno, "logfile requires a path"));
-            }
-            b.log_file = Some(PathBuf::from(vals.join(" ")));
+            b.log_file = Some(parse_path(vals, lineno, "logfile")?);
         }
         "logformat" | "log.format" => b.log_format = Some(parse_log_format(vals, lineno)?),
         "logrotatesize" | "logrotate.size" | "log.rotate.size" => {
@@ -963,7 +957,14 @@ fn parse_path(vals: &[String], lineno: usize, setting: &str) -> Result<PathBuf> 
     if vals.is_empty() {
         return Err(cfg_err(lineno, &format!("{setting} requires a path")));
     }
-    Ok(PathBuf::from(vals.join(" ")))
+    let path = vals.join(" ");
+    if path.chars().any(char::is_control) {
+        return Err(cfg_err(
+            lineno,
+            &format!("{setting} path must not contain control characters"),
+        ));
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Parses a `usize` setting (zero allowed), rejecting a value too large for the
@@ -2224,6 +2225,25 @@ ratelimit.bytes: 64KiB/30
         .unwrap();
         assert_eq!(cfg.socks_methods, vec![AuthKind::Username, AuthKind::None]);
         assert_eq!(cfg.userlist, Some(PathBuf::from("/tmp/users")));
+    }
+
+    #[test]
+    fn filesystem_paths_reject_control_characters() {
+        for setting in [
+            "userlist",
+            "logfile",
+            "tls.certfile",
+            "tls.keyfile",
+            "tls.acme.cache",
+        ] {
+            let text = format!("internal: 127.0.0.1:1080\n{setting}: /tmp/\u{1b}hidden");
+            let err = Config::parse(&text).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("path must not contain control characters"),
+                "{setting}: {err}"
+            );
+        }
     }
 
     #[test]

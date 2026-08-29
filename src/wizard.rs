@@ -720,6 +720,11 @@ fn wizard_form_from_fields(
             userlist_path.as_deref(),
             log_file.as_deref(),
         )?;
+        validate_public_userlist_deployment_path(
+            userlist_path
+                .as_deref()
+                .expect("public userlist presence was checked above"),
+        )?;
 
         let staging = parse_checkbox(fields, "acme_staging", false)?;
         let udp_enabled = parse_checkbox(fields, "udp_enabled", true)?;
@@ -863,6 +868,40 @@ fn validate_public_userlist_path(path: &Path) -> Result<(), String> {
         );
     }
     validate_public_regular_file_or_missing("public profile userlist path", path)
+}
+
+fn validate_public_userlist_deployment_path(path: &Path) -> Result<(), String> {
+    if public_userlist_path_supported_by_deployment(path) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    return Err(
+        "Linux public profile userlist path must be a direct file in /etc/alighieri (for example /etc/alighieri/users) so the hardened service can reach it"
+            .into(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    return Err("public profile userlist path must be absolute so the service can reach it".into());
+}
+
+/// Whether the public profile's supported service deployment can manage this
+/// userlist location without changing directory permissions or weakening its
+/// sandbox. On Linux, the installer owns and hardens `/etc/alighieri` itself;
+/// requiring a direct child means its file-level chown/chmod instructions are
+/// sufficient (a nested custom directory could still block traversal). Other
+/// platforms retain their existing absolute-path behavior.
+fn public_userlist_path_supported_by_deployment(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(file_name) = path.file_name() else {
+            return false;
+        };
+        let expected = Path::new("/etc/alighieri").join(file_name);
+        path.as_os_str() == expected.as_os_str()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        path.is_absolute()
+    }
 }
 
 fn validate_public_log_path(path: &Path) -> Result<(), String> {
@@ -1858,8 +1897,8 @@ fn public_acme_profile(config: &Config) -> Option<PublicAcmeProfile<'_>> {
         || config.socks_methods.as_slice() != [AuthKind::Username]
         || !config
             .userlist
-            .as_ref()
-            .is_some_and(|path| path.is_absolute())
+            .as_deref()
+            .is_some_and(public_userlist_path_supported_by_deployment)
         || config.auth_command.is_some()
     {
         return None;
@@ -2611,6 +2650,11 @@ fn render_wizard_form(
                 .to_string(),
         )
     };
+    let userlist_help = if cfg!(target_os = "linux") {
+        "For the Linux public service profile, use a direct file in <code>/etc/alighieri</code>; that managed directory stays reachable inside the hardened systemd sandbox."
+    } else {
+        "The public service profile requires an absolute path so user creation and the service use the same file."
+    };
     let (local_checked, lan_checked, public_checked) = match template {
         WizardTemplate::LocalNoAuth => (" checked", "", ""),
         WizardTemplate::LanUsername => ("", " checked", ""),
@@ -2683,7 +2727,7 @@ fn render_wizard_form(
 <section>
 <h2>Files</h2>
 <label>Config output <input name="output" value="{output}" required placeholder="alighieri.conf" autocomplete="off"></label>
-<label>Userlist path <input name="userlist" value="{userlist}" data-standard-default="{standard_userlist}" data-public-default="{public_userlist}" placeholder="required for username profiles" autocomplete="off"{userlist_required}><span class="help">The public service profile requires an absolute path so user creation and the service use the same file.</span></label>
+<label>Userlist path <input name="userlist" value="{userlist}" data-standard-default="{standard_userlist}" data-public-default="{public_userlist}" placeholder="required for username profiles" autocomplete="off"{userlist_required}><span class="help">{userlist_help}</span></label>
 <label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="{logfile_placeholder}" autocomplete="off"><span class="help">{logfile_help}</span></label>
 </section>
 <section id="public-profile"{public_hidden}>
@@ -3148,7 +3192,7 @@ fn render_public_success(
             html_escape(&default_public_service_log_path().display().to_string())
         )
     } else {
-        "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the selected command above installs that exact generated file there before restarting. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom paths outside them require a corresponding unit permission change."
+        "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the selected command above installs that exact generated file there before restarting. Public-profile userlists stay directly under the installer-managed <code>/etc/alighieri</code> directory. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom cache or log paths outside them require a corresponding unit permission change."
             .to_string()
     };
 
@@ -3639,7 +3683,7 @@ mod tests {
                 r"C:\ProgramData\Alighieri Data\acme",
             )
         } else {
-            ("/etc/alighieri data/users", "/var/lib/alighieri data/acme")
+            ("/etc/alighieri/user db", "/var/lib/alighieri data/acme")
         };
         let mut single_spaces = public_tls_fields();
         single_spaces.insert("userlist".into(), userlist.into());
@@ -3653,6 +3697,45 @@ mod tests {
             panic!("expected ACME configuration");
         };
         assert_eq!(acme.cache_dir, PathBuf::from(cache));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_tls_linux_userlist_must_be_a_direct_managed_file() {
+        for accepted in ["/etc/alighieri/users", "/etc/alighieri/public-users"] {
+            let mut fields = public_tls_fields();
+            fields.insert("userlist".into(), accepted.into());
+            let form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
+            assert_eq!(form.userlist_path.as_deref(), Some(Path::new(accepted)));
+        }
+
+        for rejected in [
+            "/home/alice/users",
+            "/root/users",
+            "/run/user/1000/users",
+            "/tmp/users",
+            "/var/tmp/users",
+            "/opt/private/users",
+            "/etc/alighieri/private/users",
+            "/etc/alighieri/../private/users",
+            "/etc/alighieri/./users",
+            "/etc/alighieri/users/",
+        ] {
+            let mut fields = public_tls_fields();
+            fields.insert("userlist".into(), rejected.into());
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+            assert!(
+                err.contains("direct file in /etc/alighieri"),
+                "{rejected}: {err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_windows_keeps_custom_absolute_userlist_support() {
+        let custom = PathBuf::from(r"C:\ServiceData\Alighieri\users");
+        assert!(public_userlist_path_supported_by_deployment(&custom));
     }
 
     #[test]
@@ -3822,14 +3905,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let regular = dir.path().join("users");
         std::fs::write(&regular, b"alice:password\n").unwrap();
-        let mut fields = public_tls_fields();
-        fields.insert("userlist".into(), regular.display().to_string());
-        wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
+        validate_public_userlist_path(&regular).unwrap();
 
         let directory = dir.path().join("users-dir");
         std::fs::create_dir(&directory).unwrap();
-        fields.insert("userlist".into(), directory.display().to_string());
-        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        let err = validate_public_userlist_path(&directory).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
 
         #[cfg(unix)]
@@ -3838,8 +3918,7 @@ mod tests {
 
             let link = dir.path().join("users-link");
             symlink(&regular, &link).unwrap();
-            fields.insert("userlist".into(), link.display().to_string());
-            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+            let err = validate_public_userlist_path(&link).unwrap_err();
             assert!(err.contains("is a symlink"), "{err}");
         }
     }
@@ -4832,6 +4911,25 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             assert!(!warnings.iter().any(|warning| warning.contains("TLS")));
             assert!(!warnings.iter().any(|warning| warning.contains("UDP")));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn public_tls_import_does_not_classify_an_unmanaged_userlist_path() {
+        let text = render_config(&public_tls_form()).replace(
+            "userlist: /etc/alighieri/users",
+            "userlist: /opt/private/users",
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert!(public_acme_profile(&config).is_none());
+        let extracted = wizard_form_from_config(&config, Path::new("public.conf"));
+        assert_eq!(extracted.template, WizardTemplate::LanUsername);
+        let warnings = import_loss_warnings(&config, &extracted).unwrap();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("TLS")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
