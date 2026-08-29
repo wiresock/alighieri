@@ -701,27 +701,27 @@ enum UserCommand {
 }
 
 fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
-    // Preserve conventional `user --help` and `user add --help` handling while
-    // allowing those otherwise-valid strings as a username or userlist path
-    // when the complete command makes their positional role unambiguous.
-    if args
-        .first()
-        .is_some_and(|arg| arg == "-h" || arg == "--help")
-        || (args.len() == 2 && args[1] == "-h")
-        || (args.len() == 2 && args[1] == "--help")
-    {
-        return Ok(UserCommand::Help);
-    }
     let Some(command) = args.first().map(String::as_str) else {
         return Err(user_usage());
     };
+    if is_help_arg(command) {
+        return Ok(UserCommand::Help);
+    }
     match command {
         "add" | "delete" | "verify" => {
             let username = args
                 .get(1)
                 .cloned()
                 .ok_or_else(|| format!("{command} requires USER"))?;
-            let userlist = parse_userlist_arg(&args[2..])?;
+            // With no following option this is conventional subcommand help;
+            // once the command is otherwise complete, the same spelling is a
+            // valid positional username.
+            if args.len() == 2 && is_help_arg(&username) {
+                return Ok(UserCommand::Help);
+            }
+            let UserlistArg::Path(userlist) = parse_userlist_arg(&args[2..])? else {
+                return Ok(UserCommand::Help);
+            };
             match command {
                 "add" => Ok(UserCommand::Add { username, userlist }),
                 "delete" => Ok(UserCommand::Delete { username, userlist }),
@@ -729,15 +729,27 @@ fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
                 _ => unreachable!(),
             }
         }
-        "list" => Ok(UserCommand::List {
-            userlist: parse_userlist_arg(&args[1..])?,
-        }),
+        "list" => match parse_userlist_arg(&args[1..])? {
+            UserlistArg::Path(userlist) => Ok(UserCommand::List { userlist }),
+            UserlistArg::Help => Ok(UserCommand::Help),
+        },
+        _ if args.iter().skip(1).any(|arg| is_help_arg(arg)) => Ok(UserCommand::Help),
         _ => Err(user_usage()),
     }
 }
 
-fn parse_userlist_arg(args: &[String]) -> Result<PathBuf, String> {
+enum UserlistArg {
+    Path(PathBuf),
+    Help,
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
+}
+
+fn parse_userlist_arg(args: &[String]) -> Result<UserlistArg, String> {
     let mut userlist = None;
+    let mut invalid = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -747,10 +759,16 @@ fn parse_userlist_arg(args: &[String]) -> Result<PathBuf, String> {
                 };
                 userlist = Some(PathBuf::from(path));
             }
-            _ => return Err(user_usage()),
+            "-h" | "--help" => return Ok(UserlistArg::Help),
+            _ => invalid = true,
         }
     }
-    userlist.ok_or_else(|| "--userlist requires a path".into())
+    if invalid {
+        return Err(user_usage());
+    }
+    userlist
+        .map(UserlistArg::Path)
+        .ok_or_else(|| "--userlist requires a path".into())
 }
 
 fn handle_user(args: Vec<String>) -> ExitCode {
@@ -1809,6 +1827,35 @@ mod tests {
         );
         assert_eq!(
             parse_user_command(vec!["add".into(), "--help".into()]).unwrap(),
+            UserCommand::Help
+        );
+        assert_eq!(
+            parse_user_command(vec!["list".into(), "--userlist".into(), "--help".into()]).unwrap(),
+            UserCommand::List {
+                userlist: PathBuf::from("--help"),
+            }
+        );
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "--help".into(), "--userlist".into()])
+                .unwrap_err(),
+            "--userlist requires a path"
+        );
+    }
+
+    #[test]
+    fn unconsumed_user_help_tokens_show_help() {
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "alice".into(), "--help".into()]).unwrap(),
+            UserCommand::Help
+        );
+        assert_eq!(
+            parse_user_command(vec![
+                "list".into(),
+                "--userlist".into(),
+                "users.txt".into(),
+                "-h".into(),
+            ])
+            .unwrap(),
             UserCommand::Help
         );
     }

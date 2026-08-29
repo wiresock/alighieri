@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
 #[cfg(test)]
 const PUBLIC_DOMAIN_EXAMPLE: &str = "proxy.example.com";
 const PUBLIC_UDP_RANGE: &str = "40000-40099";
+const WIZARD_LOG_ROTATE_KEEP: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWizardArgs {
@@ -581,12 +582,23 @@ fn wizard_form_from_fields(
                 .into(),
         );
     }
+    if template == WizardTemplate::PublicTls
+        && log_file.as_ref().is_some_and(|path| !path.is_absolute())
+    {
+        return Err(
+            "public profile log file path must be absolute so it resolves identically in the wizard and service"
+                .into(),
+        );
+    }
     if template == WizardTemplate::PublicTls {
         validate_public_userlist_path(
             userlist_path
                 .as_deref()
                 .expect("public userlist presence was checked above"),
         )?;
+        if let Some(log_file) = &log_file {
+            validate_public_log_path(log_file)?;
+        }
     }
     if template == WizardTemplate::PublicTls && trusted_client != "0.0.0.0/0" {
         return Err("public TLS profile client range must be 0.0.0.0/0".into());
@@ -649,6 +661,12 @@ fn wizard_form_from_fields(
             );
         }
         validate_public_acme_cache_path(&cache_path)?;
+        validate_public_service_path_roles(
+            &cache_path,
+            &output_path,
+            userlist_path.as_deref(),
+            log_file.as_deref(),
+        )?;
 
         let staging = parse_checkbox(fields, "acme_staging", false)?;
         let udp_enabled = parse_checkbox(fields, "udp_enabled", true)?;
@@ -791,6 +809,53 @@ fn validate_public_userlist_path(path: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    validate_public_regular_file_or_missing("public profile userlist path", path)
+}
+
+fn validate_public_log_path(path: &Path) -> Result<(), String> {
+    let text = path.display().to_string();
+    let probe = format!("internal: 0.0.0.0 port = 443\nlogoutput: file\nlogfile: {text}\n");
+    let parsed = Config::parse(&probe)
+        .map_err(|e| format!("public profile log file path is invalid: {e}"))?;
+    if parsed.log_file.as_deref() != Some(path) {
+        return Err(
+            "public profile log file path changes when parsed as configuration; replace tabs or repeated whitespace with a single space"
+                .into(),
+        );
+    }
+    validate_public_regular_file_or_missing("public profile log file path", path)?;
+    for index in 1..=WIZARD_LOG_ROTATE_KEEP {
+        validate_public_regular_file_or_missing(
+            "public profile rotated log path",
+            &wizard_rotated_log_path(path, index),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_public_regular_file_or_missing(label: &str, path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "{label} {} is a symlink; choose a regular file path",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "{label} {} exists but is not a regular file",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if public_path_metadata_can_be_deferred(&error) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {label} {}: {error}",
+                path.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -809,6 +874,225 @@ fn validate_public_acme_cache_path(path: &Path) -> Result<(), String> {
             "ACME cache path changes when parsed as configuration; replace tabs or repeated whitespace with a single space"
                 .into(),
         );
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "ACME cache path {} is a symlink; choose a real directory",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "ACME cache path {} exists but is not a directory",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if public_path_metadata_can_be_deferred(&error) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect ACME cache path {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn public_path_metadata_can_be_deferred(error: &std::io::Error) -> bool {
+    // Public-profile defaults live below service directories that are
+    // intentionally inaccessible to ordinary users after installation. The
+    // wizard can still validate their lexical roles; elevated deployment and
+    // runtime setup perform the authoritative filesystem checks later.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
+}
+
+fn validate_public_path_spelling(label: &str, path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+
+        let mut verbatim = false;
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(_) => {}
+                    Prefix::UNC(server, share) => {
+                        validate_public_windows_component(label, server, false, false)?;
+                        validate_public_windows_component(label, share, false, false)?;
+                    }
+                    Prefix::VerbatimDisk(_) => verbatim = true,
+                    Prefix::VerbatimUNC(server, share) => {
+                        verbatim = true;
+                        validate_public_windows_component(label, server, false, false)?;
+                        validate_public_windows_component(label, share, false, false)?;
+                    }
+                    Prefix::DeviceNS(_) | Prefix::Verbatim(_) => {
+                        return Err(format!(
+                            "{label} must use a normal drive-letter or UNC filesystem path"
+                        ));
+                    }
+                },
+                Component::CurDir | Component::ParentDir if verbatim => {
+                    return Err(format!(
+                        "{label} must not contain literal '.' or '..' components in a verbatim Windows path"
+                    ));
+                }
+                Component::Normal(value) => {
+                    validate_public_windows_component(label, value, verbatim, true)?;
+                }
+                Component::RootDir | Component::CurDir | Component::ParentDir => {}
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (label, path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_public_windows_component(
+    label: &str,
+    value: &std::ffi::OsStr,
+    reject_dot_components: bool,
+    reject_reserved_name: bool,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let encoded: Vec<u16> = value.encode_wide().collect();
+    if encoded.is_empty() {
+        return Err(format!(
+            "{label} must not contain an empty Windows UNC server or share name"
+        ));
+    }
+    if reject_dot_components && (encoded == [b'.' as u16] || encoded == [b'.' as u16; 2]) {
+        return Err(format!(
+            "{label} must not contain literal '.' or '..' components in a verbatim Windows path"
+        ));
+    }
+    if encoded.iter().any(|unit| {
+        *unit <= 31
+            || *unit == b'<' as u16
+            || *unit == b'>' as u16
+            || *unit == b':' as u16
+            || *unit == b'"' as u16
+            || *unit == b'|' as u16
+            || *unit == b'?' as u16
+            || *unit == b'*' as u16
+            || *unit == b'/' as u16
+    }) {
+        return Err(format!(
+            "{label} contains a character that is not valid in a Windows file name"
+        ));
+    }
+    if matches!(encoded.last(), Some(unit) if *unit == b'.' as u16 || *unit == b' ' as u16) {
+        return Err(format!(
+            "{label} must not contain a Windows path component ending in a dot or space"
+        ));
+    }
+
+    let name = String::from_utf16_lossy(&encoded);
+    let base = name.split('.').next().unwrap_or("").to_uppercase();
+    let reserved = matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        base.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    });
+    if reject_reserved_name && reserved {
+        return Err(format!(
+            "{label} must not use the reserved Windows device name '{base}'"
+        ));
+    }
+    Ok(())
+}
+
+fn wizard_rotated_log_path(path: &Path, index: usize) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("alighieri.log"))
+        .to_os_string();
+    file_name.push(format!(".{index}"));
+    path.with_file_name(file_name)
+}
+
+fn validate_public_service_path_roles(
+    cache_path: &Path,
+    output_path: &Path,
+    userlist_path: Option<&Path>,
+    log_file: Option<&Path>,
+) -> Result<(), String> {
+    let output_backup = backup_path(output_path);
+    let service_config = default_public_service_config_path();
+    let service_config_backup = backup_path(&service_config);
+    let mut file_paths = vec![
+        ("configuration output path", output_path.to_path_buf()),
+        ("configuration output backup path", output_backup.clone()),
+    ];
+    // Writing directly to the canonical service path is supported; in that
+    // case its primary and backup are the same artifacts already listed.
+    if !paths_refer_to_same_file(output_path, &service_config) {
+        file_paths.push(("canonical service configuration path", service_config));
+    }
+    if !paths_refer_to_same_file(&output_backup, &service_config_backup) {
+        file_paths.push((
+            "canonical service configuration backup path",
+            service_config_backup,
+        ));
+    }
+    if let Some(userlist_path) = userlist_path {
+        file_paths.push(("userlist path", userlist_path.to_path_buf()));
+        file_paths.push((
+            "userlist backup path",
+            super::userlist_backup_path(userlist_path),
+        ));
+        file_paths.push((
+            "userlist lock path",
+            super::userlist_lock_path(userlist_path),
+        ));
+    }
+    if let Some(log_file) = log_file {
+        file_paths.push(("log file", log_file.to_path_buf()));
+        for index in 1..=WIZARD_LOG_ROTATE_KEEP {
+            file_paths.push(("rotated log path", wizard_rotated_log_path(log_file, index)));
+        }
+    }
+
+    validate_public_path_spelling("ACME cache path", cache_path)?;
+    for (label, path) in &file_paths {
+        validate_public_path_spelling(label, path)?;
+    }
+
+    for (index, (left_label, left_path)) in file_paths.iter().enumerate() {
+        for (right_label, right_path) in &file_paths[index + 1..] {
+            if file_paths_conflict(left_path, right_path) {
+                return Err(format!(
+                    "the {left_label} and {right_label} must resolve to separate, non-nested file locations"
+                ));
+            }
+        }
+    }
+
+    for (label, path) in file_paths {
+        if path_is_same_or_descendant(cache_path, &path) {
+            return Err(format!(
+                "ACME cache path must not resolve to or beneath the {label}; the cache must be a directory and the {label} is a file"
+            ));
+        }
+        if path_is_same_or_descendant(&path, cache_path) {
+            return Err(format!(
+                "the {label} must not resolve within the ACME cache path; the cache owns its directory contents"
+            ));
+        }
     }
     Ok(())
 }
@@ -916,6 +1200,13 @@ fn validate_optional_config_path(label: &str, path: &Option<PathBuf>) -> Result<
 fn validate_output_path(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     let path = Path::new(trimmed);
+    #[cfg(windows)]
+    if matches!(path.components().next(), Some(Component::Prefix(_))) && !path.has_root() {
+        return Err(
+            "output path must not use drive-relative syntax; use a normal relative path or an absolute path"
+                .into(),
+        );
+    }
     if trimmed.is_empty()
         || trimmed.ends_with('/')
         || trimmed.ends_with('\\')
@@ -969,10 +1260,176 @@ fn path_value_matches(left: &str, right: &str) -> bool {
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left.components().eq(right.components()),
+    if existing_paths_refer_to_same_file(left, right) {
+        return true;
     }
+    let left = normalized_path_for_comparison(left);
+    let right = normalized_path_for_comparison(right);
+    normalized_paths_equal(&left, &right)
+}
+
+fn existing_paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let (Ok(left), Ok(right)) = (std::fs::metadata(left), std::fs::metadata(right)) else {
+            return false;
+        };
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(left).is_some_and(|identity| {
+            windows_file_identity(right).is_some_and(|other| identity == other)
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut information = FILE_ID_INFO::default();
+    let information_size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).ok()?;
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            information_size,
+        )
+    } == 0
+    {
+        return None;
+    }
+    Some((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
+
+fn file_paths_conflict(left: &Path, right: &Path) -> bool {
+    paths_refer_to_same_file(left, right)
+        || path_is_same_or_descendant(left, right)
+        || path_is_same_or_descendant(right, left)
+}
+
+fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
+    let path = normalized_path_for_comparison(path);
+    let ancestor = normalized_path_for_comparison(ancestor);
+    let mut path_components = path.components();
+    ancestor.components().all(|ancestor_component| {
+        path_components.next().is_some_and(|path_component| {
+            path_component_equal(path_component.as_os_str(), ancestor_component.as_os_str())
+        })
+    })
+}
+
+fn normalized_paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_os_strings_equal_case_insensitive(left.as_os_str(), right.as_os_str())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn path_component_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        windows_os_strings_equal_case_insensitive(left, right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+#[cfg(windows)]
+fn windows_os_strings_equal_case_insensitive(
+    left: &std::ffi::OsStr,
+    right: &std::ffi::OsStr,
+) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    // Windows path matching is normally case-insensitive. Ordinal comparison
+    // provides the same locale-independent Unicode folding expected for file
+    // names; treating case-sensitive directories conservatively is safe here.
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    }
+}
+
+/// Produces a stable path identity without requiring the final target to exist.
+/// Components are resolved incrementally so an existing symlink is
+/// canonicalized whenever it becomes reachable, even after `..` cancels an
+/// earlier nonexistent component.
+fn normalized_path_for_comparison(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    resolved.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    resolved.pop();
+                } else if !absolute.is_absolute() {
+                    resolved.push(component.as_os_str());
+                }
+            }
+            Component::Normal(value) => {
+                resolved.push(value);
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+            Component::Prefix(_) => resolved.push(component.as_os_str()),
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                // On Windows, canonicalizing the existing drive/share root
+                // unifies ordinary and verbatim prefixes before a missing
+                // child prevents any later canonicalization attempt.
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+        }
+    }
+    resolved
 }
 
 fn default_listen_host(template: WizardTemplate) -> &'static str {
@@ -1147,7 +1604,7 @@ fn render_config(form: &WizardForm) -> String {
         .unwrap();
         writeln!(text, "logfile: {}", log_file.display()).unwrap();
         writeln!(text, "logrotate.size: 10MiB").unwrap();
-        writeln!(text, "logrotate.keep: 5").unwrap();
+        writeln!(text, "logrotate.keep: {WIZARD_LOG_ROTATE_KEEP}").unwrap();
     } else {
         writeln!(text, "logoutput: stdout").unwrap();
     }
@@ -2039,7 +2496,7 @@ fn render_wizard_form(
 <h2>Files</h2>
 <label>Config output <input name="output" value="{output}" required placeholder="alighieri.conf" autocomplete="off"></label>
 <label>Userlist path <input name="userlist" value="{userlist}" data-standard-default="{standard_userlist}" data-public-default="{public_userlist}" placeholder="required for username profiles" autocomplete="off"{userlist_required}><span class="help">The public service profile requires an absolute path so user creation and the service use the same file.</span></label>
-<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path recommended; empty = stdout / journald" autocomplete="off"></label>
+<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path recommended; empty = stdout / journald" autocomplete="off"><span class="help">The public service profile requires an absolute path when file logging is enabled.</span></label>
 </section>
 <section id="public-profile"{public_hidden}>
 <h2>Public TLS endpoint</h2>
@@ -2372,7 +2829,7 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
     let service_config_arg = shell_quote_command_argument(&service_config_text);
     let service_preparation = if cfg!(windows) {
         let copy_config = if paths_refer_to_same_file(
-            &command_output_path,
+            &report.output_path,
             Path::new(&service_config_text),
         ) {
             format!(
@@ -2409,7 +2866,7 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
         ))
     } else {
         let install_config = if paths_refer_to_same_file(
-            &command_output_path,
+            &report.output_path,
             Path::new("/etc/alighieri/alighieri.conf"),
         ) {
             String::new()
@@ -2661,6 +3118,19 @@ mod tests {
         assert_eq!(err, "config wizard --output path must be a single line");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn wizard_rejects_drive_relative_output_paths() {
+        let err =
+            parse_config_wizard_args(&["--output".into(), r"D:public.conf".into()]).unwrap_err();
+        assert!(err.contains("must not use drive-relative syntax"), "{err}");
+
+        let mut fields = public_tls_fields();
+        fields.insert("output".into(), r"D:public.conf".into());
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("must not use drive-relative syntax"), "{err}");
+    }
+
     #[test]
     fn local_template_generates_valid_config() {
         let mut fields = HashMap::new();
@@ -2858,6 +3328,11 @@ mod tests {
         let err = wizard_form_from_fields(&relative_cache, Path::new("public.conf")).unwrap_err();
         assert!(err.contains("ACME cache path must be absolute"), "{err}");
 
+        let mut relative_log = public_tls_fields();
+        relative_log.insert("logfile".into(), "logs/alighieri.log".into());
+        let err = wizard_form_from_fields(&relative_log, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("log file path must be absolute"), "{err}");
+
         let whitespace_paths = if cfg!(windows) {
             [
                 ("userlist", r"C:\ProgramData\Alighieri\user  db"),
@@ -2903,6 +3378,398 @@ mod tests {
             panic!("expected ACME configuration");
         };
         assert_eq!(acme.cache_dir, PathBuf::from(cache));
+    }
+
+    #[test]
+    fn public_tls_rejects_acme_cache_file_path_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("state");
+        // Keep the cache target nonexistent and lexically aliased so validation
+        // cannot rely only on canonicalizing the complete path.
+        let cache_alias = dir.path().join("missing").join("..").join("state");
+
+        for (field, label) in [
+            ("output", "configuration output path"),
+            ("userlist", "userlist path"),
+            ("logfile", "log file"),
+        ] {
+            let mut fields = public_tls_fields();
+            fields.insert(field.into(), file_path.display().to_string());
+            fields.insert("acme_cache".into(), cache_alias.display().to_string());
+
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+            assert!(err.contains(label), "{field}: {err}");
+            assert!(err.contains("cache must be a directory"), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn public_tls_rejects_collisions_between_file_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("state");
+        let file_alias = dir.path().join("missing").join("..").join("state");
+
+        for (left, left_label, right, right_label) in [
+            (
+                "output",
+                "configuration output path",
+                "userlist",
+                "userlist path",
+            ),
+            ("output", "configuration output path", "logfile", "log file"),
+            ("userlist", "userlist path", "logfile", "log file"),
+        ] {
+            let mut fields = public_tls_fields();
+            fields.insert(left.into(), file_path.display().to_string());
+            fields.insert(right.into(), file_alias.display().to_string());
+
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+            assert!(err.contains(left_label), "{left}/{right}: {err}");
+            assert!(err.contains(right_label), "{left}/{right}: {err}");
+        }
+    }
+
+    #[test]
+    fn public_tls_rejects_file_ancestor_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+
+        let mut cache_beneath_output = public_tls_fields();
+        cache_beneath_output.insert("output".into(), state.display().to_string());
+        cache_beneath_output.insert(
+            "acme_cache".into(),
+            state.join("acme").display().to_string(),
+        );
+        let err =
+            wizard_form_from_fields(&cache_beneath_output, Path::new("public.conf")).unwrap_err();
+        assert!(
+            err.contains("beneath the configuration output path"),
+            "{err}"
+        );
+
+        let mut output_beneath_cache = public_tls_fields();
+        output_beneath_cache.insert("output".into(), state.join("config").display().to_string());
+        output_beneath_cache.insert("acme_cache".into(), state.display().to_string());
+        let err =
+            wizard_form_from_fields(&output_beneath_cache, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("within the ACME cache path"), "{err}");
+
+        for (output, userlist) in [
+            (state.clone(), state.join("users")),
+            (state.join("config"), state.clone()),
+        ] {
+            let mut fields = public_tls_fields();
+            fields.insert("output".into(), output.display().to_string());
+            fields.insert("userlist".into(), userlist.display().to_string());
+
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+            assert!(err.contains("configuration output path"), "{err}");
+            assert!(err.contains("userlist path"), "{err}");
+            assert!(err.contains("non-nested"), "{err}");
+        }
+    }
+
+    #[test]
+    fn public_tls_rejects_an_existing_file_as_the_acme_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join("acme-state");
+        std::fs::write(&cache_file, b"not a directory").unwrap();
+        let mut fields = public_tls_fields();
+        fields.insert("acme_cache".into(), cache_file.display().to_string());
+
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+        assert!(err.contains("exists but is not a directory"), "{err}");
+    }
+
+    #[test]
+    fn public_tls_reserves_deployment_paths_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("acme");
+        let output = dir.path().join("public.conf");
+        let userlist = dir.path().join("users");
+
+        let err =
+            validate_public_service_path_roles(&cache, &output, Some(&backup_path(&output)), None)
+                .unwrap_err();
+        assert!(err.contains("configuration output backup path"), "{err}");
+        assert!(err.contains("userlist path"), "{err}");
+
+        let err = validate_public_service_path_roles(
+            &cache,
+            &crate::userlist_backup_path(&userlist),
+            Some(&userlist),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("configuration output path"), "{err}");
+        assert!(err.contains("userlist backup path"), "{err}");
+
+        let err = validate_public_service_path_roles(
+            &cache,
+            &crate::userlist_lock_path(&userlist),
+            Some(&userlist),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("configuration output path"), "{err}");
+        assert!(err.contains("userlist lock path"), "{err}");
+
+        let service_config = default_public_service_config_path();
+        let err = validate_public_service_path_roles(&cache, &output, Some(&service_config), None)
+            .unwrap_err();
+        assert!(
+            err.contains("canonical service configuration path"),
+            "{err}"
+        );
+        assert!(err.contains("userlist path"), "{err}");
+
+        let err = validate_public_service_path_roles(
+            &cache,
+            &backup_path(&service_config),
+            Some(&userlist),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("canonical service configuration backup path"),
+            "{err}"
+        );
+
+        validate_public_service_path_roles(&cache, &service_config, Some(&userlist), None).unwrap();
+    }
+
+    #[test]
+    fn public_tls_userlist_must_be_a_regular_file_or_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("users");
+        std::fs::write(&regular, b"alice:password\n").unwrap();
+        let mut fields = public_tls_fields();
+        fields.insert("userlist".into(), regular.display().to_string());
+        wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
+
+        let directory = dir.path().join("users-dir");
+        std::fs::create_dir(&directory).unwrap();
+        fields.insert("userlist".into(), directory.display().to_string());
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = dir.path().join("users-link");
+            symlink(&regular, &link).unwrap();
+            fields.insert("userlist".into(), link.display().to_string());
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+            assert!(err.contains("is a symlink"), "{err}");
+        }
+    }
+
+    #[test]
+    fn public_tls_logfile_must_be_a_regular_file_or_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_directory = dir.path().join("logs");
+        std::fs::create_dir(&log_directory).unwrap();
+        let mut fields = public_tls_fields();
+        fields.insert("logfile".into(), log_directory.display().to_string());
+
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+        assert!(err.contains("log file path"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let logfile = dir.path().join("alighieri.log");
+        std::fs::create_dir(wizard_rotated_log_path(&logfile, WIZARD_LOG_ROTATE_KEEP)).unwrap();
+        let mut rotated = public_tls_fields();
+        rotated.insert("logfile".into(), logfile.display().to_string());
+        let err = wizard_form_from_fields(&rotated, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("rotated log path"), "{err}");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn public_tls_rejects_hard_linked_file_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let userlist = dir.path().join("users");
+        let logfile = dir.path().join("alighieri.log");
+        std::fs::write(&userlist, b"alice:password\n").unwrap();
+        std::fs::hard_link(&userlist, &logfile).unwrap();
+        let mut fields = public_tls_fields();
+        fields.insert("userlist".into(), userlist.display().to_string());
+        fields.insert("logfile".into(), logfile.display().to_string());
+
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+        assert!(err.contains("userlist path"), "{err}");
+        assert!(err.contains("log file"), "{err}");
+    }
+
+    #[test]
+    fn public_tls_reserves_rotated_log_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let logfile = dir.path().join("alighieri.log");
+        let mut fields = public_tls_fields();
+        fields.insert(
+            "userlist".into(),
+            wizard_rotated_log_path(&logfile, 1).display().to_string(),
+        );
+        fields.insert("logfile".into(), logfile.display().to_string());
+
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+
+        assert!(err.contains("userlist path"), "{err}");
+        assert!(err.contains("rotated log path"), "{err}");
+    }
+
+    #[test]
+    fn public_path_metadata_defers_expected_unavailable_targets() {
+        assert!(public_path_metadata_can_be_deferred(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(public_path_metadata_can_be_deferred(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!public_path_metadata_can_be_deferred(
+            &std::io::Error::from(std::io::ErrorKind::InvalidInput)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_comparison_resolves_parent_components_after_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        let real_child = real_parent.join("child");
+        std::fs::create_dir_all(&real_child).unwrap();
+        let link = dir.path().join("link");
+        symlink(&real_child, &link).unwrap();
+
+        let through_link = link.join("..").join("state");
+        let actual_target = real_parent.join("state");
+        let lexical_target = dir.path().join("state");
+
+        assert!(paths_refer_to_same_file(&through_link, &actual_target));
+        assert!(!paths_refer_to_same_file(&through_link, &lexical_target));
+
+        let after_missing = dir
+            .path()
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("..")
+            .join("state");
+        assert!(paths_refer_to_same_file(&after_missing, &actual_target));
+        assert!(!paths_refer_to_same_file(&after_missing, &lexical_target));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_comparison_uses_windows_unicode_case_folding() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("Ä-state");
+        let lower = dir.path().join("ä-state");
+
+        assert!(paths_refer_to_same_file(&upper, &lower));
+        assert!(path_is_same_or_descendant(&upper.join("child"), &lower));
+        assert!(!path_is_same_or_descendant(&upper, &lower.join("child")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_rejects_ambiguous_windows_artifact_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        for (output, expected) in [
+            (dir.path().join("state."), "ending in a dot or space"),
+            (
+                dir.path().join("parent ").join("state"),
+                "ending in a dot or space",
+            ),
+            (
+                dir.path().join("state::$DATA"),
+                "not valid in a Windows file name",
+            ),
+            (
+                PathBuf::from(r"nested\C:\state"),
+                "not valid in a Windows file name",
+            ),
+            (
+                PathBuf::from(r"C:\Temp\public*.conf"),
+                "not valid in a Windows file name",
+            ),
+            (PathBuf::from(r"C:\Temp\NUL.txt"), "reserved Windows"),
+            (PathBuf::from("C:\\Temp\\LPT¹.foo"), "reserved Windows"),
+            (
+                PathBuf::from(r"\\.\PIPE\alighieri"),
+                "normal drive-letter or UNC",
+            ),
+            (
+                PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1\state"),
+                "normal drive-letter or UNC",
+            ),
+            (PathBuf::from(r"\\?\C:\Temp\.\users"), "literal '.' or '..'"),
+            (
+                PathBuf::from(r"\\?\C:\Temp\..\users"),
+                "literal '.' or '..'",
+            ),
+            (PathBuf::from(r"\\?\UNC\server\\state"), "empty Windows UNC"),
+            (
+                PathBuf::from(r"\\?\C:\Temp/log.txt"),
+                "not valid in a Windows file name",
+            ),
+        ] {
+            let err =
+                validate_public_path_spelling("configuration output path", &output).unwrap_err();
+
+            assert!(err.contains(expected), "{}: {err}", output.display());
+        }
+
+        for valid in [
+            Path::new(r"relative\state"),
+            Path::new(r"C:\Temp\state"),
+            Path::new(r"\\server\share\state"),
+            Path::new(r"\\con.example.com\NUL\state"),
+            Path::new(r"\\?\C:\Temp\state"),
+            Path::new(r"\\?\UNC\server\share\state"),
+        ] {
+            validate_public_path_spelling("configuration output path", valid).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_comparison_unifies_windows_verbatim_prefixes_before_missing_components() {
+        let mut drive_root = PathBuf::new();
+        for component in std::env::temp_dir().components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    drive_root.push(component.as_os_str());
+                }
+                _ => break,
+            }
+        }
+        let unique = format!(
+            "alighieri-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let ordinary = drive_root.join(unique).join("state");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
+
+        assert!(!ordinary.exists());
+        assert!(paths_refer_to_same_file(&ordinary, &verbatim));
+        assert!(path_is_same_or_descendant(
+            &ordinary.join("child"),
+            &verbatim
+        ));
     }
 
     #[test]
