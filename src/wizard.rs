@@ -137,6 +137,13 @@ fn powershell_single_quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn powershell_checked_native(command: String, failure: &str) -> String {
+    format!(
+        "{command}\nif (-not $? -or $LASTEXITCODE -ne 0) {{ throw {} }}",
+        powershell_single_quoted(failure)
+    )
+}
+
 /// Form pre-fill derived from an existing configuration loaded with `--import`.
 #[derive(Debug)]
 struct ImportPrefill {
@@ -3261,9 +3268,23 @@ fn render_public_success(
                 html_escape(&service_config_text)
             )
         };
-        let fresh_commands = html_escape(&format!(
-            "{alighieri} --check --config {output_arg}\n{alighieri} service install --config {output_arg}\n{alighieri} service uninstall"
-        ));
+        let fresh_commands = html_escape(
+            &[
+                powershell_checked_native(
+                    format!("{alighieri} --check --config {output_arg}"),
+                    "generated configuration validation failed",
+                ),
+                powershell_checked_native(
+                    format!("{alighieri} service install --config {output_arg}"),
+                    "temporary service installation failed",
+                ),
+                powershell_checked_native(
+                    format!("{alighieri} service uninstall"),
+                    "temporary service removal failed",
+                ),
+            ]
+            .join("\n"),
+        );
         let uninstall_command = html_escape(&format!("{alighieri} service uninstall"));
         format!(
             "<section class=\"notice\"><h2>Prepare the Windows service data directory</h2>\
@@ -3278,12 +3299,25 @@ fn render_public_success(
     };
     let service_commands = if cfg!(windows) {
         let alighieri = completion.powershell_command();
-        format!(
-            "<pre>{}</pre>",
-            html_escape(&format!(
-                "{alighieri} --check --config {service_config_arg}\n{alighieri} service install --config {service_config_arg}\n{alighieri} service start\n{alighieri} service status\nwevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
-            ))
-        )
+        let commands = [
+            powershell_checked_native(
+                format!("{alighieri} --check --config {service_config_arg}"),
+                "service configuration validation failed",
+            ),
+            powershell_checked_native(
+                format!("{alighieri} service install --config {service_config_arg}"),
+                "service installation failed",
+            ),
+            powershell_checked_native(format!("{alighieri} service start"), "service start failed"),
+            powershell_checked_native(
+                format!("{alighieri} service status"),
+                "service status failed",
+            ),
+            "wevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
+                .to_string(),
+        ]
+        .join("\n");
+        format!("<pre>{}</pre>", html_escape(&commands))
     } else {
         let prepare_config = |validator: &str| {
             if paths_are_same_physical_install_target(
@@ -6089,6 +6123,58 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         ] {
             assert!(ordinary_html.contains(&html_escape(&format!("{command}{suffix}"))));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_public_completion_fails_fast_after_each_alighieri_step() {
+        let completion = completion_context();
+        let report = write_report();
+        let html = render_success(&report, &public_tls_form(), &completion);
+        let alighieri = completion.powershell_command();
+        let output_path =
+            std::path::absolute(&report.output_path).unwrap_or_else(|_| report.output_path.clone());
+        let output_arg = powershell_single_quoted(&output_path.display().to_string());
+        let service_arg =
+            powershell_single_quoted(&default_public_service_config_path().display().to_string());
+
+        for (command, failure) in [
+            (
+                format!("{alighieri} --check --config {output_arg}"),
+                "generated configuration validation failed",
+            ),
+            (
+                format!("{alighieri} service install --config {output_arg}"),
+                "temporary service installation failed",
+            ),
+            (
+                format!("{alighieri} service uninstall"),
+                "temporary service removal failed",
+            ),
+            (
+                format!("{alighieri} --check --config {service_arg}"),
+                "service configuration validation failed",
+            ),
+            (
+                format!("{alighieri} service install --config {service_arg}"),
+                "service installation failed",
+            ),
+            (format!("{alighieri} service start"), "service start failed"),
+            (
+                format!("{alighieri} service status"),
+                "service status failed",
+            ),
+        ] {
+            let guarded = html_escape(&powershell_checked_native(command, failure));
+            assert!(
+                html.contains(&guarded),
+                "missing fail-fast block: {failure}"
+            );
+        }
+
+        // Seven workflow commands above plus the staged-copy validator, whose
+        // existing guard must remain intact.
+        assert_eq!(html.matches("$LASTEXITCODE -ne 0").count(), 8);
     }
 
     #[test]

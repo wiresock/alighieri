@@ -571,7 +571,7 @@ effective_service_sandbox_properties() {
 # state the next restart will use without reimplementing systemd's unit parser.
 effective_service_path_namespace_matches() {
     local object version property output signature count value extra
-    local -a properties=(InaccessiblePaths BindPaths BindReadOnlyPaths)
+    local -a properties=(ReadOnlyPaths InaccessiblePaths BindPaths BindReadOnlyPaths)
 
     object="$(service_unit_object_path)" || return 1
 
@@ -624,6 +624,12 @@ loaded_single_string_array_equals() {
     [ "$decoded" = "$expected" ]
 }
 
+loaded_empty_string_array() {
+    local raw="$1" signature count extra
+    read -r signature count extra <<<"$raw"
+    [ "$signature" = as ] && [ "$count" = 0 ] && [ -z "${extra:-}" ]
+}
+
 loaded_unsigned_equals() {
     local raw="$1" expected_signature="$2" expected="$3" signature value extra
     read -r signature value extra <<<"$raw"
@@ -658,7 +664,7 @@ loaded_state_directory_mapping_matches() {
 # List-valued drop-ins can reset StateDirectory/ReadWritePaths or add broader
 # paths while leaving the scalar namespace properties above unchanged.
 effective_service_managed_storage_matches() {
-    local object version raw
+    local object version property raw
     object="$(service_unit_object_path)" || return 1
 
     raw="$(loaded_service_property "$object" StateDirectory)" || return 1
@@ -670,6 +676,14 @@ effective_service_managed_storage_matches() {
 
     raw="$(loaded_service_property "$object" ReadWritePaths)" || return 1
     loaded_single_string_array_equals "$raw" "$LOG_DIR" || return 1
+
+    # These managed-directory directives create additional service-writable
+    # roots despite ProtectSystem=strict. The generated unit uses none of them,
+    # so a surviving drop-in must not be allowed to add one.
+    for property in RuntimeDirectory CacheDirectory LogsDirectory ConfigurationDirectory; do
+        raw="$(loaded_service_property "$object" "$property")" || return 1
+        loaded_empty_string_array "$raw" || return 1
+    done
 
     version="$(systemd_manager_version)" || return 1
     if [ "$version" -ge 250 ]; then
@@ -2345,6 +2359,7 @@ run_selftest() {
         local saved_unit="$UNIT_FILE" mock_effective_payload="" \
               mock_working_directory="/" mock_root_directory="" \
               mock_namespace_property="" mock_systemd_version="255.4-test" \
+              mock_string_array_property="" mock_string_array_value="" \
               mock_exec_start_flags=0 mock_source_exec_prefix="" \
               mock_state_directory='as 1 "alighieri"' \
               mock_state_directory_mode='u 488' \
@@ -2453,6 +2468,9 @@ run_selftest() {
                         printf '%s\n' "$mock_bounding_set"
                     elif [ "$property" = AmbientCapabilities ]; then
                         printf '%s\n' "$mock_ambient_capabilities"
+                    elif [ -n "$mock_string_array_property" ] &&
+                        [ "$property" = "$mock_string_array_property" ]; then
+                        printf 'as 1 "%s"\n' "$mock_string_array_value"
                     elif [ "$property" = "$mock_namespace_property" ]; then
                         printf '%s\n' 'a(ssbt) 1 "/srv/users" "/etc/alighieri" false true'
                     else
@@ -2644,6 +2662,27 @@ run_selftest() {
         fi
         mock_state_directory_mode='u 488'
 
+        # Runtime/Cache/Logs/ConfigurationDirectory are writable exceptions to
+        # ProtectSystem=strict. Every one must remain empty even on the oldest
+        # manager that supports the generated StateDirectory directive.
+        mock_systemd_version="235.9-test"
+        local storage_property
+        for storage_property in RuntimeDirectory CacheDirectory LogsDirectory ConfigurationDirectory; do
+            mock_string_array_property="$storage_property"
+            mock_string_array_value="shared"
+            if effective_service_sandbox_matches 0; then
+                printf 'FAIL effective storage guard accepted non-empty %s\n' \
+                    "$storage_property"
+                failures=$((failures + 1))
+            else
+                printf 'ok   effective storage guard rejects non-empty %s\n' \
+                    "$storage_property"
+            fi
+        done
+        mock_string_array_property=""
+        mock_string_array_value=""
+        mock_systemd_version="255.4-test"
+
         mock_state_directory_symlink='a(sst) 1 "alighieri" "elsewhere" 0'
         if effective_service_sandbox_matches 0; then
             printf 'FAIL effective storage guard accepted a StateDirectory destination override\n'
@@ -2712,6 +2751,17 @@ run_selftest() {
         # old systemctl releases cannot print their effective values. The raw
         # D-Bus array count must still catch an additive bind mount.
         mock_root_directory=""
+        mock_systemd_version="235.9-test"
+        mock_string_array_property="ReadOnlyPaths"
+        mock_string_array_value="/var/lib/alighieri/acme"
+        if effective_service_sandbox_matches; then
+            printf 'FAIL effective namespace guard accepted ReadOnlyPaths on systemd 235\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective namespace guard checks ReadOnlyPaths on systemd 235\n'
+        fi
+        mock_string_array_property=""
+        mock_string_array_value=""
         mock_systemd_version="247.9-test"
         mock_namespace_property="MountImages"
         if effective_service_sandbox_matches; then

@@ -138,14 +138,23 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$dir/scripts" "$dir/doc"
+          mkdir -p "$dir/scripts" "$dir/doc/templates"
           install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
           install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
           install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
+          install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
+          install -m 644 \
+            doc/templates/public-tls-proxifyre.conf \
+            "$dir/doc/templates/public-tls-proxifyre.conf"
           install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
           test -x "$dir/scripts/alighieri.sh"
           test -f "$dir/doc/alighieri.conf"
           tar czf "$dir.tar.gz" "$dir"
+          archive_contents="$(tar tzf "$dir.tar.gz")"
+          grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
+          grep -Fqx \
+            "$dir/doc/templates/public-tls-proxifyre.conf" \
+            <<< "$archive_contents"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -153,10 +162,23 @@ jobs:
         shell: pwsh
         run: |
           $dir = "alighieri-$env:GITHUB_REF_NAME-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $dir | Out-Null
+          New-Item -ItemType Directory -Path "$dir/doc/templates" -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/alighieri.exe" $dir/
+          Copy-Item doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
+          Copy-Item doc/templates/public-tls-proxifyre.conf "$dir/doc/templates/public-tls-proxifyre.conf"
           Copy-Item README.md, LICENSE, CHANGELOG.md $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $archiveCheckDir = Join-Path $env:RUNNER_TEMP "$dir-archive-check"
+          Expand-Archive -LiteralPath "$dir.zip" -DestinationPath $archiveCheckDir
+          $expectedArchiveFiles = @(
+            (Join-Path $archiveCheckDir "$dir/doc/acme-tls-test.md"),
+            (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf")
+          )
+          foreach ($path in $expectedArchiveFiles) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required release archive file is missing: $path"
+            }
+          }
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload build artifact
