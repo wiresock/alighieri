@@ -5814,15 +5814,16 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("DNS A record"));
         assert!(html.contains("AAAA record only when IPv6 TCP 443"));
         assert!(html.contains("inbound UDP <code>40000-40099</code>"));
-        assert!(html.contains("alighieri --check"));
+        assert!(html.contains("--check --config"));
         #[cfg(not(windows))]
         {
             assert!(html.contains("scripts/alighieri.sh install --no-start"));
             assert!(html.contains("scripts/alighieri.sh install --binary ./alighieri --no-start"));
             assert!(html.contains("archive bundles the version-matched helper and default config"));
             assert!(html.contains("cargo build --release --locked"));
-            assert!(html.contains("./target/release/alighieri --check --config"));
-            assert!(html.contains("./alighieri --check --config"));
+            assert!(html.contains("&quot;$validator&quot; --check --config &quot;$staged&quot;"));
+            assert!(html.contains("./target/release/alighieri"));
+            assert!(html.contains("./alighieri"));
             assert!(html
                 .contains("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"));
             assert!(html.contains(
