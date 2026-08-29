@@ -17,10 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, LogFormat, LogOutput};
 #[cfg(windows)]
-use crate::config::{
-    ConfigLoadProvenance, LoadedIncludePattern, TlsConfig, DEFAULT_LOG_ROTATE_KEEP,
-    DEFAULT_LOG_ROTATE_SIZE_BYTES,
-};
+use crate::config::{LoadedIncludePattern, TlsConfig};
 use crate::errors::{Error, Result};
 use crate::server::Server;
 
@@ -334,37 +331,6 @@ fn init_logging(
     Ok(guard)
 }
 
-/// Initialises file logging for service mode and returns the active log file
-/// together with the guard that flushes the writer on drop.
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn init_file_logging(
-    config_path: &Path,
-    log_dir: &Path,
-    service_config_marker: &Path,
-    config_load_provenance: &ConfigLoadProvenance,
-) -> io::Result<(PathBuf, LogGuard)> {
-    let log_path = validate_windows_service_fallback_logging_paths(
-        config_path,
-        log_dir,
-        service_config_marker,
-        config_load_provenance,
-    )?;
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let writer = LogWriters::file(
-        log_path.clone(),
-        DEFAULT_LOG_ROTATE_SIZE_BYTES,
-        DEFAULT_LOG_ROTATE_KEEP,
-    )?;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let guard = init_logging(filter, writer, LogFormat::Text, true)?;
-
-    Ok((log_path, guard))
-}
-
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn init_service_logging(
@@ -414,6 +380,10 @@ pub fn validate_windows_service_logging_paths(
 ) -> io::Result<PathBuf> {
     let selected_log_path = windows_service_log_path(config, config_path, default_log_dir)?;
     windows_service_validate_path_spelling("Windows Service logfile", &selected_log_path)?;
+    windows_service_reject_unresolved_reparse_points(
+        "Windows Service logfile",
+        &selected_log_path,
+    )?;
     // Freeze any existing parent reparse points (and a final symlink, if
     // present) before opening the writer. Pinning the final file handle alone
     // cannot stop a junction earlier in the configured spelling from being
@@ -427,79 +397,6 @@ pub fn validate_windows_service_logging_paths(
         &log_path,
         config.log_rotate_keep,
         service_config_marker,
-    )?;
-    let configured_family = WindowsServiceLogFamily::new(&log_path, config.log_rotate_keep);
-    let selected_fallback_path = default_log_dir.join("alighieri.log");
-    windows_service_validate_path_spelling(
-        "Windows Service fallback logfile",
-        &selected_fallback_path,
-    )?;
-    let fallback_path = windows_service_normalized_path(&selected_fallback_path);
-    let fallback_family = WindowsServiceLogFamily::new(&fallback_path, DEFAULT_LOG_ROTATE_KEEP);
-    // A load failure switches to this fixed family before a Config exists. It is
-    // therefore always reserved against every artifact from the last valid
-    // configuration, even when normal service operation selects a custom log.
-    validate_windows_service_active_log_paths(
-        config,
-        config_path,
-        &fallback_path,
-        DEFAULT_LOG_ROTATE_KEEP,
-        service_config_marker,
-    )?;
-    validate_windows_service_log_families_do_not_overlap(&configured_family, &fallback_family)?;
-    Ok(log_path)
-}
-
-/// Validates the fixed failure-reporting log family before a configuration is
-/// available. Even a malformed top-level config must not be appended to or
-/// rotated while the service is trying to report that load failure.
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn validate_windows_service_fallback_logging_paths(
-    config_path: &Path,
-    default_log_dir: &Path,
-    service_config_marker: &Path,
-    config_load_provenance: &ConfigLoadProvenance,
-) -> io::Result<PathBuf> {
-    let selected_log_path = default_log_dir.join("alighieri.log");
-    windows_service_validate_path_spelling("Windows Service fallback logfile", &selected_log_path)?;
-    windows_service_validate_path_spelling("active configuration", config_path)?;
-    windows_service_validate_path_spelling("service configuration marker", service_config_marker)?;
-    let config_backup =
-        windows_service_suffixed_sibling_path(config_path, "alighieri.conf", "", ".bak");
-    windows_service_validate_path_spelling("active configuration backup", &config_backup)?;
-
-    let log_path = windows_service_normalized_path(&selected_log_path);
-    let log_family = WindowsServiceLogFamily::new(&log_path, DEFAULT_LOG_ROTATE_KEEP);
-    let mut protected_files = vec![
-        (
-            "active configuration",
-            WindowsServiceComparablePath::new(config_path.to_path_buf()),
-        ),
-        (
-            "active configuration backup",
-            WindowsServiceComparablePath::new(config_backup),
-        ),
-        (
-            "service configuration marker",
-            WindowsServiceComparablePath::new(service_config_marker.to_path_buf()),
-        ),
-    ];
-    for source_path in config_load_provenance.source_paths() {
-        protected_files.push((
-            "configuration load source",
-            WindowsServiceComparablePath::new(source_path.clone()),
-        ));
-    }
-    validate_windows_service_log_family_against_include_patterns(
-        &log_family,
-        config_load_provenance.include_patterns(),
-        windows_service_fallback_log_candidate_label,
-    )?;
-    validate_windows_service_log_family_against_files(
-        &log_family,
-        &protected_files,
-        windows_service_fallback_log_candidate_label,
     )?;
     Ok(log_path)
 }
@@ -637,6 +534,24 @@ pub fn validate_windows_service_active_log_paths(
         windows_service_log_candidate_label,
     )?;
 
+    // Loaded configuration sources are regular files, not directory trees. A
+    // would-be logfile at or above one of them is necessarily a directory and
+    // cannot be opened as the configured file; the inverse nesting is equally
+    // impossible because the source file occupies an ancestor component. Run
+    // this broader check after exact/hardlink comparisons so collisions with
+    // the active entrypoint retain their more specific diagnostic.
+    for source_path in config.loaded_source_paths() {
+        let source = WindowsServiceComparablePath::new(source_path.clone());
+        if let Some(index) = log_family.conflicting_tree_member(&source.normalized) {
+            return Err(service_log_collision_error(
+                windows_service_log_candidate_label(index),
+                &log_family.candidate_path(index),
+                "loaded configuration source",
+                &source.path,
+            ));
+        }
+    }
+
     if let Some(cache) = &acme_cache {
         // The ACME cache owns a directory tree. A log anywhere inside it can
         // collide with rustls-acme's current or future cache entries; making the
@@ -679,6 +594,18 @@ fn validate_windows_service_log_family_against_include_patterns(
 ) -> io::Result<()> {
     for pattern in patterns {
         let normalized_parent = windows_service_normalized_path(pattern.parent());
+        // The include directory must remain a directory. A base/rotation path
+        // at or above it would be opened as a file and make startup (or a later
+        // rotation) deterministically fail. A logfile merely *inside* the same
+        // directory remains valid and is handled by the filename match below.
+        if let Some(index) = log_family.member_containing_path(&normalized_parent) {
+            return Err(service_log_collision_error(
+                candidate_label(index),
+                &log_family.candidate_path(index),
+                "configuration include directory",
+                pattern.parent(),
+            ));
+        }
         if !windows_service_normalized_paths_equal(
             &log_family.normalized_rotation_parent,
             &normalized_parent,
@@ -792,61 +719,6 @@ fn windows_service_auth_program_candidates(program: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn validate_windows_service_log_families_do_not_overlap(
-    configured: &WindowsServiceLogFamily,
-    fallback: &WindowsServiceLogFamily,
-) -> io::Result<()> {
-    // The same path spelling is one intentional family even when the valid
-    // config and the config-load-failure fallback retain different counts.
-    // Reparse/hardlink aliases do not qualify: their adjacent rotation names
-    // differ, so treating them as one family would leave an overlap unguarded.
-    if configured.has_same_path_family(fallback) {
-        return Ok(());
-    }
-
-    let fallback_members = (0..=fallback.keep)
-        .map(|index| {
-            let path = fallback.candidate_path(index);
-            WindowsServiceComparablePath::new(path)
-        })
-        .collect::<Vec<_>>();
-
-    for (fallback_index, fallback_member) in fallback_members.iter().enumerate() {
-        if let Some(configured_index) = configured.member_index(&fallback_member.normalized) {
-            return Err(service_log_collision_error(
-                windows_service_log_candidate_label(configured_index),
-                &configured.candidate_path(configured_index),
-                windows_service_fallback_log_candidate_label(fallback_index),
-                &fallback_member.path,
-            ));
-        }
-    }
-
-    // Preserve the hardlink guarantee for the fallback family as well. Only
-    // existing configured members need probing; a hardlink at such a name is,
-    // by definition, already present in this enumeration.
-    for configured_member in configured.existing_members()? {
-        for (fallback_index, fallback_member) in fallback_members.iter().enumerate() {
-            if configured_member
-                .identity
-                .zip(fallback_member.identity)
-                .is_some_and(|(configured_identity, fallback_identity)| {
-                    configured_identity == fallback_identity
-                })
-            {
-                return Err(service_log_collision_error(
-                    windows_service_log_candidate_label(configured_member.index),
-                    &configured_member.path,
-                    windows_service_fallback_log_candidate_label(fallback_index),
-                    &fallback_member.path,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 fn windows_service_validate_path_spelling(label: &str, path: &Path) -> io::Result<()> {
     use std::path::{Component, Prefix};
 
@@ -905,6 +777,65 @@ fn windows_service_validate_path_spelling(label: &str, path: &Path) -> io::Resul
                 ));
             }
             Component::RootDir | Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a reparse component that cannot be resolved to a stable target.
+///
+/// A missing ordinary suffix is expected for a new logfile, but a dangling
+/// symlink/junction must not be mistaken for one: path normalization would then
+/// validate the link spelling while the eventual open either follows a newly
+/// available target or fails at a surprising location.
+#[cfg(windows)]
+fn windows_service_reject_unresolved_reparse_points(label: &str, path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use std::path::Component;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let absolute = std::path::absolute(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot resolve {label} '{}' before checking Windows reparse points: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut prefix = PathBuf::new();
+    for component in absolute.components() {
+        prefix.push(component.as_os_str());
+        if !matches!(component, Component::Normal(_)) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) => metadata,
+            // Once an ordinary component is absent, no later component can
+            // exist (Win32 parent segments were already collapsed by
+            // `absolute`), so the remaining suffix is safe to create normally.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot inspect {label} component '{}' for Windows reparse points: {e}",
+                        prefix.display()
+                    ),
+                ))
+            }
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            if let Err(e) = std::fs::canonicalize(&prefix) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{label} '{}' contains an unresolved Windows reparse point at '{}': {e}",
+                        path.display(),
+                        prefix.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -1100,15 +1031,6 @@ impl WindowsServiceLogFamily {
         }
     }
 
-    fn has_same_path_family(&self, other: &Self) -> bool {
-        (0..=other.keep).all(|index| {
-            windows_service_normalized_paths_equal(
-                &windows_service_normalized_path(&self.candidate_path(index)),
-                &windows_service_normalized_path(&other.candidate_path(index)),
-            )
-        })
-    }
-
     fn member_index(&self, normalized_path: &Path) -> Option<usize> {
         if windows_service_normalized_paths_equal(normalized_path, &self.normalized_base) {
             return Some(0);
@@ -1125,6 +1047,36 @@ impl WindowsServiceLogFamily {
         // Index zero is the base itself; a different normalized path that merely
         // has the same leaf is not that base (notably the root-path fallback).
         (index != 0).then_some(index)
+    }
+
+    /// Returns the family member that equals or is an ancestor of `path`.
+    /// Unlike `conflicting_tree_member`, this is intentionally one-way so an
+    /// ordinary logfile inside an include/cache directory is not classified as
+    /// containing that directory.
+    fn member_containing_path(&self, normalized_path: &Path) -> Option<usize> {
+        if windows_service_normalized_path_is_same_or_descendant(
+            normalized_path,
+            &self.normalized_base,
+        ) {
+            return Some(0);
+        }
+        if self.keep == 0
+            || !windows_service_normalized_path_is_same_or_descendant(
+                normalized_path,
+                &self.normalized_rotation_parent,
+            )
+        {
+            return None;
+        }
+
+        let parent_components = self.normalized_rotation_parent.components().count();
+        let first_relative = normalized_path.components().nth(parent_components)?;
+        windows_service_log_file_name_index(
+            &self.base_file_name,
+            first_relative.as_os_str(),
+            self.keep,
+        )
+        .filter(|index| *index != 0)
     }
 
     fn existing_members(&self) -> io::Result<Vec<WindowsServiceExistingLogMember>> {
@@ -1210,15 +1162,6 @@ fn windows_service_log_candidate_label(index: usize) -> &'static str {
         "Windows Service logfile"
     } else {
         "Windows Service rotated logfile"
-    }
-}
-
-#[cfg(windows)]
-fn windows_service_fallback_log_candidate_label(index: usize) -> &'static str {
-    if index == 0 {
-        "Windows Service fallback logfile"
-    } else {
-        "Windows Service fallback rotated logfile"
     }
 }
 
@@ -2087,158 +2030,6 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_service_load_failure_log_protects_known_service_files() {
-        for rotation_index in [0, 1] {
-            let dir = tempfile::tempdir().unwrap();
-            let default_log_dir = dir.path().join("logs");
-            let fallback = default_log_dir.join("alighieri.log");
-            let config_path = if rotation_index == 0 {
-                fallback.clone()
-            } else {
-                rotated_path(&fallback, rotation_index)
-            };
-            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-            std::fs::write(&config_path, "this is not valid configuration\n").unwrap();
-
-            let error = validate_windows_service_fallback_logging_paths(
-                &config_path,
-                &default_log_dir,
-                &dir.path().join("service-config-path.txt"),
-                &ConfigLoadProvenance::default(),
-            )
-            .unwrap_err();
-
-            assert!(
-                error.to_string().contains("active configuration"),
-                "{error}"
-            );
-            if rotation_index == 1 {
-                assert!(
-                    error.to_string().contains("fallback rotated logfile"),
-                    "{error}"
-                );
-            }
-            assert_eq!(
-                std::fs::read_to_string(&config_path).unwrap(),
-                "this is not valid configuration\n"
-            );
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let default_log_dir = dir.path().join("logs");
-        let fallback = default_log_dir.join("alighieri.log");
-        let marker_path = rotated_path(&fallback, 1);
-        let error = validate_windows_service_fallback_logging_paths(
-            &dir.path().join("alighieri.conf"),
-            &default_log_dir,
-            &marker_path,
-            &ConfigLoadProvenance::default(),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("service configuration marker"),
-            "{error}"
-        );
-
-        let dir = tempfile::tempdir().unwrap();
-        let default_log_dir = dir.path().join("logs");
-        let fallback = default_log_dir.join("alighieri.log");
-        let config_path = dir.path().join("alighieri.conf");
-        let config_backup =
-            windows_service_suffixed_sibling_path(&config_path, "alighieri.conf", "", ".bak");
-        std::fs::create_dir_all(&default_log_dir).unwrap();
-        std::fs::write(&config_backup, "backup").unwrap();
-        std::fs::hard_link(&config_backup, &fallback).unwrap();
-        let error = validate_windows_service_fallback_logging_paths(
-            &config_path,
-            &default_log_dir,
-            &dir.path().join("service-config-path.txt"),
-            &ConfigLoadProvenance::default(),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("active configuration backup"),
-            "{error}"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_service_load_failure_log_protects_failed_include_sources() {
-        for rotation_index in [0, 1] {
-            let dir = tempfile::tempdir().unwrap();
-            let config_path = dir.path().join("alighieri.conf");
-            let default_log_dir = dir.path().join("logs");
-            let fallback = default_log_dir.join("alighieri.log");
-            let included = if rotation_index == 0 {
-                fallback.clone()
-            } else {
-                rotated_path(&fallback, rotation_index)
-            };
-            std::fs::create_dir_all(&default_log_dir).unwrap();
-            std::fs::write(
-                &config_path,
-                format!(
-                    "include: logs/{}\n",
-                    included.file_name().unwrap().to_string_lossy()
-                ),
-            )
-            .unwrap();
-            std::fs::write(&included, "invalid included configuration\n").unwrap();
-
-            let (result, provenance) = Config::load_with_provenance(&config_path);
-            assert!(result.is_err());
-            let error = validate_windows_service_fallback_logging_paths(
-                &config_path,
-                &default_log_dir,
-                &dir.path().join("service-config-path.txt"),
-                &provenance,
-            )
-            .unwrap_err();
-
-            assert!(
-                error.to_string().contains("configuration load source"),
-                "rotation {rotation_index}: {error}"
-            );
-            assert_eq!(
-                std::fs::read_to_string(&included).unwrap(),
-                "invalid included configuration\n"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_service_load_failure_log_reserves_unresolved_includes() {
-        for include in ["logs/alighieri.log", "logs/*.log"] {
-            let dir = tempfile::tempdir().unwrap();
-            let config_path = dir.path().join("alighieri.conf");
-            let default_log_dir = dir.path().join("logs");
-            std::fs::write(&config_path, format!("include: {include}\n")).unwrap();
-
-            let (result, provenance) = Config::load_with_provenance(&config_path);
-            assert!(result.is_err());
-            let error = validate_windows_service_fallback_logging_paths(
-                &config_path,
-                &default_log_dir,
-                &dir.path().join("service-config-path.txt"),
-                &provenance,
-            )
-            .unwrap_err();
-
-            let message = error.to_string();
-            let expected = if include.contains('*') {
-                "configuration include pattern"
-            } else {
-                "configuration load source"
-            };
-            assert!(message.contains(expected), "{include}: {message}");
-            assert!(!default_log_dir.join("alighieri.log").exists());
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn windows_service_protects_every_loaded_configuration_source() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("alighieri.conf");
@@ -2286,6 +2077,54 @@ mod tests {
             &marker_path,
         )
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_rejects_log_members_that_contain_configuration_sources() {
+        for rotation_index in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("alighieri.conf");
+            let marker_path = dir.path().join("service-config-path.txt");
+            let log_path = dir.path().join("service.log");
+            let containing_member = if rotation_index == 0 {
+                log_path.clone()
+            } else {
+                rotated_path(&log_path, rotation_index)
+            };
+            std::fs::create_dir(&containing_member).unwrap();
+            let included_path = containing_member.join("policy.conf");
+            std::fs::write(&included_path, "socks pass { command: connect }\n").unwrap();
+            std::fs::write(
+                &config_path,
+                format!(
+                    "internal: 127.0.0.1:1080\ninclude: {}\nlogoutput: file\nlogfile: {}\nlogrotate.keep: 1\n",
+                    included_path.display(),
+                    log_path.display()
+                ),
+            )
+            .unwrap();
+            let config = Config::load(&config_path).unwrap();
+
+            let error = validate_windows_service_logging_paths(
+                &config,
+                &config_path,
+                &dir.path().join("default-logs"),
+                &marker_path,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("loaded configuration source"),
+                "rotation {rotation_index}: {error}"
+            );
+            if rotation_index == 1 {
+                assert!(
+                    error.to_string().contains("rotated logfile"),
+                    "rotation {rotation_index}: {error}"
+                );
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -2344,33 +2183,6 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("rotated logfile"), "{message}");
-
-        let fallback_dir = dir.path().join("fallback-logs");
-        std::fs::create_dir(&fallback_dir).unwrap();
-        std::fs::write(fallback_dir.join("policy.log"), "socks pass { }\n").unwrap();
-        std::fs::write(
-            &config_path,
-            format!(
-                "internal: 127.0.0.1:1080\ninclude: {}\nlogoutput: file\nlogfile: {}\n",
-                fallback_dir.join("*.log").display(),
-                dir.path().join("custom.log").display()
-            ),
-        )
-        .unwrap();
-        let config = Config::load(&config_path).unwrap();
-        let error = validate_windows_service_logging_paths(
-            &config,
-            &config_path,
-            &fallback_dir,
-            &marker_path,
-        )
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("Service logfile"), "{message}");
-        assert!(
-            message.contains("configuration include pattern"),
-            "{message}"
-        );
     }
 
     #[cfg(windows)]
@@ -2585,6 +2397,65 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_service_rejects_unresolved_log_reparse_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("alighieri.conf");
+        let marker_path = dir.path().join("service-config-path.txt");
+        let default_log_dir = dir.path().join("default-logs");
+
+        let dangling_target = dir.path().join("missing-target.log");
+        let file_link = dir.path().join("file-link.log");
+        if std::os::windows::fs::symlink_file(&dangling_target, &file_link).is_ok() {
+            let config = windows_file_logging_config(file_link.clone(), 1);
+            let error = validate_windows_service_logging_paths(
+                &config,
+                &config_path,
+                &default_log_dir,
+                &marker_path,
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("unresolved Windows reparse point"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&file_link.display().to_string()),
+                "{message}"
+            );
+            std::fs::remove_file(&file_link).unwrap();
+        } else {
+            eprintln!("skipping dangling file-symlink assertion: symlinks are unavailable");
+        }
+
+        let target_dir = dir.path().join("junction-target");
+        std::fs::create_dir(&target_dir).unwrap();
+        let junction = dir.path().join("junction");
+        create_windows_junction(&junction, &target_dir);
+        std::fs::remove_dir(&target_dir).unwrap();
+        let configured_log = junction.join("service.log");
+        let config = windows_file_logging_config(configured_log.clone(), 1);
+        let error = validate_windows_service_logging_paths(
+            &config,
+            &config_path,
+            &default_log_dir,
+            &marker_path,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("unresolved Windows reparse point"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&junction.display().to_string()),
+            "{message}"
+        );
+        std::fs::remove_dir(&junction).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_service_rejects_ambiguous_or_device_path_components() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("alighieri.conf");
@@ -2652,55 +2523,6 @@ mod tests {
             &marker_path,
         )
         .unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_service_explicit_log_cannot_reuse_the_fallback_family() {
-        let dir = tempfile::tempdir().unwrap();
-        let default_log_dir = dir.path().join("logs");
-        let fallback = default_log_dir.join("alighieri.log");
-        let config_path = dir.path().join("alighieri.conf");
-        let marker_path = dir.path().join("service-config-path.txt");
-
-        let same_family = windows_file_logging_config(fallback.clone(), 1);
-        validate_windows_service_logging_paths(
-            &same_family,
-            &config_path,
-            &default_log_dir,
-            &marker_path,
-        )
-        .unwrap();
-
-        let overlapping = windows_file_logging_config(rotated_path(&fallback, 1), 1);
-        let error = validate_windows_service_logging_paths(
-            &overlapping,
-            &config_path,
-            &default_log_dir,
-            &marker_path,
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("fallback rotated logfile"),
-            "{error}"
-        );
-
-        let mut custom = windows_file_logging_config(dir.path().join("custom.log"), 1);
-        custom.userlist = Some(rotated_path(&fallback, 1));
-        let error = validate_windows_service_logging_paths(
-            &custom,
-            &config_path,
-            &default_log_dir,
-            &marker_path,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("configured userlist"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains(&rotated_path(&fallback, 1).display().to_string()),
-            "{error}"
-        );
     }
 
     #[cfg(windows)]

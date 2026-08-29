@@ -20,9 +20,7 @@ use crate::platform::windows::event_log::{self, EventLevel};
 use crate::platform::windows::service_manager::{
     default_config_path, default_log_dir, service_config_marker_path,
 };
-use crate::runtime::{
-    init_file_logging, init_service_logging, run_bound_windows_service_reloading_until_shutdown,
-};
+use crate::runtime::{init_service_logging, run_bound_windows_service_reloading_until_shutdown};
 use crate::server::Server;
 
 pub const SERVICE_NAME: &str = "Alighieri";
@@ -70,23 +68,16 @@ fn run_service() -> windows_service::Result<()> {
         .flatten()
         .unwrap_or_else(default_config_path);
 
-    let (config_result, config_load_provenance) = Config::load_with_provenance(&config_path);
-    let config = match config_result {
+    let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(e) => {
-            // The guard flushes queued records when this error path returns.
-            let _log_guard = match init_file_logging(
-                &config_path,
-                &default_log_dir(),
-                &service_config_marker_path(),
-                &config_load_provenance,
-            ) {
-                Ok((_, guard)) => Some(guard),
-                Err(log_error) => {
-                    eprintln!("failed to initialise service file logging: {log_error}");
-                    None
-                }
-            };
+            // No valid Config exists yet, so no file path can be proven disjoint
+            // from every partially parsed service artifact. Report the complete
+            // load error only through channels that cannot overwrite those files.
+            eprintln!(
+                "Failed to load service configuration '{}': {e}",
+                config_path.display()
+            );
             event_log::report(
                 EventLevel::Error,
                 event_log::EVENT_SERVICE_CONFIG_ERROR,

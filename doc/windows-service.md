@@ -55,7 +55,10 @@ file so only administrators and the service account can read them.
 When `auth.command` is configured, its program must be an explicit filesystem
 path in Windows Service mode rather than a bare name resolved through `PATH`.
 This lets startup and reload validation keep the helper executable disjoint
-from every configured and fallback log-rotation target.
+from every configured log-rotation target. If the configuration cannot be
+loaded, the service reports the complete error to stderr and the Windows Event
+Log without opening a file logger, because no valid configuration exists from
+which all protected artifact paths can be proven.
 
 ## Logging
 

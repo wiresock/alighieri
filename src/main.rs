@@ -225,7 +225,10 @@ async fn main() -> ExitCode {
 /// effective `userlist` setting (empty when unset), so tooling — e.g. the systemd
 /// installer deciding whether to grant `CAP_NET_BIND_SERVICE`, or checking paths
 /// from included/last-wins settings as the service account — can read the parsed
-/// facts without reparsing config.
+/// facts without reparsing config. The declared and canonical configuration
+/// source and wildcard-pattern arrays let the installer validate both include
+/// spellings, every parsed physical file, and directories that could supply a
+/// new wildcard match on reload.
 fn check_ok_json(config_path: &Path, config: &Config) -> String {
     let acme = matches!(config.tls, Some(TlsConfig::Acme(_)));
     let acme_cache = match &config.tls {
@@ -250,15 +253,57 @@ fn check_ok_json(config_path: &Path, config: &Config) -> String {
         .userlist
         .as_deref()
         .map_or_else(String::new, |path| path.display().to_string());
+    let declared_config_sources = json_path_array(
+        config
+            .loaded_config_sources()
+            .iter()
+            .map(|source| source.declared_path()),
+    );
+    let canonical_config_sources = json_path_array(
+        config
+            .loaded_config_sources()
+            .iter()
+            .map(|source| source.canonical_path()),
+    );
+    let declared_config_include_patterns = json_path_array(
+        config
+            .loaded_include_patterns()
+            .iter()
+            .map(|pattern| pattern.declared_path()),
+    );
+    let canonical_config_include_patterns = json_path_array(
+        config
+            .loaded_include_patterns()
+            .iter()
+            .map(|pattern| pattern.canonical_path()),
+    );
     format!(
-        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\",\"userlist\":\"{}\"}}",
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\",\"userlist\":\"{}\",\"declared_config_sources\":{},\"canonical_config_sources\":{},\"declared_config_include_patterns\":{},\"canonical_config_include_patterns\":{}}}",
         json_escape(&config_path.display().to_string()),
         json_escape(&config.internal.to_string()),
         acme,
         json_escape(&acme_cache),
         json_escape(&log_file),
-        json_escape(&userlist)
+        json_escape(&userlist),
+        declared_config_sources,
+        canonical_config_sources,
+        declared_config_include_patterns,
+        canonical_config_include_patterns,
     )
+}
+
+fn json_path_array<'a>(paths: impl IntoIterator<Item = &'a Path>) -> String {
+    let mut json = String::from("[");
+    for (index, path) in paths.into_iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(&json_escape(&path.display().to_string()));
+        json.push('"');
+    }
+    json.push(']');
+    json
 }
 
 fn validate_config(config_path: &Path, format: CheckOutputFormat) -> ExitCode {
@@ -1712,6 +1757,16 @@ mod tests {
             json.contains("\"userlist\":\"/etc/alighieri/users\""),
             "{json}"
         );
+        assert!(json.contains("\"declared_config_sources\":[]"), "{json}");
+        assert!(json.contains("\"canonical_config_sources\":[]"), "{json}");
+        assert!(
+            json.contains("\"declared_config_include_patterns\":[]"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"canonical_config_include_patterns\":[]"),
+            "{json}"
+        );
 
         let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
@@ -1750,6 +1805,152 @@ mod tests {
         let json = check_ok_json(Path::new("test.conf"), &config);
 
         assert!(json.contains("\"userlist\":\"final-users\""), "{json}");
+    }
+
+    #[test]
+    fn check_json_reports_declared_and_canonical_config_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main config.conf");
+        let include = dir.path().join("policy fragment.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: policy fragment.conf\n",
+        )
+        .unwrap();
+        std::fs::write(&include, "socks pass { command: connect }\n").unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_include = std::fs::canonicalize(&include).unwrap();
+        let declared_include = canonical_main
+            .parent()
+            .unwrap()
+            .join("policy fragment.conf");
+
+        assert!(
+            json.contains(&format!(
+                "\"declared_config_sources\":[\"{}\",\"{}\"]",
+                json_escape(&main.display().to_string()),
+                json_escape(&declared_include.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"canonical_config_sources\":[\"{}\",\"{}\"]",
+                json_escape(&canonical_main.display().to_string()),
+                json_escape(&canonical_include.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"declared_config_include_patterns\":[]"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"canonical_config_include_patterns\":[]"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn check_json_reports_declared_and_canonical_include_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("policy fragments");
+        std::fs::create_dir(&fragments).unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: policy fragments/*.conf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fragments.join("current safe.conf"),
+            "socks pass { command: connect }\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let declared_pattern = canonical_main
+            .parent()
+            .unwrap()
+            .join("policy fragments/*.conf");
+        let canonical_pattern = std::fs::canonicalize(&fragments).unwrap().join("*.conf");
+
+        assert!(
+            json.contains(&format!(
+                "\"declared_config_include_patterns\":[\"{}\"]",
+                json_escape(&declared_pattern.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"canonical_config_include_patterns\":[\"{}\"]",
+                json_escape(&canonical_pattern.display().to_string())
+            )),
+            "{json}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_json_keeps_symlinked_include_spellings_separate_from_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("real-fragments");
+        let fragments_alias = dir.path().join("fragments-alias");
+        std::fs::create_dir(&fragments).unwrap();
+        std::os::unix::fs::symlink(&fragments, &fragments_alias).unwrap();
+        let included = fragments.join("policy.conf");
+        std::fs::write(&included, "socks pass { command: connect }\n").unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: fragments-alias/*.conf\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let declared_parent = canonical_main.parent().unwrap().join("fragments-alias");
+        let canonical_parent = std::fs::canonicalize(&fragments).unwrap();
+        let canonical_included = std::fs::canonicalize(&included).unwrap();
+
+        assert!(
+            json.contains(&json_escape(
+                &declared_parent.join("policy.conf").display().to_string()
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(&canonical_included.display().to_string())),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(
+                &declared_parent.join("*.conf").display().to_string()
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(
+                &canonical_parent.join("*.conf").display().to_string()
+            )),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn json_path_array_preserves_spaces_quotes_and_backslashes() {
+        let path = Path::new("config dir/part \"quoted\"\\tail.conf");
+        assert_eq!(
+            json_path_array([path]),
+            r#"["config dir/part \"quoted\"\\tail.conf"]"#
+        );
     }
 
     #[test]

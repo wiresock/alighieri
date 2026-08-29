@@ -1373,6 +1373,77 @@ json_string_field() {
     '
 }
 
+# Extract a JSON array of strings from the `--check --json` output. Each decoded
+# value is printed on its own line, so callers must consume it with
+# `IFS= read -r` to preserve spaces and backslashes. Configuration paths cannot
+# contain control characters; reject their JSON escapes (and every unsupported
+# escape) rather than turning one path into multiple records. Returns non-zero
+# when the field is absent, is not an array of strings, or is malformed.
+json_string_array_field() {
+    awk -v key="$1" '
+    function quote_is_escaped(text, pos,    i, slashes) {
+        slashes = 0
+        for (i = pos - 1; i > 0 && substr(text, i, 1) == "\\"; i--) slashes++
+        return (slashes % 2) == 1
+    }
+    function trim_left(text) {
+        sub(/^[[:space:]]*/, "", text)
+        return text
+    }
+    { json = json $0 }
+    END {
+        marker = "\"" key "\""
+        mlen = length(marker)
+        start = 1
+        while ((at = index(substr(json, start), marker)) > 0) {
+            pos = start + at - 1
+            start = pos + 1
+            if (quote_is_escaped(json, pos)) continue
+            rest = trim_left(substr(json, pos + mlen))
+            if (substr(rest, 1, 1) != ":") continue
+            rest = trim_left(substr(rest, 2))
+            if (substr(rest, 1, 1) != "[") exit 1
+            rest = trim_left(substr(rest, 2))
+            if (substr(rest, 1, 1) == "]") exit 0
+
+            while (length(rest) > 0) {
+                if (substr(rest, 1, 1) != "\"") exit 1
+                rest = substr(rest, 2)
+                out = ""
+                closed = 0
+                i = 1
+                while (i <= length(rest)) {
+                    c = substr(rest, i, 1)
+                    if (c == "\\") {
+                        e = substr(rest, i + 1, 1)
+                        if (e == "\"") out = out "\""
+                        else if (e == "\\") out = out "\\"
+                        else if (e == "/") out = out "/"
+                        else exit 1
+                        i += 2
+                    } else if (c == "\"") {
+                        closed = 1
+                        rest = trim_left(substr(rest, i + 1))
+                        break
+                    } else {
+                        if (c ~ /[[:cntrl:]]/) exit 1
+                        out = out c
+                        i++
+                    }
+                }
+                if (!closed) exit 1
+                printf "%s\n", out
+                if (substr(rest, 1, 1) == "]") exit 0
+                if (substr(rest, 1, 1) != ",") exit 1
+                rest = trim_left(substr(rest, 2))
+            }
+            exit 1
+        }
+        exit 1
+    }
+    '
+}
+
 # Whether a JSON field named $1 is present in the flat `--check --json` object,
 # escape- and key-aware to match `json_string_field`. A plain `case`/glob on
 # `"<key>"` would also match
@@ -1522,6 +1593,139 @@ service_userlist_path_kind() {
         printf '%s' other
     else
         printf '%s' missing
+    fi
+}
+
+service_config_source_path_kind() {
+    if [ -L "$1" ]; then
+        printf '%s' symlink
+    elif [ -f "$1" ]; then
+        printf '%s' regular
+    elif [ -e "$1" ]; then
+        printf '%s' other
+    else
+        printf '%s' missing
+    fi
+}
+
+validate_service_config_source_path() {
+    local label="$1" path="$2" kind directory
+    case "$path" in
+        /*) ;;
+        *) die "$label $path is not absolute; refusing an ambiguous configuration source" ;;
+    esac
+    [ "$(normalize_path "$path")" = "$path" ] ||
+        die "$label $path is not lexically canonical; remove redundant '.', '..', or repeated separators from the include path"
+    reject_hidden_service_path "$label" "$path"
+
+    kind="$(service_config_source_path_kind "$path")"
+    case "$kind" in
+        regular) ;;
+        symlink)
+            die "$label $path is a symlink; use a physical, root-controlled configuration file"
+            ;;
+        missing)
+            die "$label $path disappeared after configuration validation"
+            ;;
+        *)
+            die "$label $path is not a regular file"
+            ;;
+    esac
+
+    directory="$(dirname -- "$path")"
+    require_safe_service_config_directory "$directory"
+    # Check the leaf again after walking both the lexical and physical parent
+    # chains. This makes a concurrent redirect beneath an unsafe writable
+    # parent fail before metadata is trusted.
+    [ "$(service_config_source_path_kind "$path")" = regular ] ||
+        die "$label $path changed while its parent path was being validated"
+    require_secure_service_config_file "$path"
+}
+
+validate_service_config_include_pattern() {
+    local label="$1" pattern="$2" directory file_pattern
+    case "$pattern" in
+        /*) ;;
+        *) die "$label $pattern is not absolute; refusing an ambiguous include pattern" ;;
+    esac
+    [ "$(normalize_path "$pattern")" = "$pattern" ] ||
+        die "$label $pattern is not lexically canonical; remove redundant '.', '..', or repeated separators from the include path"
+    directory="$(dirname -- "$pattern")"
+    file_pattern="${pattern##*/}"
+    case "$file_pattern" in
+        *'*'* | *'?'*) ;;
+        *) die "$label $pattern does not contain a filename wildcard" ;;
+    esac
+    reject_hidden_service_path "$label parent" "$directory"
+    require_safe_service_config_directory "$directory"
+}
+
+# Validate every file and wildcard directory consumed by Config::load, not only
+# the unit entrypoint. The binary reports parallel arrays because both spellings
+# are security relevant: declared paths expose writable ancestry and leaf links,
+# while canonical paths identify parsed files and physical wildcard parents.
+# Fail closed with an old/malformed binary rather than silently leaving includes
+# or future reload matches outside the config integrity boundary.
+validate_service_config_sources() {
+    local summary="$1" declared_sources canonical_sources declared_count canonical_count source \
+          declared_patterns canonical_patterns declared_pattern_count canonical_pattern_count pattern
+    if ! declared_sources="$(printf '%s\n' "$summary" |
+        json_string_array_field declared_config_sources)"; then
+        die "installed alighieri does not report declared configuration sources in --check --json; use the helper with its matching current binary"
+    fi
+    if ! canonical_sources="$(printf '%s\n' "$summary" |
+        json_string_array_field canonical_config_sources)"; then
+        die "installed alighieri does not report canonical configuration sources in --check --json; use the helper with its matching current binary"
+    fi
+    if ! declared_patterns="$(printf '%s\n' "$summary" |
+        json_string_array_field declared_config_include_patterns)"; then
+        die "installed alighieri does not report declared configuration include patterns in --check --json; use the helper with its matching current binary"
+    fi
+    if ! canonical_patterns="$(printf '%s\n' "$summary" |
+        json_string_array_field canonical_config_include_patterns)"; then
+        die "installed alighieri does not report canonical configuration include patterns in --check --json; use the helper with its matching current binary"
+    fi
+    [ -n "$declared_sources" ] && [ -n "$canonical_sources" ] ||
+        die "installed alighieri reported an empty configuration source set"
+
+    declared_count="$(printf '%s\n' "$declared_sources" | awk 'END { print NR }')"
+    canonical_count="$(printf '%s\n' "$canonical_sources" | awk 'END { print NR }')"
+    [ "$declared_count" -eq "$canonical_count" ] ||
+        die "installed alighieri reported inconsistent declared and canonical configuration source sets"
+    if [ -n "$declared_patterns" ]; then
+        declared_pattern_count="$(printf '%s\n' "$declared_patterns" | awk 'END { print NR }')"
+    else
+        declared_pattern_count=0
+    fi
+    if [ -n "$canonical_patterns" ]; then
+        canonical_pattern_count="$(printf '%s\n' "$canonical_patterns" | awk 'END { print NR }')"
+    else
+        canonical_pattern_count=0
+    fi
+    [ "$declared_pattern_count" -eq "$canonical_pattern_count" ] ||
+        die "installed alighieri reported inconsistent declared and canonical configuration include pattern sets"
+
+    while IFS= read -r source; do
+        [ -n "$source" ] || die "installed alighieri reported an empty declared configuration source"
+        validate_service_config_source_path "declared configuration source" "$source"
+    done <<<"$declared_sources"
+    while IFS= read -r source; do
+        [ -n "$source" ] || die "installed alighieri reported an empty canonical configuration source"
+        validate_service_config_source_path "canonical configuration source" "$source"
+    done <<<"$canonical_sources"
+    if [ -n "$declared_patterns" ]; then
+        while IFS= read -r pattern; do
+            [ -n "$pattern" ] || die "installed alighieri reported an empty declared configuration include pattern"
+            validate_service_config_include_pattern \
+                "declared configuration include pattern" "$pattern"
+        done <<<"$declared_patterns"
+    fi
+    if [ -n "$canonical_patterns" ]; then
+        while IFS= read -r pattern; do
+            [ -n "$pattern" ] || die "installed alighieri reported an empty canonical configuration include pattern"
+            validate_service_config_include_pattern \
+                "canonical configuration include pattern" "$pattern"
+        done <<<"$canonical_patterns"
     fi
 }
 
@@ -2269,6 +2473,79 @@ run_selftest() {
         'PARENT:/|METADATA:/users|SANDBOX:' \
         '/usr/local/bin/alighieri user list --userlist users'
 
+    _check_config_sources_preflight() { # description summary want expected [unsafe-parent symlink-path]
+        local desc="$1" summary="$2" want="$3" expected="$4" \
+              unsafe_parent="${5:-}" symlink_path="${6:-}" out got
+        if out="$(
+            service_config_source_path_kind() {
+                if [ -n "$symlink_path" ] && [ "$1" = "$symlink_path" ]; then
+                    printf '%s' symlink
+                else
+                    printf '%s' regular
+                fi
+            }
+            reject_hidden_service_path() { :; }
+            require_safe_service_config_directory() {
+                printf 'PARENT:%s|' "$1" >&2
+                if [ -n "$unsafe_parent" ] && [ "$1" = "$unsafe_parent" ]; then
+                    die "mock unsafe configuration source parent $1"
+                fi
+            }
+            require_secure_service_config_file() {
+                printf 'METADATA:%s|' "$1" >&2
+            }
+            validate_service_config_sources "$summary" 2>&1
+        )"; then
+            got=ok
+        else
+            got=fail
+        fi
+        if [ "$got" = "$want" ] && [[ "$out" == *"$expected"* ]]; then
+            printf 'ok   service configuration source preflight %s\n' "$desc"
+        else
+            printf 'FAIL service configuration source preflight %s: got %s [%s], want %s containing [%s]\n' \
+                "$desc" "$got" "$out" "$want" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_config_sources_preflight "preserves include spaces and escaping" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/conf d/part \"one\".conf"],"canonical_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/conf d/part \"one\".conf"],"declared_config_include_patterns":[],"canonical_config_include_patterns":[]}' \
+        ok 'PARENT:/etc/alighieri/conf d|METADATA:/etc/alighieri/conf d/part "one".conf|'
+    _check_config_sources_preflight "rejects an older summary" \
+        '{"ok":true}' fail "does not report declared configuration sources"
+    _check_config_sources_preflight "rejects inconsistent source arrays" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf"],"canonical_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/extra.conf"],"declared_config_include_patterns":[],"canonical_config_include_patterns":[]}' \
+        fail "inconsistent declared and canonical"
+    _check_config_sources_preflight "rejects a declared include symlink" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/policy-link"],"canonical_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/policy.conf"],"declared_config_include_patterns":[],"canonical_config_include_patterns":[]}' \
+        fail "declared configuration source /etc/alighieri/policy-link is a symlink" \
+        '' /etc/alighieri/policy-link
+    _check_config_sources_preflight "rejects a service-owned include" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf","/var/lib/alighieri/policy.conf"],"canonical_config_sources":["/etc/alighieri/main.conf","/var/lib/alighieri/policy.conf"],"declared_config_include_patterns":[],"canonical_config_include_patterns":[]}' \
+        fail "mock unsafe configuration source parent /var/lib/alighieri" \
+        /var/lib/alighieri
+    _check_config_sources_preflight "rejects a canonical target under service-owned ancestry" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/policy.conf"],"canonical_config_sources":["/etc/alighieri/main.conf","/var/lib/alighieri/policy.conf"],"declared_config_include_patterns":[],"canonical_config_include_patterns":[]}' \
+        fail "mock unsafe configuration source parent /var/lib/alighieri" \
+        /var/lib/alighieri
+    _check_config_sources_preflight "rejects a summary without wildcard provenance" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf"],"canonical_config_sources":["/etc/alighieri/main.conf"]}' \
+        fail "does not report declared configuration include patterns"
+    _check_config_sources_preflight "rejects inconsistent wildcard pattern arrays" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf"],"canonical_config_sources":["/etc/alighieri/main.conf"],"declared_config_include_patterns":["/etc/alighieri/conf.d/*.conf"],"canonical_config_include_patterns":[]}' \
+        fail "inconsistent declared and canonical configuration include pattern sets"
+    # Model a currently unmatched wildcard separately from loaded sources. A
+    # service-writable parent would let the daemon create a future match and
+    # make it executable configuration on SIGHUP.
+    _check_config_sources_preflight "rejects a zero-source wildcard under service-owned ancestry" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf"],"canonical_config_sources":["/etc/alighieri/main.conf"],"declared_config_include_patterns":["/var/lib/alighieri/*.conf"],"canonical_config_include_patterns":["/var/lib/alighieri/*.conf"]}' \
+        fail "mock unsafe configuration source parent /var/lib/alighieri" \
+        /var/lib/alighieri
+    _check_config_sources_preflight "accepts a root-controlled wildcard with spaces" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf"],"canonical_config_sources":["/etc/alighieri/main.conf"],"declared_config_include_patterns":["/etc/alighieri/policy fragments/*.conf"],"canonical_config_include_patterns":["/etc/alighieri/policy fragments/*.conf"]}' \
+        ok "PARENT:/etc/alighieri/policy fragments|"
+
     _check_warn() { # description want(warn|quiet) func summary
         local desc="$1" want="$2" func="$3" summary="$4" out got
         out="$("$func" "$summary" 2>&1)" || true
@@ -2322,6 +2599,42 @@ run_selftest() {
         '{"message":"acme_cache","acme_cache":"/real/path"}' acme_cache "/real/path"
     _check_json "skips a quoted key-like substring in a value" \
         '{"path":"x\"acme_cache\"y","acme_cache":"/real"}' acme_cache "/real"
+
+    _check_json_array() { # description json key want(ok|fail) expected
+        local got='' status=fail
+        if got="$(printf '%s' "$2" | json_string_array_field "$3")"; then
+            status=ok
+        fi
+        if [ "$status" = "$4" ] &&
+            { [ "$status" = fail ] || [ "$got" = "$5" ]; }; then
+            printf 'ok   json_string_array_field %s\n' "$1"
+        else
+            printf 'FAIL json_string_array_field %s: got %s [%s] want %s [%s]\n' \
+                "$1" "$status" "$got" "$4" "$5"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Source arrays must retain shell-significant path text exactly. Reject
+    # controls because the line-oriented consumer cannot represent them without
+    # confusing a single path for multiple sources.
+    _check_json_array "preserves spaces, quotes, and backslashes" \
+        '{"declared_config_sources":["/etc/alighieri/main.conf","/etc/alighieri/conf d/part \"one\"\\leaf.conf"]}' \
+        declared_config_sources ok \
+        $'/etc/alighieri/main.conf\n/etc/alighieri/conf d/part "one"\\leaf.conf'
+    _check_json_array "skips a key-like value" \
+        '{"message":"declared_config_sources","declared_config_sources":["/etc/alighieri/main.conf"]}' \
+        declared_config_sources ok '/etc/alighieri/main.conf'
+    _check_json_array "accepts an empty array" \
+        '{"declared_config_sources":[]}' declared_config_sources ok ''
+    _check_json_array "rejects an absent array" \
+        '{"ok":true}' declared_config_sources fail ''
+    _check_json_array "rejects a non-string member" \
+        '{"declared_config_sources":["/etc/main",42]}' \
+        declared_config_sources fail ''
+    _check_json_array "rejects escaped controls" \
+        '{"declared_config_sources":["/etc/a\ninclude"]}' \
+        declared_config_sources fail ''
 
     _check_has() { # description json key want(yes|no)
         local got
@@ -3027,6 +3340,11 @@ run_selftest() {
                     [ "$failure_mode" != config-metadata ] ||
                         die "unsafe service config metadata"
                 }
+                validate_service_config_sources() {
+                    printf 'config-sources|' >>"$calls"
+                    [ "$failure_mode" != config-source ] ||
+                        die "unsafe included configuration source"
+                }
                 service_userlist_path_kind() { printf '%s' regular; }
                 require_safe_service_userlist_directory() { :; }
                 require_secure_service_userlist_file() { :; }
@@ -3119,24 +3437,28 @@ run_selftest() {
                     expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
                     expected_error="invalid or unreachable"
                     ;;
+                config-source)
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|"
+                    expected_error="unsafe included configuration source"
+                    ;;
                 userlist)
-                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|sandbox:$expected_staged user list --userlist $userlist|"
                     expected_error="cannot be loaded"
                     ;;
                 reload)
-                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|systemctl:daemon-reload|"
                     expected_error="daemon-reload failed"
                     ;;
                 exec)
-                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|systemctl:daemon-reload|"
                     expected_error="overriding drop-in"
                     ;;
                 sandbox)
-                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|systemctl:daemon-reload|"
                     expected_error="filesystem namespace"
                     ;;
                 binary-move)
-                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|binary-move|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|config-sources|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|binary-move|systemctl:daemon-reload|"
                     expected_error="could not install the validated binary"
                     ;;
             esac
@@ -3163,6 +3485,7 @@ run_selftest() {
         _check_install_failure_case config-dir "unsafe config directory"
         _check_install_failure_case config-metadata "unsafe config metadata"
         _check_install_failure_case config "config preflight failure"
+        _check_install_failure_case config-source "included config integrity failure"
         _check_install_failure_case userlist "userlist preflight failure"
         _check_install_failure_case reload "daemon-reload validation failure"
         _check_install_failure_case exec "surviving ExecStart drop-in rejection"
@@ -3297,6 +3620,7 @@ run_selftest() {
                 reject_hidden_service_path() { :; }
                 require_safe_service_config_directory() { :; }
                 require_secure_service_config_file() { :; }
+                validate_service_config_sources() { :; }
                 service_capability_mask() { printf '%s' 0; }
                 chown() { [ "${!#}" != "$config" ]; }
                 install() {
@@ -3384,7 +3708,7 @@ run_selftest() {
 
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
-              expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|restart|' \
+              expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|restart|' \
               reload_count=0 change_exec_start=0 invalid_exec_start=0 \
               config_guard_failure='' succeeded=0
         upgrade_tmp="$(mktemp -d)"
@@ -3433,6 +3757,9 @@ run_selftest() {
         run_in_service_sandbox() {
             printf 'preflight|' >>"$order"
             printf '%s\n' '{"ok":true,"userlist":""}'
+        }
+        validate_service_config_sources() {
+            printf 'config-sources|' >>"$order"
         }
         service_capability_mask() { printf '%s' 0; }
         systemctl() {
@@ -3493,7 +3820,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an ExecStart change before binary replacement\n'
@@ -3539,7 +3866,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = installed ]; then
             printf 'ok   --no-restart upgrade refuses an ExecStart race before replacement\n'
@@ -3563,7 +3890,7 @@ run_selftest() {
         if do_upgrade >/dev/null 2>&1; then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|'
         if [ "$succeeded" -eq 1 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = source ]; then
             printf 'ok   --no-restart upgrade reloads and validates before replacement\n'
@@ -3824,6 +4151,7 @@ do_install() {
         run_in_service_sandbox "$STAGED_BIN" --check "$config_file" || true
         die "config $config_file is invalid or unreachable by $SERVICE_USER inside the hardened systemd sandbox; fix the errors above, then re-run install"
     fi
+    validate_service_config_sources "$check_summary"
     validate_service_userlist "$STAGED_BIN" "$check_summary" "$START_ON_INSTALL"
     warn_acme_cache_outside_state_dir "$check_summary"
     warn_logfile_outside_log_dir "$check_summary"
@@ -3954,6 +4282,7 @@ do_upgrade() {
         run_in_service_sandbox "$STAGED_BIN" --check "$config_file" || true
         die "new binary rejects $config_file or cannot read it inside the hardened service sandbox; fix the errors above before upgrading"
     fi
+    validate_service_config_sources "$check_summary"
     validate_service_userlist "$STAGED_BIN" "$check_summary" 1
     capability_mask="$(service_capability_mask "$check_summary")"
 
