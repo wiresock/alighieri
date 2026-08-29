@@ -195,12 +195,12 @@ That should print the **VPS's IP**, proving the request was relayed through the
 proxy over TLS. (`socat TCP-LISTEN:1080,fork,reuseaddr OPENSSL:proxy.example.com:443,verify=0`
 is a quick one-liner alternative to stunnel.)
 
-This walkthrough exercises TCP CONNECT. SOCKS5 authentication and the control
-connection use TLS, but UDP ASSOCIATE relay datagrams travel through separate
-UDP sockets and are not encapsulated in the TLS stream. If you enable UDP for a
-public deployment, configure a fixed `udp.portrange`, open that inbound UDP
-range, and rely on the application protocol (for example QUIC) for any UDP
-payload encryption it requires.
+This walkthrough exercises TCP CONNECT. SOCKS5 authentication, the control
+connection, and relayed TCP traffic use TLS, but UDP ASSOCIATE relay datagrams
+travel through separate UDP sockets and are not encapsulated in the TLS stream.
+If you enable UDP for a public deployment, configure a fixed `udp.portrange`,
+open that inbound UDP range, and rely on the application protocol (for example
+QUIC) for any UDP payload encryption it requires.
 
 ## Step 6 — Switch to a real (trusted) certificate
 

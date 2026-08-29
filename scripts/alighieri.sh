@@ -48,6 +48,7 @@ CONFIG_FILE="${CONFIG_DIR}/${SERVICE_NAME}.conf"
 PREFIX="/usr/local"
 PREFIX_EXPLICIT=0
 BINARY=""
+BINARY_EXPLICIT=0
 RESTART_ON_UPGRADE=1
 START_ON_INSTALL=1
 PURGE_CONFIG=0
@@ -130,7 +131,7 @@ while [ $# -gt 0 ]; do
             [ "$COMMAND_SEEN" -eq 0 ] || die "only one command may be given (already '$ACTION'): $1"
             ACTION="$1"; COMMAND_SEEN=1 ;;
         help | -h | --help) usage; exit 0 ;; # help always wins, immediately
-        --binary) shift; [ $# -gt 0 ] || die "--binary requires a path"; BINARY="$1" ;;
+        --binary) shift; [ $# -gt 0 ] || die "--binary requires a path"; BINARY="$1"; BINARY_EXPLICIT=1 ;;
         --prefix) shift; [ $# -gt 0 ] || die "--prefix requires a path"; PREFIX="$1"; PREFIX_EXPLICIT=1 ;;
         --no-restart) RESTART_ON_UPGRADE=0 ;;
         --no-start) START_ON_INSTALL=0 ;;
@@ -638,6 +639,34 @@ warn_logfile_outside_log_dir() {
          "will fail at runtime. Put the logfile under $LOG_DIR/ or grant the unit write access."
 }
 
+# Commands printed after installation run back in the invoking shell. Preserve
+# the privilege mechanism when this script was entered through sudo, but avoid
+# suggesting sudo to an operator already working directly as root.
+followup_elevation() {
+    local invoking_user="${SUDO_USER:-}"
+    if [ -n "$invoking_user" ] && [ "$invoking_user" != "root" ]; then
+        printf 'sudo'
+    fi
+}
+
+# Re-running install after creating credentials must retain an explicit
+# prebuilt source. Otherwise a standalone install would unexpectedly clone and
+# build the project (and may fail on a machine with no Rust toolchain). Quote
+# both paths for safe copy/paste when the script or binary path contains spaces.
+followup_install_command() {
+    local script_path elevation quoted_script quoted_binary
+    script_path="${1:-${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")}"
+    elevation="$(followup_elevation)"
+    printf -v quoted_script '%q' "$script_path"
+    if [ "$BINARY_EXPLICIT" -eq 1 ]; then
+        printf -v quoted_binary '%q' "$BINARY"
+        printf '%s%s%s install --binary %s' \
+            "$elevation" "${elevation:+ }" "$quoted_script" "$quoted_binary"
+    else
+        printf '%s%s%s install' "$elevation" "${elevation:+ }" "$quoted_script"
+    fi
+}
+
 # Hidden, test-only entry point: exercise normalize_path and the two hardened-path
 # warnings against a fixed table of cases. Run by CI (`bash scripts/alighieri.sh
 # __selftest`) and intentionally kept off the operator-facing command surface.
@@ -792,6 +821,34 @@ run_selftest() {
     _check_install_activation 0 "daemon-reload"
     _check_install_activation 1 \
         "daemon-reload|enable ${SERVICE_NAME}.service|restart ${SERVICE_NAME}.service"
+
+    _check_followup_install() { # description sudo-user explicit binary script expected
+        local desc="$1" sudo_user="$2" explicit="$3" binary="$4" \
+              script="$5" expected="$6" got
+        got="$(
+            SUDO_USER="$sudo_user"
+            BINARY_EXPLICIT="$explicit"
+            BINARY="$binary"
+            followup_install_command "$script"
+        )"
+        if [ "$got" = "$expected" ]; then
+            printf 'ok   follow-up install command %s\n' "$desc"
+        else
+            printf 'FAIL follow-up install command %s: got [%s] want [%s]\n' \
+                "$desc" "$got" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # The post-install command returns to the unprivileged invoking shell after
+    # sudo and must keep a prebuilt path exactly (with shell-safe quoting). A
+    # direct-root source install needs neither sudo nor a synthetic --binary.
+    _check_followup_install "sudo + prebuilt" alice 1 \
+        "/tmp/release builds/alighieri" "/opt/alighieri tools/alighieri.sh" \
+        "sudo /opt/alighieri\\ tools/alighieri.sh install --binary /tmp/release\\ builds/alighieri"
+    _check_followup_install "direct root + source build" root 0 \
+        "/unused/generated/binary" "/opt/alighieri tools/alighieri.sh" \
+        "/opt/alighieri\\ tools/alighieri.sh install"
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
@@ -998,6 +1055,11 @@ do_install() {
     write_unit "$install_bin" "$config_file" "$check_summary"
 
     activate_installed_service
+    local elevation followup_install quoted_install_bin quoted_userlist
+    elevation="$(followup_elevation)"
+    followup_install="$(followup_install_command)"
+    printf -v quoted_install_bin '%q' "$install_bin"
+    printf -v quoted_userlist '%q' "$config_dir/users"
     cat <<DONE >&2
   Config:   $config_file   (edit, then: systemctl reload $SERVICE_NAME)
   Logs:     journalctl -u $SERVICE_NAME -f
@@ -1006,9 +1068,9 @@ do_install() {
   Stop:     systemctl stop $SERVICE_NAME
 
 If the config uses username authentication, create the userlist now, e.g.:
-  $install_bin user add alice --userlist $config_dir/users
-  chown root:$SERVICE_USER $config_dir/users && chmod 640 $config_dir/users
-  $0 install
+  ${elevation:+$elevation }$quoted_install_bin user add alice --userlist $quoted_userlist
+  ${elevation:+$elevation }chown root:$SERVICE_USER $quoted_userlist && ${elevation:+$elevation }chmod 640 $quoted_userlist
+  $followup_install
 DONE
 }
 

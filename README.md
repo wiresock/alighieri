@@ -284,11 +284,11 @@ certificate is publicly trusted, so neither a fingerprint pin nor
 `tlsAllowInvalidCertificate: true` is appropriate.
 
 The endpoint is an application proxy, not a full IP-level VPN. TLS protects the
-SOCKS5 control connection and authentication, but UDP relay datagrams use
-separate sockets and are not encapsulated in the TLS stream. Applications such
-as QUIC, voice clients, and games may provide their own UDP payload encryption.
-Selecting ACME staging is useful for issuance testing, but its certificate is
-not trusted by normal clients.
+SOCKS5 control connection, authentication, and relayed TCP CONNECT traffic, but
+UDP relay datagrams use separate sockets and are not encapsulated in the TLS
+stream. Applications such as QUIC, voice clients, and games may provide their
+own UDP payload encryption. Selecting ACME staging is useful for issuance
+testing, but its certificate is not trusted by normal clients.
 
 ### Editing an existing configuration
 
@@ -473,10 +473,10 @@ on shared hosts or loopback). Set `udp.strictreply: false` to relax the match to
 host-only (any source port on a contacted host) for servers that legitimately
 answer from a different port (e.g. TFTP) — at the cost of that protection.
 
-On a TLS listener, TLS protects the SOCKS5 control connection and authentication
-only. UDP relay datagrams travel through separate UDP sockets and are not
-encapsulated in the TLS stream; any payload confidentiality for UDP comes from
-the application protocol itself (for example QUIC).
+On a TLS listener, TLS protects the SOCKS5 control connection, authentication,
+and relayed TCP CONNECT traffic. UDP relay datagrams travel through separate UDP
+sockets and are not encapsulated in the TLS stream; any payload confidentiality
+for UDP comes from the application protocol itself (for example QUIC).
 
 When `metrics.listen` is set, Alighieri serves Prometheus-style text metrics at
 `/metrics`. The endpoint is unauthenticated and exposes operational counters and
@@ -888,7 +888,8 @@ The installed service uses:
 - display name: `Alighieri SOCKS5 Proxy Server`
 - startup type: automatic
 - account: `NT AUTHORITY\LocalService`
-- log file: `C:\ProgramData\Alighieri\logs\alighieri.log`
+- default log file: `C:\ProgramData\Alighieri\logs\alighieri.log` (a configured
+  `logfile` is honored; custom locations must be writable by `LocalService`)
 - Event Log source: `Alighieri` in the Windows Application log
 - recovery: restart on crash (after 5s, then 30s, then 60s; failure count resets
   after an hour), the Windows equivalent of systemd's `Restart=on-failure`
@@ -901,9 +902,10 @@ The installer validates the configuration before creating the service and the
 start and reload commands validate the installed configuration before asking
 the Service Control Manager to act on the service. Credentials stay in the
 configured `userlist` file; the service command line stores only the
-configuration file path. Service file logs rotate with the same
-`logrotate.size`, `logrotate.keep`, and `logformat` settings as console file
-logging.
+configuration file path. Service file logs use the configured `logfile` when
+present and otherwise use the default ProgramData path. They rotate with the
+same `logrotate.size`, `logrotate.keep`, and `logformat` settings as console
+file logging.
 
 Service install registers the `Alighieri` Event Log source. Service mode writes
 startup, stop, reload-request, and startup/runtime failure events to the Windows

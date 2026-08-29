@@ -87,8 +87,53 @@ struct WriteReport {
 struct WizardState {
     token: String,
     default_output_path: PathBuf,
+    completion: CompletionContext,
     /// Pre-filled form data when the wizard was started with `--import`.
     prefill: Option<ImportPrefill>,
+}
+
+/// Platform-specific facts needed to render completion commands. Resolve the
+/// Windows executable once when the wizard starts: service installation records
+/// the exact invoked binary, and PowerShell does not search the current
+/// directory for a bare `alighieri.exe` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionContext {
+    executable: String,
+}
+
+impl CompletionContext {
+    fn current() -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            let executable = std::env::current_exe()
+                .map_err(|e| format!("failed to locate the running Alighieri executable: {e}"))?;
+            let executable = executable.to_str().ok_or_else(|| {
+                format!(
+                    "the running Alighieri executable path cannot be represented in the Windows completion commands: {}",
+                    executable.display()
+                )
+            })?;
+            Ok(Self {
+                executable: executable.to_string(),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {
+                executable: "alighieri".to_string(),
+            })
+        }
+    }
+
+    fn powershell_command(&self) -> String {
+        format!("& {}", powershell_single_quoted(&self.executable))
+    }
+}
+
+/// Quotes one PowerShell argument without interpolation. In a single-quoted
+/// PowerShell string, an embedded quote is represented by two single quotes.
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Form pre-fill derived from an existing configuration loaded with `--import`.
@@ -172,6 +217,7 @@ fn config_wizard_usage() -> String {
 }
 
 pub async fn run_config_wizard(args: ConfigWizardArgs) -> Result<(), String> {
+    let completion = CompletionContext::current()?;
     let listener = TcpListener::bind(args.listen)
         .await
         .map_err(|e| format!("failed to bind config wizard to {}: {e}", args.listen))?;
@@ -185,6 +231,7 @@ pub async fn run_config_wizard(args: ConfigWizardArgs) -> Result<(), String> {
     let state = WizardState {
         token: random_token(),
         default_output_path: args.output_path,
+        completion,
         prefill,
     };
     let url = format!("http://{local_addr}/?token={}", state.token);
@@ -308,7 +355,12 @@ fn route_request(request: &HttpRequest, state: &WizardState) -> Result<HttpRespo
                     )
                 })?;
             print_save_report(&report);
-            Ok(HttpResponse::html(200, "OK", render_success(&report, &wizard_form)).done())
+            Ok(HttpResponse::html(
+                200,
+                "OK",
+                render_success(&report, &wizard_form, &state.completion),
+            )
+            .done())
         }
         _ => Err(HttpResponse::text(404, "Not Found", "not found")),
     }
@@ -1259,6 +1311,9 @@ fn path_value_matches(left: &str, right: &str) -> bool {
         .eq(Path::new(right).components())
 }
 
+/// Conservative path-collision predicate. On Windows, the lexical fallback is
+/// case-insensitive so potentially colliding deployment artifacts are rejected
+/// even when their final targets do not exist yet.
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     if existing_paths_refer_to_same_file(left, right) {
         return true;
@@ -1266,6 +1321,14 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     let left = normalized_path_for_comparison(left);
     let right = normalized_path_for_comparison(right);
     normalized_paths_equal(&left, &right)
+}
+
+/// Returns true only when skipping an installation copy is known to be safe.
+/// Unlike the collision predicate above, the fallback comparison deliberately
+/// preserves case because NTFS directories can opt into case-sensitive names.
+fn paths_are_same_install_target(left: &Path, right: &Path) -> bool {
+    existing_paths_refer_to_same_file(left, right)
+        || normalized_path_for_comparison(left) == normalized_path_for_comparison(right)
 }
 
 fn existing_paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -1379,7 +1442,8 @@ fn windows_os_strings_equal_case_insensitive(
     };
     // Windows path matching is normally case-insensitive. Ordinal comparison
     // provides the same locale-independent Unicode folding expected for file
-    // names; treating case-sensitive directories conservatively is safe here.
+    // names; treating case-sensitive directories conservatively is safe for
+    // collision validation. Install-copy decisions use the stricter predicate.
     unsafe {
         CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
     }
@@ -1482,6 +1546,16 @@ fn default_public_service_config_path() -> PathBuf {
 #[cfg(not(windows))]
 fn default_public_service_config_path() -> PathBuf {
     PathBuf::from("/etc/alighieri/alighieri.conf")
+}
+
+#[cfg(windows)]
+fn default_public_service_log_path() -> PathBuf {
+    alighieri::platform::windows::service_manager::default_log_dir().join("alighieri.log")
+}
+
+#[cfg(not(windows))]
+fn default_public_service_log_path() -> PathBuf {
+    PathBuf::from("/var/log/alighieri/alighieri.log")
 }
 
 fn default_userlist_path(output_path: &Path) -> String {
@@ -2281,9 +2355,7 @@ fn shell_quote_command_argument(value: &str) -> String {
     if is_safe {
         value.to_string()
     } else if cfg!(windows) {
-        // PowerShell single-quoted strings escape an embedded quote by doubling
-        // it; no interpolation or command substitution occurs inside them.
-        format!("'{}'", value.replace('\'', "''"))
+        powershell_single_quoted(value)
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -2423,6 +2495,22 @@ fn render_wizard_form(
     let acme_cache = html_escape(&acme_cache_value);
     let udp_range = html_escape(udp_range_value);
     let udp_advertise = html_escape(udp_advertise_value);
+    let (logfile_placeholder, logfile_help) = if cfg!(windows) {
+        let service_log = default_public_service_log_path().display().to_string();
+        (
+            "empty = Windows Service default".to_string(),
+            format!(
+                "The Windows Service honors this path when set; when empty, it writes to <code>{}</code>.",
+                html_escape(&service_log)
+            ),
+        )
+    } else {
+        (
+            "absolute path recommended; empty = stdout / journald".to_string(),
+            "The public service profile requires an absolute path when file logging is enabled."
+                .to_string(),
+        )
+    };
     let (local_checked, lan_checked, public_checked) = match template {
         WizardTemplate::LocalNoAuth => (" checked", "", ""),
         WizardTemplate::LanUsername => ("", " checked", ""),
@@ -2496,7 +2584,7 @@ fn render_wizard_form(
 <h2>Files</h2>
 <label>Config output <input name="output" value="{output}" required placeholder="alighieri.conf" autocomplete="off"></label>
 <label>Userlist path <input name="userlist" value="{userlist}" data-standard-default="{standard_userlist}" data-public-default="{public_userlist}" placeholder="required for username profiles" autocomplete="off"{userlist_required}><span class="help">The public service profile requires an absolute path so user creation and the service use the same file.</span></label>
-<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="absolute path recommended; empty = stdout / journald" autocomplete="off"><span class="help">The public service profile requires an absolute path when file logging is enabled.</span></label>
+<label>Log file (optional) <input name="logfile" value="{logfile}" placeholder="{logfile_placeholder}" autocomplete="off"><span class="help">{logfile_help}</span></label>
 </section>
 <section id="public-profile"{public_hidden}>
 <h2>Public TLS endpoint</h2>
@@ -2625,9 +2713,13 @@ fn render_import_banner(prefill: Option<&ImportPrefill>) -> String {
     banner
 }
 
-fn render_success(report: &WriteReport, form: &WizardForm) -> String {
+fn render_success(
+    report: &WriteReport,
+    form: &WizardForm,
+    completion: &CompletionContext,
+) -> String {
     if form.template == WizardTemplate::PublicTls {
-        return render_public_success(report, form);
+        return render_public_success(report, form, completion);
     }
     let output = html_escape(&report.output_path.display().to_string());
     let backup = report.backup_path.as_ref().map(|backup| {
@@ -2636,28 +2728,46 @@ fn render_success(report: &WriteReport, form: &WizardForm) -> String {
             html_escape(&backup.display().to_string())
         )
     });
-    let run = html_escape(&format!(
-        "alighieri --config {}",
-        shell_quote_path(&report.output_path)
-    ));
     let commands = if cfg!(windows) {
-        let install = html_escape(&format!(
-            "alighieri service install --config {}",
-            shell_quote_path(&report.output_path)
-        ));
-        format!("{run}\n{install}\nalighieri service start\nalighieri service reload")
+        let alighieri = completion.powershell_command();
+        let command_output_path =
+            std::path::absolute(&report.output_path).unwrap_or_else(|_| report.output_path.clone());
+        let output_arg = powershell_single_quoted(&command_output_path.display().to_string());
+        html_escape(&format!(
+            "{alighieri} --config {output_arg}\n{alighieri} service install --config {output_arg}\n{alighieri} service start\n{alighieri} service reload"
+        ))
     } else {
-        run
+        html_escape(&format!(
+            "alighieri --config {}",
+            shell_quote_path(&report.output_path)
+        ))
+    };
+    let service_executable_note = if cfg!(windows) {
+        format!(
+            "<p>The service install command records the exact executable at <code>{}</code>. If this is a temporary build path, copy Alighieri to a durable, administrator-controlled location and rerun the wizard from there before installing the service.</p>",
+            html_escape(&completion.executable)
+        )
+    } else {
+        String::new()
     };
     // The username/password template authenticates against a userlist, which
     // the wizard does not create — point the operator at the tooling.
     let userlist_section = match (form.template, &form.userlist_path) {
         (WizardTemplate::LanUsername, Some(path)) => {
             let userlist = html_escape(&path.display().to_string());
-            let add = html_escape(&format!(
-                "alighieri user add USERNAME --userlist {}",
-                shell_quote_path(path)
-            ));
+            let add = if cfg!(windows) {
+                html_escape(&format!(
+                    "{} user add {} --userlist {}",
+                    completion.powershell_command(),
+                    powershell_single_quoted("USERNAME"),
+                    powershell_single_quoted(&path.display().to_string())
+                ))
+            } else {
+                html_escape(&format!(
+                    "alighieri user add USERNAME --userlist {}",
+                    shell_quote_path(path)
+                ))
+            };
             format!(
                 "<h2>Create the userlist</h2><p>This config authenticates against \
                  <code>{userlist}</code>, which must contain at least one user before \
@@ -2670,22 +2780,28 @@ fn render_success(report: &WriteReport, form: &WizardForm) -> String {
     html_page(
         "Configuration Saved",
         &format!(
-            "<main><h1>Configuration Saved</h1><p>Wrote <code>{output}</code>.</p>{}<h2>Commands</h2><pre>{commands}</pre>{userlist_section}</main>",
+            "<main><h1>Configuration Saved</h1><p>Wrote <code>{output}</code>.</p>{}<h2>Commands</h2>{service_executable_note}<pre>{commands}</pre>{userlist_section}</main>",
             backup.unwrap_or_default()
         ),
     )
 }
 
-fn windows_atomic_config_install(source_arg: &str, destination_arg: &str) -> String {
-    let mut command = format!("$source = {source_arg}\n$destination = {destination_arg}");
+fn windows_atomic_config_install(
+    source_arg: &str,
+    destination_arg: &str,
+    completion: &CompletionContext,
+) -> String {
+    let executable_arg = powershell_single_quoted(&completion.executable);
+    let mut command = format!(
+        "$alighieri = {executable_arg}\n$source = {source_arg}\n$destination = {destination_arg}"
+    );
     command.push_str(
         r#"
 $backup = "$destination.bak"
 $staged = Join-Path (Split-Path -Parent $destination) ([IO.Path]::GetRandomFileName())
 try {
     Copy-Item -LiteralPath $source -Destination $staged -ErrorAction Stop
-    $checker = (Get-Command alighieri -CommandType Application -ErrorAction Stop).Source
-    & $checker --check --config $staged
+    & $alighieri --check --config $staged
     if (-not $? -or $LASTEXITCODE -ne 0) {
         throw "staged service configuration failed validation"
     }
@@ -2739,7 +2855,11 @@ staged=
     format!("{script} {source_arg} {destination_arg}")
 }
 
-fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
+fn render_public_success(
+    report: &WriteReport,
+    form: &WizardForm,
+    completion: &CompletionContext,
+) -> String {
     let output_text = report.output_path.display().to_string();
     let output = html_escape(&output_text);
     // Completion commands may be pasted into a newly elevated shell whose
@@ -2800,12 +2920,20 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
         }
     );
     let proxifyre_config = html_escape(&proxifyre_config);
-    let add_command = format!(
-        "{}alighieri user add {} --userlist {}",
-        if cfg!(windows) { "" } else { "sudo " },
-        shell_quote_command_argument(username_text),
-        shell_quote_command_argument(&userlist_text)
-    );
+    let add_command = if cfg!(windows) {
+        format!(
+            "{} user add {} --userlist {}",
+            completion.powershell_command(),
+            powershell_single_quoted(username_text),
+            powershell_single_quoted(&userlist_text)
+        )
+    } else {
+        format!(
+            "sudo alighieri user add {} --userlist {}",
+            shell_quote_command_argument(username_text),
+            shell_quote_command_argument(&userlist_text)
+        )
+    };
     let add_command = html_escape(&add_command);
 
     let ownership_commands = if cfg!(windows) {
@@ -2824,11 +2952,20 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
         )
     };
 
-    let output_arg = shell_quote_command_argument(&command_output_text);
+    let output_arg = if cfg!(windows) {
+        powershell_single_quoted(&command_output_text)
+    } else {
+        shell_quote_command_argument(&command_output_text)
+    };
     let service_config_text = default_public_service_config_path().display().to_string();
-    let service_config_arg = shell_quote_command_argument(&service_config_text);
+    let service_config_arg = if cfg!(windows) {
+        powershell_single_quoted(&service_config_text)
+    } else {
+        shell_quote_command_argument(&service_config_text)
+    };
     let service_preparation = if cfg!(windows) {
-        let copy_config = if paths_refer_to_same_file(
+        let alighieri = completion.powershell_command();
+        let copy_config = if paths_are_same_install_target(
             &report.output_path,
             Path::new(&service_config_text),
         ) {
@@ -2840,6 +2977,7 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
             let copy_command = html_escape(&windows_atomic_config_install(
                 &output_arg,
                 &service_config_arg,
+                completion,
             ));
             format!(
                 "<p>After either preparation branch, atomically install the generated file into the hardened service-data directory. If a service configuration already exists, PowerShell preserves it as <code>{}.bak</code>:</p><pre>{copy_command}</pre>",
@@ -2847,25 +2985,27 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
             )
         };
         let fresh_commands = html_escape(&format!(
-            "alighieri --check --config {output_arg}\nalighieri service install --config {output_arg}\nalighieri service uninstall"
+            "{alighieri} --check --config {output_arg}\n{alighieri} service install --config {output_arg}\n{alighieri} service uninstall"
         ));
+        let uninstall_command = html_escape(&format!("{alighieri} service uninstall"));
         format!(
             "<section class=\"notice\"><h2>Prepare the Windows service data directory</h2>\
              <p>Run these commands in an elevated PowerShell. On a fresh installation, the temporary install below atomically creates and hardens the ProgramData directory; it does not start the service:</p>\
              <pre>{fresh_commands}</pre>\
              <p>If Alighieri is already installed, its data directory is already hardened. Unregister that service instead (the command stops it when needed):</p>\
-             <pre>alighieri service uninstall</pre>\
+             <pre>{uninstall_command}</pre>\
              {copy_config}</section>"
         )
     } else {
         "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run <code>sudo ./scripts/alighieri.sh install --no-start</code> before the steps below. It creates the <code>alighieri</code> account, service directories, binary, and unit without enabling or starting the service. This is safe even when the wizard wrote directly to <code>/etc/alighieri/alighieri.conf</code>. Create the userlist next, then run the normal installer command shown below to enable and start Alighieri.<p>Release archives do not bundle the lifecycle script. Outside a source checkout, download the standalone helper below, use <code>./alighieri.sh</code> wherever the commands show <code>./scripts/alighieri.sh</code>, and pass <code>--binary /path/to/extracted/alighieri</code> when installing a prebuilt binary.</p><pre>curl -fsSLo alighieri.sh https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh\nchmod +x alighieri.sh</pre></section>".to_string()
     };
     let service_commands = if cfg!(windows) {
+        let alighieri = completion.powershell_command();
         html_escape(&format!(
-            "alighieri --check --config {service_config_arg}\nalighieri service install --config {service_config_arg}\nalighieri service start\nalighieri service status\nwevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
+            "{alighieri} --check --config {service_config_arg}\n{alighieri} service install --config {service_config_arg}\n{alighieri} service start\n{alighieri} service status\nwevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
         ))
     } else {
-        let install_config = if paths_refer_to_same_file(
+        let install_config = if paths_are_same_install_target(
             &report.output_path,
             Path::new("/etc/alighieri/alighieri.conf"),
         ) {
@@ -2881,9 +3021,13 @@ fn render_public_success(report: &WriteReport, form: &WizardForm) -> String {
         ))
     };
     let service_note = if cfg!(windows) {
-        "The final install records the canonical ProgramData configuration path and recursively hardens files under the Alighieri service-data directory before the service can start. If you selected a userlist, ACME cache, or logfile outside that directory, explicitly grant LocalService the required access and protect the files from untrusted local users."
+        format!(
+            "The final install records the exact executable shown above and the canonical ProgramData configuration path. Keep that executable at a durable, administrator-controlled path; if it moves, reinstall the service. Installation recursively hardens files under the Alighieri service-data directory before the service can start. The Windows Service defaults to <code>{}</code> and honors a configured logfile. If you selected a userlist, ACME cache, or logfile outside the service-data directory, explicitly grant LocalService the required access and protect the files from untrusted local users.",
+            html_escape(&default_public_service_log_path().display().to_string())
+        )
     } else {
         "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the command above installs that exact generated file there. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom paths outside them require a corresponding unit permission change."
+            .to_string()
     };
 
     let udp_firewall = if form.udp_enabled {
@@ -3598,6 +3742,7 @@ mod tests {
         let logfile = dir.path().join("alighieri.log");
         std::fs::write(&userlist, b"alice:password\n").unwrap();
         std::fs::hard_link(&userlist, &logfile).unwrap();
+        assert!(paths_are_same_install_target(&userlist, &logfile));
         let mut fields = public_tls_fields();
         fields.insert("userlist".into(), userlist.display().to_string());
         fields.insert("logfile".into(), logfile.display().to_string());
@@ -3655,6 +3800,7 @@ mod tests {
         let lexical_target = dir.path().join("state");
 
         assert!(paths_refer_to_same_file(&through_link, &actual_target));
+        assert!(paths_are_same_install_target(&through_link, &actual_target));
         assert!(!paths_refer_to_same_file(&through_link, &lexical_target));
 
         let after_missing = dir
@@ -3665,6 +3811,10 @@ mod tests {
             .join("..")
             .join("state");
         assert!(paths_refer_to_same_file(&after_missing, &actual_target));
+        assert!(paths_are_same_install_target(
+            &after_missing,
+            &actual_target
+        ));
         assert!(!paths_refer_to_same_file(&after_missing, &lexical_target));
     }
 
@@ -3676,6 +3826,8 @@ mod tests {
         let lower = dir.path().join("ä-state");
 
         assert!(paths_refer_to_same_file(&upper, &lower));
+        assert!(!paths_are_same_install_target(&upper, &lower));
+        assert!(paths_are_same_install_target(&upper, &upper));
         assert!(path_is_same_or_descendant(&upper.join("child"), &lower));
         assert!(!path_is_same_or_descendant(&upper, &lower.join("child")));
     }
@@ -3766,6 +3918,7 @@ mod tests {
 
         assert!(!ordinary.exists());
         assert!(paths_refer_to_same_file(&ordinary, &verbatim));
+        assert!(paths_are_same_install_target(&ordinary, &verbatim));
         assert!(path_is_same_or_descendant(
             &ordinary.join("child"),
             &verbatim
@@ -4807,6 +4960,16 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         }
     }
 
+    fn completion_context() -> CompletionContext {
+        CompletionContext {
+            executable: if cfg!(windows) {
+                r"C:\Program Files\Alighieri\alighieri.exe".to_string()
+            } else {
+                "alighieri".to_string()
+            },
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn success_page_includes_service_commands_on_windows() {
@@ -4815,11 +4978,22 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             backup_path: None,
         };
 
-        let html = render_success(&report, &sample_form(WizardTemplate::LocalNoAuth, None));
+        let completion = completion_context();
+        let html = render_success(
+            &report,
+            &sample_form(WizardTemplate::LocalNoAuth, None),
+            &completion,
+        );
 
-        assert!(html.contains("alighieri service install"));
-        assert!(html.contains("alighieri service start"));
-        assert!(html.contains("alighieri service reload"));
+        let command = completion.powershell_command();
+        let absolute_output = std::path::absolute(&report.output_path).unwrap();
+        assert!(html.contains(&html_escape(&format!("{command} service install"))));
+        assert!(html.contains(&html_escape(&format!("{command} service start"))));
+        assert!(html.contains(&html_escape(&format!("{command} service reload"))));
+        assert!(html.contains(&html_escape(&powershell_single_quoted(
+            &absolute_output.display().to_string()
+        ))));
+        assert!(!html.contains("--config &#39;alighieri.conf&#39;"));
     }
 
     #[cfg(not(windows))]
@@ -4830,7 +5004,11 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             backup_path: None,
         };
 
-        let html = render_success(&report, &sample_form(WizardTemplate::LocalNoAuth, None));
+        let html = render_success(
+            &report,
+            &sample_form(WizardTemplate::LocalNoAuth, None),
+            &completion_context(),
+        );
 
         assert!(html.contains("alighieri --config"));
         assert!(!html.contains("alighieri service"));
@@ -4845,10 +5023,14 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let userlist = PathBuf::from("/etc/alighieri/users");
         let form = sample_form(WizardTemplate::LanUsername, Some(userlist.clone()));
 
-        let html = render_success(&report, &form);
+        let html = render_success(&report, &form, &completion_context());
 
         assert!(html.contains("Create the userlist"));
-        assert!(html.contains("alighieri user add USERNAME"));
+        if cfg!(windows) {
+            assert!(html.contains("user add &#39;USERNAME&#39; --userlist"));
+        } else {
+            assert!(html.contains("alighieri user add USERNAME"));
+        }
         // Derive the expected string from the same display() the page uses, so
         // the assertion holds on any platform's path rendering.
         assert!(html.contains(&userlist.display().to_string()));
@@ -4861,7 +5043,11 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             backup_path: None,
         };
 
-        let html = render_success(&report, &sample_form(WizardTemplate::LocalNoAuth, None));
+        let html = render_success(
+            &report,
+            &sample_form(WizardTemplate::LocalNoAuth, None),
+            &completion_context(),
+        );
 
         assert!(!html.contains("Create the userlist"));
     }
@@ -4871,10 +5057,14 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let mut form = public_tls_form();
         form.initial_username = Some("proxyuser".into());
         assert!(!render_config(&form).contains("proxyuser"));
-        let html = render_success(&write_report(), &form);
+        let html = render_success(&write_report(), &form, &completion_context());
 
         assert!(html.contains("passed the real Alighieri configuration parser"));
-        assert!(html.contains("alighieri user add proxyuser --userlist"));
+        if cfg!(windows) {
+            assert!(html.contains("user add &#39;proxyuser&#39; --userlist"));
+        } else {
+            assert!(html.contains("alighieri user add proxyuser --userlist"));
+        }
         assert!(html.contains("prompts for the password securely"));
         assert!(html.contains("Inbound TCP 443"));
         assert!(html.contains("Outbound TCP 443"));
@@ -4910,7 +5100,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
                 .find("Prepare the Windows service data directory")
                 .unwrap();
             let user = html.find("Create the authenticated user").unwrap();
-            let start = html.find("alighieri service start").unwrap();
+            let start = html.find("service start").unwrap();
             assert!(bootstrap < user && user < start);
             assert!(html.contains("Copy-Item -LiteralPath"));
             assert!(html.contains("Alighieri\\alighieri.conf"));
@@ -4924,7 +5114,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         form.udp_port_range = None;
         form.udp_advertise = None;
         form.acme_staging = true;
-        let html = render_success(&write_report(), &form);
+        let html = render_success(&write_report(), &form, &completion_context());
 
         assert!(html.contains("ACME staging is enabled"));
         assert!(html.contains("will not be trusted by normal clients"));
@@ -4951,19 +5141,28 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         };
         fields.insert("userlist".into(), injected_userlist.into());
         let form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
-        let html = render_success(&write_report(), &form);
+        let html = render_success(&write_report(), &form, &completion_context());
 
-        let expected = html_escape(&format!(
-            "alighieri user add {} --userlist {}",
-            shell_quote_command_argument("proxyuser;echo-owned"),
-            shell_quote_command_argument(injected_userlist)
-        ));
+        let expected = if cfg!(windows) {
+            html_escape(&format!(
+                "{} user add {} --userlist {}",
+                completion_context().powershell_command(),
+                powershell_single_quoted("proxyuser;echo-owned"),
+                powershell_single_quoted(injected_userlist)
+            ))
+        } else {
+            html_escape(&format!(
+                "sudo alighieri user add {} --userlist {}",
+                shell_quote_command_argument("proxyuser;echo-owned"),
+                shell_quote_command_argument(injected_userlist)
+            ))
+        };
         assert!(html.contains(&expected));
         assert!(!html.contains("user add proxyuser;echo-owned"));
 
         let mut markup = form;
         markup.initial_username = Some("<img src=x onerror=alert(1)>".into());
-        let markup_html = render_success(&write_report(), &markup);
+        let markup_html = render_success(&write_report(), &markup, &completion_context());
         assert!(!markup_html.contains("<img src=x"));
         assert!(markup_html.contains("&lt;img src=x onerror=alert(1)&gt;"));
     }
@@ -4977,7 +5176,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             backup_path: None,
         };
 
-        let html = render_success(&report, &form);
+        let html = render_success(&report, &form, &completion_context());
         let absolute_output = std::path::absolute(&report.output_path).unwrap();
 
         assert!(html.contains("alighieri --check --config"));
@@ -4996,14 +5195,20 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             output_path: PathBuf::from("generated-public.conf"),
             backup_path: None,
         };
-        let html = render_success(&report, &public_tls_form());
+        let html = render_success(&report, &public_tls_form(), &completion_context());
 
         #[cfg(windows)]
         {
+            let completion = completion_context();
             assert!(html.contains("--check --config $staged"));
             assert!(html.contains("[IO.File]::Replace"));
             assert!(html.contains("[IO.File]::Move"));
-            assert!(html.contains("Get-Command alighieri -CommandType Application"));
+            assert!(html.contains(&html_escape(&format!(
+                "$alighieri = {}",
+                powershell_single_quoted(&completion.executable)
+            ))));
+            assert!(html.contains("&amp; $alighieri --check --config $staged"));
+            assert!(!html.contains("Get-Command alighieri"));
             assert!(html.contains("-not $?"));
             assert!(!html.contains("[IO.File]::Delete"));
             assert!(html.contains("$destination.bak"));
@@ -5026,6 +5231,55 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
     fn powershell_splat_and_array_arguments_are_quoted() {
         assert_eq!(shell_quote_command_argument("@proxyuser"), "'@proxyuser'");
         assert_eq!(shell_quote_command_argument("one,two"), "'one,two'");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_completion_uses_and_escapes_the_running_executable_everywhere() {
+        let completion = CompletionContext {
+            executable: r"C:\Program Files\O'Brien\alighieri.exe".to_string(),
+        };
+        assert_eq!(
+            completion.powershell_command(),
+            r"& 'C:\Program Files\O''Brien\alighieri.exe'"
+        );
+
+        let public_html = render_success(&write_report(), &public_tls_form(), &completion);
+        let command = completion.powershell_command();
+        for (suffix, expected_count) in [
+            (" --check --config", 2),
+            (" service install --config", 2),
+            (" service uninstall", 2),
+            (" user add", 1),
+            (" service start", 1),
+            (" service status", 1),
+        ] {
+            let expected = html_escape(&format!("{command}{suffix}"));
+            assert_eq!(
+                public_html.matches(&expected).count(),
+                expected_count,
+                "missing exact executable for {suffix}"
+            );
+        }
+        assert!(public_html.contains(&html_escape(&format!(
+            "$alighieri = {}",
+            powershell_single_quoted(&completion.executable)
+        ))));
+        assert!(!public_html.contains("Get-Command alighieri"));
+
+        let ordinary_html = render_success(
+            &write_report(),
+            &sample_form(WizardTemplate::LocalNoAuth, None),
+            &completion,
+        );
+        for suffix in [
+            " --config",
+            " service install --config",
+            " service start",
+            " service reload",
+        ] {
+            assert!(ordinary_html.contains(&html_escape(&format!("{command}{suffix}"))));
+        }
     }
 
     #[test]
@@ -5170,6 +5424,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let state = WizardState {
             token: "token".into(),
             default_output_path: PathBuf::from("alighieri.conf"),
+            completion: completion_context(),
             prefill: None,
         };
 
@@ -5200,6 +5455,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let state = WizardState {
             token: "token".into(),
             default_output_path: PathBuf::from("alighieri.conf"),
+            completion: completion_context(),
             prefill: None,
         };
 
@@ -5228,6 +5484,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let state = WizardState {
             token: "token".into(),
             default_output_path: PathBuf::from("alighieri.conf"),
+            completion: completion_context(),
             prefill: None,
         };
 
@@ -5262,6 +5519,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let state = WizardState {
             token: "token".into(),
             default_output_path: PathBuf::from("alighieri.conf"),
+            completion: completion_context(),
             prefill: None,
         };
 

@@ -278,8 +278,13 @@ pub fn init_file_logging(log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn init_service_logging(config: &Config, log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
-    std::fs::create_dir_all(log_dir)?;
-    let log_path = log_dir.join("alighieri.log");
+    let log_path = windows_service_log_path(config, log_dir);
+    if let Some(parent) = log_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let writer = LogWriters::file(
         log_path.clone(),
         config.log_rotate_size,
@@ -290,6 +295,18 @@ pub fn init_service_logging(config: &Config, log_dir: &Path) -> io::Result<(Path
     let guard = init_logging(filter, writer, config.log_format, true)?;
 
     Ok((log_path, guard))
+}
+
+#[cfg(windows)]
+fn windows_service_log_path(config: &Config, default_log_dir: &Path) -> PathBuf {
+    if config.uses_file_logging() {
+        config
+            .log_file
+            .clone()
+            .unwrap_or_else(|| default_log_dir.join("alighieri.log"))
+    } else {
+        default_log_dir.join("alighieri.log")
+    }
 }
 
 /// Queue depth for the background log writer. Records beyond this are
@@ -804,6 +821,23 @@ pub async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_honors_configured_logfile_and_keeps_a_safe_default() {
+        let default_dir = PathBuf::from(r"C:\ProgramData\Alighieri\logs");
+        let custom_log = PathBuf::from(r"D:\Alighieri Data\proxy.log");
+        let mut config = Config::parse("internal: 127.0.0.1:1080").unwrap();
+
+        assert_eq!(
+            windows_service_log_path(&config, &default_dir),
+            default_dir.join("alighieri.log")
+        );
+
+        config.log_outputs = vec![LogOutput::File];
+        config.log_file = Some(custom_log.clone());
+        assert_eq!(windows_service_log_path(&config, &default_dir), custom_log);
+    }
 
     #[tokio::test]
     async fn run_server_exits_when_shutdown_future_resolves() {
