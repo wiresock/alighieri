@@ -894,7 +894,8 @@ run_selftest() {
         }
 
         _check_rejected_effective_payload() { # description effective-payload
-            local desc="$1" out
+            local desc="$1" out activation_succeeded=0 \
+                  saved_start="$START_ON_INSTALL"
             mock_effective_payload="$2"
             if ! effective_exec_start_overrides_base; then
                 printf 'FAIL systemd drop-in override was not detected (%s)\n' "$desc"
@@ -903,18 +904,25 @@ run_selftest() {
                 "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf"; then
                 printf 'FAIL systemd drop-in incorrectly matched the rewritten base unit (%s)\n' "$desc"
                 failures=$((failures + 1))
-            elif out="$(
-                START_ON_INSTALL=1
-                activate_installed_service \
-                    "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
-            )"; then
-                printf 'FAIL install activation accepted an overriding ExecStart drop-in (%s)\n' "$desc"
-                failures=$((failures + 1))
-            elif [[ "$out" == *"overriding drop-in"* && "$out" != *"CALL restart"* && "$out" != *"CALL enable"* ]]; then
-                printf 'ok   install activation refuses %s before start\n' "$desc"
             else
-                printf 'FAIL install activation drop-in guard %s output: [%s]\n' "$desc" "$out"
-                failures=$((failures + 1))
+                START_ON_INSTALL=1
+                if out="$(
+                    activate_installed_service \
+                        "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                )"; then
+                    activation_succeeded=1
+                fi
+                START_ON_INSTALL="$saved_start"
+
+                if [ "$activation_succeeded" -eq 1 ]; then
+                    printf 'FAIL install activation accepted an overriding ExecStart drop-in (%s)\n' "$desc"
+                    failures=$((failures + 1))
+                elif [[ "$out" == *"overriding drop-in"* && "$out" != *"CALL restart"* && "$out" != *"CALL enable"* ]]; then
+                    printf 'ok   install activation refuses %s before start\n' "$desc"
+                else
+                    printf 'FAIL install activation drop-in guard %s output: [%s]\n' "$desc" "$out"
+                    failures=$((failures + 1))
+                fi
             fi
         }
 
@@ -959,15 +967,21 @@ run_selftest() {
 
     _check_followup_install() { # description sudo-user bin-exp binary cfg-exp config script expected
         local desc="$1" sudo_user="$2" binary_explicit="$3" binary="$4" \
-              config_explicit="$5" config="$6" script="$7" expected="$8" got
-        got="$(
-            SUDO_USER="$sudo_user"
-            BINARY_EXPLICIT="$binary_explicit"
-            BINARY="$binary"
-            CONFIG_EXPLICIT="$config_explicit"
-            INSTALL_CONFIG="$config"
-            followup_install_command "$script"
-        )"
+              config_explicit="$5" config="$6" script="$7" expected="$8" got \
+              saved_sudo_user="${SUDO_USER:-}" \
+              saved_binary_explicit="$BINARY_EXPLICIT" saved_binary="$BINARY" \
+              saved_config_explicit="$CONFIG_EXPLICIT" saved_config="$INSTALL_CONFIG"
+        SUDO_USER="$sudo_user"
+        BINARY_EXPLICIT="$binary_explicit"
+        BINARY="$binary"
+        CONFIG_EXPLICIT="$config_explicit"
+        INSTALL_CONFIG="$config"
+        got="$(followup_install_command "$script")"
+        SUDO_USER="$saved_sudo_user"
+        BINARY_EXPLICIT="$saved_binary_explicit"
+        BINARY="$saved_binary"
+        CONFIG_EXPLICIT="$saved_config_explicit"
+        INSTALL_CONFIG="$saved_config"
         if [ "$got" = "$expected" ]; then
             printf 'ok   follow-up install command %s\n' "$desc"
         else
@@ -1016,7 +1030,7 @@ run_selftest() {
         install --config "/etc/alighieri/%n.conf"
     _check_cli_rejected "systemd variable in --config path" \
         "--config must not contain systemd ExecStart metacharacters" \
-        install --config '/etc/alighieri/$CONFIG.conf'
+        install --config "/etc/alighieri/\$CONFIG.conf"
     _check_cli_rejected "systemd quoting in --config path" \
         "--config must not contain systemd ExecStart metacharacters" \
         install --config '/etc/alighieri/"quoted".conf'

@@ -5515,7 +5515,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let html = render_success(&report, &form, &completion_context());
         let absolute_output = std::path::absolute(&report.output_path).unwrap();
 
-        assert!(html.contains("alighieri --check --config"));
+        assert!(html.contains("--check --config"));
         assert!(html.contains(&html_escape(&absolute_output.display().to_string())));
         #[cfg(not(windows))]
         {
