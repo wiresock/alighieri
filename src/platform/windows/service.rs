@@ -94,7 +94,7 @@ fn run_service() -> windows_service::Result<()> {
     };
 
     // Held for the life of the service; dropping it flushes queued records.
-    let _log_guard = match init_service_logging(&config, &default_log_dir()) {
+    let _log_guard = match init_service_logging(&config, &config_path, &default_log_dir()) {
         Ok((_, guard)) => guard,
         Err(e) => {
             eprintln!("failed to initialise service file logging: {e}");

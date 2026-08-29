@@ -277,8 +277,12 @@ pub fn init_file_logging(log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn init_service_logging(config: &Config, log_dir: &Path) -> io::Result<(PathBuf, LogGuard)> {
-    let log_path = windows_service_log_path(config, log_dir);
+pub fn init_service_logging(
+    config: &Config,
+    config_path: &Path,
+    default_log_dir: &Path,
+) -> io::Result<(PathBuf, LogGuard)> {
+    let log_path = windows_service_log_path(config, config_path, default_log_dir)?;
     if let Some(parent) = log_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -298,15 +302,43 @@ pub fn init_service_logging(config: &Config, log_dir: &Path) -> io::Result<(Path
 }
 
 #[cfg(windows)]
-fn windows_service_log_path(config: &Config, default_log_dir: &Path) -> PathBuf {
-    if config.uses_file_logging() {
-        config
-            .log_file
-            .clone()
-            .unwrap_or_else(|| default_log_dir.join("alighieri.log"))
-    } else {
-        default_log_dir.join("alighieri.log")
+fn windows_service_log_path(
+    config: &Config,
+    config_path: &Path,
+    default_log_dir: &Path,
+) -> io::Result<PathBuf> {
+    let default_log_path = || default_log_dir.join("alighieri.log");
+
+    if !config.uses_file_logging() {
+        return Ok(default_log_path());
     }
+
+    let Some(configured_path) = config.log_file.as_deref() else {
+        return Ok(default_log_path());
+    };
+    if configured_path.is_absolute() {
+        return Ok(configured_path.to_path_buf());
+    }
+    let has_prefix = configured_path
+        .components()
+        .next()
+        .is_some_and(|component| matches!(component, std::path::Component::Prefix(_)));
+    if configured_path.has_root() || has_prefix {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "service logfile path '{}' is anchored but not fully absolute; use a fully absolute path or an ordinary relative path (resolved against the configuration file directory)",
+                configured_path.display()
+            ),
+        ));
+    }
+
+    // Services do not have a stable working directory (SCM normally starts
+    // them in System32), so resolve explicit relative paths beside the config.
+    Ok(config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(configured_path))
 }
 
 /// Queue depth for the background log writer. Records beyond this are
@@ -824,19 +856,47 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_service_honors_configured_logfile_and_keeps_a_safe_default() {
+    fn windows_service_resolves_configured_logfiles_from_a_stable_base() {
         let default_dir = PathBuf::from(r"C:\ProgramData\Alighieri\logs");
+        let config_path = PathBuf::from(r"C:\ProgramData\Alighieri\alighieri.conf");
         let custom_log = PathBuf::from(r"D:\Alighieri Data\proxy.log");
         let mut config = Config::parse("internal: 127.0.0.1:1080").unwrap();
+        let default_log = default_dir.join("alighieri.log");
 
         assert_eq!(
-            windows_service_log_path(&config, &default_dir),
-            default_dir.join("alighieri.log")
+            windows_service_log_path(&config, &config_path, &default_dir).unwrap(),
+            default_log
         );
 
         config.log_outputs = vec![LogOutput::File];
         config.log_file = Some(custom_log.clone());
-        assert_eq!(windows_service_log_path(&config, &default_dir), custom_log);
+        assert_eq!(
+            windows_service_log_path(&config, &config_path, &default_dir).unwrap(),
+            custom_log
+        );
+
+        config.log_file = Some(PathBuf::from(r"logs\custom.log"));
+        assert_eq!(
+            windows_service_log_path(&config, &config_path, &default_dir).unwrap(),
+            PathBuf::from(r"C:\ProgramData\Alighieri\logs\custom.log")
+        );
+
+        config.log_file = Some(PathBuf::from(r"..\shared-logs\custom.log"));
+        assert_eq!(
+            windows_service_log_path(&config, &config_path, &default_dir).unwrap(),
+            PathBuf::from(r"C:\ProgramData\Alighieri\..\shared-logs\custom.log")
+        );
+
+        for ambiguous_path in [r"D:logs\custom.log", r"\logs\custom.log"] {
+            config.log_file = Some(PathBuf::from(ambiguous_path));
+            let error = windows_service_log_path(&config, &config_path, &default_dir).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error
+                .to_string()
+                .contains("anchored but not fully absolute"));
+            assert!(error.to_string().contains("ordinary relative path"));
+            assert!(error.to_string().contains("configuration file directory"));
+        }
     }
 
     #[tokio::test]

@@ -61,8 +61,9 @@ Service mode writes logs to the configured `logfile`, or to this default when
 C:\ProgramData\Alighieri\logs\alighieri.log
 ```
 
-Custom log directories must be writable by `LocalService` and protected from
-untrusted local users.
+Ordinary relative configured `logfile` paths resolve against the active
+configuration file's directory. Custom log directories must be writable by
+`LocalService` and protected from untrusted local users.
 
 Service install registers the `Alighieri` Event Log source. Service mode writes
 startup, stop, reload-request, and startup/runtime failure events to the Windows

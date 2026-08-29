@@ -90,6 +90,90 @@ validate_exec_start_path() {
     esac
 }
 
+# Lexically normalise a path — collapse `.`, `..`, and redundant `/` — using only
+# shell parameter expansion, with no external command. Symlinks are deliberately
+# NOT resolved: callers compare declared paths and need identical behaviour on
+# GNU and BusyBox systems (which may lack `realpath -m`). A leading `/` is
+# preserved; the result has no trailing slash except for the root itself.
+normalize_path() {
+    local path="$1" abs='' out='' rest comp
+    case "$path" in
+        /*) abs=1 ;;
+    esac
+    rest="$path"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            /*) rest="${rest#/}"; continue ;; # collapse leading / and // runs
+        esac
+        comp="${rest%%/*}"                     # next component, up to the slash
+        case "$rest" in
+            */*) rest="${rest#*/}" ;;
+            *) rest='' ;;
+        esac
+        case "$comp" in
+            '' | '.') ;;                       # drop empty and `.` segments
+            '..')
+                case "$out" in
+                    '') [ -n "$abs" ] || out='..' ;; # absolute: `..` at root is a no-op
+                    '..' | *'/..') out="$out/.." ;;  # relative escape: cannot pop a `..`
+                    */*) out="${out%/*}" ;;          # pop the last segment
+                    *) out='' ;;                     # pop the only segment
+                esac
+                ;;
+            *) if [ -z "$out" ]; then out="$comp"; else out="$out/$comp"; fi ;;
+        esac
+    done
+    if [ -n "$abs" ]; then
+        printf '%s\n' "/$out"
+    elif [ -n "$out" ]; then
+        printf '%s\n' "$out"
+    else
+        printf '%s\n' "."
+    fi
+}
+
+install_bin_dir_for_prefix() {
+    local prefix="$1"
+    [ "$(normalize_path "$prefix")" = "$prefix" ] || return 1
+    join_path_child "$prefix" bin
+}
+
+join_path_child() {
+    local directory="$1" child="$2"
+    # `${directory%/}` is empty only for `/`, yielding `/child` instead of
+    # `//child`. Every other accepted managed directory is already canonical.
+    printf '%s/%s' "${directory%/}" "$child"
+}
+
+validate_existing_install_directory() {
+    local directory="$1"
+    case "$directory" in
+        /*) ;;
+        *) die "the existing unit's install directory is not absolute ($directory); fix ExecStart or pass --prefix with an absolute path" ;;
+    esac
+    case "$directory" in
+        *[[:space:]]*)
+            die "the existing unit's install directory contains whitespace ($directory); pass --prefix with a whitespace-free path" ;;
+    esac
+    validate_exec_start_path "the existing unit's install directory" "$directory"
+    [ "$(normalize_path "$directory")" = "$directory" ] ||
+        die "the existing unit's install directory is not canonical ($directory); fix ExecStart or pass --prefix with a canonical path"
+}
+
+existing_install_directory_for_binary() {
+    local binary="$1" directory
+    case "$binary" in
+        /*) ;;
+        *) die "the existing unit's executable path is not absolute ($binary); fix ExecStart or pass --prefix with an absolute path" ;;
+    esac
+    [ "$(normalize_path "$binary")" = "$binary" ] ||
+        die "the existing unit's executable path is not canonical ($binary); fix ExecStart or pass --prefix with a canonical path"
+    directory="$(dirname -- "$binary")" ||
+        die "could not derive the existing unit's install directory from $binary"
+    validate_existing_install_directory "$directory"
+    printf '%s' "$directory"
+}
+
 usage() {
     cat <<EOF
 alighieri.sh — install, upgrade, and uninstall Alighieri as a systemd service.
@@ -172,6 +256,11 @@ case "$PREFIX" in
     *[[:space:]]*) die "--prefix must not contain whitespace: $PREFIX" ;;
 esac
 validate_exec_start_path "--prefix" "$PREFIX"
+# Do not silently normalize: `/opt/link/..` is not necessarily `/opt` when
+# `link` is a symlink. Requiring the canonical lexical spelling keeps both the
+# kernel target and systemd's loaded path/argv comparison unambiguous.
+[ "$(normalize_path "$PREFIX")" = "$PREFIX" ] ||
+    die "--prefix must use a canonical path without trailing/repeated slashes, . or .. components: $PREFIX"
 if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
     [ "$ACTION" = "install" ] || die "--config is valid only with the install command"
     case "$INSTALL_CONFIG" in
@@ -184,7 +273,8 @@ if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
     validate_exec_start_path "--config" "$INSTALL_CONFIG"
 fi
 
-BIN_DIR="${PREFIX}/bin"
+BIN_DIR="$(install_bin_dir_for_prefix "$PREFIX")" ||
+    die "could not derive an install directory from --prefix: $PREFIX"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 require_root() {
@@ -399,7 +489,7 @@ installed_binary_path() {
             fi
             ;;
     esac
-    printf '%s' "${BIN_DIR}/${SERVICE_NAME}"
+    join_path_child "$BIN_DIR" "$SERVICE_NAME"
 }
 
 # Resolve the config path the installed unit actually launches with. An explicit
@@ -564,6 +654,198 @@ select_install_config_path() {
     fi
 }
 
+# BusyBox applet builds do not consistently implement GNU's destination-as-file
+# option. Keep the same exact-path semantics with explicit pre/postcondition
+# checks: candidates may be regular files only, an absent staging/backup path may
+# not be repurposed as a directory, and a replacement must consume its source and
+# leave a regular non-symlink at the requested destination. Binary parent
+# directories are verified as root-controlled before staging, so the checks and
+# following operation cannot be raced by the unprivileged service account.
+install_file_command() { command install "$@"; }
+copy_file_command() { command cp "$@"; }
+move_file_command() { command mv "$@"; }
+
+stage_executable_copy() {
+    local source="$1" destination="$2"
+    [ -f "$source" ] || return 1
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+    install_file_command -m 755 -- "$source" "$destination" || return 1
+    [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+}
+
+copy_regular_file_to_absent_path() {
+    local source="$1" destination="$2"
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+    copy_file_command -p -- "$source" "$destination" || return 1
+    [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+}
+
+binary_directory_metadata_is_safe() {
+    local owner="$1" mode="$2"
+    [ "$owner" = 0 ] || return 1
+    case "$mode" in
+        '' | *[!0-7]*) return 1 ;;
+    esac
+    # Special bits are harmless here; only group/other write permission lets an
+    # unprivileged process replace the staged/final child between our checks.
+    [ $((8#$mode & 8#22)) -eq 0 ]
+}
+
+binary_directory_path_metadata() {
+    command stat -L -c '%u %a' -- "$1"
+}
+
+physical_directory_path() {
+    CDPATH='' cd -- "$1" 2>/dev/null && pwd -P
+}
+
+binary_directory_exists() {
+    [ -d "$1" ]
+}
+
+binary_path_is_symlink() {
+    [ -L "$1" ]
+}
+
+binary_path_symlink_target() {
+    readlink -- "$1"
+}
+
+binary_path_kind() {
+    if binary_path_is_symlink "$1"; then
+        if [ -d "$1" ]; then
+            printf '%s' directory-symlink
+        else
+            printf '%s' invalid-symlink
+        fi
+    elif [ -d "$1" ]; then
+        printf '%s' directory
+    elif [ -e "$1" ]; then
+        printf '%s' other
+    else
+        printf '%s' missing
+    fi
+}
+
+require_safe_binary_directory_chain() {
+    local path="$1" description="$2" current='/' rest component \
+          owner mode extra metadata symlink_target
+    case "$path" in
+        /) rest='' ;;
+        /*) rest="${path#/}" ;;
+        *) die "$description is not absolute: $path" ;;
+    esac
+
+    while :; do
+        if binary_path_is_symlink "$current"; then
+            symlink_target="$(binary_path_symlink_target "$current" 2>/dev/null)" ||
+                die "could not inspect $description symlink $current"
+            # Conservatively reject custom symlink ancestry: even when its final
+            # physical destination is safe, a nested target may pass through an
+            # attacker-writable hop that `pwd -P` no longer exposes. The standard
+            # merged-/usr root link is the sole narrow exception; `/` is already
+            # validated and its direct, canonical target is checked below too.
+            if [ "$current" != /bin ] ||
+                { [ "$symlink_target" != usr/bin ] &&
+                    [ "$symlink_target" != /usr/bin ]; }; then
+                die "$description contains symlink $current -> $symlink_target; use a physical root-controlled install path (only the standard /bin -> usr/bin merged-/usr link is accepted)"
+            fi
+        fi
+        metadata="$(binary_directory_path_metadata "$current" 2>/dev/null)" ||
+            die "could not inspect $description ancestor $current"
+        read -r owner mode extra <<<"$metadata"
+        if [ -n "${extra:-}" ] ||
+            ! binary_directory_metadata_is_safe "$owner" "$mode"; then
+            die "$description ancestor $current must resolve to a root-owned directory that is not group- or world-writable; fix its ownership/mode or choose a safe --prefix"
+        fi
+        [ -n "$rest" ] || break
+        component="${rest%%/*}"
+        case "$rest" in
+            */*) rest="${rest#*/}" ;;
+            *) rest='' ;;
+        esac
+        current="$(join_path_child "$current" "$component")"
+    done
+}
+
+require_safe_binary_directory() {
+    local directory="$1" physical
+    case "$directory" in
+        /*) ;;
+        *) die "binary install directory is not absolute: $directory" ;;
+    esac
+    [ "$(normalize_path "$directory")" = "$directory" ] ||
+        die "binary install directory is not canonical: $directory"
+    binary_directory_exists "$directory" ||
+        die "binary install directory $directory is missing or is not a directory"
+
+    # Validate both spellings. The lexical chain protects every pathname entry
+    # used during staging; the physical chain catches an intermediate symlink
+    # whose target lives below a user-controlled ancestor. `/bin` remains valid
+    # on merged-/usr systems when both `/bin` and `/usr/bin` chains are trusted.
+    physical="$(physical_directory_path "$directory")" ||
+        die "could not resolve binary install directory $directory"
+    require_safe_binary_directory_chain "$directory" "binary install path"
+    if [ "$physical" != "$directory" ]; then
+        require_safe_binary_directory_chain "$physical" \
+            "resolved binary install path for $directory"
+    fi
+}
+
+require_safe_binary_directory_parent_for_creation() {
+    local directory="$1" current kind parent
+    case "$directory" in
+        /*) ;;
+        *) die "binary install directory is not absolute: $directory" ;;
+    esac
+    [ "$(normalize_path "$directory")" = "$directory" ] ||
+        die "binary install directory is not canonical: $directory"
+    current="$directory"
+    while :; do
+        kind="$(binary_path_kind "$current")" ||
+            die "could not inspect prospective binary install path $current"
+        case "$kind" in
+            directory | directory-symlink) break ;;
+            missing)
+                parent="$(dirname -- "$current")" ||
+                    die "could not inspect prospective binary install path $current"
+                [ "$parent" != "$current" ] ||
+                    die "could not find an existing parent for binary install directory $directory"
+                current="$parent"
+                ;;
+            invalid-symlink)
+                die "prospective binary install path $current is a dangling or non-directory symlink; remove it or choose a safe --prefix"
+                ;;
+            *)
+                die "prospective binary install path $current exists but is not a directory; remove it or choose a safe --prefix"
+                ;;
+        esac
+    done
+    require_safe_binary_directory "$current"
+}
+
+prepare_binary_directory() {
+    local directory="$1"
+    # Validate the nearest existing parent before creating a missing tail, then
+    # revalidate the completed lexical and physical chains before staging bytes.
+    require_safe_binary_directory_parent_for_creation "$directory"
+    install_file_command -d -m 755 -- "$directory" ||
+        die "could not create binary install directory $directory"
+    require_safe_binary_directory "$directory"
+}
+
+replace_file_atomically() {
+    local source="$1" destination="$2"
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    # Plain `mv SOURCE DEST` treats an existing directory (including a symlink
+    # to one) as a container. Reject that shape before the same-filesystem rename.
+    [ ! -d "$destination" ] || return 1
+    move_file_command -f -- "$source" "$destination" || return 1
+    [ ! -e "$source" ] && [ ! -L "$source" ] &&
+        [ -f "$destination" ] && [ ! -L "$destination" ]
+}
+
 # "Installed" means this script's systemd unit is present. A bare binary at the
 # default path (e.g. from `cargo install`) is not treated as an install, so the
 # menu and uninstall never act on something we did not deploy.
@@ -580,7 +862,7 @@ rollback_unit_transaction() {
     local restored=0
     if [ "$UNIT_HAD_ORIGINAL" -eq 1 ]; then
         if [ -n "$UNIT_BACKUP" ] && [ -f "$UNIT_BACKUP" ] &&
-            command mv -fT -- "$UNIT_BACKUP" "$UNIT_FILE" 2>/dev/null; then
+            replace_file_atomically "$UNIT_BACKUP" "$UNIT_FILE" 2>/dev/null; then
             restored=1
         fi
     elif command rm -f -- "$UNIT_FILE" 2>/dev/null; then
@@ -606,17 +888,20 @@ rollback_unit_transaction() {
 }
 
 begin_unit_transaction() {
-    [ -n "$STAGED_UNIT" ] && [ -f "$STAGED_UNIT" ] ||
+    if [ -z "$STAGED_UNIT" ] || [ ! -f "$STAGED_UNIT" ]; then
         die "staged systemd unit is missing; refusing to modify $UNIT_FILE"
+    fi
 
     UNIT_BACKUP="${UNIT_FILE}.previous.$$"
     UNIT_HAD_ORIGINAL=0
     if [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
-        [ -f "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] ||
+        if [ ! -f "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
             die "systemd unit path $UNIT_FILE is not a regular file; refusing to replace it"
-        [ ! -e "$UNIT_BACKUP" ] && [ ! -L "$UNIT_BACKUP" ] ||
+        fi
+        if [ -e "$UNIT_BACKUP" ] || [ -L "$UNIT_BACKUP" ]; then
             die "temporary unit backup path already exists: $UNIT_BACKUP"
-        command cp -p -T -- "$UNIT_FILE" "$UNIT_BACKUP" ||
+        fi
+        copy_regular_file_to_absent_path "$UNIT_FILE" "$UNIT_BACKUP" ||
             die "could not preserve the existing systemd unit at $UNIT_BACKUP"
         UNIT_HAD_ORIGINAL=1
     else
@@ -626,7 +911,7 @@ begin_unit_transaction() {
     # Set the guard before the atomic replacement so cleanup also handles an
     # interrupted/failed move. The old unit remains recoverable in UNIT_BACKUP.
     UNIT_TRANSACTION_ACTIVE=1
-    if ! command mv -fT -- "$STAGED_UNIT" "$UNIT_FILE"; then
+    if ! replace_file_atomically "$STAGED_UNIT" "$UNIT_FILE"; then
         rollback_unit_transaction
         die "could not stage the new systemd unit at $UNIT_FILE"
     fi
@@ -810,53 +1095,6 @@ needs_net_bind_capability() {
     esac
     port=$((10#$port))   # force base-10 so a leading zero is never read as octal
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
-}
-
-# Lexically normalise a path — collapse `.`, `..`, and redundant `/` — using only
-# shell parameter expansion, with no external command. Symlinks are deliberately
-# NOT resolved: the prefix checks below compare the *declared* config path against
-# the unit's StateDirectory/log dir, so the lexical form is both sufficient and
-# correct, and it behaves identically everywhere (including busybox, which lacks
-# GNU `realpath -m`). Without this a traversal like `$STATE_DIR/../elsewhere`
-# would textually match the `$STATE_DIR/*` prefix and silently suppress the
-# warning. A leading `/` is preserved; the result has no trailing slash, except
-# an absolute path that collapses to the root (e.g. `/`, `/a/..`, `/../`), which
-# normalises to `/`.
-normalize_path() {
-    local path="$1" abs='' out='' rest comp
-    case "$path" in
-        /*) abs=1 ;;
-    esac
-    rest="$path"
-    while [ -n "$rest" ]; do
-        case "$rest" in
-            /*) rest="${rest#/}"; continue ;; # collapse leading / and // runs
-        esac
-        comp="${rest%%/*}"                     # next component, up to the slash
-        case "$rest" in
-            */*) rest="${rest#*/}" ;;
-            *) rest='' ;;
-        esac
-        case "$comp" in
-            '' | '.') ;;                       # drop empty and `.` segments
-            '..')
-                case "$out" in
-                    '') [ -n "$abs" ] || out='..' ;; # absolute: `..` at root is a no-op
-                    '..' | *'/..') out="$out/.." ;;  # relative escape: cannot pop a `..`
-                    */*) out="${out%/*}" ;;          # pop the last segment
-                    *) out='' ;;                     # pop the only segment
-                esac
-                ;;
-            *) if [ -z "$out" ]; then out="$comp"; else out="$out/$comp"; fi ;;
-        esac
-    done
-    if [ -n "$abs" ]; then
-        printf '%s\n' "/$out"
-    elif [ -n "$out" ]; then
-        printf '%s\n' "$out"
-    else
-        printf '%s\n' "."
-    fi
 }
 
 # Extract a JSON string field's value from the flat `--check --json` output,
@@ -1213,6 +1451,276 @@ run_selftest() {
     _check_norm "foo/../bar" "bar"
     _check_norm "../../x" "../../x"
     _check_norm ".." ".."
+
+    _check_prefix_dir() { # prefix want(accept|reject) expected-dir
+        local prefix="$1" want="$2" expected="${3:-}" got='' result=reject
+        if got="$(install_bin_dir_for_prefix "$prefix")"; then result=accept; fi
+        if [ "$result" = "$want" ] &&
+            { [ "$want" = reject ] || [ "$got" = "$expected" ]; }; then
+            printf 'ok   install prefix %-30s -> %s%s\n' \
+                "$prefix" "$result" "${got:+ ($got)}"
+        else
+            printf 'FAIL install prefix %-30s -> %s [%s] (want %s [%s])\n' \
+                "$prefix" "$result" "$got" "$want" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # systemd simplifies the executable path but retains the original argv[0].
+    # Accept only spellings that round-trip exactly; root remains valid and must
+    # join to `/bin`, never `//bin`.
+    _check_prefix_dir "/usr/local" accept "/usr/local/bin"
+    _check_prefix_dir "/" accept "/bin"
+    _check_prefix_dir "/usr/local/" reject
+    _check_prefix_dir "//usr/local" reject
+    _check_prefix_dir "/usr/./local" reject
+    _check_prefix_dir "/usr/lib/../local" reject
+
+    _check_reused_install_location() { # binary want(accept|reject) expected-binary
+        local binary="$1" want="$2" expected="${3:-}" got='' directory='' result=reject
+        if got="$({
+            directory="$(existing_install_directory_for_binary "$binary")" &&
+                join_path_child "$directory" "$SERVICE_NAME"
+        } 2>/dev/null)"; then
+            result=accept
+        fi
+        if [ "$result" = "$want" ] &&
+            { [ "$want" = reject ] || [ "$got" = "$expected" ]; }; then
+            printf 'ok   reused executable %-28s -> %s%s\n' \
+                "$binary" "$result" "${got:+ ($got)}"
+        else
+            printf 'FAIL reused executable %-28s -> %s [%s] (want %s [%s])\n' \
+                "$binary" "$result" "$got" "$want" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_reused_install_location "/alighieri" accept "/alighieri"
+    _check_reused_install_location "/bin/alighieri" accept "/bin/alighieri"
+    _check_reused_install_location "/bin//alighieri" reject
+    _check_reused_install_location "/opt/alighieri//bin/alighieri" reject
+    _check_reused_install_location "/opt/link/../bin/alighieri" reject
+
+    _check_binary_directory_metadata() { # owner mode want(safe|unsafe)
+        local owner="$1" mode="$2" want="$3" got=unsafe
+        if binary_directory_metadata_is_safe "$owner" "$mode"; then got=safe; fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   binary directory owner/mode %s:%s -> %s\n' "$owner" "$mode" "$got"
+        else
+            printf 'FAIL binary directory owner/mode %s:%s -> %s (want %s)\n' \
+                "$owner" "$mode" "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_binary_directory_metadata 0 755 safe
+    _check_binary_directory_metadata 0 700 safe
+    _check_binary_directory_metadata 0 2755 safe
+    _check_binary_directory_metadata 0 775 unsafe
+    _check_binary_directory_metadata 0 757 unsafe
+    _check_binary_directory_metadata 1000 755 unsafe
+    _check_binary_directory_metadata 0 invalid unsafe
+
+    _check_binary_directory_chain() { # description path physical unsafe want [link target ...]
+        local description="$1" path="$2" simulated_physical="$3" unsafe_path="$4" \
+              want="$5" link_one="${6:-}" target_one="${7:-}" \
+              link_two="${8:-}" target_two="${9:-}" got=unsafe
+        if (
+            physical_directory_path() { printf '%s' "$simulated_physical"; }
+            binary_directory_path_metadata() {
+                if [ -n "$unsafe_path" ] && [ "$1" = "$unsafe_path" ]; then
+                    printf '%s\n' '1000 755'
+                else
+                    printf '%s\n' '0 755'
+                fi
+            }
+            binary_path_is_symlink() {
+                [ -n "$link_one" ] &&
+                    { [ "$1" = "$link_one" ] ||
+                        { [ -n "$link_two" ] && [ "$1" = "$link_two" ]; }; }
+            }
+            binary_path_symlink_target() {
+                if [ "$1" = "$link_one" ]; then
+                    printf '%s' "$target_one"
+                elif [ -n "$link_two" ] && [ "$1" = "$link_two" ]; then
+                    printf '%s' "$target_two"
+                else
+                    return 1
+                fi
+            }
+            # Paths are simulated; bypass only the real filesystem shape check
+            # while exercising both lexical and physical ancestor walks.
+            binary_directory_exists() { return 0; }
+            require_safe_binary_directory "$path"
+        ) 2>/dev/null; then
+            got=safe
+        fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   binary directory chain %s -> %s\n' "$description" "$got"
+        else
+            printf 'FAIL binary directory chain %s -> %s (want %s)\n' \
+                "$description" "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_binary_directory_chain "safe /usr/local/bin" \
+        /usr/local/bin /usr/local/bin '' safe
+    _check_binary_directory_chain "unsafe lexical parent" \
+        /opt/alighieri/bin /opt/alighieri/bin /opt unsafe
+    _check_binary_directory_chain "unsafe intermediate symlink target parent" \
+        /srv/alighieri/bin /home/alice/bin /home unsafe
+    _check_binary_directory_chain "nested symlink via unsafe parent" \
+        /opt/alighieri/bin /usr/local/bin /tmp/attacker unsafe \
+        /opt/alighieri /tmp/attacker/hop /tmp/attacker/hop /usr/local
+    _check_binary_directory_chain "trusted merged-/usr /bin" \
+        /bin /usr/bin '' safe /bin usr/bin
+
+    _check_binary_directory_prepare() { # description target existing unsafe want install
+        local description="$1" target="$2" existing="$3" unsafe_path="$4" \
+              want="$5" want_install="$6" got=unsafe installed=no out=''
+        if out="$(
+            (
+                local created=0
+                binary_path_kind() {
+                    if [ "$created" -eq 1 ] && [ "$1" = "$target" ]; then
+                        printf '%s' directory
+                    elif [ "$1" = "$existing" ]; then
+                        printf '%s' directory
+                    else
+                        printf '%s' missing
+                    fi
+                }
+                binary_directory_exists() {
+                    [ "$1" = "$existing" ] ||
+                        { [ "$created" -eq 1 ] && [ "$1" = "$target" ]; }
+                }
+                physical_directory_path() { printf '%s' "$1"; }
+                binary_directory_path_metadata() {
+                    if [ -n "$unsafe_path" ] && [ "$1" = "$unsafe_path" ]; then
+                        printf '%s\n' '1000 755'
+                    else
+                        printf '%s\n' '0 755'
+                    fi
+                }
+                install_file_command() {
+                    [ "$*" = "-d -m 755 -- $target" ] || return 98
+                    created=1
+                    printf '%s\n' INSTALL
+                }
+                prepare_binary_directory "$target"
+            ) 2>/dev/null
+        )"; then
+            got=safe
+        fi
+        case "$out" in *INSTALL*) installed=yes ;; esac
+        if [ "$got" = "$want" ] && [ "$installed" = "$want_install" ]; then
+            printf 'ok   binary directory prepare %s -> %s, install %s\n' \
+                "$description" "$got" "$installed"
+        else
+            printf 'FAIL binary directory prepare %s -> %s, install %s (want %s/%s)\n' \
+                "$description" "$got" "$installed" "$want" "$want_install"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_binary_directory_prepare "missing tail under safe parent" \
+        /usr/local/alighieri/bin /usr/local '' safe yes
+    _check_binary_directory_prepare "unsafe existing parent is rejected first" \
+        /opt/alighieri/bin /opt /opt unsafe no
+
+    _check_portable_file_helpers() {
+        local helper_tmp source staged installed backup blocked destination_dir \
+              symlink_path mode_probe symlink_suffix='' symlink_checked=0 \
+              mode_checked=0 result=0
+        helper_tmp="$(mktemp -d)"
+        source="$helper_tmp/source"
+        staged="$helper_tmp/staged"
+        installed="$helper_tmp/installed"
+        backup="$helper_tmp/backup"
+        blocked="$helper_tmp/blocked"
+        destination_dir="$helper_tmp/destination-dir"
+        symlink_path="$helper_tmp/staged-link"
+        mode_probe="$helper_tmp/mode-probe"
+        printf '%s\n' candidate >"$source"
+        printf '%s\n' previous >"$installed"
+        printf '%s\n' blocked >"$blocked"
+        printf '%s\n' probe >"$mode_probe"
+        command mkdir -- "$destination_dir"
+        if command chmod 700 -- "$mode_probe" 2>/dev/null &&
+            [ "$(command stat -c '%a' -- "$mode_probe")" = 700 ]; then
+            mode_checked=1
+        fi
+
+        # Model an applet set that rejects any destination-as-file option. The
+        # real helpers must succeed using only the common BusyBox argument set.
+        install_file_command() {
+            local arg
+            for arg in "$@"; do case "$arg" in -*T*) return 97 ;; esac; done
+            command install "$@"
+        }
+        copy_file_command() {
+            local arg
+            for arg in "$@"; do case "$arg" in -*T*) return 97 ;; esac; done
+            command cp "$@"
+        }
+        move_file_command() {
+            local arg
+            for arg in "$@"; do case "$arg" in -*T*) return 97 ;; esac; done
+            command mv "$@"
+        }
+
+        stage_executable_copy "$source" "$staged" || result=1
+        if [ "$mode_checked" -eq 1 ]; then
+            [ "$(command stat -c '%a' -- "$staged")" = 755 ] || result=1
+        fi
+        copy_regular_file_to_absent_path "$source" "$backup" || result=1
+        replace_file_atomically "$staged" "$installed" || result=1
+        [ "$(<"$installed")" = candidate ] &&
+            [ "$(<"$backup")" = candidate ] && [ ! -e "$staged" ] || result=1
+
+        # None of the helpers may reinterpret a directory as a destination
+        # container, and a rejected atomic replacement must retain its source.
+        if stage_executable_copy "$source" "$destination_dir" ||
+            copy_regular_file_to_absent_path "$source" "$destination_dir" ||
+            replace_file_atomically "$blocked" "$destination_dir"; then
+            result=1
+        fi
+        [ -f "$blocked" ] &&
+            [ ! -e "$destination_dir/$(basename -- "$source")" ] &&
+            [ ! -e "$destination_dir/$(basename -- "$blocked")" ] || result=1
+
+        # Destination symlinks are never followed while staging. Some Windows
+        # Git Bash environments cannot create symlinks; Linux CI exercises it.
+        if command ln -s -- "$source" "$symlink_path" 2>/dev/null &&
+            [ -L "$symlink_path" ]; then
+            symlink_checked=1
+            if stage_executable_copy "$source" "$symlink_path"; then result=1; fi
+            [ -L "$symlink_path" ] && [ "$(<"$source")" = candidate ] || result=1
+        fi
+
+        # Restore the production wrappers after these dynamically-scoped mocks.
+        install_file_command() { command install "$@"; }
+        copy_file_command() { command cp "$@"; }
+        move_file_command() { command mv "$@"; }
+        command rm -f -- "$source" "$staged" "$installed" "$backup" "$blocked" "$mode_probe" \
+            "$symlink_path" "$destination_dir/$(basename -- "$source")" \
+            "$destination_dir/$(basename -- "$blocked")"
+        command rmdir -- "$destination_dir" "$helper_tmp"
+        if [ "$result" -eq 0 ]; then
+            if [ "$symlink_checked" -eq 1 ]; then
+                symlink_suffix=' (including symlinks)'
+            fi
+            printf 'ok   portable file helpers preserve exact-path and atomic replacement semantics%s\n' \
+                "$symlink_suffix"
+        else
+            printf 'FAIL portable file helper exact-path/atomic replacement checks\n'
+            return 1
+        fi
+    }
+
+    if ! _check_portable_file_helpers; then failures=$((failures + 1)); fi
+    unset -f _check_portable_file_helpers
 
     _check_hidden() { # path want(hidden|visible)
         local got
@@ -1869,6 +2377,14 @@ run_selftest() {
     _check_cli_rejected "systemd specifier in --prefix" \
         "--prefix must not contain systemd ExecStart metacharacters" \
         install --prefix "/opt/%n"
+    _check_cli_rejected "trailing slash in --prefix" \
+        "--prefix must use a canonical path" install --prefix "/opt/alighieri/"
+    _check_cli_rejected "repeated slash in --prefix" \
+        "--prefix must use a canonical path" install --prefix "//opt/alighieri"
+    _check_cli_rejected "dot component in --prefix" \
+        "--prefix must use a canonical path" install --prefix "/opt/./alighieri"
+    _check_cli_rejected "dot-dot component in --prefix" \
+        "--prefix must use a canonical path" install --prefix "/opt/link/../alighieri"
     _check_cli_rejected "--config on upgrade" "--config is valid only with the install command" \
         upgrade --config /etc/alighieri/alighieri.conf
 
@@ -1933,6 +2449,7 @@ run_selftest() {
                 # deployment globals above are function-local and dynamically
                 # visible here, so neither kind of test state leaks afterward.
                 require_service_sandbox() { :; }
+                prepare_binary_directory() { command mkdir -p -- "$1"; }
                 resolve_source_binary() { :; }
                 ensure_user() { :; }
                 installed_config_path() { printf '%s' "$config"; }
@@ -1984,9 +2501,9 @@ run_selftest() {
                         die "effective systemd service identity, WorkingDirectory, or filesystem namespace differs from the managed unit"
                 }
                 activate_prevalidated_service() { printf 'activate|' >>"$calls"; }
-                mv() {
+                move_file_command() {
                     if [ "$failure_mode" = "binary-move" ] &&
-                        [ "${1:-}" = "-fT" ] && [ "${3:-}" = "$expected_staged" ]; then
+                        [ "${1:-}" = "-f" ] && [ "${3:-}" = "$expected_staged" ]; then
                         printf 'binary-move|' >>"$calls"
                         return 1
                     fi
@@ -2115,7 +2632,7 @@ run_selftest() {
             systemctl() { printf 'daemon-reload|' >>"$signal_calls"; }
             begin_unit_transaction
             BINARY_COMMIT_IN_PROGRESS=1
-            command mv -fT -- "$STAGED_BIN" "$signal_installed"
+            replace_file_atomically "$STAGED_BIN" "$signal_installed"
             cleanup
             [ "$(<"$UNIT_FILE")" = "new-unit" ] &&
                 [ "$(<"$signal_installed")" = "new-binary" ] &&
@@ -2187,6 +2704,7 @@ run_selftest() {
 
             if (
                 require_service_sandbox() { :; }
+                prepare_binary_directory() { command mkdir -p -- "$1"; }
                 resolve_source_binary() { :; }
                 ensure_user() { :; }
                 reject_hidden_service_path() { :; }
@@ -2295,6 +2813,7 @@ run_selftest() {
         RESTART_ON_UPGRADE=1
         STAGED_BIN=""
         require_service_sandbox() { :; }
+        require_safe_binary_directory() { :; }
         require_effective_service_sandbox() { printf 'guard|' >>"$order"; }
         loaded_exec_start_payload() {
             [ "$invalid_exec_start" -eq 0 ] || return 1
@@ -2496,13 +3015,9 @@ do_install() {
     # so we don't relocate the binary to the default and orphan the old one.
     if [ "$PREFIX_EXPLICIT" -eq 0 ] && [ -f "$UNIT_FILE" ]; then
         local existing_dir
-        existing_dir="$(dirname -- "$(installed_binary_path)")"
-        # Whitespace would break the space-delimited ExecStart we rewrite below,
-        # like the --prefix validation; reject it rather than emit a broken unit.
-        case "$existing_dir" in
-            *[[:space:]]*) die "the existing unit's install directory contains whitespace ($existing_dir); pass --prefix with a whitespace-free path" ;;
-        esac
-        validate_exec_start_path "the existing unit's install directory" "$existing_dir"
+        # Apply the same canonical spelling invariant as --prefix before the
+        # directory is reused to render and verify a new ExecStart.
+        existing_dir="$(existing_install_directory_for_binary "$(installed_binary_path)")"
         if [ "$existing_dir" != "$BIN_DIR" ]; then
             info "reusing existing install location $existing_dir (pass --prefix to override)"
             BIN_DIR="$existing_dir"
@@ -2512,16 +3027,18 @@ do_install() {
     resolve_source_binary
     ensure_user
 
-    local install_bin="${BIN_DIR}/${SERVICE_NAME}"
-    install -d -m 755 -- "$BIN_DIR"
+    local install_bin
+    install_bin="$(join_path_child "$BIN_DIR" "$SERVICE_NAME")"
+    prepare_binary_directory "$BIN_DIR"
     # Keep the active executable untouched until every failure-prone config and
     # userlist preflight has succeeded. Staging beside the destination also
     # keeps the final move atomic and lets the EXIT trap clean up any rejection.
     STAGED_BIN="${install_bin}.new.$$"
     info "staging binary for service preflight at $STAGED_BIN"
-    # `--` so a --binary source (or any path) beginning with `-` is never parsed
-    # as an install option in this root script.
-    install -m 755 -T -- "$BINARY" "$STAGED_BIN"
+    # The helper keeps exact-path semantics without a GNU-only option, so this
+    # also works with BusyBox and refuses a pre-existing symlink or directory.
+    stage_executable_copy "$BINARY" "$STAGED_BIN" ||
+        die "could not stage the candidate binary at $STAGED_BIN"
 
     # Preserve the config path the existing unit launches with unless the
     # operator explicitly selects a replacement via install --config. This lets
@@ -2642,13 +3159,13 @@ do_install() {
     reload_and_validate_installed_service "$install_bin" "$config_file"
 
     info "installing validated binary to $install_bin"
-    # `-T` refuses an unexpected directory destination instead of moving the
-    # staged executable inside it under a different basename.
+    # The checked replacement refuses an unexpected directory destination
+    # instead of moving the staged executable inside it under another basename.
     # Arm cleanup to distinguish a signal before the atomic rename (source still
     # present: roll back) from one after it (source gone: commit the validated
     # unit so it remains consistent with the newly installed binary).
     BINARY_COMMIT_IN_PROGRESS=1
-    if ! mv -fT -- "$STAGED_BIN" "$install_bin"; then
+    if ! replace_file_atomically "$STAGED_BIN" "$install_bin"; then
         BINARY_COMMIT_IN_PROGRESS=0
         die "could not install the validated binary at $install_bin; the previous unit will be restored"
     fi
@@ -2698,10 +3215,12 @@ do_upgrade() {
     # restart still uses stale loaded state.
     systemctl daemon-reload
     require_effective_service_sandbox
-    local install_bin config_file expected_exec_start current_exec_start
+    local install_bin install_dir config_file expected_exec_start current_exec_start
     expected_exec_start="$(loaded_exec_start_payload)" ||
         die "effective systemd ExecStart is empty or unsupported; fix the unit before upgrading"
     install_bin="$(installed_binary_path)"
+    install_dir="$(existing_install_directory_for_binary "$install_bin")"
+    require_safe_binary_directory "$install_dir"
     config_file="$(installed_config_path)"
     # Upgrade replaces an existing binary. Require a regular file at that path so
     # a malformed unit (ExecStart pointing at a directory, or under a missing
@@ -2725,7 +3244,8 @@ do_upgrade() {
     # instead of crash-looping, then move it into place atomically — which also
     # avoids ETXTBSY from rewriting the binary the running service is executing.
     STAGED_BIN="${install_bin}.new.$$"
-    install -m 755 -T -- "$BINARY" "$STAGED_BIN"
+    stage_executable_copy "$BINARY" "$STAGED_BIN" ||
+        die "could not stage the candidate binary at $STAGED_BIN"
     local check_summary
     if ! check_summary="$(run_in_service_sandbox \
         "$STAGED_BIN" --check --json "$config_file" 2>/dev/null)"; then
@@ -2748,7 +3268,8 @@ do_upgrade() {
     fi
 
     info "upgrading binary at $install_bin"
-    mv -fT -- "$STAGED_BIN" "$install_bin"
+    replace_file_atomically "$STAGED_BIN" "$install_bin" ||
+        die "could not replace the installed binary at $install_bin"
     STAGED_BIN=""
 
     if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then

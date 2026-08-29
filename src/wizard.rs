@@ -619,6 +619,10 @@ fn wizard_form_from_fields(
     validate_config_value("trusted client range", &trusted_client)?;
     validate_optional_config_path("userlist path", &userlist_path)?;
     validate_optional_config_path("log file", &log_file)?;
+    #[cfg(windows)]
+    if let Some(log_file) = &log_file {
+        validate_windows_service_log_path(log_file)?;
+    }
     if trusted_client.trim().is_empty() {
         return Err("trusted client range is required".into());
     }
@@ -1339,6 +1343,21 @@ fn validate_optional_config_path(label: &str, path: &Option<PathBuf>) -> Result<
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_windows_service_log_path(path: &Path) -> Result<(), String> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    let has_prefix = matches!(path.components().next(), Some(Component::Prefix(_)));
+    if path.has_root() || has_prefix {
+        return Err(
+            "log file path must be fully absolute or an ordinary relative path (resolved against the configuration file directory)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_output_path(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     let path = Path::new(trimmed);
@@ -1731,16 +1750,31 @@ fn render_config(form: &WizardForm) -> String {
     if let Some(log_file) = &form.log_file {
         writeln!(text, "logoutput: file").unwrap();
         if log_file.is_relative() {
+            #[cfg(windows)]
+            writeln!(
+                text,
+                "# This relative logfile resolves against the configuration file directory."
+            )
+            .unwrap();
+            #[cfg(windows)]
+            writeln!(
+                text,
+                "# Ensure LocalService has write access to that directory and log file."
+            )
+            .unwrap();
+            #[cfg(not(windows))]
             writeln!(
                 text,
                 "# WARNING: this logfile path is relative; it resolves against the service"
             )
             .unwrap();
+            #[cfg(not(windows))]
             writeln!(
                 text,
                 "# working directory. If that location is not writable, logging fails to"
             )
             .unwrap();
+            #[cfg(not(windows))]
             writeln!(
                 text,
                 "# initialise and the proxy exits at startup. Use an absolute path instead."
@@ -3500,6 +3534,24 @@ mod tests {
         assert!(err.contains("must not use drive-relative syntax"), "{err}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn wizard_rejects_anchored_non_absolute_service_log_paths() {
+        for logfile in [r"D:logs\custom.log", r"\logs\custom.log"] {
+            let mut fields = HashMap::new();
+            fields.insert("template".into(), "local-no-auth".into());
+            fields.insert("logfile".into(), logfile.into());
+
+            let err = wizard_form_from_fields(&fields, Path::new("alighieri.conf")).unwrap_err();
+            assert!(err.contains("fully absolute"), "{logfile}: {err}");
+            assert!(err.contains("ordinary relative path"), "{logfile}: {err}");
+            assert!(
+                err.contains("configuration file directory"),
+                "{logfile}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn local_template_generates_valid_config() {
         let mut fields = HashMap::new();
@@ -4635,16 +4687,26 @@ mod tests {
     }
 
     #[test]
-    fn relative_logfile_warns_in_config_but_absolute_does_not() {
-        // A relative path gets an explicit warning about the hardened-unit footgun.
+    fn relative_logfile_guidance_is_platform_specific() {
         let mut rel = HashMap::new();
         rel.insert("template".into(), "local-no-auth".into());
         rel.insert("logfile".into(), "logs/alighieri.log".into());
         let rel_form = wizard_form_from_fields(&rel, Path::new("alighieri.conf")).unwrap();
         let rel_config = render_config(&rel_form);
-        assert!(rel_config.contains("# WARNING: this logfile path is relative"));
-        // The footgun is a hard startup failure (logging init aborts), not silent loss.
-        assert!(rel_config.contains("exits at startup"));
+        #[cfg(windows)]
+        {
+            assert!(rel_config.contains("configuration file directory"));
+            assert!(rel_config.contains("LocalService has write access"));
+            assert!(!rel_config.contains("service working directory"));
+            assert!(!rel_config.contains("exits at startup"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(rel_config.contains("# WARNING: this logfile path is relative"));
+            // The hardened service unit cannot write its working directory, so
+            // logging initialisation aborts instead of silently dropping logs.
+            assert!(rel_config.contains("exits at startup"));
+        }
         assert!(rel_config.contains("# logfile should be an absolute path"));
         Config::parse(&rel_config).unwrap();
         // The systemd specifics are scoped to Linux; other platforms must not see them.

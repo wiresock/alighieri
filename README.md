@@ -916,7 +916,9 @@ The installed service uses:
 - startup type: automatic
 - account: `NT AUTHORITY\LocalService`
 - default log file: `C:\ProgramData\Alighieri\logs\alighieri.log` (a configured
-  `logfile` is honored; custom locations must be writable by `LocalService`)
+  `logfile` is honored; ordinary relative paths resolve against the active
+  configuration file's directory, and that location must be writable by
+  `LocalService`)
 - Event Log source: `Alighieri` in the Windows Application log
 - recovery: restart on crash (after 5s, then 30s, then 60s; failure count resets
   after an hour), the Windows equivalent of systemd's `Restart=on-failure`
@@ -930,9 +932,11 @@ start and reload commands validate the installed configuration before asking
 the Service Control Manager to act on the service. Credentials stay in the
 configured `userlist` file; the service command line stores only the
 configuration file path. Service file logs use the configured `logfile` when
-present and otherwise use the default ProgramData path. They rotate with the
-same `logrotate.size`, `logrotate.keep`, and `logformat` settings as console
-file logging.
+present and otherwise use the default ProgramData path. An ordinary relative
+configured path resolves against the active configuration file's directory,
+which must be writable by `LocalService`. Service logs rotate with the same
+`logrotate.size`, `logrotate.keep`, and `logformat` settings as console file
+logging.
 
 Service install registers the `Alighieri` Event Log source. Service mode writes
 startup, stop, reload-request, and startup/runtime failure events to the Windows
