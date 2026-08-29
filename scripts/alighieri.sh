@@ -608,6 +608,87 @@ effective_service_path_namespace_matches() {
     fi
 }
 
+loaded_service_property() {
+    local object="$1" property="$2"
+    busctl get-property \
+        org.freedesktop.systemd1 "$object" \
+        org.freedesktop.systemd1.Service "$property" 2>/dev/null
+}
+
+loaded_single_string_array_equals() {
+    local raw="$1" expected="$2" signature count encoded extra decoded
+    read -r signature count encoded extra <<<"$raw"
+    [ "$signature" = as ] && [ "$count" = 1 ] && [ -n "$encoded" ] &&
+        [ -z "${extra:-}" ] || return 1
+    decoded="$(decode_busctl_simple_string "$encoded")" || return 1
+    [ "$decoded" = "$expected" ]
+}
+
+loaded_unsigned_equals() {
+    local raw="$1" expected_signature="$2" expected="$3" signature value extra
+    read -r signature value extra <<<"$raw"
+    [ "$signature" = "$expected_signature" ] && [ -z "${extra:-}" ] || return 1
+    case "$value" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$value" = "$expected" ]
+}
+
+# StateDirectorySymlink was added in systemd 250. Older implementations expose
+# only actual destination mappings, while newer ones expose the ordinary
+# `StateDirectory=alighieri` entry with an empty destination as well. Either
+# exact representation is safe; every non-empty destination or flag is not.
+loaded_state_directory_mapping_matches() {
+    local raw="$1" signature count source destination flags extra
+    read -r signature count source destination flags extra <<<"$raw"
+    [ "$signature" = 'a(sst)' ] || return 1
+    if [ "$count" = 0 ]; then
+        [ -z "${source:-}" ]
+        return
+    fi
+    [ "$count" = 1 ] && [ -n "${source:-}" ] &&
+        [ -n "${destination:-}" ] && [ -n "${flags:-}" ] &&
+        [ -z "${extra:-}" ] || return 1
+    source="$(decode_busctl_simple_string "$source")" || return 1
+    destination="$(decode_busctl_simple_string "$destination")" || return 1
+    [ "$source" = "$SERVICE_NAME" ] && [ -z "$destination" ] && [ "$flags" = 0 ]
+}
+
+# Verify the manager-loaded writable locations, not just the base unit text.
+# List-valued drop-ins can reset StateDirectory/ReadWritePaths or add broader
+# paths while leaving the scalar namespace properties above unchanged.
+effective_service_managed_storage_matches() {
+    local object version raw
+    object="$(service_unit_object_path)" || return 1
+
+    raw="$(loaded_service_property "$object" StateDirectory)" || return 1
+    loaded_single_string_array_equals "$raw" "$SERVICE_NAME" || return 1
+
+    raw="$(loaded_service_property "$object" StateDirectoryMode)" || return 1
+    # 0750 expressed as the unsigned decimal D-Bus value.
+    loaded_unsigned_equals "$raw" u 488 || return 1
+
+    raw="$(loaded_service_property "$object" ReadWritePaths)" || return 1
+    loaded_single_string_array_equals "$raw" "$LOG_DIR" || return 1
+
+    version="$(systemd_manager_version)" || return 1
+    if [ "$version" -ge 250 ]; then
+        raw="$(loaded_service_property "$object" StateDirectorySymlink)" || return 1
+        loaded_state_directory_mapping_matches "$raw" || return 1
+    fi
+}
+
+effective_service_capability_sets_match() {
+    local expected="$1" object raw
+    case "$expected" in 0 | 1024) ;; *) return 1 ;; esac
+    object="$(service_unit_object_path)" || return 1
+
+    raw="$(loaded_service_property "$object" CapabilityBoundingSet)" || return 1
+    loaded_unsigned_equals "$raw" t "$expected" || return 1
+    raw="$(loaded_service_property "$object" AmbientCapabilities)" || return 1
+    loaded_unsigned_equals "$raw" t "$expected"
+}
+
 effective_service_sandbox_matches() {
     local properties expected
     properties="$(effective_service_sandbox_properties 2>/dev/null)" || return 1
@@ -635,11 +716,18 @@ effective_service_sandbox_matches() {
 
     # Additive namespace directives can still shadow otherwise identical paths.
     effective_service_path_namespace_matches || return 1
+    effective_service_managed_storage_matches || return 1
+    if [ "$#" -gt 0 ]; then
+        effective_service_capability_sets_match "$1" || return 1
+    fi
 }
 
 require_effective_service_sandbox() {
-    effective_service_sandbox_matches ||
-        die "effective systemd service identity, WorkingDirectory, or filesystem namespace differs from the managed unit; remove or update the overriding drop-in, then retry"
+    if [ "$#" -gt 0 ]; then
+        effective_service_sandbox_matches "$1"
+    else
+        effective_service_sandbox_matches
+    fi || die "effective systemd service identity, WorkingDirectory, filesystem namespace, writable paths, or capabilities differ from the managed unit; remove or update the overriding drop-in, then retry"
 }
 
 # Select the config for an install/reconfigure. Passing the installed unit's
@@ -800,25 +888,34 @@ require_safe_binary_directory() {
     fi
 }
 
-require_safe_service_config_directory() {
-    local directory="$1" physical \
-          remediation="fix its ownership/mode or choose a config under $CONFIG_DIR"
+require_safe_service_file_directory() {
+    local directory="$1" description="$2" remediation="$3" physical
     case "$directory" in
         /*) ;;
-        *) die "service config directory is not absolute: $directory" ;;
+        *) die "$description directory is not absolute: $directory" ;;
     esac
     [ "$(normalize_path "$directory")" = "$directory" ] ||
-        die "service config directory is not canonical: $directory"
+        die "$description directory is not canonical: $directory"
     binary_directory_exists "$directory" ||
-        die "service config directory $directory is missing or is not a directory"
+        die "$description directory $directory is missing or is not a directory"
 
     physical="$(physical_directory_path "$directory")" ||
-        die "could not resolve service config directory $directory"
-    require_safe_directory_chain "$directory" "service config path" "$remediation"
+        die "could not resolve $description directory $directory"
+    require_safe_directory_chain "$directory" "$description path" "$remediation"
     if [ "$physical" != "$directory" ]; then
         require_safe_directory_chain "$physical" \
-            "resolved service config path for $directory" "$remediation"
+            "resolved $description path for $directory" "$remediation"
     fi
+}
+
+require_safe_service_config_directory() {
+    require_safe_service_file_directory "$1" "service config" \
+        "fix its ownership/mode or choose a config under $CONFIG_DIR"
+}
+
+require_safe_service_userlist_directory() {
+    require_safe_service_file_directory "$1" "service userlist" \
+        "fix its ownership/mode or choose a userlist under $CONFIG_DIR"
 }
 
 service_config_metadata_is_safe() {
@@ -859,6 +956,22 @@ require_secure_service_config_file() {
         ! service_config_metadata_is_safe "$owner" "$group" "$mode" "$expected_group"; then
         printf -v quoted_path '%q' "$path"
         die "service config $path must be owned by root:$SERVICE_USER with mode 640; run: chown root:$SERVICE_USER -- $quoted_path && chmod 640 -- $quoted_path, then retry"
+    fi
+}
+
+require_secure_service_userlist_file() {
+    local path="$1" metadata owner group mode extra expected_group quoted_path
+    [ "$(service_userlist_path_kind "$path")" = regular ] ||
+        die "configured userlist $path changed while it was being validated; it must be a physical regular file"
+    metadata="$(service_config_path_metadata "$path" 2>/dev/null)" ||
+        die "could not inspect service userlist metadata at $path"
+    read -r owner group mode extra <<<"$metadata"
+    expected_group="$(service_group_id)" ||
+        die "could not resolve group id for service group $SERVICE_USER"
+    if [ -n "${extra:-}" ] ||
+        ! service_config_metadata_is_safe "$owner" "$group" "$mode" "$expected_group"; then
+        printf -v quoted_path '%q' "$path"
+        die "service userlist $path must be owned by root:$SERVICE_USER with mode 640; run: chown root:$SERVICE_USER -- $quoted_path && chmod 640 -- $quoted_path, then retry"
     fi
 }
 
@@ -1166,6 +1279,16 @@ needs_net_bind_capability() {
     [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]
 }
 
+# CapabilityBoundingSet/AmbientCapabilities are unsigned 64-bit masks on the
+# systemd D-Bus API. CAP_NET_BIND_SERVICE is Linux capability bit 10.
+service_capability_mask() {
+    if needs_net_bind_capability "$1"; then
+        printf '%s' 1024
+    else
+        printf '%s' 0
+    fi
+}
+
 # Extract a JSON string field's value from the flat `--check --json` output,
 # honouring JSON string escapes. Reads the JSON on stdin and the field name as
 # $1; prints the unescaped value (no trailing newline), or nothing if the field
@@ -1368,14 +1491,29 @@ service_runtime_path() {
     esac
 }
 
-# Load the parser-selected userlist as the service account when this install will
-# start the service. Merely testing `-r` would miss malformed credential data;
-# `user list` uses the same UserDb loader as startup. `--no-start` intentionally
-# permits a missing file for first-user bootstrap, but validates one that already
-# exists. An absent JSON field means an older binary cannot safely report an
-# include-aware/last-wins path, so fail closed rather than silently skip it.
+service_userlist_path_kind() {
+    if [ -L "$1" ]; then
+        printf '%s' symlink
+    elif [ -f "$1" ]; then
+        printf '%s' regular
+    elif [ -e "$1" ]; then
+        printf '%s' other
+    else
+        printf '%s' missing
+    fi
+}
+
+# Validate the parser-selected userlist as an integrity boundary before loading
+# it as the service account. A physical, root-owned 0640 leaf beneath trusted
+# parents prevents the service or another local user from changing credentials
+# after this root process accepts them; `user list` then exercises the same
+# UserDb loader as startup. `--no-start` permits only a genuinely missing file
+# for first-user bootstrap. An absent JSON field means an older binary cannot
+# safely report an include-aware/last-wins path, so fail closed rather than
+# silently skip it.
 validate_service_userlist() {
-    local install_bin="$1" summary="$2" will_start="${3:-1}" userlist runtime_path
+    local install_bin="$1" summary="$2" will_start="${3:-1}" userlist runtime_path \
+          userlist_kind userlist_dir
     if ! printf '%s\n' "$summary" | json_has_field userlist; then
         die "installed alighieri does not report the effective userlist in --check --json; use the helper with its matching current binary before installing the hardened service"
     fi
@@ -1384,10 +1522,27 @@ validate_service_userlist() {
     reject_hidden_service_path "configured userlist path" "$userlist"
 
     runtime_path="$(service_runtime_path "$userlist")"
-    if [ "$will_start" -eq 0 ] && [ ! -e "$runtime_path" ]; then
+    userlist_kind="$(service_userlist_path_kind "$runtime_path")"
+    if [ "$will_start" -eq 0 ] && [ "$userlist_kind" = missing ]; then
         warn "configured userlist $userlist does not exist yet; --no-start leaves the service stopped so credentials can be created before the final install"
         return 0
     fi
+    case "$userlist_kind" in
+        regular) ;;
+        symlink)
+            die "configured userlist $userlist is a symlink; replace it with a physical, root-controlled file before installing the service"
+            ;;
+        missing)
+            die "configured userlist $userlist does not exist; create it with root:$SERVICE_USER ownership and mode 640, or use --no-start for first-user bootstrap"
+            ;;
+        *)
+            die "configured userlist $userlist exists but is not a regular file"
+            ;;
+    esac
+
+    userlist_dir="$(dirname -- "$runtime_path")"
+    require_safe_service_userlist_directory "$userlist_dir"
+    require_secure_service_userlist_file "$runtime_path"
     if ! run_in_service_sandbox \
         "$install_bin" user list --userlist "$userlist" >/dev/null; then
         die "configured userlist $userlist cannot be loaded by $SERVICE_USER inside the hardened systemd sandbox; fix its contents and every parent directory's access, then re-run install"
@@ -1694,6 +1849,44 @@ run_selftest() {
     _check_custom_config_metadata 1000 991 640 991 unsafe
     _check_custom_config_metadata 0 991 1640 991 unsafe
 
+    _check_service_userlist_metadata() { # description kind metadata want(safe|unsafe)
+        local description="$1" kind="$2" mock_metadata="$3" want="$4" got=unsafe
+        if (
+            service_userlist_path_kind() { printf '%s' "$kind"; }
+            service_config_path_metadata() { printf '%s\n' "$mock_metadata"; }
+            service_group_id() { printf '%s' 991; }
+            require_secure_service_userlist_file /etc/alighieri/users
+        ) 2>/dev/null; then
+            got=safe
+        fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   service userlist metadata %s -> %s\n' "$description" "$got"
+        else
+            printf 'FAIL service userlist metadata %s -> %s (want %s)\n' \
+                "$description" "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_service_userlist_metadata "root:service 640 regular file" \
+        regular '0 991 640' safe
+    _check_service_userlist_metadata "service-owned file" \
+        regular '991 991 640' unsafe
+    _check_service_userlist_metadata "wrong group" \
+        regular '0 0 640' unsafe
+    _check_service_userlist_metadata "owner-only mode" \
+        regular '0 991 600' unsafe
+    _check_service_userlist_metadata "world-readable mode" \
+        regular '0 991 644' unsafe
+    _check_service_userlist_metadata "group-writable file" \
+        regular '0 991 660' unsafe
+    _check_service_userlist_metadata "special permission bits" \
+        regular '0 991 1640' unsafe
+    _check_service_userlist_metadata "symlink after parent validation" \
+        symlink '0 991 640' unsafe
+    _check_service_userlist_metadata "non-regular file after parent validation" \
+        other '0 991 640' unsafe
+
     _check_named_service_group_id() { # group-record expected-or-reject
         local simulated_record="$1" expected="$2" got=reject
         got="$(
@@ -1955,22 +2148,35 @@ run_selftest() {
         failures=$((failures + 1))
     fi
 
-    _check_userlist_preflight() { # description summary will-start mock-status want expected [command]
+    _check_userlist_preflight() { # description summary will-start sandbox-status want expected [command kind parent-status metadata-status]
         local desc="$1" summary="$2" will_start="$3" mock_status="$4" \
-              want="$5" expected="$6" expected_command="${7:-}" out got
-        systemd-run() {
-            if [ -n "$expected_command" ] && [[ "$*" != *"$expected_command"* ]]; then
-                return 99
-            fi
-            return "$mock_status"
-        }
-        if out="$(validate_service_userlist \
-            /usr/local/bin/alighieri "$summary" "$will_start" 2>&1)"; then
+              want="$5" expected="$6" expected_command="${7:-}" \
+              mock_kind="${8:-regular}" mock_parent_status="${9:-0}" \
+              mock_metadata_status="${10:-0}" out got
+        if out="$(
+            service_userlist_path_kind() { printf '%s' "$mock_kind"; }
+            require_safe_service_userlist_directory() {
+                printf 'PARENT:%s|' "$1" >&2
+                [ "$mock_parent_status" -eq 0 ] || die "mock unsafe userlist parent"
+            }
+            require_secure_service_userlist_file() {
+                printf 'METADATA:%s|' "$1" >&2
+                [ "$mock_metadata_status" -eq 0 ] || die "mock unsafe userlist metadata"
+            }
+            systemd-run() {
+                printf 'SANDBOX:%s|' "$*" >&2
+                if [ -n "$expected_command" ] && [[ "$*" != *"$expected_command"* ]]; then
+                    return 99
+                fi
+                return "$mock_status"
+            }
+            validate_service_userlist \
+                /usr/local/bin/alighieri "$summary" "$will_start" 2>&1
+        )"; then
             got=ok
         else
             got=fail
         fi
-        unset -f systemd-run
         if [ "$got" = "$want" ] && [[ "$out" == *"$expected"* ]]; then
             printf 'ok   service userlist preflight %s\n' "$desc"
         else
@@ -1985,7 +2191,8 @@ run_selftest() {
     _check_userlist_preflight "skips an unset userlist" \
         '{"ok":true,"userlist":""}' 1 1 ok ""
     _check_userlist_preflight "accepts a readable managed userlist" \
-        '{"ok":true,"userlist":"/etc/alighieri/users"}' 1 0 ok "" \
+        '{"ok":true,"userlist":"/etc/alighieri/users"}' 1 0 ok \
+        'PARENT:/etc/alighieri|METADATA:/etc/alighieri/users|SANDBOX:' \
         '/usr/local/bin/alighieri user list --userlist /etc/alighieri/users'
     _check_userlist_preflight "rejects a sandbox-hidden userlist" \
         '{"ok":true,"userlist":"/home/alice/users"}' 0 0 fail "hidden by the service"
@@ -1993,7 +2200,26 @@ run_selftest() {
         '{"ok":true,"userlist":"/opt/private/users"}' 1 1 fail "cannot be loaded"
     _check_userlist_preflight "allows a missing bootstrap userlist while stopped" \
         "{\"ok\":true,\"userlist\":\"/opt/alighieri-selftest-missing-$$\"}" \
-        0 1 ok "does not exist yet"
+        0 1 ok "does not exist yet" "" missing
+    _check_userlist_preflight "rejects a missing userlist before start" \
+        '{"ok":true,"userlist":"/opt/missing-users"}' \
+        1 0 fail "does not exist" "" missing
+    _check_userlist_preflight "does not exempt a dangling symlink while stopped" \
+        '{"ok":true,"userlist":"/opt/dangling-users"}' \
+        0 0 fail "is a symlink" "" symlink
+    _check_userlist_preflight "rejects a non-regular userlist" \
+        '{"ok":true,"userlist":"/opt/users-dir"}' \
+        1 0 fail "not a regular file" "" other
+    _check_userlist_preflight "rejects an unsafe userlist parent before sandboxing" \
+        '{"ok":true,"userlist":"/opt/users"}' \
+        1 0 fail "mock unsafe userlist parent" "" regular 1 0
+    _check_userlist_preflight "rejects unsafe userlist metadata before sandboxing" \
+        '{"ok":true,"userlist":"/opt/users"}' \
+        1 0 fail "mock unsafe userlist metadata" "" regular 0 1
+    _check_userlist_preflight "checks a relative path at the service runtime location" \
+        '{"ok":true,"userlist":"users"}' 1 0 ok \
+        'PARENT:/|METADATA:/users|SANDBOX:' \
+        '/usr/local/bin/alighieri user list --userlist users'
 
     _check_warn() { # description want(warn|quiet) func summary
         local desc="$1" want="$2" func="$3" summary="$4" out got
@@ -2119,7 +2345,12 @@ run_selftest() {
         local saved_unit="$UNIT_FILE" mock_effective_payload="" \
               mock_working_directory="/" mock_root_directory="" \
               mock_namespace_property="" mock_systemd_version="255.4-test" \
-              mock_exec_start_flags=0 mock_source_exec_prefix=""
+              mock_exec_start_flags=0 mock_source_exec_prefix="" \
+              mock_state_directory='as 1 "alighieri"' \
+              mock_state_directory_mode='u 488' \
+              mock_state_directory_symlink='a(sst) 0' \
+              mock_read_write_paths='as 1 "/var/log/alighieri"' \
+              mock_bounding_set='t 0' mock_ambient_capabilities='t 0'
         UNIT_FILE="$(mktemp)"
         printf '%s\n' \
             '[Service]' \
@@ -2210,6 +2441,18 @@ run_selftest() {
                         else
                             printf '%s\n' 's ""'
                         fi
+                    elif [ "$property" = StateDirectory ]; then
+                        printf '%s\n' "$mock_state_directory"
+                    elif [ "$property" = StateDirectoryMode ]; then
+                        printf '%s\n' "$mock_state_directory_mode"
+                    elif [ "$property" = StateDirectorySymlink ]; then
+                        printf '%s\n' "$mock_state_directory_symlink"
+                    elif [ "$property" = ReadWritePaths ]; then
+                        printf '%s\n' "$mock_read_write_paths"
+                    elif [ "$property" = CapabilityBoundingSet ]; then
+                        printf '%s\n' "$mock_bounding_set"
+                    elif [ "$property" = AmbientCapabilities ]; then
+                        printf '%s\n' "$mock_ambient_capabilities"
                     elif [ "$property" = "$mock_namespace_property" ]; then
                         printf '%s\n' 'a(ssbt) 1 "/srv/users" "/etc/alighieri" false true'
                     else
@@ -2244,7 +2487,7 @@ run_selftest() {
                 START_ON_INSTALL=1
                 if out="$(
                     activate_installed_service \
-                        "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                        "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
                 )"; then
                     activation_succeeded=1
                 fi
@@ -2280,7 +2523,7 @@ run_selftest() {
         START_ON_INSTALL=1
         if flags_out="$(
             activate_installed_service \
-                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
         )"; then
             flags_accepted=1
         fi
@@ -2328,7 +2571,7 @@ run_selftest() {
         START_ON_INSTALL=1
         if sandbox_out="$(
             activate_installed_service \
-                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
         )"; then
             sandbox_accepted=1
         fi
@@ -2343,6 +2586,103 @@ run_selftest() {
             failures=$((failures + 1))
         fi
 
+        # Manager-loaded writable directories and capability masks must match
+        # the candidate unit exactly; they are list/bitmask properties that do
+        # not appear in the scalar sandbox output above.
+        mock_working_directory="/"
+        if effective_service_sandbox_matches 0; then
+            printf 'ok   effective managed storage and empty capabilities match\n'
+        else
+            printf 'FAIL effective managed storage or empty capabilities did not match\n'
+            failures=$((failures + 1))
+        fi
+
+        mock_bounding_set='t 1024'
+        mock_ambient_capabilities='t 1024'
+        if effective_service_sandbox_matches 1024 &&
+            ! effective_service_sandbox_matches 0; then
+            printf 'ok   effective bind capability matches only the privileged profile\n'
+        else
+            printf 'FAIL effective bind capability mask comparison\n'
+            failures=$((failures + 1))
+        fi
+
+        mock_bounding_set='t 1025'
+        if effective_service_sandbox_matches 1024; then
+            printf 'FAIL effective capability guard accepted an extra capability bit\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective capability guard rejects extra capability bits\n'
+        fi
+        mock_bounding_set='t 0'
+        mock_ambient_capabilities='t 0'
+
+        mock_read_write_paths='as 2 "/var/log/alighieri" "/"'
+        if effective_service_sandbox_matches 0; then
+            printf 'FAIL effective storage guard accepted an extra writable path\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective storage guard rejects extra writable paths\n'
+        fi
+        mock_read_write_paths='as 1 "/var/log/alighieri"'
+
+        mock_state_directory='as 0'
+        if effective_service_sandbox_matches 0; then
+            printf 'FAIL effective storage guard accepted a cleared StateDirectory\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective storage guard rejects a cleared StateDirectory\n'
+        fi
+        mock_state_directory='as 1 "alighieri"'
+
+        mock_state_directory_mode='u 511'
+        if effective_service_sandbox_matches 0; then
+            printf 'FAIL effective storage guard accepted a broadened StateDirectoryMode\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective storage guard rejects a broadened StateDirectoryMode\n'
+        fi
+        mock_state_directory_mode='u 488'
+
+        mock_state_directory_symlink='a(sst) 1 "alighieri" "elsewhere" 0'
+        if effective_service_sandbox_matches 0; then
+            printf 'FAIL effective storage guard accepted a StateDirectory destination override\n'
+            failures=$((failures + 1))
+        else
+            printf 'ok   effective storage guard rejects a StateDirectory destination override\n'
+        fi
+        mock_state_directory_symlink='a(sst) 1 "alighieri" "" 0'
+        if effective_service_sandbox_matches 0; then
+            printf 'ok   effective storage guard accepts an empty StateDirectory mapping\n'
+        else
+            printf 'FAIL effective storage guard rejected an empty StateDirectory mapping\n'
+            failures=$((failures + 1))
+        fi
+        mock_state_directory_symlink='a(sst) 0'
+
+        # A capability mismatch must abort the activation wrapper before either
+        # enable or restart is attempted.
+        mock_ambient_capabilities='t 1025'
+        sandbox_accepted=0
+        START_ON_INSTALL=1
+        if sandbox_out="$(
+            activate_installed_service \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
+        )"; then
+            sandbox_accepted=1
+        fi
+        START_ON_INSTALL="$saved_start"
+        if [ "$sandbox_accepted" -eq 0 ] &&
+            [[ "$sandbox_out" == *"capabilities differ"* &&
+                "$sandbox_out" != *"CALL restart"* &&
+                "$sandbox_out" != *"CALL enable"* ]]; then
+            printf 'ok   install activation refuses capability overrides before start\n'
+        else
+            printf 'FAIL install activation capability guard output: [%s]\n' "$sandbox_out"
+            failures=$((failures + 1))
+        fi
+        mock_ambient_capabilities='t 0'
+
         # Namespace settings are additive, so comparing only scalar hardening
         # properties does not detect a surviving chroot/mount drop-in. It must
         # be rejected before activation even when ExecStart and every scalar
@@ -2353,7 +2693,7 @@ run_selftest() {
         START_ON_INSTALL=1
         if sandbox_out="$(
             activate_installed_service \
-                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
         )"; then
             sandbox_accepted=1
         fi
@@ -2394,7 +2734,7 @@ run_selftest() {
         START_ON_INSTALL=1
         if sandbox_out="$(
             activate_installed_service \
-                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 0 2>&1
         )"; then
             sandbox_accepted=1
         fi
@@ -2603,6 +2943,10 @@ run_selftest() {
                     [ "$failure_mode" != config-metadata ] ||
                         die "unsafe service config metadata"
                 }
+                service_userlist_path_kind() { printf '%s' regular; }
+                require_safe_service_userlist_directory() { :; }
+                require_secure_service_userlist_file() { :; }
+                service_capability_mask() { printf '%s' 0; }
                 chown() { [ "${!#}" != "$config" ]; }
                 chmod() { [ "${!#}" != "$config" ]; }
                 install() {
@@ -2869,6 +3213,7 @@ run_selftest() {
                 reject_hidden_service_path() { :; }
                 require_safe_service_config_directory() { :; }
                 require_secure_service_config_file() { :; }
+                service_capability_mask() { printf '%s' 0; }
                 chown() { [ "${!#}" != "$config" ]; }
                 install() {
                     local destination
@@ -2955,7 +3300,7 @@ run_selftest() {
 
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
-              expected='reload|guard|config-dir|config-file|preflight|reload|guard|restart|' \
+              expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|restart|' \
               reload_count=0 change_exec_start=0 invalid_exec_start=0 \
               config_guard_failure='' succeeded=0
         upgrade_tmp="$(mktemp -d)"
@@ -2976,7 +3321,9 @@ run_selftest() {
         STAGED_BIN=""
         require_service_sandbox() { :; }
         require_safe_binary_directory() { :; }
-        require_effective_service_sandbox() { printf 'guard|' >>"$order"; }
+        require_effective_service_sandbox() {
+            printf 'guard:%s|' "${1:-storage}" >>"$order"
+        }
         loaded_exec_start_payload() {
             [ "$invalid_exec_start" -eq 0 ] || return 1
             if [ "$change_exec_start" -eq 1 ] && [ "$reload_count" -ge 2 ]; then
@@ -3003,6 +3350,7 @@ run_selftest() {
             printf 'preflight|' >>"$order"
             printf '%s\n' '{"ok":true,"userlist":""}'
         }
+        service_capability_mask() { printf '%s' 0; }
         systemctl() {
             case "${1:-}" in
                 daemon-reload)
@@ -3034,9 +3382,9 @@ run_selftest() {
             got="$(<"$order")"
             installed_contents="$(<"$installed")"
             if [ "$config_guard_failure" = directory ]; then
-                expected='reload|guard|config-dir|'
+                expected='reload|guard:storage|config-dir|'
             else
-                expected='reload|guard|config-dir|config-file|'
+                expected='reload|guard:storage|config-dir|config-file|'
             fi
             if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
                 [ "$installed_contents" = installed ]; then
@@ -3053,6 +3401,7 @@ run_selftest() {
         # If the second reload changes ExecStart, abort before replacing the
         # captured binary or restarting a command that was never preflighted.
         printf '%s\n' installed >"$installed"
+        command rm -f -- "${installed}.new.$$"
         : >"$order"
         reload_count=0
         change_exec_start=1
@@ -3060,7 +3409,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard|config-dir|config-file|preflight|reload|guard|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an ExecStart change before binary replacement\n'
@@ -3083,7 +3432,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard|'
+        expected='reload|guard:storage|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an expandable ExecStart before binary replacement\n'
@@ -3092,6 +3441,54 @@ run_selftest() {
                 "$succeeded" "$got" "$installed_contents"
             failures=$((failures + 1))
         fi
+
+        # The same final reload/ExecStart race check applies when the operator
+        # deliberately leaves the current process running.
+        printf '%s\n' installed >"$installed"
+        command rm -f -- "${installed}.new.$$"
+        : >"$order"
+        reload_count=0
+        invalid_exec_start=0
+        change_exec_start=1
+        RESTART_ON_UPGRADE=0
+        succeeded=0
+        if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
+        got="$(<"$order")"
+        installed_contents="$(<"$installed")"
+        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
+        if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
+            [ "$installed_contents" = installed ]; then
+            printf 'ok   --no-restart upgrade refuses an ExecStart race before replacement\n'
+        else
+            printf 'FAIL --no-restart ExecStart race guard: status %s, calls [%s], binary [%s]\n' \
+                "$succeeded" "$got" "$installed_contents"
+            failures=$((failures + 1))
+        fi
+
+        # --no-restart still replaces the on-disk binary, so reload and require
+        # the manager-loaded command/capability profile to match the candidate
+        # config even though the service process is deliberately left untouched.
+        printf '%s\n' installed >"$installed"
+        command rm -f -- "${installed}.new.$$"
+        : >"$order"
+        reload_count=0
+        invalid_exec_start=0
+        change_exec_start=0
+        RESTART_ON_UPGRADE=0
+        succeeded=0
+        if do_upgrade >/dev/null 2>&1; then succeeded=1; fi
+        got="$(<"$order")"
+        installed_contents="$(<"$installed")"
+        expected='reload|guard:storage|config-dir|config-file|preflight|reload|guard:0|'
+        if [ "$succeeded" -eq 1 ] && [ "$got" = "$expected" ] &&
+            [ "$installed_contents" = source ]; then
+            printf 'ok   --no-restart upgrade reloads and validates before replacement\n'
+        else
+            printf 'FAIL --no-restart capability guard: status %s, calls [%s], binary [%s]\n' \
+                "$succeeded" "$got" "$installed_contents"
+            failures=$((failures + 1))
+        fi
+        RESTART_ON_UPGRADE=1
         rm -f -- "$unit" "$config" "$source" "$installed" "$order" \
             "${installed}.new.$$"
         rmdir -- "$upgrade_tmp"
@@ -3110,14 +3507,16 @@ run_selftest() {
 }
 
 write_unit() {
-    local install_bin="$1" config_file="$2" summary="$3" \
+    local install_bin="$1" config_file="$2" capability_mask="$3" \
           output_file="${4:-$UNIT_FILE}"
     # Grant the minimal capability to bind a privileged port only when the
     # config actually needs one; otherwise keep all capabilities dropped.
     local caps=""
-    if needs_net_bind_capability "$summary"; then
-        caps="CAP_NET_BIND_SERVICE"
-    fi
+    case "$capability_mask" in
+        0) ;;
+        1024) caps="CAP_NET_BIND_SERVICE" ;;
+        *) return 1 ;;
+    esac
     cat >"$output_file" <<UNIT
 [Unit]
 Description=Alighieri SOCKS5 proxy server
@@ -3168,7 +3567,8 @@ UNIT
 
 # ── Actions ───────────────────────────────────────────────────────────────────
 reload_and_validate_installed_service() {
-    local expected_binary="${1:-}" expected_config="${2:-}"
+    local expected_binary="${1:-}" expected_config="${2:-}" \
+          expected_capability_mask="${3:-}"
     systemctl daemon-reload ||
         die "systemd daemon-reload failed while validating the new unit; the previous unit will be restored"
     if [ -n "$expected_binary" ] &&
@@ -3176,7 +3576,11 @@ reload_and_validate_installed_service() {
         die "effective systemd ExecStart command or execution flags do not match $expected_binary $expected_config; remove or update the overriding drop-in, then re-run install"
     fi
     if [ -n "$expected_binary" ]; then
-        require_effective_service_sandbox
+        case "$expected_capability_mask" in
+            0 | 1024) ;;
+            *) die "internal error: expected systemd capability mask was not provided" ;;
+        esac
+        require_effective_service_sandbox "$expected_capability_mask"
     fi
 }
 
@@ -3193,8 +3597,7 @@ activate_prevalidated_service() {
 }
 
 activate_installed_service() {
-    local expected_binary="${1:-}" expected_config="${2:-}"
-    reload_and_validate_installed_service "$expected_binary" "$expected_config"
+    reload_and_validate_installed_service "$@"
     activate_prevalidated_service
 }
 
@@ -3331,7 +3734,7 @@ do_install() {
     # read but the service user or the unit's path-hiding controls cannot reach.
     # A config failure must abort before rewriting/restarting the active unit; on
     # failure, re-run in text mode to surface the human-readable error first.
-    local check_summary
+    local check_summary capability_mask
     if ! check_summary="$(run_in_service_sandbox \
         "$STAGED_BIN" --check --json "$config_file" 2>/dev/null)"; then
         run_in_service_sandbox "$STAGED_BIN" --check "$config_file" || true
@@ -3340,6 +3743,7 @@ do_install() {
     validate_service_userlist "$STAGED_BIN" "$check_summary" "$START_ON_INSTALL"
     warn_acme_cache_outside_state_dir "$check_summary"
     warn_logfile_outside_log_dir "$check_summary"
+    capability_mask="$(service_capability_mask "$check_summary")"
 
     # Log directory for optional file logging. The default config logs to
     # stdout, which systemd captures into the journal. As with the config dir,
@@ -3358,12 +3762,13 @@ do_install() {
     # service sandbox have both matched the generated unit.
     STAGED_UNIT="${UNIT_FILE}.new.$$"
     info "staging systemd unit validation at $STAGED_UNIT"
-    write_unit "$install_bin" "$config_file" "$check_summary" "$STAGED_UNIT" ||
+    write_unit "$install_bin" "$config_file" "$capability_mask" "$STAGED_UNIT" ||
         die "could not render the staged systemd unit at $STAGED_UNIT"
     chmod 644 "$STAGED_UNIT" ||
         die "could not set safe permissions on the staged systemd unit at $STAGED_UNIT"
     begin_unit_transaction
-    reload_and_validate_installed_service "$install_bin" "$config_file"
+    reload_and_validate_installed_service \
+        "$install_bin" "$config_file" "$capability_mask"
 
     info "installing validated binary to $install_bin"
     # The checked replacement refuses an unexpected directory destination
@@ -3422,7 +3827,7 @@ do_upgrade() {
     # restart still uses stale loaded state.
     systemctl daemon-reload
     require_effective_service_sandbox
-    local install_bin install_dir config_file config_dir \
+    local install_bin install_dir config_file config_dir capability_mask \
           expected_exec_start current_exec_start
     expected_exec_start="$(loaded_exec_start_payload)" ||
         die "effective systemd ExecStart is empty or unsupported; fix the unit before upgrading"
@@ -3466,18 +3871,18 @@ do_upgrade() {
         die "new binary rejects $config_file or cannot read it inside the hardened service sandbox; fix the errors above before upgrading"
     fi
     validate_service_userlist "$STAGED_BIN" "$check_summary" 1
+    capability_mask="$(service_capability_mask "$check_summary")"
 
     # Source builds and service-user preflights can take time. Reload and verify
-    # once more immediately before replacing/restarting so a drop-in changed
-    # during that window cannot silently invalidate the sandbox comparison.
-    if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then
-        systemctl daemon-reload
-        require_effective_service_sandbox
-        current_exec_start="$(loaded_exec_start_payload 2>/dev/null || true)"
-        if [ "$current_exec_start" != "$expected_exec_start" ]; then
-            [ -n "$current_exec_start" ] || current_exec_start="<empty>"
-            die "effective systemd ExecStart changed during upgrade (now $current_exec_start); no binary was replaced and the service was not restarted; review the unit/drop-ins, then retry"
-        fi
+    # once more immediately before replacing the binary, even with --no-restart,
+    # so a drop-in changed during that window cannot evade validation and alter
+    # the command or sandbox used by the next activation.
+    systemctl daemon-reload
+    require_effective_service_sandbox "$capability_mask"
+    current_exec_start="$(loaded_exec_start_payload 2>/dev/null || true)"
+    if [ "$current_exec_start" != "$expected_exec_start" ]; then
+        [ -n "$current_exec_start" ] || current_exec_start="<empty>"
+        die "effective systemd ExecStart changed during upgrade (now $current_exec_start); no binary was replaced and the service was not restarted; review the unit/drop-ins, then retry"
     fi
 
     info "upgrading binary at $install_bin"

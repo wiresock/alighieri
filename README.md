@@ -835,10 +835,13 @@ Before rewriting or restarting the managed unit, the installer validates the
 configuration inside a transient sandbox with the same service account,
 working directory, and path-hiding protections (including `ProtectHome`,
 `PrivateTmp`, and `PrivateDevices`). When starting an authenticated deployment,
-it also fully parses the effective userlist there. This rejects custom paths the
-root account can read but the service cannot traverse or see, as well as
-malformed credentials; `--no-start` still permits a not-yet-created userlist for
-first-time credential bootstrap.
+it also requires the effective userlist to be a physical file below a
+root-controlled directory chain, owned by `root:alighieri` with mode `0640`, and
+fully parses it there. This rejects credentials the service could rewrite,
+custom paths the root account can read but the service cannot traverse or see,
+and malformed entries; `--no-start` exempts only a genuinely missing userlist
+for first-time credential bootstrap. The final install enforces the complete
+policy before starting the service.
 
 The unit runs as the `alighieri` user with `NoNewPrivileges`,
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a capability set restricted
