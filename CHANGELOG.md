@@ -17,6 +17,16 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   installation without enabling or starting it, allowing authenticated public
   profiles to create their userlist before first launch.
 
+### Changed
+
+- The Linux lifecycle helper no longer downloads or builds a mutable `main`
+  branch when run outside a checkout. Linux release archives now bundle the
+  version-matched helper and default config; standalone-helper users should
+  migrate to an extracted release archive or a source checkout.
+- Public-profile import now requires an ACL and authentication backend that the
+  wizard can represent without broadening access, and the Linux installer
+  accepts an explicit install-only `--config` path for intentional unit updates.
+
 ## [0.4.0] - 2026-07-23
 
 ### Added

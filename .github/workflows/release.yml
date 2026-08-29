@@ -138,9 +138,13 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/alighieri" "$dir"/
-          cp README.md LICENSE CHANGELOG.md "$dir"/
+          mkdir -p "$dir/scripts" "$dir/doc"
+          install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
+          install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
+          install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
+          install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
+          test -x "$dir/scripts/alighieri.sh"
+          test -f "$dir/doc/alighieri.conf"
           tar czf "$dir.tar.gz" "$dir"
           echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
 

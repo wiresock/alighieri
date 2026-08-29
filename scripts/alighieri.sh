@@ -10,29 +10,20 @@
 #   sudo ./scripts/alighieri.sh status          Show deployment status
 #   sudo ./scripts/alighieri.sh help            Detailed help
 #
-# It also runs standalone — download just this file and run it:
-#
-#   curl -O https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh
-#   chmod +x alighieri.sh
-#   sudo ./alighieri.sh
-#
-# Run from a repository checkout, or standalone: when it can't find the source
-# locally it shallow-clones the repository into a temporary directory to build
-# the binary and read the default config (needs git and a Rust toolchain; or
-# pass --binary to install a prebuilt binary and skip the build).
+# Run it from a repository checkout, or from a Linux release archive, which
+# bundles this helper, the matching prebuilt binary, and the default config.
+# Release installs should pass --binary ./alighieri; that path uses only the
+# extracted release payload. A checkout without a prebuilt binary builds with
+# Cargo and may fetch its locked dependencies, but the helper never clones a
+# mutable repository branch or downloads a replacement lifecycle script.
 #
 # Configuration constants are intentionally NOT read from the environment:
-# this script runs as root, and honouring env overrides would widen the
-# attack surface for privilege escalation via environment injection (including
-# the clone source below). Use the documented flags instead.
+# this script runs as root, and honouring env overrides would widen the attack
+# surface for privilege escalation via environment injection. Use the
+# documented flags instead.
 #
 # https://github.com/wiresock/alighieri
 set -euo pipefail
-
-# Source fetched when running standalone. Hardcoded, never from the environment:
-# this runs as root, so an attacker-controlled clone URL would be code execution.
-readonly REPO_URL="https://github.com/wiresock/alighieri.git"
-readonly REPO_REF="main"
 
 SERVICE_NAME="alighieri"
 SERVICE_USER="alighieri"
@@ -49,6 +40,8 @@ PREFIX="/usr/local"
 PREFIX_EXPLICIT=0
 BINARY=""
 BINARY_EXPLICIT=0
+INSTALL_CONFIG=""
+CONFIG_EXPLICIT=0
 RESTART_ON_UPGRADE=1
 START_ON_INSTALL=1
 PURGE_CONFIG=0
@@ -57,7 +50,6 @@ PURGE_STATE=0
 PURGE_USER=0
 ACTION="auto"
 COMMAND_SEEN=0
-BOOTSTRAP_DIR=""
 STAGED_BIN=""
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -78,6 +70,20 @@ info() { printf '%s\n' "$*" >&2; }
 warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
 ok()   { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_RESET" >&2; }
 die()  { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+# systemd parses ExecStart itself rather than passing it through a shell. These
+# characters introduce specifier/environment expansion or quoting/escaping, so
+# the simple whitespace-delimited unit format below cannot represent them as
+# literal path bytes. Reject them instead of validating one path and launching
+# another.
+validate_exec_start_path() {
+    local option="$1" value="$2"
+    case "$value" in
+        *%*|*'$'*|*'"'*|*"'"*|*\\*)
+            die "$option must not contain systemd ExecStart metacharacters (%, $, quotes, or backslash): $value"
+            ;;
+    esac
+}
 
 usage() {
     cat <<EOF
@@ -103,6 +109,8 @@ Commands:
 Options:
   --binary PATH      Use this prebuilt alighieri binary instead of building.
   --prefix DIR       Install prefix for the binary (default: ${PREFIX}).
+  --config PATH      (install) Use this config in the systemd unit. Without it,
+                     reconfiguration preserves the unit's current config path.
   --no-restart       (upgrade) Replace the binary but do not restart the service.
   --no-start         (install) Prepare files and the unit without enabling or
                      starting it. Re-run install after creating credentials.
@@ -116,6 +124,8 @@ Options:
 Examples:
   sudo $0                                   # install, or manage if installed
   sudo $0 install --binary ./alighieri      # install a prebuilt binary
+  sudo $0 install --config /etc/alighieri/alighieri.conf
+                                             # explicitly select the unit config
   sudo $0 upgrade                            # rebuild from source and restart
   sudo $0 upgrade --binary ./alighieri      # swap in a prebuilt binary
   sudo $0 uninstall --purge-all             # remove everything
@@ -133,6 +143,8 @@ while [ $# -gt 0 ]; do
         help | -h | --help) usage; exit 0 ;; # help always wins, immediately
         --binary) shift; [ $# -gt 0 ] || die "--binary requires a path"; BINARY="$1"; BINARY_EXPLICIT=1 ;;
         --prefix) shift; [ $# -gt 0 ] || die "--prefix requires a path"; PREFIX="$1"; PREFIX_EXPLICIT=1 ;;
+        --config) shift; [ $# -gt 0 ] || die "--config requires a path"; INSTALL_CONFIG="$1"; CONFIG_EXPLICIT=1 ;;
+        --config=*) INSTALL_CONFIG="${1#--config=}"; [ -n "$INSTALL_CONFIG" ] || die "--config requires a path"; CONFIG_EXPLICIT=1 ;;
         --no-restart) RESTART_ON_UPGRADE=0 ;;
         --no-start) START_ON_INSTALL=0 ;;
         --purge-config) PURGE_CONFIG=1 ;;
@@ -154,6 +166,18 @@ esac
 case "$PREFIX" in
     *[[:space:]]*) die "--prefix must not contain whitespace: $PREFIX" ;;
 esac
+validate_exec_start_path "--prefix" "$PREFIX"
+if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+    [ "$ACTION" = "install" ] || die "--config is valid only with the install command"
+    case "$INSTALL_CONFIG" in
+        /*) ;;
+        *) die "--config must be an absolute path: $INSTALL_CONFIG" ;;
+    esac
+    case "$INSTALL_CONFIG" in
+        *[[:space:]]*) die "--config must not contain whitespace: $INSTALL_CONFIG" ;;
+    esac
+    validate_exec_start_path "--config" "$INSTALL_CONFIG"
+fi
 
 BIN_DIR="${PREFIX}/bin"
 
@@ -180,6 +204,16 @@ nologin_shell() {
     printf '%s' /bin/false
 }
 
+# ExecStart payload from the base unit file only. Empty when absent.
+unit_file_exec_start_payload() {
+    local line=""
+    if [ -f "$UNIT_FILE" ]; then
+        line="$(grep '^[[:space:]]*ExecStart=' "$UNIT_FILE" 2>/dev/null | tail -n1 || true)"
+    fi
+    [ -n "$line" ] && printf '%s' "${line#*=}"
+    return 0
+}
+
 # Effective ExecStart payload (everything after its first '=') for the service.
 # Prefer the merged unit (base + drop-ins) via `systemctl cat`, so a
 # `systemctl edit` override of ExecStart is honoured; fall back to the on-disk
@@ -191,11 +225,21 @@ exec_start_payload() {
         line="$(systemctl cat -- "${SERVICE_NAME}.service" 2>/dev/null |
             grep '^[[:space:]]*ExecStart=' | tail -n1 || true)"
     fi
-    if [ -z "$line" ] && [ -f "$UNIT_FILE" ]; then
-        line="$(grep '^[[:space:]]*ExecStart=' "$UNIT_FILE" 2>/dev/null | tail -n1 || true)"
+    if [ -z "$line" ]; then
+        unit_file_exec_start_payload
+    else
+        printf '%s' "${line#*=}"
     fi
-    [ -n "$line" ] && printf '%s' "${line#*=}"
     return 0
+}
+
+# True when systemd's merged ExecStart differs from the base unit we manage,
+# which means a drop-in will survive rewriting that base file.
+effective_exec_start_overrides_base() {
+    local base effective
+    base="$(unit_file_exec_start_payload)"
+    effective="$(exec_start_payload)"
+    [ "$effective" != "$base" ]
 }
 
 # Resolve where the binary actually lives, from the effective ExecStart (so a
@@ -252,6 +296,32 @@ installed_config_path() {
     printf '%s' "$CONFIG_FILE"
 }
 
+effective_install_matches() {
+    local expected_binary="$1" expected_config="$2" effective
+    # This is a post-daemon-reload safety check, not a status-path lookup. Match
+    # the exact payload we just wrote instead of using installed_*_path, whose
+    # deliberately conservative fallbacks would turn an empty/malformed
+    # surviving drop-in into the expected defaults and allow a stale service to
+    # start. Paths accepted by the installer contain neither whitespace nor
+    # systemd expansion/quoting characters, so this canonical form is exact.
+    effective="$(exec_start_payload)"
+    [ "$effective" = "$expected_binary $expected_config" ]
+}
+
+# Select the config for an install/reconfigure. Passing the installed unit's
+# effective path keeps this helper pure and self-testable; an explicit --config
+# is the only way to override that preserved path.
+select_install_config_path() {
+    local installed_path="${1:-}"
+    if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+        printf '%s' "$INSTALL_CONFIG"
+    elif [ -n "$installed_path" ]; then
+        printf '%s' "$installed_path"
+    else
+        printf '%s' "$CONFIG_FILE"
+    fi
+}
+
 # "Installed" means this script's systemd unit is present. A bare binary at the
 # default path (e.g. from `cargo install`) is not treated as an install, so the
 # menu and uninstall never act on something we did not deploy.
@@ -259,13 +329,11 @@ is_installed() {
     [ -f "$UNIT_FILE" ]
 }
 
-# Remove transient artifacts on exit: any temporary clone created by
-# bootstrap_repo, and any staged upgrade binary that was not moved into place.
-# The installed binary and config have already been copied out by then.
+# Remove any staged upgrade binary that was not moved into place. The installed
+# binary and config have already been copied out by then.
 cleanup() {
     # Best-effort: a failing rm must not abort the EXIT trap (under errexit) or
     # change the script's original exit status, so swallow any error.
-    if [ -n "$BOOTSTRAP_DIR" ]; then rm -rf -- "$BOOTSTRAP_DIR" 2>/dev/null || true; fi
     if [ -n "$STAGED_BIN" ]; then rm -f -- "$STAGED_BIN" 2>/dev/null || true; fi
     return 0
 }
@@ -276,29 +344,16 @@ in_checkout() {
     [ -f "${REPO_ROOT}/Cargo.toml" ] && [ -f "${REPO_ROOT}/doc/alighieri.conf" ]
 }
 
-# When running standalone (the script was downloaded on its own rather than from
-# a checkout), shallow-clone the repository so we have the source to build and
-# the default config to install. Points REPO_ROOT at the clone; a no-op when
-# already inside a checkout or after a previous clone this run.
-bootstrap_repo() {
-    in_checkout && return 0
-    command -v git >/dev/null 2>&1 ||
-        die "running standalone but git is not installed; install git and re-run, run from a checkout, or pass --binary"
-    # `--` everywhere the temp-dir path is used so a TMPDIR beginning with `-`
-    # (e.g. preserved via sudo -E) can't make mktemp/git/chown/cd/cp parse it as
-    # an option in this root script.
-    BOOTSTRAP_DIR="$(mktemp -d -- "${TMPDIR:-/tmp}/alighieri-bootstrap.XXXXXX")"
-    info "fetching source: git clone --depth 1 --branch ${REPO_REF} ${REPO_URL}"
-    GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$REPO_REF" -- "$REPO_URL" "$BOOTSTRAP_DIR" >&2 ||
-        die "failed to clone ${REPO_URL} (private repo or no network?); clone it manually and run from the checkout, or pass --binary"
-    REPO_ROOT="$BOOTSTRAP_DIR"
+# Refuse to obtain executable source dynamically in a root process. Source
+# builds must come from the checkout containing this script; Linux release
+# archives instead carry a matching binary and default config.
+require_checkout() {
     in_checkout ||
-        die "cloned repository at ${REPO_ROOT} is missing Cargo.toml or doc/alighieri.conf"
+        die "source checkout not found; run this helper from an Alighieri checkout, or use a Linux release archive and pass --binary ./alighieri"
 }
 
 # Locate the binary to install/upgrade from: an explicit --binary, a prebuilt
-# target/release build, or a fresh cargo build from the checkout (cloning the
-# source first when running standalone).
+# target/release build, or a fresh cargo build from the checkout.
 resolve_source_binary() {
     if [ -n "$BINARY" ]; then
         # A regular file is enough; install sets mode 755 on the destination, so
@@ -310,18 +365,17 @@ resolve_source_binary() {
         BINARY="${REPO_ROOT}/target/release/${SERVICE_NAME}"
         return
     fi
-    bootstrap_repo
+    require_checkout
     build_from_source
     BINARY="${REPO_ROOT}/target/release/${SERVICE_NAME}"
 }
 
 # Build the release binary in REPO_ROOT. cargo runs dependency build scripts and
 # proc-macros, so when invoked via sudo we build as the original unprivileged
-# user (via runuser) instead of executing that third-party code as root — giving
-# them ownership of a temporary clone, but never re-owning an existing checkout.
-# Building as the invoking user also picks up their per-user Rust toolchain,
-# which root's PATH often lacks. Otherwise build as the current user, warning
-# when that user is root.
+# user (via runuser) instead of executing that third-party code as root, without
+# changing ownership of the checkout. Building as the invoking user also picks
+# up their per-user Rust toolchain, which root's PATH often lacks. Otherwise
+# build as the current user, warning when that user is root.
 build_from_source() {
     local build_user="" invoker="${SUDO_USER:-}"
     if [ "$(id -u)" -eq 0 ] && [ -n "$invoker" ] && [ "$invoker" != "root" ] &&
@@ -330,13 +384,6 @@ build_from_source() {
     fi
 
     if [ -n "$build_user" ]; then
-        # The build user needs to write target/; hand over a temporary clone, but
-        # never change ownership of a checkout the user already has. -h re-owns
-        # any symlink itself rather than dereferencing it, so a link in the clone
-        # can't redirect this root chown onto a target outside the clone.
-        if [ -n "$BOOTSTRAP_DIR" ] && [ "$REPO_ROOT" = "$BOOTSTRAP_DIR" ]; then
-            chown -hR -- "$build_user" "$REPO_ROOT"
-        fi
         info "building release binary as $build_user (not root)..."
         # Pass REPO_ROOT as a positional parameter to a login shell rather than
         # interpolating it into the command string, so a path with spaces or
@@ -650,20 +697,21 @@ followup_elevation() {
 }
 
 # Re-running install after creating credentials must retain an explicit
-# prebuilt source. Otherwise a standalone install would unexpectedly clone and
-# build the project (and may fail on a machine with no Rust toolchain). Quote
-# both paths for safe copy/paste when the script or binary path contains spaces.
+# prebuilt source and config override. Quote every path for safe copy/paste when
+# the script, binary, or config path contains shell metacharacters.
 followup_install_command() {
-    local script_path elevation quoted_script quoted_binary
+    local script_path elevation quoted_script quoted_binary quoted_config
     script_path="${1:-${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")}"
     elevation="$(followup_elevation)"
     printf -v quoted_script '%q' "$script_path"
+    printf '%s%s%s install' "$elevation" "${elevation:+ }" "$quoted_script"
     if [ "$BINARY_EXPLICIT" -eq 1 ]; then
         printf -v quoted_binary '%q' "$BINARY"
-        printf '%s%s%s install --binary %s' \
-            "$elevation" "${elevation:+ }" "$quoted_script" "$quoted_binary"
-    else
-        printf '%s%s%s install' "$elevation" "${elevation:+ }" "$quoted_script"
+        printf ' --binary %s' "$quoted_binary"
+    fi
+    if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+        printf -v quoted_config '%q' "$INSTALL_CONFIG"
+        printf ' --config %s' "$quoted_config"
     fi
 }
 
@@ -822,13 +870,102 @@ run_selftest() {
     _check_install_activation 1 \
         "daemon-reload|enable ${SERVICE_NAME}.service|restart ${SERVICE_NAME}.service"
 
-    _check_followup_install() { # description sudo-user explicit binary script expected
-        local desc="$1" sudo_user="$2" explicit="$3" binary="$4" \
-              script="$5" expected="$6" got
+    _check_exec_start_dropin_guard() {
+        local saved_unit="$UNIT_FILE" mock_effective_payload=""
+        UNIT_FILE="$(mktemp)"
+        printf '%s\n' \
+            '[Service]' \
+            'ExecStart=/usr/local/bin/alighieri /etc/alighieri/alighieri.conf' \
+            >"$UNIT_FILE"
+        systemctl() {
+            case "${1:-}" in
+                daemon-reload) printf 'CALL daemon-reload\n' >&2 ;;
+                cat)
+                    printf '%s\n' \
+                        '[Service]' \
+                        'ExecStart=/usr/local/bin/alighieri /etc/alighieri/alighieri.conf' \
+                        '# /etc/systemd/system/alighieri.service.d/override.conf' \
+                        'ExecStart='
+                    [ -z "$mock_effective_payload" ] ||
+                        printf 'ExecStart=%s\n' "$mock_effective_payload"
+                    ;;
+                enable | restart) printf 'CALL %s\n' "$*" >&2 ;;
+            esac
+        }
+
+        _check_rejected_effective_payload() { # description effective-payload
+            local desc="$1" out
+            mock_effective_payload="$2"
+            if ! effective_exec_start_overrides_base; then
+                printf 'FAIL systemd drop-in override was not detected (%s)\n' "$desc"
+                failures=$((failures + 1))
+            elif effective_install_matches \
+                "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf"; then
+                printf 'FAIL systemd drop-in incorrectly matched the rewritten base unit (%s)\n' "$desc"
+                failures=$((failures + 1))
+            elif out="$(
+                START_ON_INSTALL=1
+                activate_installed_service \
+                    "/usr/local/bin/alighieri" "/etc/alighieri/alighieri.conf" 2>&1
+            )"; then
+                printf 'FAIL install activation accepted an overriding ExecStart drop-in (%s)\n' "$desc"
+                failures=$((failures + 1))
+            elif [[ "$out" == *"overriding drop-in"* && "$out" != *"CALL restart"* && "$out" != *"CALL enable"* ]]; then
+                printf 'ok   install activation refuses %s before start\n' "$desc"
+            else
+                printf 'FAIL install activation drop-in guard %s output: [%s]\n' "$desc" "$out"
+                failures=$((failures + 1))
+            fi
+        }
+
+        _check_rejected_effective_payload "a different ExecStart" \
+            "/opt/alighieri/alighieri /opt/alighieri/custom.conf"
+        _check_rejected_effective_payload "an empty ExecStart reset" ""
+        _check_rejected_effective_payload "a wrapper without a config" "/opt/wrapper"
+
+        unset -f _check_rejected_effective_payload
+        unset -f systemctl
+        rm -f -- "$UNIT_FILE"
+        UNIT_FILE="$saved_unit"
+    }
+
+    _check_exec_start_dropin_guard
+
+    _check_install_config() { # description explicit requested installed expected
+        local desc="$1" explicit="$2" requested="$3" installed="$4" expected="$5" \
+              got saved_explicit="$CONFIG_EXPLICIT" saved_requested="$INSTALL_CONFIG"
+        CONFIG_EXPLICIT="$explicit"
+        INSTALL_CONFIG="$requested"
+        got="$(select_install_config_path "$installed")"
+        CONFIG_EXPLICIT="$saved_explicit"
+        INSTALL_CONFIG="$saved_requested"
+        if [ "$got" = "$expected" ]; then
+            printf 'ok   install config selection %s -> %s\n' "$desc" "$got"
+        else
+            printf 'FAIL install config selection %s: got [%s] want [%s]\n' \
+                "$desc" "$got" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Plain reconfiguration preserves a custom unit path; --config deliberately
+    # overrides it; and a fresh install retains the canonical default.
+    _check_install_config "preserves existing custom path" 0 "" \
+        "/opt/alighieri/custom.conf" "/opt/alighieri/custom.conf"
+    _check_install_config "explicit path overrides existing unit" 1 \
+        "/etc/alighieri/alighieri.conf" "/opt/alighieri/custom.conf" \
+        "/etc/alighieri/alighieri.conf"
+    _check_install_config "fresh install uses default" 0 "" "" "$CONFIG_FILE"
+
+    _check_followup_install() { # description sudo-user bin-exp binary cfg-exp config script expected
+        local desc="$1" sudo_user="$2" binary_explicit="$3" binary="$4" \
+              config_explicit="$5" config="$6" script="$7" expected="$8" got
         got="$(
             SUDO_USER="$sudo_user"
-            BINARY_EXPLICIT="$explicit"
+            BINARY_EXPLICIT="$binary_explicit"
             BINARY="$binary"
+            CONFIG_EXPLICIT="$config_explicit"
+            INSTALL_CONFIG="$config"
             followup_install_command "$script"
         )"
         if [ "$got" = "$expected" ]; then
@@ -843,12 +980,51 @@ run_selftest() {
     # The post-install command returns to the unprivileged invoking shell after
     # sudo and must keep a prebuilt path exactly (with shell-safe quoting). A
     # direct-root source install needs neither sudo nor a synthetic --binary.
-    _check_followup_install "sudo + prebuilt" alice 1 \
-        "/tmp/release builds/alighieri" "/opt/alighieri tools/alighieri.sh" \
-        "sudo /opt/alighieri\\ tools/alighieri.sh install --binary /tmp/release\\ builds/alighieri"
+    _check_followup_install "sudo + prebuilt + explicit config" alice 1 \
+        "/tmp/release builds/alighieri" 1 "/etc/alighieri/alighieri.conf" \
+        "/opt/alighieri tools/alighieri.sh" \
+        "sudo /opt/alighieri\\ tools/alighieri.sh install --binary /tmp/release\\ builds/alighieri --config /etc/alighieri/alighieri.conf"
     _check_followup_install "direct root + source build" root 0 \
-        "/unused/generated/binary" "/opt/alighieri tools/alighieri.sh" \
+        "/unused/generated/binary" 0 "" "/opt/alighieri tools/alighieri.sh" \
         "/opt/alighieri\\ tools/alighieri.sh install"
+
+    _check_cli_rejected() { # description expected-error arguments...
+        local desc="$1" expected="$2" out
+        shift 2
+        if out="$(bash "${BASH_SOURCE[0]}" "$@" 2>&1)"; then
+            printf 'FAIL installer CLI accepted invalid %s\n' "$desc"
+            failures=$((failures + 1))
+        elif [[ "$out" == *"$expected"* && "$out" != *"must run as root"* ]]; then
+            printf 'ok   installer CLI rejects %s\n' "$desc"
+        else
+            printf 'FAIL installer CLI %s: got [%s], want error containing [%s]\n' \
+                "$desc" "$out" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    # Reject invalid install-only config overrides before root/systemd checks or
+    # any filesystem mutation.
+    _check_cli_rejected "missing --config value" "--config requires a path" install --config
+    _check_cli_rejected "empty --config value" "--config requires a path" install --config=
+    _check_cli_rejected "relative --config path" "--config must be an absolute path" \
+        install --config relative.conf
+    _check_cli_rejected "whitespace in --config path" "--config must not contain whitespace" \
+        install --config "/etc/alighieri/bad config"
+    _check_cli_rejected "systemd specifier in --config path" \
+        "--config must not contain systemd ExecStart metacharacters" \
+        install --config "/etc/alighieri/%n.conf"
+    _check_cli_rejected "systemd variable in --config path" \
+        "--config must not contain systemd ExecStart metacharacters" \
+        install --config '/etc/alighieri/$CONFIG.conf'
+    _check_cli_rejected "systemd quoting in --config path" \
+        "--config must not contain systemd ExecStart metacharacters" \
+        install --config '/etc/alighieri/"quoted".conf'
+    _check_cli_rejected "systemd specifier in --prefix" \
+        "--prefix must not contain systemd ExecStart metacharacters" \
+        install --prefix "/opt/%n"
+    _check_cli_rejected "--config on upgrade" "--config is valid only with the install command" \
+        upgrade --config /etc/alighieri/alighieri.conf
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
@@ -914,7 +1090,15 @@ UNIT
 
 # ── Actions ───────────────────────────────────────────────────────────────────
 activate_installed_service() {
+    local expected_binary="${1:-}" expected_config="${2:-}"
     systemctl daemon-reload
+    if [ -n "$expected_binary" ] &&
+        ! effective_install_matches "$expected_binary" "$expected_config"; then
+        local effective
+        effective="$(exec_start_payload)"
+        [ -n "$effective" ] || effective="<empty>"
+        die "effective systemd ExecStart is $effective, not $expected_binary $expected_config; remove or update the overriding drop-in, then re-run install"
+    fi
     if [ "$START_ON_INSTALL" -eq 1 ]; then
         systemctl enable "${SERVICE_NAME}.service"
         # restart, not just start, so re-running install applies an updated binary
@@ -927,6 +1111,15 @@ activate_installed_service() {
 }
 
 do_install() {
+    # Rewriting the base unit cannot supersede an existing systemd ExecStart
+    # drop-in. Refuse an explicit config switch before mutating the binary, and
+    # verify again after daemon-reload below to close the race with new drop-ins.
+    if [ "$CONFIG_EXPLICIT" -eq 1 ] && [ -f "$UNIT_FILE" ] &&
+        effective_exec_start_overrides_base &&
+        [ "$(installed_config_path)" != "$INSTALL_CONFIG" ]; then
+        die "cannot apply --config $INSTALL_CONFIG while a systemd drop-in overrides ExecStart; remove or update the override, then re-run install"
+    fi
+
     # Reconfiguring an existing install without an explicit --prefix (e.g. the
     # menu's "reconfigure") should reuse the prefix the unit already points at,
     # so we don't relocate the binary to the default and orphan the old one.
@@ -938,6 +1131,7 @@ do_install() {
         case "$existing_dir" in
             *[[:space:]]*) die "the existing unit's install directory contains whitespace ($existing_dir); pass --prefix with a whitespace-free path" ;;
         esac
+        validate_exec_start_path "the existing unit's install directory" "$existing_dir"
         if [ "$existing_dir" != "$BIN_DIR" ]; then
             info "reusing existing install location $existing_dir (pass --prefix to override)"
             BIN_DIR="$existing_dir"
@@ -954,18 +1148,22 @@ do_install() {
     # as an install option in this root script.
     install -m 755 -- "$BINARY" "$install_bin"
 
-    # Preserve the config path the existing unit launches with, so a reconfigure
-    # doesn't silently switch the service to the default config. A custom path
-    # (operator-set via --config or a positional arg in a hand-edited unit) is
-    # kept verbatim.
-    local config_file="$CONFIG_FILE"
+    # Preserve the config path the existing unit launches with unless the
+    # operator explicitly selects a replacement via install --config. This lets
+    # automated workflows intentionally switch an old custom unit to a newly
+    # generated canonical config without changing plain reconfigure behavior.
+    local existing_cfg=""
     if [ -f "$UNIT_FILE" ]; then
-        local existing_cfg
         existing_cfg="$(installed_config_path)"
-        if [ "$existing_cfg" != "$CONFIG_FILE" ]; then
-            info "reusing the config path from the existing unit: $existing_cfg"
-            config_file="$existing_cfg"
+    fi
+    local config_file
+    config_file="$(select_install_config_path "$existing_cfg")"
+    if [ "$CONFIG_EXPLICIT" -eq 1 ]; then
+        if [ -n "$existing_cfg" ] && [ "$existing_cfg" != "$config_file" ]; then
+            info "replacing the existing unit's config path $existing_cfg with explicit path $config_file"
         fi
+    elif [ -n "$existing_cfg" ] && [ "$existing_cfg" != "$CONFIG_FILE" ]; then
+        info "reusing the config path from the existing unit: $existing_cfg"
     fi
     local config_dir
     config_dir="$(dirname -- "$config_file")"
@@ -984,6 +1182,7 @@ do_install() {
         *[[:space:]]*)
             die "config path $config_file contains whitespace, which the space-delimited ExecStart cannot represent; use a whitespace-free path" ;;
     esac
+    validate_exec_start_path "config path" "$config_file"
 
     # Create and harden the config directory only when the config lives in the
     # dedicated default dir — even under a custom filename like custom.conf, so
@@ -1005,11 +1204,11 @@ do_install() {
         if [ -f "$config_file" ]; then
             info "keeping existing config $config_file"
         else
-            # A prebuilt --binary install skips the build, so the source (and its
-            # default config) may not be present yet; fetch it when standalone.
-            bootstrap_repo
+            # Both source checkouts and Linux release archives carry the
+            # version-matched default config. Never fetch a mutable replacement
+            # while this installer is running as root.
             [ -f "${REPO_ROOT}/doc/alighieri.conf" ] ||
-                die "default config ${REPO_ROOT}/doc/alighieri.conf not found; run from a checkout or create $config_file first"
+                die "default config ${REPO_ROOT}/doc/alighieri.conf not found; run from a checkout or Linux release archive, or create $config_file first"
             info "installing default config to $config_file"
             cp -- "${REPO_ROOT}/doc/alighieri.conf" "$config_file"
         fi
@@ -1054,7 +1253,7 @@ do_install() {
     info "writing systemd unit $UNIT_FILE"
     write_unit "$install_bin" "$config_file" "$check_summary"
 
-    activate_installed_service
+    activate_installed_service "$install_bin" "$config_file"
     local elevation followup_install quoted_install_bin quoted_userlist
     elevation="$(followup_elevation)"
     followup_install="$(followup_install_command)"
@@ -1267,8 +1466,16 @@ manage_menu() {
                 warn "journalctl is not available on this system"
             fi
             ;;
-        3) do_upgrade ;;
-        4) do_install ;;
+        3)
+            in_checkout ||
+                die "upgrade from a release layout requires an explicit artifact; re-run: sudo $0 upgrade --binary /path/to/alighieri"
+            do_upgrade
+            ;;
+        4)
+            in_checkout ||
+                die "reconfigure from a release layout requires an explicit artifact; re-run: sudo $0 install --binary /path/to/alighieri"
+            do_install
+            ;;
         5) uninstall_menu ;;
         6) exit 0 ;;
     esac

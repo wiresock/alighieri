@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use alighieri::auth::UserDb;
 use alighieri::config::{
-    AuthKind, Cidr, Config, LogOutput, PortRange, RuleSet, Scope, TlsConfig, UdpAdvertise, Verdict,
+    AcmeConfig, AddrSpec, AuthKind, Cidr, Command as SocksCommand, Config, LogOutput, PortRange,
+    Protocol, Rule, RuleSet, Scope, TlsConfig, UdpAdvertise, Verdict,
 };
 use alighieri::util::constant_time_eq;
 use password_hash::rand_core::{OsRng, RngCore};
@@ -1767,8 +1768,8 @@ fn load_import_prefill(path: &Path, output_path: &Path) -> Result<ImportPrefill,
 /// Best-effort extraction of the wizard's modelled fields from a parsed config.
 /// Anything the wizard does not model is recovered separately as a loss warning.
 fn wizard_form_from_config(config: &Config, output_path: &Path) -> WizardForm {
-    let public_acme = public_acme_profile(config);
-    let template = if public_acme.is_some() {
+    let public_profile = public_acme_profile(config);
+    let template = if public_profile.is_some() {
         WizardTemplate::PublicTls
     } else if config.socks_methods.contains(&AuthKind::Username) {
         WizardTemplate::LanUsername
@@ -1788,7 +1789,9 @@ fn wizard_form_from_config(config: &Config, output_path: &Path) -> WizardForm {
     } else {
         None
     };
-    let udp_enabled = template == WizardTemplate::PublicTls && config_allows_public_udp(config);
+    let udp_enabled =
+        public_profile.is_some_and(|profile| matches!(profile.acl_mode, PublicAclMode::TcpAndUdp));
+    let public_acme = public_profile.map(|profile| profile.acme);
     let public_domain = public_acme.and_then(|acme| acme.domains.first().cloned());
     let acme_email = public_acme.and_then(|acme| acme.email.clone());
     let acme_cache_path = public_acme.map(|acme| acme.cache_dir.clone());
@@ -1833,11 +1836,23 @@ fn wizard_form_from_config(config: &Config, output_path: &Path) -> WizardForm {
     }
 }
 
-/// Returns the modelled ACME settings only when the imported listener and auth
-/// shape identify the public profile unambiguously. Richer public configs still
-/// get loss warnings after extraction; LAN username configs cannot be
-/// accidentally reclassified merely because they use username authentication.
-fn public_acme_profile(config: &Config) -> Option<&alighieri::config::AcmeConfig> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicAclMode {
+    TcpOnly,
+    TcpAndUdp,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublicAcmeProfile<'a> {
+    acme: &'a AcmeConfig,
+    acl_mode: PublicAclMode,
+}
+
+/// Returns the modelled ACME settings only when the imported listener, auth,
+/// and ACL are exactly representable by the public profile. This conservative
+/// check prevents saving a restricted policy as the wizard's public all-port,
+/// all-IPv4-destination policy.
+fn public_acme_profile(config: &Config) -> Option<PublicAcmeProfile<'_>> {
     if config.internal.ip() != IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         || config.internal.port() != 443
         || config.socks_methods.as_slice() != [AuthKind::Username]
@@ -1845,24 +1860,106 @@ fn public_acme_profile(config: &Config) -> Option<&alighieri::config::AcmeConfig
             .userlist
             .as_ref()
             .is_some_and(|path| path.is_absolute())
-        || extract_trusted_client(config).as_deref() != Some("0.0.0.0/0")
+        || config.auth_command.is_some()
     {
         return None;
     }
-    match &config.tls {
-        Some(TlsConfig::Acme(acme)) if acme.domains.len() == 1 && acme.cache_dir.is_absolute() => {
-            Some(acme)
-        }
-        _ => None,
+    let acl_mode = public_acl_mode(&config.rules)?;
+    let Some(TlsConfig::Acme(acme)) = &config.tls else {
+        return None;
+    };
+    (acme.domains.len() == 1 && acme.cache_dir.is_absolute())
+        .then_some(PublicAcmeProfile { acme, acl_mode })
+}
+
+/// Recognises only the two ACLs the public profile itself renders. Rule names
+/// and source lines are cosmetic, but every effective selector and rule order
+/// within each scope must match. Extra rules are rejected even when currently
+/// unreachable: preserving them is outside the wizard's model, and later edits
+/// could make them security-relevant.
+fn public_acl_mode(ruleset: &RuleSet) -> Option<PublicAclMode> {
+    let ipv4_any = "0.0.0.0/0".parse::<Cidr>().ok()?;
+    let ipv4_loopback = "127.0.0.0/8".parse::<Cidr>().ok()?;
+    let client_rules = ruleset
+        .rules
+        .iter()
+        .filter(|rule| rule.scope == Scope::Client)
+        .collect::<Vec<_>>();
+    let socks_rules = ruleset
+        .rules
+        .iter()
+        .filter(|rule| rule.scope == Scope::Socks)
+        .collect::<Vec<_>>();
+    if client_rules.len() + socks_rules.len() != ruleset.rules.len() {
+        return None;
+    }
+    let [client_rule] = client_rules.as_slice() else {
+        return None;
+    };
+    let [loopback_block, public_pass] = socks_rules.as_slice() else {
+        return None;
+    };
+
+    if client_rule.verdict != Verdict::Pass
+        || !addr_is_exact_cidr(&client_rule.from, &ipv4_any)
+        || !addr_is_exact_cidr(&client_rule.to, &ipv4_any)
+        || !rule_has_no_selectors(client_rule)
+        || loopback_block.verdict != Verdict::Block
+        || !addr_is_exact_cidr(&loopback_block.from, &ipv4_any)
+        || !addr_is_exact_cidr(&loopback_block.to, &ipv4_loopback)
+        || !rule_has_no_selectors(loopback_block)
+        || public_pass.verdict != Verdict::Pass
+        || !addr_is_exact_cidr(&public_pass.from, &ipv4_any)
+        || !addr_is_exact_cidr(&public_pass.to, &ipv4_any)
+        || public_pass.bandwidth.is_some()
+        || !(public_pass.methods.is_empty() || public_pass.methods.contains(&AuthKind::Username))
+    {
+        return None;
+    }
+
+    if has_exact_members(&public_pass.commands, &[SocksCommand::Connect])
+        && has_exact_members(&public_pass.protocols, &[Protocol::Tcp])
+    {
+        Some(PublicAclMode::TcpOnly)
+    } else if has_exact_members(
+        &public_pass.commands,
+        &[SocksCommand::Connect, SocksCommand::UdpAssociate],
+    ) && has_exact_members(&public_pass.protocols, &[Protocol::Tcp, Protocol::Udp])
+    {
+        Some(PublicAclMode::TcpAndUdp)
+    } else {
+        None
     }
 }
 
-fn config_allows_public_udp(config: &Config) -> bool {
-    config.rules.udp_associate_reachable(
-        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
-        49_152,
-        AuthKind::Username,
-    )
+fn addr_is_exact_cidr(spec: &AddrSpec, cidr: &Cidr) -> bool {
+    matches!(spec.cidrs.as_slice(), [actual] if cidrs_are_equivalent(actual, cidr))
+        && spec.hosts.is_empty()
+        && spec.ports.is_none_or(|ports| ports == PortRange::ANY)
+}
+
+fn cidrs_are_equivalent(actual: &Cidr, expected: &Cidr) -> bool {
+    if actual.is_v6() != expected.is_v6() || actual.prefix() != expected.prefix() {
+        return false;
+    }
+    expected
+        .to_string()
+        .split_once('/')
+        .and_then(|(address, _)| address.parse::<IpAddr>().ok())
+        .is_some_and(|representative| {
+            actual.contains(representative) && expected.contains(representative)
+        })
+}
+
+fn rule_has_no_selectors(rule: &Rule) -> bool {
+    rule.commands.is_empty()
+        && rule.protocols.is_empty()
+        && rule.methods.is_empty()
+        && rule.bandwidth.is_none()
+}
+
+fn has_exact_members<T: PartialEq>(actual: &[T], expected: &[T]) -> bool {
+    actual.len() == expected.len() && expected.iter().all(|value| actual.contains(value))
 }
 
 fn udp_advertise_value(value: &UdpAdvertise) -> Option<String> {
@@ -1982,7 +2079,10 @@ fn config_loss_warnings(original: &Config, regenerated: &Config) -> Vec<String> 
         lost.push("logging (logformat / logoutput / logfile / logrotate.*)".to_string());
     }
     if !rulesets_equivalent(&original.rules, &regenerated.rules) {
-        lost.push("access-control rules (extra or customised client/socks rules)".to_string());
+        lost.push(
+            "access-control rules (extra or customised client/socks rules; saving may broaden allowed clients, destinations, ports, commands, protocols, or methods)"
+                .to_string(),
+        );
     }
     lost
 }
@@ -2826,10 +2926,15 @@ try {
     command
 }
 
-fn unix_atomic_config_install(source_arg: &str, destination_arg: &str) -> String {
+fn unix_atomic_config_install(
+    source_arg: &str,
+    destination_arg: &str,
+    validator_arg: &str,
+) -> String {
     let script = r#"sudo sh -eu -c '
 source_path=$1
 destination_path=$2
+validator=$3
 staged=$(mktemp "${destination_path}.tmp.XXXXXX")
 backup_staged=
 cleanup() {
@@ -2838,7 +2943,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 install -m 640 -o root -g alighieri -- "$source_path" "$staged"
-alighieri --check --config "$staged"
+"$validator" --check --config "$staged"
 if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
     if [ ! -f "$destination_path" ] || [ -L "$destination_path" ]; then
         echo "refusing to replace non-regular service config: $destination_path" >&2
@@ -2852,7 +2957,7 @@ fi
 mv -fT -- "$staged" "$destination_path"
 staged=
 ' sh"#;
-    format!("{script} {source_arg} {destination_arg}")
+    format!("{script} {source_arg} {destination_arg} {validator_arg}")
 }
 
 fn render_public_success(
@@ -2997,28 +3102,45 @@ fn render_public_success(
              {copy_config}</section>"
         )
     } else {
-        "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run <code>sudo ./scripts/alighieri.sh install --no-start</code> before the steps below. It creates the <code>alighieri</code> account, service directories, binary, and unit without enabling or starting the service. This is safe even when the wizard wrote directly to <code>/etc/alighieri/alighieri.conf</code>. Create the userlist next, then run the normal installer command shown below to enable and start Alighieri.<p>Release archives do not bundle the lifecycle script. Outside a source checkout, download the standalone helper below, use <code>./alighieri.sh</code> wherever the commands show <code>./scripts/alighieri.sh</code>, and pass <code>--binary /path/to/extracted/alighieri</code> when installing a prebuilt binary.</p><pre>curl -fsSLo alighieri.sh https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh\nchmod +x alighieri.sh</pre></section>".to_string()
+        "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run one matching preparation command before the steps below. It creates the <code>alighieri</code> account, service directories, binary, and unit without enabling or starting the service. This is safe even when the wizard wrote directly to <code>/etc/alighieri/alighieri.conf</code>. Create the userlist next, then run the matching final installer command shown below to enable and start Alighieri.<p><strong>Source checkout:</strong></p><pre>sudo ./scripts/alighieri.sh install --no-start</pre><p><strong>Extracted Linux release archive:</strong> run from the archive root. The archive bundles the version-matched helper and default config.</p><pre>sudo ./scripts/alighieri.sh install --binary ./alighieri --no-start</pre></section>".to_string()
     };
     let service_commands = if cfg!(windows) {
         let alighieri = completion.powershell_command();
-        html_escape(&format!(
-            "{alighieri} --check --config {service_config_arg}\n{alighieri} service install --config {service_config_arg}\n{alighieri} service start\n{alighieri} service status\nwevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
-        ))
+        format!(
+            "<pre>{}</pre>",
+            html_escape(&format!(
+                "{alighieri} --check --config {service_config_arg}\n{alighieri} service install --config {service_config_arg}\n{alighieri} service start\n{alighieri} service status\nwevtutil qe Application /q:\"*[System[Provider[@Name='Alighieri']]]\" /f:text /c:20"
+            ))
+        )
     } else {
-        let install_config = if paths_are_same_install_target(
-            &report.output_path,
-            Path::new("/etc/alighieri/alighieri.conf"),
-        ) {
-            String::new()
-        } else {
-            format!(
-                "{}\n",
-                unix_atomic_config_install(&output_arg, &service_config_arg)
-            )
+        let prepare_config = |validator: &str| {
+            if paths_are_same_install_target(
+                &report.output_path,
+                Path::new("/etc/alighieri/alighieri.conf"),
+            ) {
+                format!("sudo {validator} --check --config {output_arg}")
+            } else {
+                unix_atomic_config_install(&output_arg, &service_config_arg, validator)
+            }
         };
-        html_escape(&format!(
-            "sudo alighieri --check --config {output_arg}\n{install_config}sudo ./scripts/alighieri.sh install\nsudo systemctl status alighieri\nsudo journalctl -u alighieri -f"
-        ))
+        // Validate with the artifact selected by each branch. A bare PATH
+        // `alighieri` may be an older installed version which cannot parse the
+        // configuration generated by the release currently running the wizard.
+        let source_prepare_config = prepare_config("./target/release/alighieri");
+        let release_prepare_config = prepare_config("./alighieri");
+        let source_commands = html_escape(&format!(
+            "cargo build --release --locked &&\n{source_prepare_config} &&\nsudo ./scripts/alighieri.sh install --config {service_config_arg}"
+        ));
+        let release_commands = html_escape(&format!(
+            "{release_prepare_config} &&\nsudo ./scripts/alighieri.sh install --binary ./alighieri --config {service_config_arg}"
+        ));
+        let status_commands =
+            html_escape("sudo systemctl status alighieri\nsudo journalctl -u alighieri -f");
+        format!(
+            "<p><strong>Source checkout:</strong></p><pre>{source_commands}</pre>\
+             <p><strong>Extracted Linux release archive (run from its root):</strong></p><pre>{release_commands}</pre>\
+             <p>After the selected install succeeds:</p><pre>{status_commands}</pre>"
+        )
     };
     let service_note = if cfg!(windows) {
         format!(
@@ -3026,7 +3148,7 @@ fn render_public_success(
             html_escape(&default_public_service_log_path().display().to_string())
         )
     } else {
-        "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the command above installs that exact generated file there. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom paths outside them require a corresponding unit permission change."
+        "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the selected command above installs that exact generated file there before restarting. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom paths outside them require a corresponding unit permission change."
             .to_string()
     };
 
@@ -3084,7 +3206,7 @@ fn render_public_success(
 </section>
 <section>
 <h2>Alighieri service commands</h2>
-<pre>{service_commands}</pre>
+{service_commands}
 <p>{service_note}</p>
 </section>
 <section>
@@ -3194,7 +3316,6 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alighieri::config::{Command as SocksCommand, Protocol};
 
     fn public_tls_fields() -> HashMap<String, String> {
         HashMap::from([
@@ -3205,6 +3326,16 @@ mod tests {
 
     fn public_tls_form() -> WizardForm {
         wizard_form_from_fields(&public_tls_fields(), Path::new("alighieri.conf")).unwrap()
+    }
+
+    fn public_config_with_socks_tail(form: &WizardForm, tail: &str) -> Config {
+        let mut text = render_config(form);
+        let pass_start = text
+            .find("socks pass \"public-internet\"")
+            .expect("public profile must contain its canonical pass rule");
+        text.truncate(pass_start);
+        text.push_str(tail);
+        Config::parse(&text).unwrap()
     }
 
     fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
@@ -4665,6 +4796,17 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             let original_form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
             let original = Config::parse(&render_config(&original_form)).unwrap();
 
+            let expected_acl_mode = if udp_enabled {
+                PublicAclMode::TcpAndUdp
+            } else {
+                PublicAclMode::TcpOnly
+            };
+            assert_eq!(public_acl_mode(&original.rules), Some(expected_acl_mode));
+            assert_eq!(
+                public_acme_profile(&original).map(|profile| profile.acl_mode),
+                Some(expected_acl_mode)
+            );
+
             let extracted = wizard_form_from_config(&original, Path::new("public.conf"));
             assert_eq!(extracted.template, WizardTemplate::PublicTls);
             assert_eq!(
@@ -4693,7 +4835,159 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
     }
 
     #[test]
-    fn public_tls_import_keeps_certificate_file_and_custom_acl_loss_warnings() {
+    fn public_tls_import_rejects_unrepresentable_socks_policies() {
+        let form = public_tls_form();
+        for (name, tail) in [
+            (
+                "no SOCKS pass",
+                "socks block \"deny-all\" { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n",
+            ),
+            (
+                "restricted destination",
+                "socks pass \"restricted\" { from: 0.0.0.0/0 to: 203.0.113.0/24 protocol: tcp command: connect method: username }\n",
+            ),
+            (
+                "restricted destination port",
+                "socks pass \"restricted-port\" { from: 0.0.0.0/0 to: 0.0.0.0/0 port = 443 protocol: tcp command: connect method: username }\n",
+            ),
+            (
+                "incompatible method",
+                "socks pass \"wrong-method\" { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect method: none }\n",
+            ),
+        ] {
+            let config = public_config_with_socks_tail(&form, tail);
+            assert_eq!(public_acl_mode(&config.rules), None, "{name}");
+            assert!(public_acme_profile(&config).is_none(), "{name}");
+            let extracted = wizard_form_from_config(&config, Path::new("public.conf"));
+            assert_eq!(extracted.template, WizardTemplate::LanUsername, "{name}");
+            let warnings = import_loss_warnings(&config, &extracted).unwrap();
+            assert!(warnings.iter().any(|warning| warning.contains("TLS")), "{name}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.contains("access-control rules")),
+                "{name}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_tls_import_does_not_use_udp_reachability_as_acl_compatibility() {
+        let mut form = public_tls_form();
+        form.udp_enabled = false;
+        form.udp_port_range = None;
+        form.udp_advertise = None;
+        let text = format!(
+            "{}\nsocks pass \"probe-only-udp\" {{\n    from: 203.0.113.1/32 port = 49152 to: 198.51.100.1/32 port = 53\n    protocol: udp\n    command: udpassociate\n    method: username\n}}\n",
+            render_config(&form)
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert!(config.rules.udp_associate_reachable(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            49_152,
+            AuthKind::Username,
+        ));
+        assert_eq!(public_acl_mode(&config.rules), None);
+        assert!(public_acme_profile(&config).is_none());
+        assert_eq!(
+            wizard_form_from_config(&config, Path::new("public.conf")).template,
+            WizardTemplate::LanUsername
+        );
+    }
+
+    #[test]
+    fn public_tls_import_rejects_extra_client_restrictions() {
+        let text = render_config(&public_tls_form()).replacen(
+            "client pass \"public-authenticated-clients\"",
+            "client block \"blocked-client\" { from: 203.0.113.7/32 to: 0.0.0.0/0 }\n\nclient pass \"public-authenticated-clients\"",
+            1,
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert_eq!(public_acl_mode(&config.rules), None);
+        assert!(public_acme_profile(&config).is_none());
+        assert_eq!(
+            wizard_form_from_config(&config, Path::new("public.conf")).template,
+            WizardTemplate::LanUsername
+        );
+    }
+
+    #[test]
+    fn public_tls_import_rejects_an_external_auth_backend() {
+        let text = render_config(&public_tls_form()).replacen(
+            "socksmethod: username\n",
+            "socksmethod: username\nauth.command: /usr/local/bin/verify-user\n",
+            1,
+        );
+        let config = Config::parse(&text).unwrap();
+
+        assert!(public_acme_profile(&config).is_none());
+        let extracted = wizard_form_from_config(&config, Path::new("public.conf"));
+        assert_eq!(extracted.template, WizardTemplate::LanUsername);
+        let warnings = import_loss_warnings(&config, &extracted).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("auth.command")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains("TLS")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn public_tls_import_accepts_effectively_equivalent_acl_spellings() {
+        let text = render_config(&public_tls_form())
+            .replace("public-authenticated-clients", "renamed-clients")
+            .replace("deny-loopback", "renamed-loopback")
+            .replace("public-internet", "renamed-public")
+            .replace("to: 127.0.0.0/8", "to: 127.0.0.1/8 port = 0-65535")
+            .replace(
+                "from: 0.0.0.0/0 to: 0.0.0.0/0\n    protocol: tcp udp",
+                "from: 0.0.0.1/0 port = 0-65535 to: 192.0.2.1/0 port = 0-65535\n    protocol: udp tcp",
+            )
+            .replace("command: connect udpassociate", "command: udpassociate connect")
+            .replace("    method: username\n", "");
+        let config = Config::parse(&text).unwrap();
+
+        assert_eq!(
+            public_acl_mode(&config.rules),
+            Some(PublicAclMode::TcpAndUdp)
+        );
+        assert_eq!(
+            public_acme_profile(&config).map(|profile| profile.acl_mode),
+            Some(PublicAclMode::TcpAndUdp)
+        );
+        let extracted = wizard_form_from_config(&config, Path::new("public.conf"));
+        assert_eq!(extracted.template, WizardTemplate::PublicTls);
+        assert!(extracted.udp_enabled);
+    }
+
+    #[test]
+    fn public_tls_import_accepts_redundant_none_method_under_username_only_auth() {
+        let text = render_config(&public_tls_form())
+            .replace("    method: username\n", "    method: username none\n");
+        let config = Config::parse(&text).unwrap();
+
+        assert_eq!(
+            public_acl_mode(&config.rules),
+            Some(PublicAclMode::TcpAndUdp)
+        );
+        assert_eq!(
+            public_acme_profile(&config).map(|profile| profile.acl_mode),
+            Some(PublicAclMode::TcpAndUdp)
+        );
+        assert_eq!(
+            wizard_form_from_config(&config, Path::new("public.conf")).template,
+            WizardTemplate::PublicTls
+        );
+    }
+
+    #[test]
+    fn import_keeps_certificate_file_and_custom_acl_loss_warnings() {
         let mut lan = sample_form(
             WizardTemplate::LanUsername,
             Some(PathBuf::from("/etc/alighieri/users")),
@@ -4715,20 +5009,39 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             "{cert_warnings:?}"
         );
 
-        let public_text = format!(
-            "{}\nsocks block \"custom-policy\" {{ to: 203.0.113.0/24 }}\n",
-            render_config(&public_tls_form())
+        let public_text = render_config(&public_tls_form()).replacen(
+            "socks pass \"public-internet\"",
+            "socks block \"custom-policy\" { to: 203.0.113.0/24 }\n\nsocks pass \"public-internet\"",
+            1,
         );
         let custom_acl = Config::parse(&public_text).unwrap();
         let custom_form = wizard_form_from_config(&custom_acl, Path::new("public.conf"));
-        assert_eq!(custom_form.template, WizardTemplate::PublicTls);
+        assert_eq!(custom_form.template, WizardTemplate::LanUsername);
         let custom_warnings = import_loss_warnings(&custom_acl, &custom_form).unwrap();
+        assert!(
+            custom_warnings
+                .iter()
+                .any(|warning| warning.contains("TLS")),
+            "{custom_warnings:?}"
+        );
         assert!(
             custom_warnings
                 .iter()
                 .any(|warning| warning.contains("access-control rules")),
             "{custom_warnings:?}"
         );
+        assert!(
+            custom_warnings
+                .iter()
+                .any(|warning| warning.contains("may broaden")),
+            "{custom_warnings:?}"
+        );
+        let banner = render_import_banner(Some(&ImportPrefill {
+            form: custom_form,
+            warnings: custom_warnings,
+            source: PathBuf::from("public.conf"),
+        }));
+        assert!(banner.contains("may broaden"), "{banner}");
     }
 
     #[test]
@@ -5075,11 +5388,34 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         #[cfg(not(windows))]
         {
             assert!(html.contains("scripts/alighieri.sh install --no-start"));
-            assert!(html.contains("Release archives do not bundle the lifecycle script"));
+            assert!(html.contains("scripts/alighieri.sh install --binary ./alighieri --no-start"));
+            assert!(html.contains("archive bundles the version-matched helper and default config"));
+            assert!(html.contains("cargo build --release --locked"));
+            assert!(html.contains("./target/release/alighieri --check --config"));
+            assert!(html.contains("./alighieri --check --config"));
+            assert!(html
+                .contains("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"));
             assert!(html.contains(
-                "raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh"
+                "scripts/alighieri.sh install --binary ./alighieri --config /etc/alighieri/alighieri.conf"
             ));
-            assert!(html.contains("--binary /path/to/extracted/alighieri"));
+            assert!(html.contains(
+                "&amp;&amp;\nsudo ./scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"
+            ));
+            assert!(html.contains(
+                "&amp;&amp;\nsudo ./scripts/alighieri.sh install --binary ./alighieri --config /etc/alighieri/alighieri.conf"
+            ));
+            let source_final = html
+                .find("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf")
+                .unwrap();
+            let release_final = html
+                .find("scripts/alighieri.sh install --binary ./alighieri --config /etc/alighieri/alighieri.conf")
+                .unwrap();
+            let source_block_end = source_final
+                + html[source_final..]
+                    .find("</pre>")
+                    .expect("source final command must have its own block");
+            assert!(source_final < source_block_end && source_block_end < release_final);
+            assert!(!html.contains("raw.githubusercontent.com"));
         }
         assert!(html.contains("ProxiFyre settings"));
         assert!(html.contains("<dt>Server</dt><dd><code>proxy.example.com</code>"));
@@ -5217,13 +5553,39 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         }
         #[cfg(not(windows))]
         {
-            assert!(html.contains("--check --config &quot;$staged&quot;"));
+            assert!(html.contains("&quot;$validator&quot; --check --config &quot;$staged&quot;"));
+            assert!(html.contains("./target/release/alighieri"));
+            assert!(html.contains("./alighieri"));
             assert!(html.contains("mktemp"));
             assert!(html.contains("destination_path}.bak.tmp.XXXXXX"));
             assert!(html.contains("mv -fT"));
             assert!(html.contains("$destination_path.bak"));
             assert!(html.contains("trap cleanup"));
+            assert!(html
+                .contains("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"));
         }
+    }
+
+    #[test]
+    fn privileged_install_guidance_never_fetches_a_mutable_helper() {
+        let mutable_main_helper = [
+            "raw.githubusercontent.com/wiresock/alighieri/",
+            "main/scripts/alighieri.sh",
+        ]
+        .concat();
+        for (name, contents) in [
+            ("README", include_str!("../README.md")),
+            ("ACME guide", include_str!("../doc/acme-tls-test.md")),
+            ("lifecycle helper", include_str!("../scripts/alighieri.sh")),
+        ] {
+            assert!(
+                !contents.contains(&mutable_main_helper),
+                "{name} downloads a mutable main-branch helper"
+            );
+        }
+        let helper = include_str!("../scripts/alighieri.sh");
+        assert!(!helper.contains("git clone"));
+        assert!(!helper.contains(&["REPO", "_REF"].concat()));
     }
 
     #[cfg(windows)]

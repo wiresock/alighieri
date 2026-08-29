@@ -122,10 +122,18 @@ alighieri user delete alice --userlist /etc/alighieri/users
 ```
 
 On Linux, install and start Alighieri as a hardened systemd service (details
-under [Linux service (systemd)](#linux-service-systemd)):
+under [Linux service (systemd)](#linux-service-systemd)). From a source
+checkout:
 
 ```sh
 sudo ./scripts/alighieri.sh           # install, or open the management menu if already installed
+```
+
+From the root of an extracted Linux release archive, select its bundled binary
+explicitly:
+
+```sh
+sudo ./scripts/alighieri.sh install --binary ./alighieri
 ```
 
 On Windows, install and start Alighieri as a native Windows Service:
@@ -222,11 +230,10 @@ path, then create the first user and make the resulting file service-readable
 before running the normal installer. That final run derives the port-443
 `CAP_NET_BIND_SERVICE` capability and starts the service:
 
-The commands below use the helper from a source checkout. Release archives do
-not bundle that script; when using a prebuilt release, first follow the
-[standalone helper download](#linux-service-systemd), use `./alighieri.sh` in
-place of `./scripts/alighieri.sh`, and pass `--binary /path/to/extracted/alighieri`
-to both installer invocations.
+The commands below use the helper from a source checkout. Linux release
+archives contain the same `scripts/alighieri.sh` path, the matching binary, and
+the default config. When working from an extracted release archive, add
+`--binary ./alighieri` to both installer invocations.
 
 ```sh
 sudo ./scripts/alighieri.sh install --no-start  # fresh VPS only
@@ -235,7 +242,7 @@ sudo alighieri user add proxyuser --userlist /etc/alighieri/users
 sudo chown root:alighieri -- /etc/alighieri/users
 sudo chmod 640 -- /etc/alighieri/users
 sudo alighieri --check --config /etc/alighieri/alighieri.conf
-sudo ./scripts/alighieri.sh install  # install/regenerate the port-443 unit
+sudo ./scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf
 systemctl status alighieri
 journalctl -u alighieri -f
 ```
@@ -765,19 +772,18 @@ On Linux, [`scripts/alighieri.sh`](scripts/alighieri.sh) manages the whole
 lifecycle as a hardened systemd service — install, upgrade, uninstall, and
 status.
 
-**Standalone (download just the script):**
+**From a Linux release archive:** extract the archive and run the bundled,
+version-matched helper from its root. Passing the bundled binary avoids a Rust
+toolchain requirement:
 
 ```sh
-curl -O https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh
-chmod +x alighieri.sh
-sudo ./alighieri.sh
+sudo ./scripts/alighieri.sh install --binary ./alighieri
 ```
 
-When run outside a checkout it shallow-clones the repository into a temporary
-directory to build the binary and read the default config, so the single file
-is enough (needs `git` and a Rust toolchain on the host; or add
-`--binary ./alighieri` to install a prebuilt binary and skip the build). The
-clone is removed when the script exits.
+The Linux archives include `scripts/alighieri.sh` and `doc/alighieri.conf`.
+With `--binary ./alighieri`, the helper uses only that archive, so the installed
+binary, lifecycle logic, and initial config all come from the same release. It
+never clones a mutable repository branch or downloads a replacement helper.
 
 **From a checkout:** run it directly — it uses an existing `target/release`
 build if present, otherwise builds one, or takes a binary extracted from a
@@ -797,9 +803,16 @@ Run with no command on an already-installed host to get an interactive menu
 (status, logs, upgrade, reconfigure, uninstall). `upgrade` swaps in the new
 binary — pre-flighting it with `--check` against the live config first — and
 restarts, leaving your unit and config untouched; `install` (re-run) also
-rewrites the unit and re-applies permissions. (The older
+rewrites the unit and re-applies permissions. A plain reconfigure preserves the
+config path already recorded in the unit; pass `install --config /absolute/path`
+to select a different one explicitly. (The older
 [`scripts/install-linux.sh`](scripts/install-linux.sh) remains as a thin
 compatibility shim that forwards to `alighieri.sh`.)
+
+The menu can build upgrades and reconfigurations only from a source checkout.
+From an extracted release, keep the archive and explicitly identify the trusted
+artifact on those operations, for example `upgrade --binary ./alighieri` or
+`install --binary ./alighieri`; status, logs, and uninstall need no source.
 
 The installer puts the binary at `/usr/local/bin/alighieri`, creates a
 dedicated unprivileged `alighieri` system user, installs a default config to
@@ -835,8 +848,10 @@ writable `StateDirectory=` (`/var/lib/alighieri`) for the ACME certificate
 cache, so `tls.acme.cache: /var/lib/alighieri/acme` works under
 `ProtectSystem=strict`. Because the capability is baked into the unit at install
 time, after switching to a privileged port or enabling ACME in an existing
-deployment re-run `sudo ./scripts/alighieri.sh install` to regenerate the unit —
-a plain `systemctl reload` keeps the old capability set.
+deployment re-run `sudo ./scripts/alighieri.sh install` from a source checkout,
+or `sudo ./scripts/alighieri.sh install --binary ./alighieri` from the extracted
+release archive, to regenerate the unit — a plain `systemctl reload` keeps the
+old capability set.
 
 ### Tuning for sustained high-rate UDP
 

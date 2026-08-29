@@ -50,9 +50,15 @@ tarball for the latest release from the
 ```sh
 curl -fsSLO <paste-the-tarball-url>     # e.g. alighieri-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 tar xzf alighieri-*.tar.gz
-sudo install alighieri-*/alighieri /usr/local/bin/alighieri
+cd alighieri-vX.Y.Z-x86_64-unknown-linux-gnu  # use the directory you extracted
+sudo ./scripts/alighieri.sh install --binary ./alighieri --no-start
 alighieri --version
 ```
+
+The preparation command installs the binary, creates the dedicated
+`alighieri` account and service directories, and writes the unit without
+enabling or starting it. The authenticated service is started only after the
+userlist and final configuration are ready below.
 
 (Or use the container image — see the README "Container image" section — and run
 it with `--network host` so it can bind 443 and be reached on it.)
@@ -106,6 +112,8 @@ Create a test user and validate the config:
 
 ```sh
 sudo alighieri user add testuser --userlist /etc/alighieri/users   # prompts for a password
+sudo chown root:alighieri -- /etc/alighieri/users
+sudo chmod 640 -- /etc/alighieri/users
 sudo alighieri --check /etc/alighieri/alighieri.conf               # validate (no side effects)
 ```
 
@@ -124,19 +132,13 @@ port below 1024), automatically grants `CAP_NET_BIND_SERVICE` so the non-root
 service can bind 443 and provisions a writable `StateDirectory=` for the ACME
 cache. So with ACME configured you can simply:
 
-The release tarballs used in Step 1 do not bundle the lifecycle script. If you
-are not running from a source checkout, download the standalone helper and use
-`./alighieri.sh` in place of `./scripts/alighieri.sh`; pass
-`--binary /path/to/extracted/alighieri` to install that prebuilt binary without
-requiring a Rust toolchain:
+Linux release archives bundle the version-matched lifecycle helper and default
+config. From the extracted archive root used in Step 1, install the bundled
+binary and explicitly select the configuration created above:
 
 ```sh
-curl -fsSLo alighieri.sh https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh
-chmod +x alighieri.sh
-```
-
-```sh
-sudo ./scripts/alighieri.sh        # or `install` to reconfigure an existing unit
+sudo ./scripts/alighieri.sh install --binary ./alighieri \
+  --config /etc/alighieri/alighieri.conf
 ```
 
 (If you hand-write your own unit, replicate the three settings the installer
