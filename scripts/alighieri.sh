@@ -1685,8 +1685,9 @@ validate_service_config_sources() {
         json_string_array_field canonical_config_include_patterns)"; then
         die "installed alighieri does not report canonical configuration include patterns in --check --json; use the helper with its matching current binary"
     fi
-    [ -n "$declared_sources" ] && [ -n "$canonical_sources" ] ||
+    if [ -z "$declared_sources" ] || [ -z "$canonical_sources" ]; then
         die "installed alighieri reported an empty configuration source set"
+    fi
 
     declared_count="$(printf '%s\n' "$declared_sources" | awk 'END { print NR }')"
     canonical_count="$(printf '%s\n' "$canonical_sources" | awk 'END { print NR }')"
