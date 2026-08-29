@@ -52,6 +52,11 @@ The installed service uses:
 machine privileges. Use tighter file ACLs on `alighieri.conf` and the userlist
 file so only administrators and the service account can read them.
 
+When `auth.command` is configured, its program must be an explicit filesystem
+path in Windows Service mode rather than a bare name resolved through `PATH`.
+This lets startup and reload validation keep the helper executable disjoint
+from every configured and fallback log-rotation target.
+
 ## Logging
 
 Service mode writes logs to the configured `logfile`, or to this default when

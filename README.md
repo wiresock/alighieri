@@ -739,7 +739,11 @@ no quoting — so a program path that itself contains spaces (for example
 `C:\Program Files\...`) cannot be expressed directly. Point `auth.command` at a
 space-free wrapper script (the usual pattern anyway, since the verifier
 typically shells out to `ldapsearch`, `curl`, `pamtester`, and the like) and put
-the real path inside it.
+the real path inside it. Windows Service mode additionally requires the first
+value to be an explicit filesystem path, such as
+`C:\Alighieri\verify-user.cmd`; it rejects a bare program name resolved through
+`PATH` so service logging can prove that its rotation files do not overlap the
+authentication helper.
 
 ### Hot reload
 

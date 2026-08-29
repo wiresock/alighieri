@@ -70,11 +70,17 @@ fn run_service() -> windows_service::Result<()> {
         .flatten()
         .unwrap_or_else(default_config_path);
 
-    let config = match Config::load(&config_path) {
+    let (config_result, config_load_provenance) = Config::load_with_provenance(&config_path);
+    let config = match config_result {
         Ok(config) => config,
         Err(e) => {
             // The guard flushes queued records when this error path returns.
-            let _log_guard = match init_file_logging(&default_log_dir()) {
+            let _log_guard = match init_file_logging(
+                &config_path,
+                &default_log_dir(),
+                &service_config_marker_path(),
+                &config_load_provenance,
+            ) {
                 Ok((_, guard)) => Some(guard),
                 Err(log_error) => {
                     eprintln!("failed to initialise service file logging: {log_error}");

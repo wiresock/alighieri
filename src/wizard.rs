@@ -1591,50 +1591,78 @@ fn windows_os_strings_equal_case_insensitive(
 }
 
 /// Produces a stable path identity without requiring the final target to exist.
-/// Components are resolved incrementally so an existing symlink is
-/// canonicalized whenever it becomes reachable, even after `..` cancels an
-/// earlier nonexistent component.
+/// On Windows, ordinary paths must be made lexically absolute before any
+/// reparse point is followed: Win32 collapses `junction\..` first, so resolving
+/// the junction before processing `..` would validate a different target than
+/// the subsequent file operation. After that lexical pass, canonicalize the
+/// longest existing prefix so aliases are still detected when the final target
+/// does not exist yet. Other platforms retain component-by-component
+/// resolution, matching their native symlink traversal semantics.
 fn normalized_path_for_comparison(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    let mut resolved = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(
-                    resolved.components().next_back(),
-                    Some(Component::Normal(_))
-                ) {
-                    resolved.pop();
-                } else if !absolute.is_absolute() {
+    #[cfg(windows)]
+    {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+            return canonical;
+        }
+
+        let mut prefix = absolute.clone();
+        let mut missing_tail = Vec::new();
+        while let Some(file_name) = prefix.file_name() {
+            missing_tail.push(file_name.to_os_string());
+            if !prefix.pop() {
+                break;
+            }
+            if let Ok(mut canonical) = std::fs::canonicalize(&prefix) {
+                for component in missing_tail.iter().rev() {
+                    canonical.push(component);
+                }
+                return canonical;
+            }
+        }
+        absolute
+    }
+
+    #[cfg(not(windows))]
+    {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let mut resolved = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(
+                        resolved.components().next_back(),
+                        Some(Component::Normal(_))
+                    ) {
+                        resolved.pop();
+                    } else if !absolute.is_absolute() {
+                        resolved.push(component.as_os_str());
+                    }
+                }
+                Component::Normal(value) => {
+                    resolved.push(value);
+                    if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                        resolved = canonical;
+                    }
+                }
+                Component::Prefix(_) => resolved.push(component.as_os_str()),
+                Component::RootDir => {
                     resolved.push(component.as_os_str());
-                }
-            }
-            Component::Normal(value) => {
-                resolved.push(value);
-                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
-                    resolved = canonical;
-                }
-            }
-            Component::Prefix(_) => resolved.push(component.as_os_str()),
-            Component::RootDir => {
-                resolved.push(component.as_os_str());
-                // On Windows, canonicalizing the existing drive/share root
-                // unifies ordinary and verbatim prefixes before a missing
-                // child prevents any later canonicalization attempt.
-                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
-                    resolved = canonical;
+                    if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                        resolved = canonical;
+                    }
                 }
             }
         }
+        resolved
     }
-    resolved
 }
 
 fn default_listen_host(template: WizardTemplate) -> &'static str {
@@ -1905,19 +1933,95 @@ fn load_import_prefill(path: &Path, output_path: &Path) -> Result<ImportPrefill,
             path.display()
         )
     })?;
-    let original = Config::parse(&contents).map_err(|e| {
+    // Load with file context so a valid configuration that uses `include:` is
+    // imported with the same expansion and ordering as normal startup.
+    let original = Config::load(path).map_err(|e| {
         format!(
             "cannot import {}: it is not a valid configuration: {e}",
             path.display()
         )
     })?;
     let form = wizard_form_from_config(&original, output_path);
-    let warnings = import_loss_warnings(&original, &form)?;
+    let mut warnings = import_loss_warnings(&original, &form)?;
+    if config_text_has_include_directive(&contents) {
+        warnings.push(
+            "include directives (saving writes the effective configuration into this file and stops applying the included fragments)"
+                .into(),
+        );
+    }
+    if form.template == WizardTemplate::PublicTls {
+        if let Err(error) = validate_imported_form_submission(&form) {
+            warnings.push(format!(
+                "public-profile deployment compatibility (the imported form cannot be saved unchanged: {error})"
+            ));
+        }
+    }
     Ok(ImportPrefill {
         form,
         warnings,
         source: path.to_path_buf(),
     })
+}
+
+fn config_text_has_include_directive(text: &str) -> bool {
+    text.lines().any(|line| {
+        let uncommented = line.split_once('#').map_or(line, |(before, _)| before);
+        uncommented
+            .split_whitespace()
+            .next()
+            .is_some_and(|head| head.trim_end_matches(':').eq_ignore_ascii_case("include"))
+    })
+}
+
+/// Re-run the same parser used by a browser submission against an extracted
+/// import form. Parsing the source config alone is insufficient for the public
+/// profile because its supported deployment adds stricter absolute-path,
+/// filesystem-role, and Windows spelling constraints.
+fn validate_imported_form_submission(form: &WizardForm) -> Result<(), String> {
+    let mut fields = HashMap::from([
+        ("template".into(), form.template.as_form_value().into()),
+        ("output".into(), form.output_path.display().to_string()),
+        ("listen_host".into(), form.listen_host.clone()),
+        ("listen_port".into(), form.listen_port.to_string()),
+        ("trusted_client".into(), form.trusted_client.clone()),
+        (
+            "logfile".into(),
+            form.log_file
+                .as_deref()
+                .map_or_else(String::new, |path| path.display().to_string()),
+        ),
+        (
+            "acme_staging".into(),
+            if form.acme_staging { "on" } else { "off" }.into(),
+        ),
+        (
+            "udp_enabled".into(),
+            if form.udp_enabled { "on" } else { "off" }.into(),
+        ),
+    ]);
+    if let Some(path) = &form.userlist_path {
+        fields.insert("userlist".into(), path.display().to_string());
+    }
+    if let Some(domain) = &form.public_domain {
+        fields.insert("public_domain".into(), domain.clone());
+    }
+    if let Some(email) = &form.acme_email {
+        fields.insert("acme_email".into(), email.clone());
+    }
+    if let Some(username) = &form.initial_username {
+        fields.insert("initial_username".into(), username.clone());
+    }
+    if let Some(path) = &form.acme_cache_path {
+        fields.insert("acme_cache".into(), path.display().to_string());
+    }
+    if let Some(range) = &form.udp_port_range {
+        fields.insert("udp_port_range".into(), range.clone());
+    }
+    if let Some(advertise) = &form.udp_advertise {
+        fields.insert("udp_advertise".into(), advertise.clone());
+    }
+
+    wizard_form_from_fields(&fields, &form.output_path).map(|_| ())
 }
 
 /// Best-effort extraction of the wizard's modelled fields from a parsed config.
@@ -4400,6 +4504,40 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn path_comparison_collapses_parent_before_following_a_junction() {
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_parent = dir.path().join("other");
+        let target = target_parent.join("nested");
+        std::fs::create_dir_all(&target).unwrap();
+        let junction = dir.path().join("alias");
+        let status = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create test junction");
+
+        let actual = dir.path().join("config.txt");
+        let wrong_if_junction_is_followed_first = target_parent.join("config.txt");
+        std::fs::write(&actual, b"actual").unwrap();
+        std::fs::write(&wrong_if_junction_is_followed_first, b"wrong").unwrap();
+        let through_parent = junction.join("..").join("config.txt");
+
+        assert_eq!(std::fs::read(&through_parent).unwrap(), b"actual");
+        assert!(paths_refer_to_same_file(&through_parent, &actual));
+        assert!(!paths_refer_to_same_file(
+            &through_parent,
+            &wrong_if_junction_is_followed_first
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn public_tls_rejects_ambiguous_windows_artifact_spellings() {
         let dir = tempfile::tempdir().unwrap();
         for (output, expected) in [
@@ -5605,6 +5743,47 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         std::fs::write(&path, "internal: not-an-address\n").unwrap();
         let err = load_import_prefill(&path, Path::new("out.conf")).unwrap_err();
         assert!(err.contains("not a valid configuration"), "{err}");
+    }
+
+    #[test]
+    fn load_import_prefill_expands_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("conf.d");
+        std::fs::create_dir(&fragments).unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(&path, "include: conf.d/*.conf\n").unwrap();
+        let mut original = wizard_form_from_fields(&HashMap::new(), Path::new("out.conf")).unwrap();
+        // Import extraction renders single-host CIDRs in canonical `/32` form.
+        original.trusted_client = "127.0.0.1/32".into();
+        std::fs::write(fragments.join("10-profile.conf"), render_config(&original)).unwrap();
+
+        let prefill = load_import_prefill(&path, Path::new("out.conf")).unwrap();
+
+        assert_eq!(prefill.form, original);
+        assert_eq!(prefill.warnings.len(), 1, "{:?}", prefill.warnings);
+        assert!(prefill.warnings[0].contains("include directives"));
+        assert!(prefill.warnings[0].contains("stops applying"));
+    }
+
+    #[test]
+    fn public_import_warns_when_extracted_form_cannot_be_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("public.conf");
+        let mut original = public_tls_form();
+        original.log_file = Some(PathBuf::from("relative.log"));
+        std::fs::write(&path, render_config(&original)).unwrap();
+
+        let prefill = load_import_prefill(&path, Path::new("out.conf")).unwrap();
+
+        assert_eq!(prefill.form.template, WizardTemplate::PublicTls);
+        assert!(
+            prefill.warnings.iter().any(|warning| {
+                warning.contains("cannot be saved unchanged")
+                    && warning.contains("must be absolute")
+            }),
+            "{:?}",
+            prefill.warnings
+        );
     }
 
     #[test]
