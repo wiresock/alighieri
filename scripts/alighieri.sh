@@ -200,6 +200,8 @@ Options:
   --prefix DIR       Install prefix for the binary (default: ${PREFIX}).
   --config PATH      (install) Use this config in the systemd unit. Without it,
                      reconfiguration preserves the unit's current config path.
+                     A custom path must already be root:${SERVICE_USER} mode 640
+                     beneath a physical, root-controlled directory chain.
   --no-restart       (upgrade) Replace the binary but do not restart the service.
   --no-start         (install) Prepare files and the unit without enabling or
                      starting it. Re-run install after creating credentials.
@@ -728,8 +730,8 @@ binary_path_kind() {
     fi
 }
 
-require_safe_binary_directory_chain() {
-    local path="$1" description="$2" current='/' rest component \
+require_safe_directory_chain() {
+    local path="$1" description="$2" remediation="$3" current='/' rest component \
           owner mode extra metadata symlink_target
     case "$path" in
         /) rest='' ;;
@@ -749,7 +751,7 @@ require_safe_binary_directory_chain() {
             if [ "$current" != /bin ] ||
                 { [ "$symlink_target" != usr/bin ] &&
                     [ "$symlink_target" != /usr/bin ]; }; then
-                die "$description contains symlink $current -> $symlink_target; use a physical root-controlled install path (only the standard /bin -> usr/bin merged-/usr link is accepted)"
+                die "$description contains symlink $current -> $symlink_target; use a physical root-controlled path (only the standard /bin -> usr/bin merged-/usr link is accepted)"
             fi
         fi
         metadata="$(binary_directory_path_metadata "$current" 2>/dev/null)" ||
@@ -757,7 +759,7 @@ require_safe_binary_directory_chain() {
         read -r owner mode extra <<<"$metadata"
         if [ -n "${extra:-}" ] ||
             ! binary_directory_metadata_is_safe "$owner" "$mode"; then
-            die "$description ancestor $current must resolve to a root-owned directory that is not group- or world-writable; fix its ownership/mode or choose a safe --prefix"
+            die "$description ancestor $current must resolve to a root-owned directory that is not group- or world-writable; $remediation"
         fi
         [ -n "$rest" ] || break
         component="${rest%%/*}"
@@ -767,6 +769,11 @@ require_safe_binary_directory_chain() {
         esac
         current="$(join_path_child "$current" "$component")"
     done
+}
+
+require_safe_binary_directory_chain() {
+    require_safe_directory_chain "$1" "$2" \
+        "fix its ownership/mode or choose a safe --prefix"
 }
 
 require_safe_binary_directory() {
@@ -790,6 +797,68 @@ require_safe_binary_directory() {
     if [ "$physical" != "$directory" ]; then
         require_safe_binary_directory_chain "$physical" \
             "resolved binary install path for $directory"
+    fi
+}
+
+require_safe_service_config_directory() {
+    local directory="$1" physical \
+          remediation="fix its ownership/mode or choose a config under $CONFIG_DIR"
+    case "$directory" in
+        /*) ;;
+        *) die "service config directory is not absolute: $directory" ;;
+    esac
+    [ "$(normalize_path "$directory")" = "$directory" ] ||
+        die "service config directory is not canonical: $directory"
+    binary_directory_exists "$directory" ||
+        die "service config directory $directory is missing or is not a directory"
+
+    physical="$(physical_directory_path "$directory")" ||
+        die "could not resolve service config directory $directory"
+    require_safe_directory_chain "$directory" "service config path" "$remediation"
+    if [ "$physical" != "$directory" ]; then
+        require_safe_directory_chain "$physical" \
+            "resolved service config path for $directory" "$remediation"
+    fi
+}
+
+service_config_metadata_is_safe() {
+    local owner="$1" group="$2" mode="$3" expected_group="$4"
+    [ "$owner" = 0 ] && [ "$group" = "$expected_group" ] && [ "$mode" = 640 ]
+}
+
+service_config_path_metadata() {
+    command stat -L -c '%u %g %a' -- "$1"
+}
+
+service_group_record() {
+    getent group "$SERVICE_USER"
+}
+
+service_group_id() {
+    local record name fields group_id
+    record="$(service_group_record 2>/dev/null)" || return 1
+    name="${record%%:*}"
+    fields="${record#*:}"
+    [ "$fields" != "$record" ] && [ "$name" = "$SERVICE_USER" ] || return 1
+    case "$fields" in *:*) fields="${fields#*:}" ;; *) return 1 ;; esac
+    case "$fields" in *:*) group_id="${fields%%:*}" ;; *) return 1 ;; esac
+    case "$group_id" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$group_id"
+}
+
+require_secure_service_config_file() {
+    local path="$1" metadata owner group mode extra expected_group quoted_path
+    metadata="$(service_config_path_metadata "$path" 2>/dev/null)" ||
+        die "could not inspect service config metadata at $path"
+    read -r owner group mode extra <<<"$metadata"
+    expected_group="$(service_group_id)" ||
+        die "could not resolve group id for service group $SERVICE_USER"
+    if [ -n "${extra:-}" ] ||
+        ! service_config_metadata_is_safe "$owner" "$group" "$mode" "$expected_group"; then
+        printf -v quoted_path '%q' "$path"
+        die "service config $path must be owned by root:$SERVICE_USER with mode 640; run: chown root:$SERVICE_USER -- $quoted_path && chmod 640 -- $quoted_path, then retry"
     fi
 }
 
@@ -1575,6 +1644,76 @@ run_selftest() {
         /opt/alighieri /tmp/attacker/hop /tmp/attacker/hop /usr/local
     _check_binary_directory_chain "trusted merged-/usr /bin" \
         /bin /usr/bin '' safe /bin usr/bin
+
+    _check_custom_config_directory_chain() { # unsafe-ancestor want(safe|unsafe)
+        local unsafe_path="$1" want="$2" got=unsafe
+        if (
+            binary_directory_exists() { return 0; }
+            physical_directory_path() { printf '%s' "$1"; }
+            binary_directory_path_metadata() {
+                if [ -n "$unsafe_path" ] && [ "$1" = "$unsafe_path" ]; then
+                    printf '%s\n' '1000 777'
+                else
+                    printf '%s\n' '0 755'
+                fi
+            }
+            binary_path_is_symlink() { return 1; }
+            require_safe_service_config_directory /srv/alighieri
+        ) 2>/dev/null; then
+            got=safe
+        fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   custom config parent chain -> %s\n' "$got"
+        else
+            printf 'FAIL custom config parent chain -> %s (want %s)\n' "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_custom_config_directory_chain '' safe
+    _check_custom_config_directory_chain /srv unsafe
+
+    _check_custom_config_metadata() { # owner group mode expected-group want(safe|unsafe)
+        local owner="$1" group="$2" mode="$3" expected_group="$4" want="$5" got=unsafe
+        if service_config_metadata_is_safe "$owner" "$group" "$mode" "$expected_group"; then
+            got=safe
+        fi
+        if [ "$got" = "$want" ]; then
+            printf 'ok   custom config metadata %s:%s:%s -> %s\n' \
+                "$owner" "$group" "$mode" "$got"
+        else
+            printf 'FAIL custom config metadata %s:%s:%s -> %s (want %s)\n' \
+                "$owner" "$group" "$mode" "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_custom_config_metadata 0 991 640 991 safe
+    _check_custom_config_metadata 0 991 600 991 unsafe
+    _check_custom_config_metadata 0 0 640 991 unsafe
+    _check_custom_config_metadata 1000 991 640 991 unsafe
+    _check_custom_config_metadata 0 991 1640 991 unsafe
+
+    _check_named_service_group_id() { # group-record expected-or-reject
+        local simulated_record="$1" expected="$2" got=reject
+        got="$(
+            service_group_record() { printf '%s\n' "$simulated_record"; }
+            # Resolve the explicit Group= name; the service user's unrelated
+            # primary group is deliberately absent from this test and helper.
+            service_group_id
+        )" || got=reject
+        if [ "$got" = "$expected" ]; then
+            printf 'ok   named service group id -> %s\n' "$got"
+        else
+            printf 'FAIL named service group id -> %s (want %s)\n' "$got" "$expected"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_named_service_group_id 'alighieri:x:991:' 991
+    _check_named_service_group_id 'alighieri:x:991:alice,bob' 991
+    _check_named_service_group_id 'other:x:991:' reject
+    _check_named_service_group_id 'alighieri:x:not-a-gid:' reject
 
     _check_binary_directory_prepare() { # description target existing unsafe want install
         local description="$1" target="$2" existing="$3" unsafe_path="$4" \
@@ -2434,7 +2573,7 @@ run_selftest() {
         BINARY_COMMIT_IN_PROGRESS=0
 
         _check_install_failure_case() { # failure-mode description
-            local description="$2"
+            local description="$2" guard_prefix='config-dir|config-file|'
             failure_mode="$1"
             succeeded=0
             printf '%s\n' 'old-binary' >"$installed"
@@ -2454,8 +2593,18 @@ run_selftest() {
                 ensure_user() { :; }
                 installed_config_path() { printf '%s' "$config"; }
                 reject_hidden_service_path() { :; }
-                chown() { :; }
-                chmod() { :; }
+                require_safe_service_config_directory() {
+                    printf 'config-dir|' >>"$calls"
+                    [ "$failure_mode" != config-dir ] ||
+                        die "unsafe service config directory"
+                }
+                require_secure_service_config_file() {
+                    printf 'config-file|' >>"$calls"
+                    [ "$failure_mode" != config-metadata ] ||
+                        die "unsafe service config metadata"
+                }
+                chown() { [ "${!#}" != "$config" ]; }
+                chmod() { [ "${!#}" != "$config" ]; }
                 install() {
                     local destination
                     if [ "${1:-}" = "-d" ]; then
@@ -2530,28 +2679,36 @@ run_selftest() {
             got_calls="$(<"$calls")"
             after_inode="$(stat -c %i -- "$installed")"
             case "$failure_mode" in
+                config-dir)
+                    expected_calls='config-dir|'
+                    expected_error="unsafe service config directory"
+                    ;;
+                config-metadata)
+                    expected_calls='config-dir|config-file|'
+                    expected_error="unsafe service config metadata"
+                    ;;
                 config)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
                     expected_error="invalid or unreachable"
                     ;;
                 userlist)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
                     expected_error="cannot be loaded"
                     ;;
                 reload)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|systemctl:daemon-reload|"
                     expected_error="daemon-reload failed"
                     ;;
                 exec)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|systemctl:daemon-reload|"
                     expected_error="overriding drop-in"
                     ;;
                 sandbox)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|systemctl:daemon-reload|"
                     expected_error="filesystem namespace"
                     ;;
                 binary-move)
-                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|binary-move|systemctl:daemon-reload|"
+                    expected_calls="${guard_prefix}sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|binary-move|systemctl:daemon-reload|"
                     expected_error="could not install the validated binary"
                     ;;
             esac
@@ -2575,6 +2732,8 @@ run_selftest() {
             fi
         }
 
+        _check_install_failure_case config-dir "unsafe config directory"
+        _check_install_failure_case config-metadata "unsafe config metadata"
         _check_install_failure_case config "config preflight failure"
         _check_install_failure_case userlist "userlist preflight failure"
         _check_install_failure_case reload "daemon-reload validation failure"
@@ -2708,7 +2867,9 @@ run_selftest() {
                 resolve_source_binary() { :; }
                 ensure_user() { :; }
                 reject_hidden_service_path() { :; }
-                chown() { :; }
+                require_safe_service_config_directory() { :; }
+                require_secure_service_config_file() { :; }
+                chown() { [ "${!#}" != "$config" ]; }
                 install() {
                     local destination
                     if [ "${1:-}" = "-d" ]; then
@@ -2794,8 +2955,9 @@ run_selftest() {
 
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
-              expected='reload|guard|preflight|reload|guard|restart|' \
-              reload_count=0 change_exec_start=0 invalid_exec_start=0 succeeded=0
+              expected='reload|guard|config-dir|config-file|preflight|reload|guard|restart|' \
+              reload_count=0 change_exec_start=0 invalid_exec_start=0 \
+              config_guard_failure='' succeeded=0
         upgrade_tmp="$(mktemp -d)"
         unit="$upgrade_tmp/alighieri.service"
         config="$upgrade_tmp/alighieri.conf"
@@ -2825,6 +2987,16 @@ run_selftest() {
         }
         installed_binary_path() { printf '%s' "$installed"; }
         installed_config_path() { printf '%s' "$config"; }
+        require_safe_service_config_directory() {
+            printf 'config-dir|' >>"$order"
+            [ "$config_guard_failure" != directory ] ||
+                die "unsafe service config directory"
+        }
+        require_secure_service_config_file() {
+            printf 'config-file|' >>"$order"
+            [ "$config_guard_failure" != metadata ] ||
+                die "unsafe service config metadata"
+        }
         reject_hidden_service_path() { :; }
         resolve_source_binary() { :; }
         run_in_service_sandbox() {
@@ -2851,6 +3023,33 @@ run_selftest() {
             failures=$((failures + 1))
         fi
 
+        # Both integrity guards must reject before the candidate is preflighted,
+        # the installed binary is replaced, or the service is restarted.
+        for config_guard_failure in directory metadata; do
+            printf '%s\n' installed >"$installed"
+            : >"$order"
+            reload_count=0
+            succeeded=0
+            if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
+            got="$(<"$order")"
+            installed_contents="$(<"$installed")"
+            if [ "$config_guard_failure" = directory ]; then
+                expected='reload|guard|config-dir|'
+            else
+                expected='reload|guard|config-dir|config-file|'
+            fi
+            if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
+                [ "$installed_contents" = installed ]; then
+                printf 'ok   upgrade refuses unsafe config %s before replacement\n' \
+                    "$config_guard_failure"
+            else
+                printf 'FAIL upgrade config %s guard: status %s, calls [%s], binary [%s]\n' \
+                    "$config_guard_failure" "$succeeded" "$got" "$installed_contents"
+                failures=$((failures + 1))
+            fi
+        done
+        config_guard_failure=''
+
         # If the second reload changes ExecStart, abort before replacing the
         # captured binary or restarting a command that was never preflighted.
         printf '%s\n' installed >"$installed"
@@ -2861,7 +3060,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard|preflight|reload|guard|'
+        expected='reload|guard|config-dir|config-file|preflight|reload|guard|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an ExecStart change before binary replacement\n'
@@ -3059,15 +3258,6 @@ do_install() {
     fi
     local config_dir
     config_dir="$(dirname -- "$config_file")"
-    # Refuse a symlinked config path (-f/-e follow symlinks, so cp/chown/chmod
-    # below would act on the link target) and any existing non-regular file (e.g.
-    # a directory, where cp would copy *into* it and chmod would change the dir),
-    # so these root operations only ever target a real file.
-    [ -L "$config_file" ] &&
-        die "config path $config_file is a symlink; refusing to write or change permissions through it"
-    if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
-        die "config path $config_file exists but is not a regular file; refusing to manage it"
-    fi
     # The unit's ExecStart is space-delimited and installed_config_path tokenizes
     # on spaces, so a whitespace path can't round-trip; reject it like --prefix.
     case "$config_file" in
@@ -3094,6 +3284,23 @@ do_install() {
         install -d -m 750 -o root -g "$SERVICE_USER" -- "$CONFIG_DIR"
         chown "root:$SERVICE_USER" "$CONFIG_DIR"
         chmod 750 "$CONFIG_DIR"
+    fi
+    # A service config is an integrity boundary: another local user must not be
+    # able to replace it after this root process validates it. Check every
+    # lexical and resolved parent before inspecting or trusting the leaf.
+    require_safe_service_config_directory "$config_dir"
+
+    # Refuse a symlinked config path (-f/-e follow symlinks) and any existing
+    # non-regular file. The managed path may be created below; a custom path must
+    # already be a physical, pre-hardened file so a typo such as /etc/shadow is
+    # never chowned/chmodded before the parser rejects it.
+    [ -L "$config_file" ] &&
+        die "config path $config_file is a symlink; refusing to write or change permissions through it"
+    if [ -e "$config_file" ] && [ ! -f "$config_file" ]; then
+        die "config path $config_file exists but is not a regular file; refusing to manage it"
+    fi
+
+    if [ "$manage_config_dir" -eq 1 ]; then
         if [ -f "$config_file" ]; then
             info "keeping existing config $config_file"
         else
@@ -3105,18 +3312,18 @@ do_install() {
             info "installing default config to $config_file"
             cp -- "${REPO_ROOT}/doc/alighieri.conf" "$config_file"
         fi
+        # Files in the dedicated managed directory are installer-owned, so
+        # re-apply their service-readable secret permissions on reconfigure.
+        chown "root:$SERVICE_USER" "$config_file"
+        chmod 640 "$config_file"
     else
-        # Custom config location from the unit: require it to exist; we manage
-        # only the file's permissions below, never its (possibly shared) dir.
+        # Never mutate an arbitrary custom file before it has passed validation.
+        # Requiring the final metadata up front also makes the later sandbox
+        # preflight authoritative without briefly exposing a sensitive typo.
         [ -f "$config_file" ] ||
             die "the unit references $config_file, which does not exist; create it, or reinstall to reset to the default config"
     fi
-    # Enforce the config file's ownership and mode so the service user can read
-    # it and no one else can — whether default or a preserved custom path.
-    # Symlinks (and directories) were rejected above, so this only ever touches a
-    # real file, never a link target.
-    chown "root:$SERVICE_USER" "$config_file"
-    chmod 640 "$config_file"
+    require_secure_service_config_file "$config_file"
 
     # Validate inside the actual service sandbox and capture the resolved facts
     # in one `--check --json`, reused below for path checks and write_unit's
@@ -3215,13 +3422,15 @@ do_upgrade() {
     # restart still uses stale loaded state.
     systemctl daemon-reload
     require_effective_service_sandbox
-    local install_bin install_dir config_file expected_exec_start current_exec_start
+    local install_bin install_dir config_file config_dir \
+          expected_exec_start current_exec_start
     expected_exec_start="$(loaded_exec_start_payload)" ||
         die "effective systemd ExecStart is empty or unsupported; fix the unit before upgrading"
     install_bin="$(installed_binary_path)"
     install_dir="$(existing_install_directory_for_binary "$install_bin")"
     require_safe_binary_directory "$install_dir"
     config_file="$(installed_config_path)"
+    config_dir="$(dirname -- "$config_file")"
     # Upgrade replaces an existing binary. Require a regular file at that path so
     # a malformed unit (ExecStart pointing at a directory, or under a missing
     # directory) fails clearly here instead of install/mv misbehaving — e.g. mv
@@ -3231,8 +3440,12 @@ do_upgrade() {
     # The service launches with this config; if it is missing, upgrading and
     # restarting would crash-loop. Fail loudly now instead of skipping the
     # pre-flight below.
+    require_safe_service_config_directory "$config_dir"
+    [ ! -L "$config_file" ] ||
+        die "the service's config $config_file is a symlink; replace it with a physical, pre-hardened file before upgrading"
     [ -f "$config_file" ] ||
         die "the service's config $config_file does not exist; create it or fix the unit before upgrading"
+    require_secure_service_config_file "$config_file"
     reject_hidden_service_path "config path" "$config_file"
     resolve_source_binary
 

@@ -1440,6 +1440,31 @@ fn paths_are_same_install_target(left: &Path, right: &Path) -> bool {
         || normalized_path_for_comparison(left) == normalized_path_for_comparison(right)
 }
 
+/// Returns true only when an installer can safely skip copying `source` to
+/// `destination`. The Linux installer deliberately refuses both a symlinked
+/// config file and a symlinked managed config directory, so following either
+/// link here would generate a completion flow that the next command rejects.
+fn paths_are_same_physical_install_target(source: &Path, destination: &Path) -> bool {
+    if !paths_are_same_install_target(source, destination) {
+        return false;
+    }
+
+    let Ok(destination_metadata) = std::fs::symlink_metadata(destination) else {
+        return false;
+    };
+    if !destination_metadata.file_type().is_file() {
+        return false;
+    }
+
+    let Some(parent) = destination.parent() else {
+        return false;
+    };
+    matches!(
+        std::fs::symlink_metadata(parent),
+        Ok(metadata) if metadata.file_type().is_dir()
+    )
+}
+
 fn existing_paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -3063,8 +3088,21 @@ fn unix_atomic_config_install(
 source_path=$1
 destination_path=$2
 validator=$3
+destination_directory=${destination_path%/*}
+[ -n "$destination_directory" ] || destination_directory=/
+if [ ! -d "$destination_directory" ] || [ -L "$destination_directory" ]; then
+    echo "refusing to use non-physical service config directory: $destination_directory" >&2
+    exit 1
+fi
 staged=$(mktemp "${destination_path}.tmp.XXXXXX")
 backup_staged=
+replace_regular_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    [ ! -d "$2" ] || return 1
+    mv -f -- "$1" "$2" || return 1
+    [ ! -e "$1" ] && [ ! -L "$1" ] &&
+        [ -f "$2" ] && [ ! -L "$2" ]
+}
 cleanup() {
     [ -z "${staged:-}" ] || rm -f -- "$staged"
     [ -z "${backup_staged:-}" ] || rm -f -- "$backup_staged"
@@ -3079,10 +3117,16 @@ if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
     fi
     backup_staged=$(mktemp "${destination_path}.bak.tmp.XXXXXX")
     cp -p -- "$destination_path" "$backup_staged"
-    mv -fT -- "$backup_staged" "$destination_path.bak"
+    if ! replace_regular_file "$backup_staged" "$destination_path.bak"; then
+        echo "refusing to replace non-regular service config backup: $destination_path.bak" >&2
+        exit 1
+    fi
     backup_staged=
 fi
-mv -fT -- "$staged" "$destination_path"
+if ! replace_regular_file "$staged" "$destination_path"; then
+    echo "refusing to replace non-regular service config: $destination_path" >&2
+    exit 1
+fi
 staged=
 ' sh"#;
     format!("{script} {source_arg} {destination_arg} {validator_arg}")
@@ -3242,7 +3286,7 @@ fn render_public_success(
         )
     } else {
         let prepare_config = |validator: &str| {
-            if paths_are_same_install_target(
+            if paths_are_same_physical_install_target(
                 &report.output_path,
                 Path::new("/etc/alighieri/alighieri.conf"),
             ) {
@@ -4276,6 +4320,34 @@ mod tests {
             &actual_target
         ));
         assert!(!paths_refer_to_same_file(&after_missing, &lexical_target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_copy_skip_requires_a_physical_destination_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let source = real_parent.join("alighieri.conf");
+        std::fs::write(&source, "internal: 127.0.0.1:1080\n").unwrap();
+
+        assert!(paths_are_same_physical_install_target(&source, &source));
+
+        let leaf_link = real_parent.join("canonical.conf");
+        symlink(&source, &leaf_link).unwrap();
+        assert!(paths_are_same_install_target(&source, &leaf_link));
+        assert!(!paths_are_same_physical_install_target(&source, &leaf_link));
+
+        let parent_link = dir.path().join("canonical-parent");
+        symlink(&real_parent, &parent_link).unwrap();
+        let through_parent_link = parent_link.join("alighieri.conf");
+        assert!(paths_are_same_install_target(&source, &through_parent_link));
+        assert!(!paths_are_same_physical_install_target(
+            &source,
+            &through_parent_link
+        ));
     }
 
     #[cfg(windows)]
@@ -5916,12 +5988,28 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             assert!(html.contains("./alighieri"));
             assert!(html.contains("mktemp"));
             assert!(html.contains("destination_path}.bak.tmp.XXXXXX"));
-            assert!(html.contains("mv -fT"));
+            assert!(html.contains("mv -f --"));
+            assert!(!html.contains("mv -fT"));
+            assert!(html.contains("non-physical service config directory"));
+            assert!(html.contains("[ ! -d &quot;$2&quot; ]"));
             assert!(html.contains("$destination_path.bak"));
             assert!(html.contains("trap cleanup"));
             assert!(html
                 .contains("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"));
         }
+    }
+
+    #[test]
+    fn unix_atomic_config_install_uses_portable_exact_path_moves() {
+        let command = unix_atomic_config_install("source", "destination", "validator");
+
+        assert!(command.contains("mv -f -- \"$1\" \"$2\""));
+        assert!(!command.contains("mv -fT"));
+        assert!(command.contains("[ ! -d \"$destination_directory\" ]"));
+        assert!(command.contains("[ -L \"$destination_directory\" ]"));
+        assert!(command.contains("[ ! -d \"$2\" ]"));
+        assert!(command.contains("[ ! -e \"$1\" ] && [ ! -L \"$1\" ]"));
+        assert!(command.contains("[ -f \"$2\" ] && [ ! -L \"$2\" ]"));
     }
 
     #[test]

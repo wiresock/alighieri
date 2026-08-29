@@ -806,9 +806,14 @@ Run with no command on an already-installed host to get an interactive menu
 (status, logs, upgrade, reconfigure, uninstall). `upgrade` swaps in the new
 binary — pre-flighting it with `--check` against the live config first — and
 restarts, leaving your unit and config untouched; `install` (re-run) also
-rewrites the unit and re-applies permissions. A plain reconfigure preserves the
-config path already recorded in the unit; pass `install --config /absolute/path`
-to select a different one explicitly. (The older
+rewrites the unit and re-applies permissions to installer-managed files. A plain
+reconfigure preserves the config path already recorded in the unit; pass
+`install --config /absolute/path` to select a different one explicitly. A
+custom config must already be owned by `root:alighieri` with mode `0640`, and
+every directory in its physical path must be root-owned and not group- or
+world-writable. On a fresh host, run the default `install --no-start` preparation
+first so the service account and group exist, harden the custom file, and then
+rerun `install --config /absolute/path`. (The older
 [`scripts/install-linux.sh`](scripts/install-linux.sh) remains as a thin
 compatibility shim that forwards to `alighieri.sh`.)
 
