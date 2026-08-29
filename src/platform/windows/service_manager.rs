@@ -18,6 +18,7 @@ use crate::platform::windows::event_log;
 use crate::platform::windows::service::{
     run_service_dispatcher, SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_RELOAD_CONTROL,
 };
+use crate::runtime::validate_windows_service_logging_paths;
 use crate::tls;
 
 const DEFAULT_CONFIG: &str = r"C:\ProgramData\Alighieri\alighieri.conf";
@@ -864,17 +865,27 @@ fn finalize_install<C: ServiceController>(
 }
 
 fn validate_config(config_path: &Path) -> ServiceCliResult<()> {
-    Config::load(config_path)
-        .and_then(|config| {
-            // Mirror the checks `Server::bind` runs at startup (same order as the
-            // `check` command) so `service install`/`start`/`reload` reject a
-            // config that would otherwise fail the moment the service binds —
-            // e.g. an unauthenticated public metrics endpoint.
-            config.validate_startup()?;
-            tls::validate_config(&config)?;
-            Ok(())
-        })
-        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))
+    let config = Config::load(config_path)
+        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
+    // Mirror the checks `Server::bind` runs at startup (same order as the
+    // `check` command) so `service install`/`start`/`reload` reject a config that
+    // would otherwise fail the moment the service binds — e.g. an
+    // unauthenticated public metrics endpoint.
+    config
+        .validate_startup()
+        .and_then(|()| tls::validate_config(&config))
+        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
+    // Service mode always writes a file log. Validate the resolved active path
+    // and every rotation before asking SCM to install/start/reload, and repeat
+    // the same check inside the service immediately before opening the writer.
+    validate_windows_service_logging_paths(
+        &config,
+        config_path,
+        &default_log_dir(),
+        &service_config_marker_path(),
+    )
+    .map(|_| ())
+    .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))
 }
 
 fn service_usage() -> String {
@@ -1264,6 +1275,28 @@ mod tests {
             panic!("service validation should refuse public metrics without metrics.allowpublic");
         };
         assert!(err.to_string().contains("metrics.allowpublic"), "{err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_a_logfile_that_is_the_active_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &path,
+            format!(
+                "internal: 127.0.0.1 port = 1080\nlogfile: {}\n",
+                path.display()
+            ),
+        )
+        .unwrap();
+
+        let error = validate_config(&path).unwrap_err();
+
+        assert!(
+            error.to_string().contains("active configuration"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("separate logfile"), "{error}");
     }
 
     #[test]

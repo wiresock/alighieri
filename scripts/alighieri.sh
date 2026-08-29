@@ -1236,8 +1236,9 @@ ensure_user() {
 # WorkingDirectory is explicit here and in the generated unit so relative config
 # values resolve identically.
 run_in_service_sandbox() {
-    local arg
+    local arg manager_version
     local -a escaped_args=()
+    local -a run_options=(--quiet --wait --pipe)
     # systemd-run expands $VAR and ${VAR} in command arguments by default.
     # Doubling every dollar is the portable escape (including on releases
     # older than --expand-environment=no) and makes the transient process see
@@ -1245,7 +1246,14 @@ run_in_service_sandbox() {
     for arg in "$@"; do
         escaped_args+=("${arg//\$/\$\$}")
     done
-    systemd-run --quiet --wait --pipe --collect \
+    manager_version="$(systemd_manager_version)" || return 1
+    # --collect was added in systemd 236. It only controls garbage collection
+    # of the completed transient unit, so omit it on v235 while preserving the
+    # same synchronous, piped preflight and propagated command exit status.
+    if [ "$manager_version" -ge 236 ]; then
+        run_options+=(--collect)
+    fi
+    systemd-run "${run_options[@]}" \
         --property="User=$SERVICE_USER" \
         --property="Group=$SERVICE_USER" \
         --property=WorkingDirectory=/ \
@@ -2116,10 +2124,12 @@ run_selftest() {
 
     # The transient command must carry every path-affecting property from the
     # generated unit and preserve argv without a shell string.
-    systemd-run() { printf '%s' "$*"; }
-    sandbox_call="$(run_in_service_sandbox \
-        /usr/local/bin/alighieri --check --json /etc/alighieri/alighieri.conf)"
-    unset -f systemd-run
+    sandbox_call="$(
+        systemd_manager_version() { printf '%s' 255; }
+        systemd-run() { printf '%s' "$*"; }
+        run_in_service_sandbox \
+            /usr/local/bin/alighieri --check --json /etc/alighieri/alighieri.conf
+    )"
     for expected_arg in \
         '--property=User=alighieri' '--property=Group=alighieri' \
         '--property=WorkingDirectory=/' '--property=ProtectSystem=strict' \
@@ -2136,15 +2146,38 @@ run_selftest() {
         fi
     done
 
+    _check_sandbox_collect_version() { # version want(present|absent)
+        local version="$1" want="$2" got
+        got="$(
+            systemd_manager_version() { printf '%s' "$version"; }
+            systemd-run() { printf '%s' "$*"; }
+            run_in_service_sandbox /usr/local/bin/alighieri --check \
+                /etc/alighieri/alighieri.conf
+        )"
+        if { [ "$want" = present ] && [[ " $got " == *' --collect '* ]]; } ||
+            { [ "$want" = absent ] && [[ " $got " != *' --collect '* ]]; }; then
+            printf 'ok   systemd %s sandbox --collect -> %s\n' "$version" "$want"
+        else
+            printf 'FAIL systemd %s sandbox --collect: got [%s], want %s\n' \
+                "$version" "$got" "$want"
+            failures=$((failures + 1))
+        fi
+    }
+
+    _check_sandbox_collect_version 235 absent
+    _check_sandbox_collect_version 236 present
+
     # systemd-run performs environment expansion in its ExecStart argv even
     # without invoking a shell. The helper must escape every literal dollar so
     # a config value such as `${SUDO_USER}/users-$$` is checked verbatim rather
     # than against the transient service manager's environment/PID spelling.
-    systemd-run() { printf '%s' "$*"; }
-    sandbox_call="$(run_in_service_sandbox \
-        /usr/local/bin/alighieri user list --userlist \
-        "\${SUDO_USER}/users-\$\$")"
-    unset -f systemd-run
+    sandbox_call="$(
+        systemd_manager_version() { printf '%s' 255; }
+        systemd-run() { printf '%s' "$*"; }
+        run_in_service_sandbox \
+            /usr/local/bin/alighieri user list --userlist \
+            "\${SUDO_USER}/users-\$\$"
+    )"
     expected_arg="user list --userlist \$\${SUDO_USER}/users-\$\$\$\$"
     if [[ "$sandbox_call" == *"$expected_arg"* ]]; then
         printf 'ok   service sandbox command escapes literal dollar arguments\n'
@@ -2177,6 +2210,7 @@ run_selftest() {
                 printf 'METADATA:%s|' "$1" >&2
                 [ "$mock_metadata_status" -eq 0 ] || die "mock unsafe userlist metadata"
             }
+            systemd_manager_version() { printf '%s' 255; }
             systemd-run() {
                 printf 'SANDBOX:%s|' "$*" >&2
                 if [ -n "$expected_command" ] && [[ "$*" != *"$expected_command"* ]]; then

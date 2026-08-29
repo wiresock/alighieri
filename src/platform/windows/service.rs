@@ -17,9 +17,11 @@ use windows_service::service_dispatcher;
 
 use crate::config::Config;
 use crate::platform::windows::event_log::{self, EventLevel};
-use crate::platform::windows::service_manager::{default_config_path, default_log_dir};
+use crate::platform::windows::service_manager::{
+    default_config_path, default_log_dir, service_config_marker_path,
+};
 use crate::runtime::{
-    init_file_logging, init_service_logging, run_bound_server_reloading_until_shutdown,
+    init_file_logging, init_service_logging, run_bound_windows_service_reloading_until_shutdown,
 };
 use crate::server::Server;
 
@@ -94,8 +96,14 @@ fn run_service() -> windows_service::Result<()> {
     };
 
     // Held for the life of the service; dropping it flushes queued records.
-    let _log_guard = match init_service_logging(&config, &config_path, &default_log_dir()) {
-        Ok((_, guard)) => guard,
+    let active_log_rotate_keep = config.log_rotate_keep;
+    let (active_log_path, _log_guard) = match init_service_logging(
+        &config,
+        &config_path,
+        &default_log_dir(),
+        &service_config_marker_path(),
+    ) {
+        Ok(logging) => logging,
         Err(e) => {
             eprintln!("failed to initialise service file logging: {e}");
             event_log::report(
@@ -163,7 +171,17 @@ fn run_service() -> windows_service::Result<()> {
         let shutdown = async move {
             let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
         };
-        run_bound_server_reloading_until_shutdown(server, config_path, shutdown, reload_rx).await
+        run_bound_windows_service_reloading_until_shutdown(
+            server,
+            config_path,
+            shutdown,
+            reload_rx,
+            active_log_path,
+            active_log_rotate_keep,
+            default_log_dir(),
+            service_config_marker_path(),
+        )
+        .await
     });
 
     status_handle.set_service_status(service_status(

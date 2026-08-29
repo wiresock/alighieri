@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, LogFormat, LogOutput};
 #[cfg(windows)]
-use crate::config::{DEFAULT_LOG_ROTATE_KEEP, DEFAULT_LOG_ROTATE_SIZE_BYTES};
+use crate::config::{TlsConfig, DEFAULT_LOG_ROTATE_KEEP, DEFAULT_LOG_ROTATE_SIZE_BYTES};
 use crate::errors::{Error, Result};
 use crate::server::Server;
 
@@ -52,15 +52,85 @@ pub async fn run_bound_server_reloading_until_shutdown<F>(
     server: Server,
     config_path: PathBuf,
     shutdown: F,
-    mut reloads: mpsc::UnboundedReceiver<()>,
+    reloads: mpsc::UnboundedReceiver<()>,
 ) -> Result<()>
 where
     F: Future<Output = ()>,
+{
+    run_bound_server_reloading_until_shutdown_validated(
+        server,
+        config_path,
+        shutdown,
+        reloads,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Windows Service reload driver that keeps reloadable filesystem settings
+/// disjoint from both the active startup log sink and the sink configured for
+/// the next service restart.
+#[cfg(windows)]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_bound_windows_service_reloading_until_shutdown<F>(
+    server: Server,
+    config_path: PathBuf,
+    shutdown: F,
+    reloads: mpsc::UnboundedReceiver<()>,
+    active_log_path: PathBuf,
+    active_log_rotate_keep: usize,
+    default_log_dir: PathBuf,
+    service_config_marker: PathBuf,
+) -> Result<()>
+where
+    F: Future<Output = ()>,
+{
+    let validation_config_path = config_path.clone();
+    run_bound_server_reloading_until_shutdown_validated(
+        server,
+        config_path,
+        shutdown,
+        reloads,
+        move |config| {
+            // Validate the family the next restart would select even when the
+            // SCM control was sent directly instead of through `service reload`.
+            validate_windows_service_logging_paths(
+                config,
+                &validation_config_path,
+                &default_log_dir,
+                &service_config_marker,
+            )?;
+            // Logging itself is not reloadable, so also guard reloadable paths
+            // against the writer that this process continues to hold.
+            validate_windows_service_active_log_paths(
+                config,
+                &validation_config_path,
+                &active_log_path,
+                active_log_rotate_keep,
+                &service_config_marker,
+            )
+        },
+    )
+    .await
+}
+
+async fn run_bound_server_reloading_until_shutdown_validated<F, V>(
+    server: Server,
+    config_path: PathBuf,
+    shutdown: F,
+    mut reloads: mpsc::UnboundedReceiver<()>,
+    validate_reload: V,
+) -> Result<()>
+where
+    F: Future<Output = ()>,
+    V: Fn(&Config) -> io::Result<()> + Send + Sync + 'static,
 {
     let server = Arc::new(server);
     let run_server = server.clone();
     let mut run_task = tokio::spawn(async move { run_server.run().await });
     let mut reloads_closed = false;
+    let validate_reload = Arc::new(validate_reload);
     tokio::pin!(shutdown);
 
     loop {
@@ -89,6 +159,7 @@ where
                         // blocking reads off-task. With `biased`, shutdown wins.
                         let reload = async {
                             let path = config_path.clone();
+                            let validate_reload = validate_reload.clone();
                             let (tx, rx) = tokio::sync::oneshot::channel();
                             // `Builder::spawn` so a transient thread-creation
                             // failure (e.g. resource exhaustion) fails the reload
@@ -96,7 +167,11 @@ where
                             if let Err(e) = std::thread::Builder::new()
                                 .name("config-reload".into())
                                 .spawn(move || {
-                                    let _ = tx.send(Config::load(&path));
+                                    let result = Config::load(&path).and_then(|config| {
+                                        validate_reload(&config).map_err(Error::Io)?;
+                                        Ok(config)
+                                    });
+                                    let _ = tx.send(result);
                                 })
                             {
                                 error!(config = %config_path.display(), error = %e, "configuration reload failed: could not spawn config-reader thread; keeping active configuration");
@@ -281,8 +356,14 @@ pub fn init_service_logging(
     config: &Config,
     config_path: &Path,
     default_log_dir: &Path,
+    service_config_marker: &Path,
 ) -> io::Result<(PathBuf, LogGuard)> {
-    let log_path = windows_service_log_path(config, config_path, default_log_dir)?;
+    let log_path = validate_windows_service_logging_paths(
+        config,
+        config_path,
+        default_log_dir,
+        service_config_marker,
+    )?;
     if let Some(parent) = log_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -299,6 +380,165 @@ pub fn init_service_logging(
     let guard = init_logging(filter, writer, config.log_format, true)?;
 
     Ok((log_path, guard))
+}
+
+/// Resolves and validates the Windows Service log path before anything opens it.
+///
+/// Service logging owns the active file and all configured rotation targets. It
+/// must never append to, rename, or remove another service artifact merely
+/// because a syntactically valid configuration reused that path as `logfile`.
+/// This check lives at the service boundary (rather than only in the wizard) so
+/// imported and hand-written configurations receive the same protection.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn validate_windows_service_logging_paths(
+    config: &Config,
+    config_path: &Path,
+    default_log_dir: &Path,
+    service_config_marker: &Path,
+) -> io::Result<PathBuf> {
+    let log_path = windows_service_log_path(config, config_path, default_log_dir)?;
+    validate_windows_service_active_log_paths(
+        config,
+        config_path,
+        &log_path,
+        config.log_rotate_keep,
+        service_config_marker,
+    )?;
+    Ok(log_path)
+}
+
+/// Rejects reloadable service paths that overlap the log family already held
+/// open by the running Windows Service process.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn validate_windows_service_active_log_paths(
+    config: &Config,
+    config_path: &Path,
+    active_log_path: &Path,
+    active_log_rotate_keep: usize,
+    service_config_marker: &Path,
+) -> io::Result<()> {
+    let mut protected_files = vec![
+        (
+            "active configuration",
+            WindowsServiceComparablePath::new(config_path.to_path_buf()),
+        ),
+        (
+            "service configuration marker",
+            WindowsServiceComparablePath::new(service_config_marker.to_path_buf()),
+        ),
+    ];
+    if let Some(userlist) = &config.userlist {
+        protected_files.push((
+            "configured userlist",
+            WindowsServiceComparablePath::new(userlist.clone()),
+        ));
+    }
+    if let Some(TlsConfig::Files {
+        cert_file,
+        key_file,
+    }) = &config.tls
+    {
+        protected_files.push((
+            "TLS certificate",
+            WindowsServiceComparablePath::new(cert_file.clone()),
+        ));
+        protected_files.push((
+            "TLS private key",
+            WindowsServiceComparablePath::new(key_file.clone()),
+        ));
+    }
+
+    let acme_cache = match &config.tls {
+        Some(TlsConfig::Acme(acme)) => {
+            Some(WindowsServiceComparablePath::new(acme.cache_dir.clone()))
+        }
+        _ => None,
+    };
+    let log_family = WindowsServiceLogFamily::new(active_log_path, active_log_rotate_keep);
+
+    // Lexical and canonical aliases can be classified directly from each
+    // protected path's parent and file name; do not probe every possible `.N`.
+    for (protected_label, protected_path) in &protected_files {
+        if let Some(index) = log_family.member_index(&protected_path.normalized) {
+            return Err(service_log_collision_error(
+                windows_service_log_candidate_label(index),
+                &log_family.candidate_path(index),
+                protected_label,
+                &protected_path.path,
+            ));
+        }
+    }
+
+    // A differently named existing hardlink cannot be found lexically. Enumerate
+    // the one log directory and inspect only entries whose names belong to this
+    // family, so `logrotate.keep: 10000` does not cause 10,001 failed opens.
+    let existing_members = log_family.existing_members()?;
+    for candidate in &existing_members {
+        for (protected_label, protected_path) in &protected_files {
+            if protected_path.identity.zip(candidate.identity).is_some_and(
+                |(protected_identity, candidate_identity)| protected_identity == candidate_identity,
+            ) {
+                return Err(service_log_collision_error(
+                    windows_service_log_candidate_label(candidate.index),
+                    &candidate.path,
+                    protected_label,
+                    &protected_path.path,
+                ));
+            }
+        }
+    }
+
+    if let Some(cache) = &acme_cache {
+        // The ACME cache owns a directory tree. A log anywhere inside it can
+        // collide with rustls-acme's current or future cache entries; making the
+        // cache a child of a would-be log file is invalid for the same filesystem
+        // reason.
+        for candidate in &existing_members {
+            if windows_service_normalized_path_is_same_or_descendant(
+                &candidate.normalized,
+                &cache.normalized,
+            ) || windows_service_normalized_path_is_same_or_descendant(
+                &cache.normalized,
+                &candidate.normalized,
+            ) {
+                return Err(service_log_collision_error(
+                    windows_service_log_candidate_label(candidate.index),
+                    &candidate.path,
+                    "ACME cache directory",
+                    &cache.path,
+                ));
+            }
+        }
+        if let Some(index) = log_family.conflicting_tree_member(&cache.normalized) {
+            return Err(service_log_collision_error(
+                windows_service_log_candidate_label(index),
+                &log_family.candidate_path(index),
+                "ACME cache directory",
+                &cache.path,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn service_log_collision_error(
+    log_label: &str,
+    log_path: &Path,
+    protected_label: &str,
+    protected_path: &Path,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{log_label} '{}' conflicts with the {protected_label} '{}'; choose a separate logfile whose rotation files do not overlap service-owned paths",
+            log_path.display(),
+            protected_path.display()
+        ),
+    )
 }
 
 #[cfg(windows)]
@@ -339,6 +579,333 @@ fn windows_service_log_path(
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .join(configured_path))
+}
+
+#[cfg(windows)]
+struct WindowsServiceComparablePath {
+    path: PathBuf,
+    normalized: PathBuf,
+    identity: Option<(u64, [u8; 16])>,
+}
+
+#[cfg(windows)]
+impl WindowsServiceComparablePath {
+    fn new(path: PathBuf) -> Self {
+        let normalized = windows_service_normalized_path(&path);
+        let identity = windows_service_file_identity(&path);
+        Self {
+            path,
+            normalized,
+            identity,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsServiceLogFamily {
+    base_path: PathBuf,
+    normalized_base: PathBuf,
+    normalized_rotation_parent: PathBuf,
+    base_file_name: OsString,
+    keep: usize,
+}
+
+#[cfg(windows)]
+struct WindowsServiceExistingLogMember {
+    index: usize,
+    path: PathBuf,
+    normalized: PathBuf,
+    identity: Option<(u64, [u8; 16])>,
+}
+
+#[cfg(windows)]
+impl WindowsServiceLogFamily {
+    fn new(base_path: &Path, keep: usize) -> Self {
+        let normalized_base = windows_service_normalized_path(base_path);
+        let normalized_rotation_parent = windows_service_normalized_path(
+            rotated_path(base_path, 1)
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        let base_file_name = base_path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("alighieri.log"))
+            .to_os_string();
+        Self {
+            base_path: base_path.to_path_buf(),
+            normalized_base,
+            normalized_rotation_parent,
+            base_file_name,
+            keep,
+        }
+    }
+
+    fn candidate_path(&self, index: usize) -> PathBuf {
+        if index == 0 {
+            self.base_path.clone()
+        } else {
+            rotated_path(&self.base_path, index)
+        }
+    }
+
+    fn member_index(&self, normalized_path: &Path) -> Option<usize> {
+        if windows_service_normalized_paths_equal(normalized_path, &self.normalized_base) {
+            return Some(0);
+        }
+        let parent = normalized_path.parent()?;
+        if !windows_service_normalized_paths_equal(parent, &self.normalized_rotation_parent) {
+            return None;
+        }
+        let index = windows_service_log_file_name_index(
+            &self.base_file_name,
+            normalized_path.file_name()?,
+            self.keep,
+        )?;
+        // Index zero is the base itself; a different normalized path that merely
+        // has the same leaf is not that base (notably the root-path fallback).
+        (index != 0).then_some(index)
+    }
+
+    fn existing_members(&self) -> io::Result<Vec<WindowsServiceExistingLogMember>> {
+        let entries = match std::fs::read_dir(&self.normalized_rotation_parent) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut members = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Some(index) = windows_service_log_file_name_index(
+                &self.base_file_name,
+                &entry.file_name(),
+                self.keep,
+            ) else {
+                continue;
+            };
+            let path = entry.path();
+            if index == 0
+                && !windows_service_normalized_paths_equal(
+                    &windows_service_normalized_path(&path),
+                    &self.normalized_base,
+                )
+            {
+                continue;
+            }
+            members.push(WindowsServiceExistingLogMember {
+                index,
+                normalized: windows_service_normalized_path(&path),
+                identity: windows_service_file_identity(&path),
+                path,
+            });
+        }
+        Ok(members)
+    }
+
+    fn conflicting_tree_member(&self, normalized_tree: &Path) -> Option<usize> {
+        if windows_service_normalized_path_is_same_or_descendant(
+            &self.normalized_base,
+            normalized_tree,
+        ) || windows_service_normalized_path_is_same_or_descendant(
+            normalized_tree,
+            &self.normalized_base,
+        ) {
+            return Some(0);
+        }
+        if self.keep == 0 {
+            return None;
+        }
+
+        // Every rotation is an immediate child of this one parent. If that parent
+        // is within the cache, the first rotation is already a conflict.
+        if windows_service_normalized_path_is_same_or_descendant(
+            &self.normalized_rotation_parent,
+            normalized_tree,
+        ) {
+            return Some(1);
+        }
+        if !windows_service_normalized_path_is_same_or_descendant(
+            normalized_tree,
+            &self.normalized_rotation_parent,
+        ) {
+            return None;
+        }
+
+        // The cache is below the rotation parent. Its first relative component
+        // names the only possible rotation that can equal or contain it.
+        let parent_components = self.normalized_rotation_parent.components().count();
+        let first_relative = normalized_tree.components().nth(parent_components)?;
+        windows_service_log_file_name_index(
+            &self.base_file_name,
+            first_relative.as_os_str(),
+            self.keep,
+        )
+        .filter(|index| *index != 0)
+    }
+}
+
+#[cfg(windows)]
+fn windows_service_log_candidate_label(index: usize) -> &'static str {
+    if index == 0 {
+        "Windows Service logfile"
+    } else {
+        "Windows Service rotated logfile"
+    }
+}
+
+#[cfg(windows)]
+fn windows_service_log_file_name_index(
+    base: &OsStr,
+    candidate: &OsStr,
+    keep: usize,
+) -> Option<usize> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let base: Vec<u16> = base.encode_wide().collect();
+    let candidate: Vec<u16> = candidate.encode_wide().collect();
+    if candidate.len() == base.len()
+        && windows_service_wide_strings_equal_case_insensitive(&base, &candidate)
+    {
+        return Some(0);
+    }
+    if candidate.len() <= base.len() + 1
+        || candidate[base.len()] != u16::from(b'.')
+        || !windows_service_wide_strings_equal_case_insensitive(&base, &candidate[..base.len()])
+    {
+        return None;
+    }
+
+    let digits = &candidate[base.len() + 1..];
+    if digits.first() == Some(&u16::from(b'0')) {
+        return None;
+    }
+    let mut index = 0usize;
+    for digit in digits {
+        let digit = u8::try_from(*digit).ok()?;
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        index = index
+            .checked_mul(10)?
+            .checked_add(usize::from(digit - b'0'))?;
+    }
+    (index >= 1 && index <= keep).then_some(index)
+}
+
+#[cfg(windows)]
+fn windows_service_normalized_paths_equal(left: &Path, right: &Path) -> bool {
+    windows_service_os_strings_equal_case_insensitive(left.as_os_str(), right.as_os_str())
+}
+
+#[cfg(windows)]
+fn windows_service_file_identity(path: &Path) -> Option<(u64, [u8; 16])> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut information = FILE_ID_INFO::default();
+    let information_size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).ok()?;
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            information_size,
+        )
+    } == 0
+    {
+        return None;
+    }
+    Some((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_service_os_strings_equal_case_insensitive(left: &OsStr, right: &OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let left: Vec<u16> = left.encode_wide().collect();
+    let right: Vec<u16> = right.encode_wide().collect();
+    windows_service_wide_strings_equal_case_insensitive(&left, &right)
+}
+
+#[cfg(windows)]
+fn windows_service_wide_strings_equal_case_insensitive(left: &[u16], right: &[u16]) -> bool {
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    }
+}
+
+#[cfg(windows)]
+fn windows_service_normalized_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    resolved.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    resolved.pop();
+                } else if !absolute.is_absolute() {
+                    resolved.push(component.as_os_str());
+                }
+            }
+            Component::Normal(value) => {
+                resolved.push(value);
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+            Component::Prefix(_) => resolved.push(component.as_os_str()),
+            Component::RootDir => {
+                resolved.push(component.as_os_str());
+                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                    resolved = canonical;
+                }
+            }
+        }
+    }
+    resolved
+}
+
+#[cfg(windows)]
+fn windows_service_normalized_path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
+    let mut path_components = path.components();
+    ancestor.components().all(|ancestor_component| {
+        path_components.next().is_some_and(|path_component| {
+            windows_service_os_strings_equal_case_insensitive(
+                path_component.as_os_str(),
+                ancestor_component.as_os_str(),
+            )
+        })
+    })
 }
 
 /// Queue depth for the background log writer. Records beyond this are
@@ -855,6 +1422,15 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    fn windows_file_logging_config(log_file: PathBuf, rotate_keep: usize) -> Config {
+        let mut config = Config::parse("internal: 127.0.0.1:1080").unwrap();
+        config.log_outputs = vec![LogOutput::File];
+        config.log_file = Some(log_file);
+        config.log_rotate_keep = rotate_keep;
+        config
+    }
+
+    #[cfg(windows)]
     #[test]
     fn windows_service_resolves_configured_logfiles_from_a_stable_base() {
         let default_dir = PathBuf::from(r"C:\ProgramData\Alighieri\logs");
@@ -897,6 +1473,190 @@ mod tests {
             assert!(error.to_string().contains("ordinary relative path"));
             assert!(error.to_string().contains("configuration file directory"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_rejects_primary_and_rotated_log_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_log_dir = dir.path().join("default-logs");
+
+        for (role_index, protected_label) in [
+            "active configuration",
+            "configured userlist",
+            "service configuration marker",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for rotated in [false, true] {
+                let stem = format!("role-{role_index}-rotated-{rotated}");
+                let log_path = dir.path().join(format!("{stem}.log"));
+                let protected_path = if rotated {
+                    rotated_path(&log_path, 1)
+                } else {
+                    log_path.clone()
+                };
+                let mut config_path = dir.path().join(format!("{stem}.conf"));
+                let mut marker_path = dir.path().join(format!("{stem}.marker"));
+                let mut config = windows_file_logging_config(log_path, usize::from(rotated));
+
+                match protected_label {
+                    "active configuration" => config_path = protected_path,
+                    "configured userlist" => config.userlist = Some(protected_path),
+                    "service configuration marker" => marker_path = protected_path,
+                    _ => unreachable!(),
+                }
+
+                let error = validate_windows_service_logging_paths(
+                    &config,
+                    &config_path,
+                    &default_log_dir,
+                    &marker_path,
+                )
+                .unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains(protected_label), "{message}");
+                if rotated {
+                    assert!(message.contains("rotated logfile"), "{message}");
+                } else {
+                    assert!(message.contains("Service logfile"), "{message}");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_collision_matching_handles_case_and_missing_tail_parent_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("service-config-path.txt");
+        let default_log_dir = dir.path().join("default-logs");
+
+        let case_log = dir.path().join("ALIGHIERI.CONF");
+        let case_config = dir.path().join("alighieri.conf");
+        let config = windows_file_logging_config(case_log, 1);
+        let error = validate_windows_service_logging_paths(
+            &config,
+            &case_config,
+            &default_log_dir,
+            &marker_path,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("active configuration"),
+            "{error}"
+        );
+
+        // The nonexistent component prevents whole-path canonicalization, so
+        // collision matching must still fold the following `..` lexically.
+        let parent_log = dir
+            .path()
+            .join("missing-tail")
+            .join("..")
+            .join("alighieri.conf");
+        let config = windows_file_logging_config(parent_log, 1);
+        let error = validate_windows_service_logging_paths(
+            &config,
+            &case_config,
+            &default_log_dir,
+            &marker_path,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("active configuration"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_rejects_an_existing_hardlink_to_a_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_path = dir.path().join("service-config-path.txt");
+
+        for rotation_index in [0, 1] {
+            let config_path = dir.path().join(format!("alighieri-{rotation_index}.conf"));
+            let log_path = dir
+                .path()
+                .join(format!("apparently-separate-{rotation_index}.log"));
+            let candidate = if rotation_index == 0 {
+                log_path.clone()
+            } else {
+                rotated_path(&log_path, rotation_index)
+            };
+            std::fs::write(&config_path, "configuration").unwrap();
+            std::fs::hard_link(&config_path, candidate).unwrap();
+            let config = windows_file_logging_config(log_path, 1);
+
+            let error = validate_windows_service_logging_paths(
+                &config,
+                &config_path,
+                &dir.path().join("logs"),
+                &marker_path,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("active configuration"),
+                "rotation {rotation_index}: {error}"
+            );
+            if rotation_index == 1 {
+                assert!(
+                    error.to_string().contains("rotated logfile"),
+                    "rotation {rotation_index}: {error}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_reload_checks_the_log_family_held_from_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let active_log = dir.path().join("active.log");
+        let new_log = dir.path().join("after-restart.log");
+        let config_path = dir.path().join("alighieri.conf");
+        let marker_path = dir.path().join("service-config-path.txt");
+        let mut reloaded = windows_file_logging_config(new_log, 2);
+        reloaded.userlist = Some(rotated_path(&active_log, 1));
+
+        // The next-restart family is disjoint; only the still-open startup
+        // writer makes this reload unsafe.
+        validate_windows_service_logging_paths(
+            &reloaded,
+            &config_path,
+            &dir.path().join("default-logs"),
+            &marker_path,
+        )
+        .unwrap();
+        let error = validate_windows_service_active_log_paths(
+            &reloaded,
+            &config_path,
+            &active_log,
+            1,
+            &marker_path,
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("rotated logfile"), "{message}");
+        assert!(message.contains("configured userlist"), "{message}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_validation_scales_to_the_maximum_rotation_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = windows_file_logging_config(dir.path().join("active.log"), 10_000);
+
+        validate_windows_service_logging_paths(
+            &config,
+            &dir.path().join("alighieri.conf"),
+            &dir.path().join("default-logs"),
+            &dir.path().join("service-config-path.txt"),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
