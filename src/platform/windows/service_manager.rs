@@ -229,7 +229,17 @@ pub fn default_log_dir() -> PathBuf {
     default_base_dir().join("logs")
 }
 
-fn config_marker_path() -> PathBuf {
+/// Returns the log file used by Windows Service mode when the configuration
+/// does not select an explicit file.
+#[doc(hidden)]
+pub fn default_service_log_path() -> PathBuf {
+    default_log_dir().join("alighieri.log")
+}
+
+/// Returns the marker in which service installation records the effective
+/// configuration path.
+#[doc(hidden)]
+pub fn service_config_marker_path() -> PathBuf {
     default_base_dir().join(SERVICE_CONFIG_MARKER)
 }
 
@@ -241,7 +251,7 @@ fn absolute_config_path(config_path: &Path) -> ServiceCliResult<PathBuf> {
 }
 
 fn installed_config_path() -> ServiceCliResult<PathBuf> {
-    read_installed_config_path(&config_marker_path())
+    read_installed_config_path(&service_config_marker_path())
 }
 
 /// Resolves the config path recorded at install time from `marker`. A genuinely
@@ -749,7 +759,10 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
 }
 
 fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
-    write_marker_atomically(&config_marker_path(), &config_path.display().to_string())?;
+    write_marker_atomically(
+        &service_config_marker_path(),
+        &config_path.display().to_string(),
+    )?;
     Ok(())
 }
 
@@ -759,7 +772,8 @@ fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
 /// makes the CLI validate the wrong (or default) config; with the rename, readers
 /// always see a complete old-or-new file (the rename also replaces a destination
 /// link rather than writing through it). Mirrors the atomic persistence used for
-/// the userlist/config writes; separated from `config_marker_path` for testing.
+/// the userlist/config writes; separated from `service_config_marker_path` for
+/// testing.
 fn write_marker_atomically(marker: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -1291,6 +1305,9 @@ mod tests {
         assert!(config.ends_with(Path::new("Alighieri").join("alighieri.conf")));
         let logs = default_log_dir();
         assert!(logs.ends_with(Path::new("Alighieri").join("logs")));
+        assert_eq!(default_service_log_path(), logs.join("alighieri.log"));
+        assert!(service_config_marker_path()
+            .ends_with(Path::new("Alighieri").join("service-config-path.txt")));
     }
 
     #[test]

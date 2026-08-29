@@ -51,6 +51,11 @@ PURGE_USER=0
 ACTION="auto"
 COMMAND_SEEN=0
 STAGED_BIN=""
+STAGED_UNIT=""
+UNIT_BACKUP=""
+UNIT_TRANSACTION_ACTIVE=0
+UNIT_HAD_ORIGINAL=0
+BINARY_COMMIT_IN_PROGRESS=0
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -223,14 +228,16 @@ unit_file_exec_start_payload() {
     return 0
 }
 
-# Resolve the D-Bus object for the manager-loaded service unit.
+# Resolve the D-Bus object for the service unit, loading a freshly written unit
+# when it is not already referenced or active. Manager.GetUnit only works for an
+# already-loaded unit, which breaks a first install (especially --no-start).
 service_unit_object_path() {
     local response type object extra
     response="$(busctl call \
         org.freedesktop.systemd1 \
         /org/freedesktop/systemd1 \
         org.freedesktop.systemd1.Manager \
-        GetUnit s "${SERVICE_NAME}.service" 2>/dev/null)" || return 1
+        LoadUnit s "${SERVICE_NAME}.service" 2>/dev/null)" || return 1
     read -r type object extra <<<"$response"
     [ "$type" = "o" ] && [ -z "$extra" ] || return 1
     object="${object#\"}"
@@ -564,11 +571,95 @@ is_installed() {
     [ -f "$UNIT_FILE" ]
 }
 
-# Remove any staged install/upgrade binary that was not moved into place.
+# Restore the previous base unit while an install validation transaction is
+# active. This is intentionally best-effort and safe under the EXIT trap: leave
+# the backup in place if restoration itself fails so an operator can recover it.
+rollback_unit_transaction() {
+    [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+
+    local restored=0
+    if [ "$UNIT_HAD_ORIGINAL" -eq 1 ]; then
+        if [ -n "$UNIT_BACKUP" ] && [ -f "$UNIT_BACKUP" ] &&
+            command mv -fT -- "$UNIT_BACKUP" "$UNIT_FILE" 2>/dev/null; then
+            restored=1
+        fi
+    elif command rm -f -- "$UNIT_FILE" 2>/dev/null; then
+        restored=1
+    fi
+
+    if [ "$restored" -eq 1 ]; then
+        UNIT_TRANSACTION_ACTIVE=0
+        UNIT_HAD_ORIGINAL=0
+        UNIT_BACKUP=""
+        # Synchronise the manager with the restored/removed unit. A failure here
+        # must not hide the original install error or make the EXIT trap recurse,
+        # but it is safety-relevant because PID 1 may retain the rejected unit.
+        if ! systemctl daemon-reload >/dev/null 2>&1; then
+            warn "the previous systemd unit was restored on disk, but daemon-reload failed; PID 1 may still retain the rejected candidate (run: systemctl daemon-reload)"
+        fi
+    elif [ "$UNIT_HAD_ORIGINAL" -eq 1 ]; then
+        warn "could not restore the previous systemd unit; recovery copy kept at $UNIT_BACKUP"
+    else
+        warn "could not remove the rejected systemd unit at $UNIT_FILE; remove it and run systemctl daemon-reload before starting the service"
+    fi
+    return 0
+}
+
+begin_unit_transaction() {
+    [ -n "$STAGED_UNIT" ] && [ -f "$STAGED_UNIT" ] ||
+        die "staged systemd unit is missing; refusing to modify $UNIT_FILE"
+
+    UNIT_BACKUP="${UNIT_FILE}.previous.$$"
+    UNIT_HAD_ORIGINAL=0
+    if [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
+        [ -f "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] ||
+            die "systemd unit path $UNIT_FILE is not a regular file; refusing to replace it"
+        [ ! -e "$UNIT_BACKUP" ] && [ ! -L "$UNIT_BACKUP" ] ||
+            die "temporary unit backup path already exists: $UNIT_BACKUP"
+        command cp -p -T -- "$UNIT_FILE" "$UNIT_BACKUP" ||
+            die "could not preserve the existing systemd unit at $UNIT_BACKUP"
+        UNIT_HAD_ORIGINAL=1
+    else
+        UNIT_BACKUP=""
+    fi
+
+    # Set the guard before the atomic replacement so cleanup also handles an
+    # interrupted/failed move. The old unit remains recoverable in UNIT_BACKUP.
+    UNIT_TRANSACTION_ACTIVE=1
+    if ! command mv -fT -- "$STAGED_UNIT" "$UNIT_FILE"; then
+        rollback_unit_transaction
+        die "could not stage the new systemd unit at $UNIT_FILE"
+    fi
+    STAGED_UNIT=""
+}
+
+commit_unit_transaction() {
+    UNIT_TRANSACTION_ACTIVE=0
+    UNIT_HAD_ORIGINAL=0
+    if [ -n "$UNIT_BACKUP" ]; then
+        command rm -f -- "$UNIT_BACKUP" 2>/dev/null ||
+            warn "could not remove obsolete unit backup $UNIT_BACKUP"
+    fi
+    UNIT_BACKUP=""
+}
+
+# Remove any staged install/upgrade artifacts and roll back an uncommitted unit.
 cleanup() {
     # Best-effort: a failing rm must not abort the EXIT trap (under errexit) or
     # change the script's original exit status, so swallow any error.
+    # The staged binary lives beside its destination, so mv uses one atomic
+    # rename. If a signal lands after that rename but before the following shell
+    # instruction, its source is gone: retain the already-validated unit rather
+    # than rolling it back around the newly installed binary.
+    if [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] &&
+        [ "$BINARY_COMMIT_IN_PROGRESS" -eq 1 ] && [ -n "$STAGED_BIN" ] &&
+        [ ! -e "$STAGED_BIN" ] && [ ! -L "$STAGED_BIN" ]; then
+        commit_unit_transaction
+    else
+        rollback_unit_transaction
+    fi
     if [ -n "$STAGED_BIN" ]; then rm -f -- "$STAGED_BIN" 2>/dev/null || true; fi
+    if [ -n "$STAGED_UNIT" ]; then rm -f -- "$STAGED_UNIT" 2>/dev/null || true; fi
     return 0
 }
 trap cleanup EXIT
@@ -1428,6 +1519,8 @@ run_selftest() {
         busctl() {
             case "${1:-}" in
                 call)
+                    [ "${5:-}" = "LoadUnit" ] && [ "${6:-}" = "s" ] &&
+                        [ "${7:-}" = "${SERVICE_NAME}.service" ] || return 1
                     printf '%s\n' \
                         'o "/org/freedesktop/systemd1/unit/alighieri_2eservice"'
                     ;;
@@ -1478,6 +1571,16 @@ run_selftest() {
                     ;;
             esac
         }
+
+        local loaded_object
+        if loaded_object="$(service_unit_object_path)" &&
+            [ "$loaded_object" = "/org/freedesktop/systemd1/unit/alighieri_2eservice" ]; then
+            printf 'ok   systemd unit lookup loads a fresh unit through Manager.LoadUnit\n'
+        else
+            printf 'FAIL systemd unit lookup did not use Manager.LoadUnit: [%s]\n' \
+                "$loaded_object"
+            failures=$((failures + 1))
+        fi
 
         _check_rejected_effective_payload() { # description effective-payload
             local desc="$1" out activation_succeeded=0 \
@@ -1771,11 +1874,16 @@ run_selftest() {
 
     _check_install_preflight_transaction() {
         local tx_tmp unit config source bin_dir installed calls output userlist \
-              expected_staged expected_calls expected_error failure_mode \
+              expected_staged expected_staged_unit expected_backup expected_calls \
+              expected_error failure_mode \
               succeeded got_binary got_unit got_calls before_inode after_inode \
+              fresh_unit fresh_staged fresh_calls \
+              signal_unit signal_staged_unit signal_staged_bin signal_installed \
+              signal_calls \
               result test_failures=0 UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR \
               BIN_DIR BINARY PREFIX_EXPLICIT CONFIG_EXPLICIT START_ON_INSTALL \
-              STAGED_BIN
+              STAGED_BIN STAGED_UNIT UNIT_BACKUP UNIT_TRANSACTION_ACTIVE \
+              UNIT_HAD_ORIGINAL BINARY_COMMIT_IN_PROGRESS
         tx_tmp="$(mktemp -d)"
         unit="$tx_tmp/alighieri.service"
         config="$tx_tmp/alighieri.conf"
@@ -1786,6 +1894,8 @@ run_selftest() {
         output="$tx_tmp/output"
         userlist="$tx_tmp/users"
         expected_staged="${installed}.new.$$"
+        expected_staged_unit="${unit}.new.$$"
+        expected_backup="${unit}.previous.$$"
         command mkdir -p -- "$bin_dir"
         printf '%s\n' 'old-unit' >"$unit"
         printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
@@ -1801,6 +1911,11 @@ run_selftest() {
         CONFIG_EXPLICIT=0
         START_ON_INSTALL=1
         STAGED_BIN=""
+        STAGED_UNIT=""
+        UNIT_BACKUP=""
+        UNIT_TRANSACTION_ACTIVE=0
+        UNIT_HAD_ORIGINAL=0
+        BINARY_COMMIT_IN_PROGRESS=0
 
         _check_install_failure_case() { # failure-mode description
             local description="$2"
@@ -1810,7 +1925,8 @@ run_selftest() {
             printf '%s\n' 'old-unit' >"$unit"
             : >"$calls"
             : >"$output"
-            command rm -f -- "$expected_staged"
+            command rm -f -- "$expected_staged" "$expected_staged_unit" \
+                "$expected_backup"
             before_inode="$(stat -c %i -- "$installed")"
             if (
                 # All command/helper mocks live only in this case process. The
@@ -1848,16 +1964,45 @@ run_selftest() {
                         printf '{"ok":true,"userlist":"%s"}\n' "$userlist"
                         return 0
                     fi
-                    # The human-readable config retry and the userlist loader
-                    # both fail in their respective test cases.
-                    return 1
+                    # The human-readable retry always fails. The userlist loader
+                    # fails only in its focused case so post-unit checks can run.
+                    [ "${2:-}" = "user" ] || return 1
+                    [ "$failure_mode" != "userlist" ]
                 }
                 write_unit() {
+                    local target="${4:-$UNIT_FILE}"
                     printf 'write|' >>"$calls"
-                    printf '%s\n' 'new-unit' >"$UNIT_FILE"
+                    printf '%s\n' 'new-unit' >"$target"
                 }
-                activate_installed_service() { printf 'activate|' >>"$calls"; }
-                systemctl() { printf 'systemctl:%s|' "$*" >>"$calls"; }
+                effective_install_matches() {
+                    printf 'effective:%s|' "$*" >>"$calls"
+                    [ "$failure_mode" != "exec" ]
+                }
+                require_effective_service_sandbox() {
+                    printf 'sandbox-guard|' >>"$calls"
+                    [ "$failure_mode" != "sandbox" ] ||
+                        die "effective systemd service identity, WorkingDirectory, or filesystem namespace differs from the managed unit"
+                }
+                activate_prevalidated_service() { printf 'activate|' >>"$calls"; }
+                mv() {
+                    if [ "$failure_mode" = "binary-move" ] &&
+                        [ "${1:-}" = "-fT" ] && [ "${3:-}" = "$expected_staged" ]; then
+                        printf 'binary-move|' >>"$calls"
+                        return 1
+                    fi
+                    command mv "$@"
+                }
+                local reload_count=0
+                systemctl() {
+                    printf 'systemctl:%s|' "$*" >>"$calls"
+                    if [ "${1:-}" = "daemon-reload" ]; then
+                        reload_count=$((reload_count + 1))
+                        if [ "$failure_mode" = "reload" ] &&
+                            [ "$reload_count" -eq 1 ]; then
+                            return 1
+                        fi
+                    fi
+                }
                 trap cleanup EXIT
                 do_install
             ) >"$output" 2>&1; then
@@ -1867,20 +2012,41 @@ run_selftest() {
             got_unit="$(<"$unit")"
             got_calls="$(<"$calls")"
             after_inode="$(stat -c %i -- "$installed")"
-            if [ "$failure_mode" = "config" ]; then
-                expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
-                expected_error="invalid or unreachable"
-            else
-                expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
-                expected_error="cannot be loaded"
-            fi
+            case "$failure_mode" in
+                config)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
+                    expected_error="invalid or unreachable"
+                    ;;
+                userlist)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
+                    expected_error="cannot be loaded"
+                    ;;
+                reload)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|systemctl:daemon-reload|"
+                    expected_error="daemon-reload failed"
+                    ;;
+                exec)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|systemctl:daemon-reload|"
+                    expected_error="overriding drop-in"
+                    ;;
+                sandbox)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|systemctl:daemon-reload|"
+                    expected_error="filesystem namespace"
+                    ;;
+                binary-move)
+                    expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|write|systemctl:daemon-reload|effective:$installed $config|sandbox-guard|binary-move|systemctl:daemon-reload|"
+                    expected_error="could not install the validated binary"
+                    ;;
+            esac
             if [ "$succeeded" -eq 0 ] &&
                 [ "$got_binary" = "old-binary" ] &&
                 [ "$before_inode" = "$after_inode" ] &&
                 [ "$got_unit" = "old-unit" ] &&
                 [ "$got_calls" = "$expected_calls" ] &&
                 grep -Fq -- "$expected_error" "$output" &&
-                [ ! -e "$expected_staged" ]; then
+                [ ! -e "$expected_staged" ] &&
+                [ ! -e "$expected_staged_unit" ] &&
+                [ ! -e "$expected_backup" ]; then
                 printf 'ok   install %s preserves binary, unit, and service\n' \
                     "$description"
             else
@@ -1894,10 +2060,80 @@ run_selftest() {
 
         _check_install_failure_case config "config preflight failure"
         _check_install_failure_case userlist "userlist preflight failure"
+        _check_install_failure_case reload "daemon-reload validation failure"
+        _check_install_failure_case exec "surviving ExecStart drop-in rejection"
+        _check_install_failure_case sandbox "surviving sandbox drop-in rejection"
+        _check_install_failure_case binary-move "binary replacement failure"
+
+        # A first install has no base unit to restore. Its transaction must remove
+        # the candidate and reload the manager when validation rejects it.
+        fresh_unit="$tx_tmp/fresh.service"
+        fresh_staged="${fresh_unit}.new.$$"
+        fresh_calls="$tx_tmp/fresh-calls"
+        printf '%s\n' 'candidate-unit' >"$fresh_staged"
+        : >"$fresh_calls"
+        if (
+            UNIT_FILE="$fresh_unit"
+            STAGED_UNIT="$fresh_staged"
+            UNIT_BACKUP=""
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_HAD_ORIGINAL=0
+            systemctl() { printf 'daemon-reload|' >>"$fresh_calls"; }
+            trap cleanup EXIT
+            begin_unit_transaction
+            [ "$(<"$UNIT_FILE")" = "candidate-unit" ]
+            rollback_unit_transaction
+            [ ! -e "$UNIT_FILE" ] && [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ]
+        ) && [ "$(<"$fresh_calls")" = "daemon-reload|" ] &&
+            [ ! -e "$fresh_unit" ] && [ ! -e "$fresh_staged" ]; then
+            printf 'ok   fresh install rollback removes the uncommitted base unit\n'
+        else
+            printf 'FAIL fresh install rollback left a unit or skipped daemon-reload\n'
+            test_failures=$((test_failures + 1))
+        fi
+
+        # Simulate EXIT landing in the instruction window immediately after the
+        # same-filesystem binary rename. The vanished staged source is proof the
+        # atomic commit completed, so cleanup must retain the validated unit.
+        signal_unit="$tx_tmp/signal.service"
+        signal_staged_unit="${signal_unit}.new.$$"
+        signal_staged_bin="$tx_tmp/signal-bin.new.$$"
+        signal_installed="$tx_tmp/signal-bin"
+        signal_calls="$tx_tmp/signal-calls"
+        printf '%s\n' 'old-unit' >"$signal_unit"
+        printf '%s\n' 'new-unit' >"$signal_staged_unit"
+        printf '%s\n' 'new-binary' >"$signal_staged_bin"
+        : >"$signal_calls"
+        if (
+            UNIT_FILE="$signal_unit"
+            STAGED_UNIT="$signal_staged_unit"
+            STAGED_BIN="$signal_staged_bin"
+            UNIT_BACKUP=""
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_HAD_ORIGINAL=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            systemctl() { printf 'daemon-reload|' >>"$signal_calls"; }
+            begin_unit_transaction
+            BINARY_COMMIT_IN_PROGRESS=1
+            command mv -fT -- "$STAGED_BIN" "$signal_installed"
+            cleanup
+            [ "$(<"$UNIT_FILE")" = "new-unit" ] &&
+                [ "$(<"$signal_installed")" = "new-binary" ] &&
+                [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ]
+        ) && [ ! -s "$signal_calls" ] &&
+            [ ! -e "${signal_unit}.previous.$$" ]; then
+            printf 'ok   cleanup commits the validated unit after an interrupted binary rename\n'
+        else
+            printf 'FAIL cleanup rolled back after the binary rename had completed\n'
+            test_failures=$((test_failures + 1))
+        fi
 
         command rm -f -- "$unit" "$config" "$source" "$installed" "$calls" \
-            "$output" "$userlist" "$expected_staged"
-        command rmdir -- "$bin_dir" "$tx_tmp"
+            "$output" "$userlist" "$expected_staged" "$expected_staged_unit" \
+            "$expected_backup" "$fresh_unit" "$fresh_staged" "$fresh_calls" \
+            "$signal_unit" "$signal_staged_unit" "$signal_staged_bin" \
+            "$signal_installed" "$signal_calls" "${signal_unit}.previous.$$"
+        command rmdir -- "$LOG_DIR" "$bin_dir" "$tx_tmp"
         result="$test_failures"
         unset -f _check_install_failure_case
         [ "$result" -eq 0 ]
@@ -1907,6 +2143,136 @@ run_selftest() {
         failures=$((failures + 1))
     fi
     unset -f _check_install_preflight_transaction
+
+    _check_fresh_install_transaction() {
+        local fresh_tmp unit config source bin_dir installed calls output mode \
+              succeeded got_calls expected_calls test_failures=0 \
+              UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR BIN_DIR BINARY \
+              BINARY_EXPLICIT PREFIX_EXPLICIT CONFIG_EXPLICIT INSTALL_CONFIG \
+              START_ON_INSTALL STAGED_BIN STAGED_UNIT UNIT_BACKUP \
+              UNIT_TRANSACTION_ACTIVE UNIT_HAD_ORIGINAL \
+              BINARY_COMMIT_IN_PROGRESS
+
+        for mode in success reject; do
+            fresh_tmp="$(mktemp -d)"
+            unit="$fresh_tmp/alighieri.service"
+            config="$fresh_tmp/alighieri.conf"
+            source="$fresh_tmp/source-alighieri"
+            bin_dir="$fresh_tmp/bin"
+            installed="$bin_dir/alighieri"
+            calls="$fresh_tmp/calls"
+            output="$fresh_tmp/output"
+            printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
+            printf '%s\n' 'new-binary' >"$source"
+            : >"$calls"
+
+            UNIT_FILE="$unit"
+            CONFIG_DIR="$fresh_tmp/managed-config"
+            CONFIG_FILE="$CONFIG_DIR/alighieri.conf"
+            LOG_DIR="$fresh_tmp/log"
+            BIN_DIR="$bin_dir"
+            BINARY="$source"
+            BINARY_EXPLICIT=1
+            PREFIX_EXPLICIT=1
+            CONFIG_EXPLICIT=1
+            INSTALL_CONFIG="$config"
+            START_ON_INSTALL=0
+            STAGED_BIN=""
+            STAGED_UNIT=""
+            UNIT_BACKUP=""
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_HAD_ORIGINAL=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            succeeded=0
+
+            if (
+                require_service_sandbox() { :; }
+                resolve_source_binary() { :; }
+                ensure_user() { :; }
+                reject_hidden_service_path() { :; }
+                chown() { :; }
+                install() {
+                    local destination
+                    if [ "${1:-}" = "-d" ]; then
+                        destination="${!#}"
+                        command mkdir -p -- "$destination"
+                        return
+                    fi
+                    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+                    [ "$#" -eq 3 ] || return 1
+                    shift
+                    command cp -- "$1" "$2"
+                    command chmod 755 -- "$2"
+                }
+                run_in_service_sandbox() {
+                    [ "${1:-}" = "${installed}.new.$$" ] || return 1
+                    printf 'preflight|' >>"$calls"
+                    printf '%s\n' '{"ok":true,"userlist":""}'
+                }
+                busctl() {
+                    [ "${1:-}" = "call" ] && [ "${5:-}" = "LoadUnit" ] &&
+                        [ "${6:-}" = "s" ] &&
+                        [ "${7:-}" = "${SERVICE_NAME}.service" ] || return 1
+                    printf 'load:LoadUnit|' >>"$calls"
+                    printf '%s\n' \
+                        'o "/org/freedesktop/systemd1/unit/alighieri_2eservice"'
+                }
+                effective_install_matches() {
+                    service_unit_object_path >/dev/null || return 1
+                    [ "$mode" = "success" ]
+                }
+                require_effective_service_sandbox() {
+                    printf 'sandbox-guard|' >>"$calls"
+                }
+                systemctl() { printf 'systemctl:%s|' "$*" >>"$calls"; }
+                trap cleanup EXIT
+                do_install
+            ) >"$output" 2>&1; then
+                succeeded=1
+            fi
+
+            got_calls="$(<"$calls")"
+            if [ "$mode" = "success" ]; then
+                expected_calls='preflight|systemctl:daemon-reload|load:LoadUnit|sandbox-guard|'
+                if [ "$succeeded" -eq 1 ] && [ "$(<"$installed")" = "new-binary" ] &&
+                    grep -Fq -- "ExecStart=$installed $config" "$unit" &&
+                    [ "$(stat -c %a -- "$unit")" = "644" ] &&
+                    [ "$got_calls" = "$expected_calls" ] &&
+                    [ ! -e "${installed}.new.$$" ] && [ ! -e "${unit}.new.$$" ] &&
+                    [ ! -e "${unit}.previous.$$" ]; then
+                    printf 'ok   fresh --no-start install loads and commits an unloaded unit\n'
+                else
+                    printf 'FAIL fresh --no-start install transaction: status %s, calls [%s]\n' \
+                        "$succeeded" "$got_calls"
+                    test_failures=$((test_failures + 1))
+                fi
+            else
+                expected_calls='preflight|systemctl:daemon-reload|load:LoadUnit|systemctl:daemon-reload|'
+                if [ "$succeeded" -eq 0 ] && [ ! -e "$installed" ] &&
+                    [ ! -e "$unit" ] && [ "$got_calls" = "$expected_calls" ] &&
+                    grep -Fq -- 'overriding drop-in' "$output" &&
+                    [ ! -e "${installed}.new.$$" ] && [ ! -e "${unit}.new.$$" ] &&
+                    [ ! -e "${unit}.previous.$$" ]; then
+                    printf 'ok   rejected fresh install leaves binary and base unit absent\n'
+                else
+                    printf 'FAIL rejected fresh install transaction: status %s, calls [%s]\n' \
+                        "$succeeded" "$got_calls"
+                    test_failures=$((test_failures + 1))
+                fi
+            fi
+
+            command rm -f -- "$unit" "$config" "$source" "$installed" "$calls" \
+                "$output" "${installed}.new.$$" "${unit}.new.$$" \
+                "${unit}.previous.$$"
+            command rmdir -- "$LOG_DIR" "$bin_dir" "$fresh_tmp"
+        done
+        [ "$test_failures" -eq 0 ]
+    }
+
+    if ! _check_fresh_install_transaction; then
+        failures=$((failures + 1))
+    fi
+    unset -f _check_fresh_install_transaction
 
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
@@ -2026,14 +2392,15 @@ run_selftest() {
 }
 
 write_unit() {
-    local install_bin="$1" config_file="$2" summary="$3"
+    local install_bin="$1" config_file="$2" summary="$3" \
+          output_file="${4:-$UNIT_FILE}"
     # Grant the minimal capability to bind a privileged port only when the
     # config actually needs one; otherwise keep all capabilities dropped.
     local caps=""
     if needs_net_bind_capability "$summary"; then
         caps="CAP_NET_BIND_SERVICE"
     fi
-    cat >"$UNIT_FILE" <<UNIT
+    cat >"$output_file" <<UNIT
 [Unit]
 Description=Alighieri SOCKS5 proxy server
 Documentation=https://github.com/wiresock/alighieri
@@ -2082,9 +2449,10 @@ UNIT
 }
 
 # ── Actions ───────────────────────────────────────────────────────────────────
-activate_installed_service() {
+reload_and_validate_installed_service() {
     local expected_binary="${1:-}" expected_config="${2:-}"
-    systemctl daemon-reload
+    systemctl daemon-reload ||
+        die "systemd daemon-reload failed while validating the new unit; the previous unit will be restored"
     if [ -n "$expected_binary" ] &&
         ! effective_install_matches "$expected_binary" "$expected_config"; then
         die "effective systemd ExecStart command or execution flags do not match $expected_binary $expected_config; remove or update the overriding drop-in, then re-run install"
@@ -2092,6 +2460,9 @@ activate_installed_service() {
     if [ -n "$expected_binary" ]; then
         require_effective_service_sandbox
     fi
+}
+
+activate_prevalidated_service() {
     if [ "$START_ON_INSTALL" -eq 1 ]; then
         systemctl enable "${SERVICE_NAME}.service"
         # restart, not just start, so re-running install applies an updated binary
@@ -2101,6 +2472,12 @@ activate_installed_service() {
     else
         ok "Alighieri is installed but was not enabled or started (--no-start)."
     fi
+}
+
+activate_installed_service() {
+    local expected_binary="${1:-}" expected_config="${2:-}"
+    reload_and_validate_installed_service "$expected_binary" "$expected_config"
+    activate_prevalidated_service
 }
 
 do_install() {
@@ -2250,16 +2627,36 @@ do_install() {
     chown "$SERVICE_USER:$SERVICE_USER" "$LOG_DIR"
     chmod 750 "$LOG_DIR"
 
+    # Render the new base unit beside its destination, then expose it only as an
+    # uncommitted transaction while systemd loads and merges surviving drop-ins.
+    # The EXIT trap restores the prior unit (and reloads it) on every rejection;
+    # the active binary remains untouched until ExecStart flags and the effective
+    # service sandbox have both matched the generated unit.
+    STAGED_UNIT="${UNIT_FILE}.new.$$"
+    info "staging systemd unit validation at $STAGED_UNIT"
+    write_unit "$install_bin" "$config_file" "$check_summary" "$STAGED_UNIT" ||
+        die "could not render the staged systemd unit at $STAGED_UNIT"
+    chmod 644 "$STAGED_UNIT" ||
+        die "could not set safe permissions on the staged systemd unit at $STAGED_UNIT"
+    begin_unit_transaction
+    reload_and_validate_installed_service "$install_bin" "$config_file"
+
     info "installing validated binary to $install_bin"
     # `-T` refuses an unexpected directory destination instead of moving the
     # staged executable inside it under a different basename.
-    mv -fT -- "$STAGED_BIN" "$install_bin"
+    # Arm cleanup to distinguish a signal before the atomic rename (source still
+    # present: roll back) from one after it (source gone: commit the validated
+    # unit so it remains consistent with the newly installed binary).
+    BINARY_COMMIT_IN_PROGRESS=1
+    if ! mv -fT -- "$STAGED_BIN" "$install_bin"; then
+        BINARY_COMMIT_IN_PROGRESS=0
+        die "could not install the validated binary at $install_bin; the previous unit will be restored"
+    fi
+    commit_unit_transaction
     STAGED_BIN=""
+    BINARY_COMMIT_IN_PROGRESS=0
 
-    info "writing systemd unit $UNIT_FILE"
-    write_unit "$install_bin" "$config_file" "$check_summary"
-
-    activate_installed_service "$install_bin" "$config_file"
+    activate_prevalidated_service
     local elevation followup_install quoted_install_bin quoted_userlist \
           effective_userlist runtime_userlist
     elevation="$(followup_elevation)"

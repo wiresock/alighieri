@@ -24,7 +24,7 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
 #[cfg(test)]
 const PUBLIC_DOMAIN_EXAMPLE: &str = "proxy.example.com";
 const PUBLIC_UDP_RANGE: &str = "40000-40099";
-const WIZARD_LOG_ROTATE_KEEP: usize = 5;
+const WIZARD_LOG_ROTATE_KEEP: usize = alighieri::config::DEFAULT_LOG_ROTATE_KEEP;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWizardArgs {
@@ -1117,6 +1117,32 @@ fn wizard_rotated_log_path(path: &Path, index: usize) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+fn append_log_artifact_paths(
+    paths: &mut Vec<(&'static str, PathBuf)>,
+    log_file: &Path,
+    log_label: &'static str,
+    rotated_log_label: &'static str,
+) {
+    paths.push((log_label, log_file.to_path_buf()));
+    for index in 1..=WIZARD_LOG_ROTATE_KEEP {
+        paths.push((rotated_log_label, wizard_rotated_log_path(log_file, index)));
+    }
+}
+
+#[cfg(windows)]
+/// Returns true only when both log names and every rotation are known to be the
+/// same install targets. This deliberately uses the case-preserving predicate:
+/// case-sensitive NTFS directories can contain otherwise similar log families.
+fn log_artifact_families_match(left: &Path, right: &Path) -> bool {
+    paths_are_same_install_target(left, right)
+        && (1..=WIZARD_LOG_ROTATE_KEEP).all(|index| {
+            paths_are_same_install_target(
+                &wizard_rotated_log_path(left, index),
+                &wizard_rotated_log_path(right, index),
+            )
+        })
+}
+
 fn validate_public_service_path_roles(
     cache_path: &Path,
     output_path: &Path,
@@ -1126,7 +1152,7 @@ fn validate_public_service_path_roles(
     let output_backup = backup_path(output_path);
     let service_config = default_public_service_config_path();
     let service_config_backup = backup_path(&service_config);
-    let mut file_paths = vec![
+    let mut file_paths: Vec<(&'static str, PathBuf)> = vec![
         ("configuration output path", output_path.to_path_buf()),
         ("configuration output backup path", output_backup.clone()),
     ];
@@ -1152,11 +1178,35 @@ fn validate_public_service_path_roles(
             super::userlist_lock_path(userlist_path),
         ));
     }
-    if let Some(log_file) = log_file {
-        file_paths.push(("log file", log_file.to_path_buf()));
-        for index in 1..=WIZARD_LOG_ROTATE_KEEP {
-            file_paths.push(("rotated log path", wizard_rotated_log_path(log_file, index)));
+
+    // Windows Service mode uses the default ProgramData log when loading the
+    // configuration fails, so that fallback log and its rotations are always
+    // service-owned. A successfully loaded explicit logfile is an additional
+    // artifact family unless it resolves to exactly the same family. The
+    // install-time config marker is also service-owned and must never be
+    // selected for another wizard role.
+    #[cfg(windows)]
+    {
+        file_paths.push((
+            "Windows Service configuration marker path",
+            alighieri::platform::windows::service_manager::service_config_marker_path(),
+        ));
+        let default_log = alighieri::platform::windows::service_manager::default_service_log_path();
+        append_log_artifact_paths(
+            &mut file_paths,
+            &default_log,
+            "Windows Service default log file",
+            "Windows Service rotated log path",
+        );
+        if let Some(log_file) =
+            log_file.filter(|log_file| !log_artifact_families_match(log_file, &default_log))
+        {
+            append_log_artifact_paths(&mut file_paths, log_file, "log file", "rotated log path");
         }
+    }
+    #[cfg(not(windows))]
+    if let Some(log_file) = log_file {
+        append_log_artifact_paths(&mut file_paths, log_file, "log file", "rotated log path");
     }
 
     validate_public_path_spelling("ACME cache path", cache_path)?;
@@ -1590,7 +1640,7 @@ fn default_public_service_config_path() -> PathBuf {
 
 #[cfg(windows)]
 fn default_public_service_log_path() -> PathBuf {
-    alighieri::platform::windows::service_manager::default_log_dir().join("alighieri.log")
+    alighieri::platform::windows::service_manager::default_service_log_path()
 }
 
 #[cfg(not(windows))]
@@ -3898,6 +3948,154 @@ mod tests {
         );
 
         validate_public_service_path_roles(&cache, &service_config, Some(&userlist), None).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_reserves_windows_service_marker_for_every_path_role() {
+        let root = Path::new(r"C:\AlighieriWizardCollisionTests");
+        let marker = alighieri::platform::windows::service_manager::service_config_marker_path();
+
+        for role in [
+            "configuration output path",
+            "userlist path",
+            "ACME cache path",
+        ] {
+            let mut cache = root.join("acme");
+            let mut output = root.join("public.conf");
+            let mut userlist = root.join("users");
+            match role {
+                "configuration output path" => output = marker.clone(),
+                "userlist path" => userlist = marker.clone(),
+                "ACME cache path" => cache = marker.clone(),
+                _ => unreachable!(),
+            }
+
+            let err = validate_public_service_path_roles(&cache, &output, Some(&userlist), None)
+                .unwrap_err();
+
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(
+                err.contains("Windows Service configuration marker path"),
+                "{role}: {err}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_reserves_implicit_windows_service_log_for_every_path_role() {
+        let root = Path::new(r"C:\AlighieriWizardCollisionTests");
+        let default_log = alighieri::platform::windows::service_manager::default_service_log_path();
+
+        for role in [
+            "configuration output path",
+            "userlist path",
+            "ACME cache path",
+        ] {
+            let mut cache = root.join("acme");
+            let mut output = root.join("public.conf");
+            let mut userlist = root.join("users");
+            match role {
+                "configuration output path" => output = default_log.clone(),
+                "userlist path" => userlist = default_log.clone(),
+                "ACME cache path" => cache = default_log.clone(),
+                _ => unreachable!(),
+            }
+
+            let err = validate_public_service_path_roles(&cache, &output, Some(&userlist), None)
+                .unwrap_err();
+
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(
+                err.contains("Windows Service default log file"),
+                "{role}: {err}"
+            );
+        }
+
+        let rotated_log = wizard_rotated_log_path(&default_log, 1);
+        let err = validate_public_service_path_roles(
+            &root.join("acme"),
+            &root.join("public.conf"),
+            Some(&rotated_log),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("userlist path"), "{err}");
+        assert!(err.contains("Windows Service rotated log path"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_explicit_log_still_reserves_windows_service_fallback_logs() {
+        let root = Path::new(r"C:\AlighieriWizardCollisionTests");
+        let default_log = alighieri::platform::windows::service_manager::default_service_log_path();
+        let explicit_log = root.join("explicit.log");
+
+        for (fallback_artifact, fallback_label) in [
+            (default_log.clone(), "Windows Service default log file"),
+            (
+                wizard_rotated_log_path(&default_log, 1),
+                "Windows Service rotated log path",
+            ),
+        ] {
+            for role in [
+                "configuration output path",
+                "userlist path",
+                "ACME cache path",
+            ] {
+                let mut cache = root.join("acme");
+                let mut output = root.join("public.conf");
+                let mut userlist = root.join("users");
+                match role {
+                    "configuration output path" => output = fallback_artifact.clone(),
+                    "userlist path" => userlist = fallback_artifact.clone(),
+                    "ACME cache path" => cache = fallback_artifact.clone(),
+                    _ => unreachable!(),
+                }
+
+                let err = validate_public_service_path_roles(
+                    &cache,
+                    &output,
+                    Some(&userlist),
+                    Some(&explicit_log),
+                )
+                .unwrap_err();
+
+                assert!(err.contains(role), "{role}/{fallback_label}: {err}");
+                assert!(
+                    err.contains(fallback_label),
+                    "{role}/{fallback_label}: {err}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn public_tls_allows_explicit_log_equal_to_windows_service_default() {
+        let root = Path::new(r"C:\AlighieriWizardCollisionTests");
+        let default_log = alighieri::platform::windows::service_manager::default_service_log_path();
+
+        validate_public_service_path_roles(
+            &root.join("acme"),
+            &root.join("public.conf"),
+            Some(&root.join("users")),
+            Some(&default_log),
+        )
+        .unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn public_tls_without_logfile_does_not_reserve_a_default_log_on_non_windows() {
+        validate_public_service_path_roles(
+            Path::new("/var/lib/alighieri/acme"),
+            &default_public_service_log_path(),
+            Some(Path::new("/etc/alighieri/users")),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
