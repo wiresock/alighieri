@@ -564,8 +564,7 @@ is_installed() {
     [ -f "$UNIT_FILE" ]
 }
 
-# Remove any staged upgrade binary that was not moved into place. The installed
-# binary and config have already been copied out by then.
+# Remove any staged install/upgrade binary that was not moved into place.
 cleanup() {
     # Best-effort: a failing rm must not abort the EXIT trap (under errexit) or
     # change the script's original exit status, so swallow any error.
@@ -1770,6 +1769,145 @@ run_selftest() {
     _check_cli_rejected "--config on upgrade" "--config is valid only with the install command" \
         upgrade --config /etc/alighieri/alighieri.conf
 
+    _check_install_preflight_transaction() {
+        local tx_tmp unit config source bin_dir installed calls output userlist \
+              expected_staged expected_calls expected_error failure_mode \
+              succeeded got_binary got_unit got_calls before_inode after_inode \
+              result test_failures=0 UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR \
+              BIN_DIR BINARY PREFIX_EXPLICIT CONFIG_EXPLICIT START_ON_INSTALL \
+              STAGED_BIN
+        tx_tmp="$(mktemp -d)"
+        unit="$tx_tmp/alighieri.service"
+        config="$tx_tmp/alighieri.conf"
+        source="$tx_tmp/source-alighieri"
+        bin_dir="$tx_tmp/bin"
+        installed="$bin_dir/alighieri"
+        calls="$tx_tmp/calls"
+        output="$tx_tmp/output"
+        userlist="$tx_tmp/users"
+        expected_staged="${installed}.new.$$"
+        command mkdir -p -- "$bin_dir"
+        printf '%s\n' 'old-unit' >"$unit"
+        printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
+        printf '%s\n' 'new-binary' >"$source"
+
+        UNIT_FILE="$unit"
+        CONFIG_DIR="$tx_tmp/managed-config"
+        CONFIG_FILE="$CONFIG_DIR/alighieri.conf"
+        LOG_DIR="$tx_tmp/log"
+        BIN_DIR="$bin_dir"
+        BINARY="$source"
+        PREFIX_EXPLICIT=1
+        CONFIG_EXPLICIT=0
+        START_ON_INSTALL=1
+        STAGED_BIN=""
+
+        _check_install_failure_case() { # failure-mode description
+            local description="$2"
+            failure_mode="$1"
+            succeeded=0
+            printf '%s\n' 'old-binary' >"$installed"
+            printf '%s\n' 'old-unit' >"$unit"
+            : >"$calls"
+            : >"$output"
+            command rm -f -- "$expected_staged"
+            before_inode="$(stat -c %i -- "$installed")"
+            if (
+                # All command/helper mocks live only in this case process. The
+                # deployment globals above are function-local and dynamically
+                # visible here, so neither kind of test state leaks afterward.
+                require_service_sandbox() { :; }
+                resolve_source_binary() { :; }
+                ensure_user() { :; }
+                installed_config_path() { printf '%s' "$config"; }
+                reject_hidden_service_path() { :; }
+                chown() { :; }
+                chmod() { :; }
+                install() {
+                    local destination
+                    if [ "${1:-}" = "-d" ]; then
+                        destination="${!#}"
+                        command mkdir -p -- "$destination"
+                        return
+                    fi
+                    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+                    [ "$#" -eq 3 ] || return 1
+                    shift
+                    command cp -- "$1" "$2"
+                    command chmod 755 -- "$2"
+                }
+                run_in_service_sandbox() {
+                    if [ "${1:-}" != "$expected_staged" ] || [ ! -f "${1:-}" ] ||
+                        [ "$(<"$1")" != "new-binary" ]; then
+                        printf 'invalid-stage:%s|' "$*" >>"$calls"
+                        return 1
+                    fi
+                    printf 'sandbox:%s|' "$*" >>"$calls"
+                    if [ "${2:-}" = "--check" ] && [ "${3:-}" = "--json" ]; then
+                        [ "$failure_mode" != "config" ] || return 1
+                        printf '{"ok":true,"userlist":"%s"}\n' "$userlist"
+                        return 0
+                    fi
+                    # The human-readable config retry and the userlist loader
+                    # both fail in their respective test cases.
+                    return 1
+                }
+                write_unit() {
+                    printf 'write|' >>"$calls"
+                    printf '%s\n' 'new-unit' >"$UNIT_FILE"
+                }
+                activate_installed_service() { printf 'activate|' >>"$calls"; }
+                systemctl() { printf 'systemctl:%s|' "$*" >>"$calls"; }
+                trap cleanup EXIT
+                do_install
+            ) >"$output" 2>&1; then
+                succeeded=1
+            fi
+            got_binary="$(<"$installed")"
+            got_unit="$(<"$unit")"
+            got_calls="$(<"$calls")"
+            after_inode="$(stat -c %i -- "$installed")"
+            if [ "$failure_mode" = "config" ]; then
+                expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged --check $config|"
+                expected_error="invalid or unreachable"
+            else
+                expected_calls="sandbox:$expected_staged --check --json $config|sandbox:$expected_staged user list --userlist $userlist|"
+                expected_error="cannot be loaded"
+            fi
+            if [ "$succeeded" -eq 0 ] &&
+                [ "$got_binary" = "old-binary" ] &&
+                [ "$before_inode" = "$after_inode" ] &&
+                [ "$got_unit" = "old-unit" ] &&
+                [ "$got_calls" = "$expected_calls" ] &&
+                grep -Fq -- "$expected_error" "$output" &&
+                [ ! -e "$expected_staged" ]; then
+                printf 'ok   install %s preserves binary, unit, and service\n' \
+                    "$description"
+            else
+                printf 'FAIL install %s transaction: status %s, binary [%s], inode %s/%s, unit [%s], calls [%s], staged %s\n' \
+                    "$description" "$succeeded" "$got_binary" "$before_inode" \
+                    "$after_inode" "$got_unit" "$got_calls" \
+                    "$([ -e "$expected_staged" ] && printf present || printf absent)"
+                test_failures=$((test_failures + 1))
+            fi
+        }
+
+        _check_install_failure_case config "config preflight failure"
+        _check_install_failure_case userlist "userlist preflight failure"
+
+        command rm -f -- "$unit" "$config" "$source" "$installed" "$calls" \
+            "$output" "$userlist" "$expected_staged"
+        command rmdir -- "$bin_dir" "$tx_tmp"
+        result="$test_failures"
+        unset -f _check_install_failure_case
+        [ "$result" -eq 0 ]
+    }
+
+    if ! _check_install_preflight_transaction; then
+        failures=$((failures + 1))
+    fi
+    unset -f _check_install_preflight_transaction
+
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
               expected='reload|guard|preflight|reload|guard|restart|' \
@@ -1998,11 +2136,15 @@ do_install() {
     ensure_user
 
     local install_bin="${BIN_DIR}/${SERVICE_NAME}"
-    info "installing binary to $install_bin"
     install -d -m 755 -- "$BIN_DIR"
+    # Keep the active executable untouched until every failure-prone config and
+    # userlist preflight has succeeded. Staging beside the destination also
+    # keeps the final move atomic and lets the EXIT trap clean up any rejection.
+    STAGED_BIN="${install_bin}.new.$$"
+    info "staging binary for service preflight at $STAGED_BIN"
     # `--` so a --binary source (or any path) beginning with `-` is never parsed
     # as an install option in this root script.
-    install -m 755 -- "$BINARY" "$install_bin"
+    install -m 755 -T -- "$BINARY" "$STAGED_BIN"
 
     # Preserve the config path the existing unit launches with unless the
     # operator explicitly selects a replacement via install --config. This lets
@@ -2090,11 +2232,11 @@ do_install() {
     # failure, re-run in text mode to surface the human-readable error first.
     local check_summary
     if ! check_summary="$(run_in_service_sandbox \
-        "$install_bin" --check --json "$config_file" 2>/dev/null)"; then
-        run_in_service_sandbox "$install_bin" --check "$config_file" || true
+        "$STAGED_BIN" --check --json "$config_file" 2>/dev/null)"; then
+        run_in_service_sandbox "$STAGED_BIN" --check "$config_file" || true
         die "config $config_file is invalid or unreachable by $SERVICE_USER inside the hardened systemd sandbox; fix the errors above, then re-run install"
     fi
-    validate_service_userlist "$install_bin" "$check_summary" "$START_ON_INSTALL"
+    validate_service_userlist "$STAGED_BIN" "$check_summary" "$START_ON_INSTALL"
     warn_acme_cache_outside_state_dir "$check_summary"
     warn_logfile_outside_log_dir "$check_summary"
 
@@ -2107,6 +2249,12 @@ do_install() {
     install -d -m 750 -o "$SERVICE_USER" -g "$SERVICE_USER" -- "$LOG_DIR"
     chown "$SERVICE_USER:$SERVICE_USER" "$LOG_DIR"
     chmod 750 "$LOG_DIR"
+
+    info "installing validated binary to $install_bin"
+    # `-T` refuses an unexpected directory destination instead of moving the
+    # staged executable inside it under a different basename.
+    mv -fT -- "$STAGED_BIN" "$install_bin"
+    STAGED_BIN=""
 
     info "writing systemd unit $UNIT_FILE"
     write_unit "$install_bin" "$config_file" "$check_summary"
@@ -2180,7 +2328,7 @@ do_upgrade() {
     # instead of crash-looping, then move it into place atomically — which also
     # avoids ETXTBSY from rewriting the binary the running service is executing.
     STAGED_BIN="${install_bin}.new.$$"
-    install -m 755 -- "$BINARY" "$STAGED_BIN"
+    install -m 755 -T -- "$BINARY" "$STAGED_BIN"
     local check_summary
     if ! check_summary="$(run_in_service_sandbox \
         "$STAGED_BIN" --check --json "$config_file" 2>/dev/null)"; then
@@ -2203,7 +2351,7 @@ do_upgrade() {
     fi
 
     info "upgrading binary at $install_bin"
-    mv -f "$STAGED_BIN" "$install_bin"
+    mv -fT -- "$STAGED_BIN" "$install_bin"
     STAGED_BIN=""
 
     if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then
