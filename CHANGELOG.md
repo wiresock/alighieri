@@ -6,6 +6,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-30
+
 ### Added
 
 - The configuration wizard now includes a **Public SOCKS5-over-TLS
@@ -697,7 +699,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/wiresock/alighieri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/wiresock/alighieri/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/wiresock/alighieri/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wiresock/alighieri/compare/v0.2.0...v0.3.0
