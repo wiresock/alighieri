@@ -1047,34 +1047,144 @@ struct ResolvedUserTarget {
 enum UserlistCreationPolicy {
     // Preserve the legacy direct-path behavior for ad-hoc userlists.
     Private,
-    // The installer makes the selected config root:service-group 0640. Matching
-    // that identity lets the same service read a newly bootstrapped userlist
-    // without coupling this cross-platform binary to a fixed account name.
+    // The managed installer makes the selected config root:alighieri 0640.
+    // Match that exact identity before bootstrapping so ACL-based or custom
+    // layouts cannot receive a misleading success or broader hash visibility.
     ConfigBacked {
         #[cfg(unix)]
         uid: u32,
         #[cfg(unix)]
         gid: u32,
+        #[cfg(unix)]
+        managed_bootstrap: bool,
     },
+}
+
+#[cfg(target_os = "linux")]
+fn managed_service_group_gid() -> std::io::Result<Option<u32>> {
+    const INITIAL_BUFFER_SIZE: usize = 1_024;
+    const MAX_BUFFER_SIZE: usize = 1_048_576;
+
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0 as libc::c_char; INITIAL_BUFFER_SIZE];
+    loop {
+        let status = unsafe {
+            libc::getgrnam_r(
+                c"alighieri".as_ptr(),
+                &mut group,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == 0 {
+            return if result.is_null() {
+                Ok(None)
+            } else {
+                Ok(Some(group.gr_gid))
+            };
+        }
+        if status != libc::ERANGE {
+            return Err(std::io::Error::from_raw_os_error(status));
+        }
+        if buffer.len() >= MAX_BUFFER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "alighieri service group record exceeds the lookup limit",
+            ));
+        }
+        buffer.resize(buffer.len() * 2, 0);
+    }
+}
+
+#[cfg(unix)]
+fn supports_managed_userlist_bootstrap(
+    is_regular_file: bool,
+    has_no_access_acl: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    expected_uid: u32,
+    service_gid: Option<u32>,
+) -> bool {
+    is_regular_file
+        && has_no_access_acl
+        && uid == expected_uid
+        && service_gid == Some(gid)
+        && mode == 0o640
 }
 
 impl UserlistCreationPolicy {
     fn config_backed(config_path: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
+            #[cfg(target_os = "linux")]
+            let service_gid = managed_service_group_gid().ok().flatten();
+            #[cfg(not(target_os = "linux"))]
+            let service_gid = None;
 
-            let metadata = std::fs::metadata(config_path)?;
-            Ok(Self::ConfigBacked {
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-            })
+            Self::config_backed_with_expected_identity(config_path, 0, service_gid)
         }
         #[cfg(not(unix))]
         {
             let _ = config_path;
             Ok(Self::ConfigBacked {})
         }
+    }
+
+    #[cfg(unix)]
+    fn config_backed_with_expected_identity(
+        config_path: &Path,
+        expected_uid: u32,
+        service_gid: Option<u32>,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path_metadata = std::fs::metadata(config_path)?;
+        #[cfg(target_os = "linux")]
+        let (metadata, has_no_access_acl) = if path_metadata.is_file() {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            match options.open(config_path) {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    let has_no_access_acl =
+                        metadata.is_file() && matches!(linux_access_acl(&file), Ok(None));
+                    (metadata, has_no_access_acl)
+                }
+                Err(_) => (path_metadata, false),
+            }
+        } else {
+            // Avoid a blocking second open for FIFOs and other special config
+            // sources. These can never authorize managed userlist creation.
+            (path_metadata, false)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let metadata = path_metadata;
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+        let mode = metadata.permissions().mode() & 0o7777;
+        #[cfg(not(target_os = "linux"))]
+        let has_no_access_acl = false;
+        Ok(Self::ConfigBacked {
+            uid,
+            gid,
+            managed_bootstrap: cfg!(target_os = "linux")
+                && supports_managed_userlist_bootstrap(
+                    metadata.is_file(),
+                    has_no_access_acl,
+                    uid,
+                    gid,
+                    mode,
+                    expected_uid,
+                    service_gid,
+                ),
+        })
     }
 }
 
@@ -1999,7 +2109,7 @@ fn create_userlist_temp(
             Ok(file) => {
                 #[cfg(unix)]
                 {
-                    if let Err(error) = apply_userlist_unix_metadata(&temp_path, &file, metadata) {
+                    if let Err(error) = apply_userlist_unix_metadata(&temp_path, &file, &metadata) {
                         drop(file);
                         let _ = std::fs::remove_file(&temp_path);
                         return Err(error);
@@ -2038,11 +2148,12 @@ fn next_userlist_temp_path(userlist: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
 struct UserlistUnixMetadata {
     mode: u32,
     uid: u32,
     gid: u32,
+    #[cfg(target_os = "linux")]
+    access_acl: Option<Vec<u8>>,
 }
 
 #[cfg(unix)]
@@ -2054,11 +2165,23 @@ fn userlist_unix_metadata(
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     if existed {
-        let metadata = std::fs::metadata(userlist)?;
+        let file = open_no_follow(userlist)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to update {}: not a regular file",
+                    userlist.display()
+                ),
+            ));
+        }
         Ok(UserlistUnixMetadata {
             mode: metadata.permissions().mode() & 0o777,
             uid: metadata.uid(),
             gid: metadata.gid(),
+            #[cfg(target_os = "linux")]
+            access_acl: linux_access_acl(&file)?,
         })
     } else {
         match creation_policy {
@@ -2066,13 +2189,99 @@ fn userlist_unix_metadata(
                 mode: 0o600,
                 uid: u32::MAX,
                 gid: u32::MAX,
+                #[cfg(target_os = "linux")]
+                access_acl: None,
             }),
-            UserlistCreationPolicy::ConfigBacked { uid, gid } => Ok(UserlistUnixMetadata {
-                mode: 0o640,
+            UserlistCreationPolicy::ConfigBacked {
                 uid,
                 gid,
-            }),
+                managed_bootstrap,
+            } => {
+                if !managed_bootstrap {
+                    #[cfg(target_os = "linux")]
+                    let message = "config-backed userlist auto-creation requires a regular config \
+                                   owned by root:alighieri with mode 0640 and no extended access \
+                                   ACL; pre-create the userlist for other ownership or ACL layouts";
+                    #[cfg(not(target_os = "linux"))]
+                    let message = "config-backed userlist auto-creation is supported only on \
+                                   Linux; pre-create the userlist on this platform";
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        message,
+                    ));
+                }
+                Ok(UserlistUnixMetadata {
+                    mode: 0o640,
+                    uid,
+                    gid,
+                    #[cfg(target_os = "linux")]
+                    access_acl: None,
+                })
+            }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_access_acl(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::io::AsRawFd;
+
+    const XATTR_SIZE_MAX: usize = 65_536;
+
+    let mut value = vec![0_u8; XATTR_SIZE_MAX];
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_access".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if size >= 0 {
+        value.truncate(size as usize);
+        return Ok(Some(value));
+    }
+
+    let error = std::io::Error::last_os_error();
+    if linux_acl_missing_or_unsupported(&error) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_acl_missing_or_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENODATA) || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_access_acl(file: &std::fs::File, access_acl: Option<&[u8]>) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let status = match access_acl {
+        Some(value) => unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        },
+        None => unsafe {
+            libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr())
+        },
+    };
+    if status == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if access_acl.is_none() && linux_acl_missing_or_unsupported(&error) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -2080,18 +2289,28 @@ fn userlist_unix_metadata(
 fn apply_userlist_unix_metadata(
     _temp_path: &Path,
     file: &std::fs::File,
-    metadata: UserlistUnixMetadata,
+    metadata: &UserlistUnixMetadata,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
+    #[cfg(target_os = "linux")]
+    set_linux_access_acl(file, None)?;
+
     if metadata.uid != u32::MAX || metadata.gid != u32::MAX {
-        let rc = unsafe { libc::fchown(file.as_raw_fd(), metadata.uid, metadata.gid) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+        let current = file.metadata()?;
+        if current.uid() != metadata.uid || current.gid() != metadata.gid {
+            let rc = unsafe { libc::fchown(file.as_raw_fd(), metadata.uid, metadata.gid) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
     }
     file.set_permissions(std::fs::Permissions::from_mode(metadata.mode))?;
+    #[cfg(target_os = "linux")]
+    if let Some(access_acl) = metadata.access_acl.as_deref() {
+        set_linux_access_acl(file, Some(access_acl))?;
+    }
     Ok(())
 }
 
@@ -2159,6 +2378,64 @@ fn user_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn test_posix_acl(owner_permissions: u16, named_uid: u32) -> Vec<u8> {
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+        const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+        let entries = [
+            (ACL_USER_OBJ, owner_permissions, ACL_UNDEFINED_ID),
+            (ACL_USER, 0o4, named_uid),
+            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+            (ACL_MASK, 0o4, ACL_UNDEFINED_ID),
+            (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+        ];
+        let mut value = Vec::with_capacity(4 + entries.len() * 8);
+        value.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, permissions, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_test_linux_xattr(
+        file: &std::fs::File,
+        name: &std::ffi::CStr,
+        value: &[u8],
+    ) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+
+        let status = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acl_test_unavailable(error: &std::io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EPERM | libc::EACCES)
+        )
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3185,8 +3462,85 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn config_backed_new_userlist_matches_config_identity_on_unix() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    fn managed_userlist_bootstrap_requires_the_service_identity_on_unix() {
+        assert!(supports_managed_userlist_bootstrap(
+            true,
+            true,
+            0,
+            4242,
+            0o640,
+            0,
+            Some(4242)
+        ));
+        for (is_regular_file, has_no_access_acl, uid, gid, mode, expected_uid, service_gid) in [
+            (false, true, 0, 4242, 0o640, 0, Some(4242)),
+            (true, false, 0, 4242, 0o640, 0, Some(4242)),
+            (true, true, 1000, 4242, 0o640, 0, Some(4242)),
+            (true, true, 0, 7, 0o640, 0, Some(4242)),
+            (true, true, 0, 4242, 0o600, 0, Some(4242)),
+            (true, true, 0, 4242, 0o644, 0, Some(4242)),
+            (true, true, 0, 4242, 0o660, 0, Some(4242)),
+            (true, true, 0, 4242, 0o4640, 0, Some(4242)),
+            (true, true, 0, 4242, 0o640, 0, None),
+        ] {
+            assert!(!supports_managed_userlist_bootstrap(
+                is_regular_file,
+                has_no_access_acl,
+                uid,
+                gid,
+                mode,
+                expected_uid,
+                service_gid
+            ));
+        }
+
+        let metadata = userlist_unix_metadata(
+            Path::new("unused"),
+            false,
+            UserlistCreationPolicy::ConfigBacked {
+                uid: 0,
+                gid: 4242,
+                managed_bootstrap: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(metadata.mode, 0o640);
+        assert_eq!(metadata.uid, 0);
+        assert_eq!(metadata.gid, 4242);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_backed_bootstrap_rejects_a_fifo_without_opening_it_on_linux() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let config_c = CString::new(config.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(config_c.as_ptr(), 0o640) }, 0);
+        let metadata = std::fs::metadata(&config).unwrap();
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            metadata.uid(),
+            Some(metadata.gid()),
+        )
+        .unwrap();
+        assert!(matches!(
+            policy,
+            UserlistCreationPolicy::ConfigBacked {
+                managed_bootstrap: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_bootstrap_strips_inherited_access_acl_on_linux() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("alighieri.conf");
@@ -3194,19 +3548,182 @@ mod tests {
         std::fs::write(&config, "userlist: users\n").unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
         let config_metadata = std::fs::metadata(&config).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let default_acl = test_posix_acl(0o7, named_uid);
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        if let Err(error) =
+            set_test_linux_xattr(&directory, c"system.posix_acl_default", &default_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test default ACL: {error}");
+        }
+
+        let control = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(dir.path().join("control"))
+            .unwrap();
+        assert!(linux_access_acl(&control).unwrap().is_some());
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            config_metadata.uid(),
+            Some(config_metadata.gid()),
+        )
+        .unwrap();
+        assert_eq!(
+            upsert_userlist_entry(&userlist, "alice", "alice:new", policy).unwrap(),
+            UpsertOutcome::Created
+        );
+
+        let created = open_no_follow(&userlist).unwrap();
+        let created_metadata = created.metadata().unwrap();
+        assert_eq!(created_metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(created_metadata.uid(), config_metadata.uid());
+        assert_eq!(created_metadata.gid(), config_metadata.gid());
+        assert!(linux_access_acl(&created).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(userlist).unwrap(), "alice:new\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_userlist_access_acl_is_preserved_on_linux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let userlist = dir.path().join("users");
+        std::fs::write(&userlist, "alice:old\n").unwrap();
+        std::fs::set_permissions(&userlist, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let access_acl = test_posix_acl(0o6, named_uid);
+        let original = open_no_follow(&userlist).unwrap();
+        if let Err(error) = set_test_linux_xattr(&original, c"system.posix_acl_access", &access_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test access ACL: {error}");
+        }
+        let expected_acl = linux_access_acl(&original).unwrap().unwrap();
+        drop(original);
 
         upsert_userlist_entry(
             &userlist,
             "alice",
             "alice:new",
-            UserlistCreationPolicy::config_backed(&config).unwrap(),
+            UserlistCreationPolicy::Private,
         )
         .unwrap();
 
-        let userlist_metadata = std::fs::metadata(userlist).unwrap();
-        assert_eq!(userlist_metadata.permissions().mode() & 0o777, 0o640);
-        assert_eq!(userlist_metadata.uid(), config_metadata.uid());
-        assert_eq!(userlist_metadata.gid(), config_metadata.gid());
+        let updated = open_no_follow(&userlist).unwrap();
+        let backup = open_no_follow(&userlist_backup_path(&userlist)).unwrap();
+        assert_eq!(
+            linux_access_acl(&updated).unwrap(),
+            Some(expected_acl.clone())
+        );
+        assert_eq!(linux_access_acl(&backup).unwrap(), Some(expected_acl));
+        assert_eq!(std::fs::read_to_string(&userlist).unwrap(), "alice:new\n");
+        assert_eq!(
+            std::fs::read_to_string(userlist_backup_path(&userlist)).unwrap(),
+            "alice:old\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_backed_bootstrap_rejects_an_extended_config_acl_on_linux() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let userlist = dir.path().join("users");
+        std::fs::write(&config, "userlist: users\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let access_acl = test_posix_acl(0o6, named_uid);
+        let config_file = open_no_follow(&config).unwrap();
+        if let Err(error) =
+            set_test_linux_xattr(&config_file, c"system.posix_acl_access", &access_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test config ACL: {error}");
+        }
+        let config_metadata = config_file.metadata().unwrap();
+        assert_eq!(config_metadata.permissions().mode() & 0o777, 0o640);
+        drop(config_file);
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            config_metadata.uid(),
+            Some(config_metadata.gid()),
+        )
+        .unwrap();
+        let error = upsert_userlist_entry(&userlist, "alice", "alice:new", policy).unwrap_err();
+        assert!(matches!(error, UserlistMutationError::Update(_)));
+        assert!(!userlist.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_backed_new_userlist_rejects_unsupported_config_modes_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o644] {
+            let case_dir = dir.path().join(format!("{mode:04o}"));
+            std::fs::create_dir(&case_dir).unwrap();
+            let config = case_dir.join("alighieri.conf");
+            let userlist = case_dir.join("users");
+            std::fs::write(&config, "userlist: users\n").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = upsert_userlist_entry(
+                &userlist,
+                "alice",
+                "alice:new",
+                UserlistCreationPolicy::config_backed(&config).unwrap(),
+            )
+            .unwrap_err();
+
+            match error {
+                UserlistMutationError::Update(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    let message = error.to_string();
+                    #[cfg(target_os = "linux")]
+                    {
+                        assert!(message.contains("root:alighieri"), "{message}");
+                        assert!(message.contains("mode 0640"), "{message}");
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    assert!(message.contains("only on Linux"), "{message}");
+                    assert!(message.contains("pre-create"), "{message}");
+                }
+                UserlistMutationError::Read(error) => {
+                    panic!("unexpected userlist read error: {error}")
+                }
+            }
+            assert!(!userlist.exists());
+        }
     }
 
     #[cfg(unix)]
@@ -3218,6 +3735,7 @@ mod tests {
         let config = dir.path().join("alighieri.conf");
         let userlist = dir.path().join("users");
         std::fs::write(&config, "userlist: users\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(&userlist, "alice:old\n").unwrap();
         std::fs::set_permissions(&userlist, std::fs::Permissions::from_mode(0o600)).unwrap();
         let original_metadata = std::fs::metadata(&userlist).unwrap();
@@ -3230,12 +3748,13 @@ mod tests {
         )
         .unwrap();
 
-        let updated_metadata = std::fs::metadata(userlist).unwrap();
+        let updated_metadata = std::fs::metadata(&userlist).unwrap();
         assert_eq!(
             updated_metadata.permissions().mode() & 0o777,
             original_metadata.permissions().mode() & 0o777
         );
         assert_eq!(updated_metadata.uid(), original_metadata.uid());
         assert_eq!(updated_metadata.gid(), original_metadata.gid());
+        assert_eq!(std::fs::read_to_string(userlist).unwrap(), "alice:new\n");
     }
 }

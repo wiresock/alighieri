@@ -784,6 +784,11 @@ hashed entries are preferred. Restrict the file to administrators and the
 account running Alighieri. A manual single-user deployment can use owner-only
 mode (`0600`); the managed Linux service requires `root:alighieri` ownership
 and mode `0640` so the unprivileged service can read but not rewrite credentials.
+On Linux, `user add --config` automatically creates a missing userlist only when
+the config is a regular file owned by `root:alighieri` with mode `0640` and no
+extended access ACL. Custom service groups and other ownership or ACL layouts
+must pre-create the userlist with the required metadata; Linux access ACLs on
+existing userlists are preserved across updates.
 
 `user add` and `user delete` update the file under a lock, replace it
 atomically, and keep the previous contents beside it as `<userlist>.bak` when
@@ -891,6 +896,11 @@ trusted-password-provider | \
 writes exactly one password record without logging it. Production clients
 should write their protected buffer directly to the SSH channel and clear it
 promptly; shell variables can leave additional copies in memory.
+
+When delegating this command through `sudo`, keep the complete transitive
+configuration and include search space administrator-controlled, including
+directories that can supply wildcard matches, or use a root-owned wrapper fixed
+to the intended userlist.
 
 This interface does not open a management port or install a resident agent.
 SSH authentication and host-key verification, operating-system privileges,

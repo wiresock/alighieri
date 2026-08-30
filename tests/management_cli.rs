@@ -762,6 +762,7 @@ fn config_target_reports_stable_resolution_errors() {
     }
 }
 
+#[cfg(not(unix))]
 #[test]
 fn config_target_can_bootstrap_a_missing_absolute_userlist() {
     let dir = tempfile::tempdir().unwrap();
@@ -775,14 +776,6 @@ fn config_target_can_bootstrap_a_missing_absolute_userlist() {
             userlist.display()
         ),
     );
-    #[cfg(unix)]
-    let config_identity = {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).unwrap();
-        let metadata = fs::metadata(&config).unwrap();
-        (metadata.uid(), metadata.gid())
-    };
     let secret = b"bootstrap-stdin-secret";
     let mut input = secret.to_vec();
     input.push(b'\n');
@@ -809,13 +802,46 @@ fn config_target_can_bootstrap_a_missing_absolute_userlist() {
     let stored = fs::read(&userlist).unwrap();
     assert!(contains_bytes(&stored, HASH_MARKER));
     assert!(!contains_bytes(&stored, secret));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+}
 
-        let metadata = fs::metadata(&userlist).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
-        assert_eq!((metadata.uid(), metadata.gid()), config_identity);
+#[cfg(unix)]
+#[test]
+fn config_target_rejects_bootstrap_from_unsupported_config_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    for mode in [0o600, 0o644] {
+        let case_dir = dir.path().join(format!("{mode:04o}"));
+        fs::create_dir(&case_dir).unwrap();
+        let userlist_dir = case_dir.join("data");
+        fs::create_dir(&userlist_dir).unwrap();
+        let userlist = userlist_dir.join("users");
+        let config = case_dir.join("bootstrap.conf");
+        write_config(
+            &config,
+            format!(
+                "internal: 127.0.0.1:1080\nsocksmethod: username\nuserlist: {}\n",
+                userlist.display()
+            ),
+        );
+        fs::set_permissions(&config, fs::Permissions::from_mode(mode)).unwrap();
+        let secret = format!("unsupported-mode-{mode:04o}-secret");
+        let mut input = secret.as_bytes().to_vec();
+        input.push(b'\n');
+
+        let output = invoke(
+            config_user_args(
+                "add",
+                Some("bootstrap-user"),
+                &config,
+                &["--password-stdin", "--json"],
+            ),
+            &input,
+        );
+
+        assert_output_excludes(&output, secret.as_bytes());
+        parse_error(&output, "user.add", ErrorCode::UserlistUpdateFailed);
+        assert!(!userlist.exists());
     }
 }
 
@@ -832,6 +858,12 @@ fn config_target_does_not_create_a_missing_userlist_parent() {
             userlist.display()
         ),
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).unwrap();
+    }
     let secret = b"missing-parent-secret";
     let mut input = secret.to_vec();
     input.push(b'\n');

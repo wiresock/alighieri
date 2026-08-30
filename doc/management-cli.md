@@ -128,12 +128,17 @@ userlist so the first authenticated deployment can be bootstrapped, but its
 parent directory must already exist with the intended service ownership,
 traversal permissions, and ACL. Config-backed mode does not create missing
 directory ancestry because elevated caller defaults may not be usable by the
-service. It does not canonicalize a file that does not exist yet. On Unix, that
-config-backed first creation inherits the supplied config file's owner and
-group and uses mode `0640`, matching the supported service deployment; existing
-userlist metadata is preserved. A missing userlist selected directly with
-`--userlist` retains the legacy caller-owned `0600` behavior, including parent
-directory creation.
+service. It does not canonicalize a file that does not exist yet. On Linux, that
+automatic config-backed creation is supported only for the managed-service
+layout: the supplied config must be a regular file owned by `root:alighieri`
+with mode `0640` and no extended access ACL. The new userlist inherits that
+identity and is created with mode `0640`; inherited extended access ACLs are
+removed. For custom service groups, owner-only, other-readable, or ACL-based
+layouts, pre-create the userlist with the required service metadata. Existing
+ownership and mode are preserved, as are Linux access ACLs. A missing userlist
+selected directly with `--userlist` retains the legacy caller-owned `0600`
+behavior, including parent directory creation. Other Unix platforms require
+the config-derived userlist to be pre-created.
 
 Successful JSON results contain both the supplied `config` path and the
 effective `userlist` path. The operating system still controls whether the
@@ -473,9 +478,16 @@ logging either stdin payloads or secret-bearing in-memory objects.
   `alighieri user *` rule: under elevation either target can select files
   outside the intended deployment. Prefer a fixed root-owned wrapper when the
   authorization policy cannot express the required argument checks. The
-  delegated account must not be able to modify the selected configuration, its
-  includes, or that wrapper. A manager must not attempt to parse or answer an
-  interactive sudo password prompt.
+  delegated account must not be able to modify or replace the selected
+  configuration, any transitive include, or that wrapper. It must also be
+  unable to create, delete, or rename entries in any directory component of
+  those paths or any directory searched by a wildcard include. Protecting only
+  files that currently match is insufficient because a new later-sorting
+  fragment can change the last-wins effective `userlist`. If the complete
+  include search space cannot be kept administrator-controlled, use a
+  root-owned wrapper fixed to an absolute `--userlist` instead of allowing
+  `--config` to select the elevated target. A manager must not attempt to parse
+  or answer an interactive sudo password prompt.
 - Passwords must be written directly to stdin, removed from client memory as
   soon as practical, and never recorded by command, SSH, diagnostic, telemetry,
   or audit logs.
