@@ -143,6 +143,7 @@ jobs:
           install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
           install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
           install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
+          install -m 644 doc/management-cli.md "$dir/doc/management-cli.md"
           install -m 644 \
             doc/templates/public-tls-proxifyre.conf \
             "$dir/doc/templates/public-tls-proxifyre.conf"
@@ -152,6 +153,7 @@ jobs:
           tar czf "$dir.tar.gz" "$dir"
           archive_contents="$(tar tzf "$dir.tar.gz")"
           grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
+          grep -Fqx "$dir/doc/management-cli.md" <<< "$archive_contents"
           grep -Fqx \
             "$dir/doc/templates/public-tls-proxifyre.conf" \
             <<< "$archive_contents"
@@ -165,6 +167,7 @@ jobs:
           New-Item -ItemType Directory -Path "$dir/doc/templates" -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/alighieri.exe" $dir/
           Copy-Item doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
+          Copy-Item doc/management-cli.md "$dir/doc/management-cli.md"
           Copy-Item doc/templates/public-tls-proxifyre.conf "$dir/doc/templates/public-tls-proxifyre.conf"
           Copy-Item README.md, LICENSE, CHANGELOG.md $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
@@ -172,6 +175,7 @@ jobs:
           Expand-Archive -LiteralPath "$dir.zip" -DestinationPath $archiveCheckDir
           $expectedArchiveFiles = @(
             (Join-Path $archiveCheckDir "$dir/doc/acme-tls-test.md"),
+            (Join-Path $archiveCheckDir "$dir/doc/management-cli.md"),
             (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf")
           )
           foreach ($path in $expectedArchiveFiles) {

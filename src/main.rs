@@ -1,5 +1,6 @@
 //! Alighieri — a lightweight SOCKS5 proxy server.
 
+mod management;
 mod wizard;
 
 use std::path::{Path, PathBuf};
@@ -12,6 +13,10 @@ use alighieri::runtime::{
     shutdown_signal,
 };
 use alighieri::tls;
+use management::{
+    AddResult, CapabilitiesResult, DeleteResult, ListResult, ManagementError, ManagementErrorCode,
+    SecretString, VerifyResult,
+};
 use tracing::{error, info};
 
 const DEFAULT_CONFIG: &str = "alighieri.conf";
@@ -32,6 +37,9 @@ enum Command {
         args: Vec<String>,
     },
     Config {
+        args: Vec<String>,
+    },
+    Capabilities {
         args: Vec<String>,
     },
     Help,
@@ -78,6 +86,11 @@ fn parse_args() -> Result<Command, String> {
 }
 
 fn parse_args_from(args: Vec<String>) -> Result<Command, String> {
+    if args.first().map(String::as_str) == Some("capabilities") {
+        return Ok(Command::Capabilities {
+            args: args.into_iter().skip(1).collect(),
+        });
+    }
     if args.first().map(String::as_str) == Some("service") {
         return Ok(Command::Service {
             args: args.into_iter().skip(1).collect(),
@@ -170,10 +183,11 @@ fn print_help() {
     println!("    alighieri --check --json [CONFIG]          Same as --json");
     println!("    alighieri config metadata --json           Print config reload metadata");
     println!("    alighieri config wizard [OPTIONS]          Open local config generator");
-    println!("    alighieri user add USER --userlist PATH    Add/update an Argon2id user");
-    println!("    alighieri user delete USER --userlist PATH Remove a user");
-    println!("    alighieri user list --userlist PATH        List users");
-    println!("    alighieri user verify USER --userlist PATH Verify a user password");
+    println!("    alighieri capabilities --json              Print management capabilities");
+    println!("    alighieri user add USER [OPTIONS]          Add/update an Argon2id user");
+    println!("    alighieri user delete USER [OPTIONS]       Remove a user");
+    println!("    alighieri user list [OPTIONS]              List users");
+    println!("    alighieri user verify USER [OPTIONS]       Verify a user password");
     #[cfg(windows)]
     {
         println!("    alighieri service install --config CONFIG  Install the Windows Service");
@@ -216,6 +230,27 @@ async fn main() -> ExitCode {
         Command::Service { args } => handle_service(args).await,
         Command::User { args } => handle_user(args),
         Command::Config { args } => handle_config(args).await,
+        Command::Capabilities { args } => handle_capabilities(args),
+    }
+}
+
+fn handle_capabilities(args: Vec<String>) -> ExitCode {
+    match args.as_slice() {
+        [arg] if arg == "--json" => {
+            management::emit_success("capabilities", CapabilitiesResult::current())
+        }
+        [] => {
+            println!("usage: alighieri capabilities --json");
+            ExitCode::SUCCESS
+        }
+        [arg] if arg == "-h" || arg == "--help" => {
+            println!("usage: alighieri capabilities --json");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("alighieri: usage: alighieri capabilities --json");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -748,12 +783,45 @@ async fn handle_service(_args: Vec<String>) -> ExitCode {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum UserTarget {
+    Userlist(PathBuf),
+    Config(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum UserCommand {
-    Add { username: String, userlist: PathBuf },
-    Delete { username: String, userlist: PathBuf },
-    List { userlist: PathBuf },
-    Verify { username: String, userlist: PathBuf },
+    Add {
+        username: String,
+        target: UserTarget,
+        password_stdin: bool,
+        json: bool,
+    },
+    Delete {
+        username: String,
+        target: UserTarget,
+        if_present: bool,
+        json: bool,
+    },
+    List {
+        target: UserTarget,
+        json: bool,
+    },
+    Verify {
+        username: String,
+        target: UserTarget,
+        password_stdin: bool,
+        json: bool,
+    },
     Help,
+}
+
+#[derive(Default)]
+struct UserOptions {
+    target: Option<UserTarget>,
+    password_stdin: bool,
+    if_present: bool,
+    json: bool,
+    help: bool,
 }
 
 fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
@@ -761,213 +829,909 @@ fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
         return Err(user_usage());
     };
     if is_help_arg(command) {
+        if args.iter().skip(1).any(|arg| arg == "--json") {
+            return Err("--json cannot be combined with user help".into());
+        }
         return Ok(UserCommand::Help);
     }
+
     match command {
         "add" | "delete" | "verify" => {
             let username = args
                 .get(1)
                 .cloned()
                 .ok_or_else(|| format!("{command} requires USER"))?;
-            // With no following option this is conventional subcommand help;
-            // once the command is otherwise complete, the same spelling is a
-            // valid positional username.
+            if is_user_option_token(&username) {
+                return Err(format!("{command} requires USER"));
+            }
             if args.len() == 2 && is_help_arg(&username) {
                 return Ok(UserCommand::Help);
             }
-            let UserlistArg::Path(userlist) = parse_userlist_arg(&args[2..])? else {
+            let options = parse_user_options(&args[2..])?;
+            if options.help {
                 return Ok(UserCommand::Help);
-            };
+            }
+            let target = options.target.ok_or_else(missing_user_target_error)?;
             match command {
-                "add" => Ok(UserCommand::Add { username, userlist }),
-                "delete" => Ok(UserCommand::Delete { username, userlist }),
-                "verify" => Ok(UserCommand::Verify { username, userlist }),
+                "add" => {
+                    if options.if_present {
+                        return Err("--if-present is valid only for user delete".into());
+                    }
+                    Ok(UserCommand::Add {
+                        username,
+                        target,
+                        password_stdin: options.password_stdin,
+                        json: options.json,
+                    })
+                }
+                "delete" => {
+                    if options.password_stdin {
+                        return Err("--password-stdin is valid only for user add and verify".into());
+                    }
+                    Ok(UserCommand::Delete {
+                        username,
+                        target,
+                        if_present: options.if_present,
+                        json: options.json,
+                    })
+                }
+                "verify" => {
+                    if options.if_present {
+                        return Err("--if-present is valid only for user delete".into());
+                    }
+                    Ok(UserCommand::Verify {
+                        username,
+                        target,
+                        password_stdin: options.password_stdin,
+                        json: options.json,
+                    })
+                }
                 _ => unreachable!(),
             }
         }
-        "list" => match parse_userlist_arg(&args[1..])? {
-            UserlistArg::Path(userlist) => Ok(UserCommand::List { userlist }),
-            UserlistArg::Help => Ok(UserCommand::Help),
-        },
-        _ if args.iter().skip(1).any(|arg| is_help_arg(arg)) => Ok(UserCommand::Help),
+        "list" => {
+            let options = parse_user_options(&args[1..])?;
+            if options.help {
+                return Ok(UserCommand::Help);
+            }
+            if options.password_stdin {
+                return Err("--password-stdin is valid only for user add and verify".into());
+            }
+            if options.if_present {
+                return Err("--if-present is valid only for user delete".into());
+            }
+            Ok(UserCommand::List {
+                target: options.target.ok_or_else(missing_user_target_error)?,
+                json: options.json,
+            })
+        }
+        _ if args.iter().skip(1).any(|arg| is_help_arg(arg))
+            && !args.iter().any(|arg| arg == "--json") =>
+        {
+            Ok(UserCommand::Help)
+        }
         _ => Err(user_usage()),
     }
 }
 
-enum UserlistArg {
-    Path(PathBuf),
-    Help,
+fn parse_user_options(args: &[String]) -> Result<UserOptions, String> {
+    let mut options = UserOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--userlist" | "--config" => {
+                let option = args[index].as_str();
+                let Some(path) = args.get(index + 1) else {
+                    return Err(format!("{option} requires a path"));
+                };
+                if is_user_option_token(path) {
+                    return Err(format!("{option} requires a path"));
+                }
+                if options.target.is_some() {
+                    return Err(
+                        "--userlist and --config are mutually exclusive and may be supplied only once"
+                            .into(),
+                    );
+                }
+                options.target = Some(if option == "--userlist" {
+                    UserTarget::Userlist(PathBuf::from(path))
+                } else {
+                    UserTarget::Config(PathBuf::from(path))
+                });
+                index += 2;
+            }
+            "--password-stdin" => {
+                if options.password_stdin {
+                    return Err("duplicate option '--password-stdin'".into());
+                }
+                options.password_stdin = true;
+                index += 1;
+            }
+            "--if-present" => {
+                if options.if_present {
+                    return Err("duplicate option '--if-present'".into());
+                }
+                options.if_present = true;
+                index += 1;
+            }
+            "--json" => {
+                if options.json {
+                    return Err("duplicate option '--json'".into());
+                }
+                options.json = true;
+                index += 1;
+            }
+            "-h" | "--help" => {
+                options.help = true;
+                index += 1;
+            }
+            _ => return Err("unknown user option".into()),
+        }
+    }
+    if options.help && options.json {
+        return Err("--json cannot be combined with user help".into());
+    }
+    Ok(options)
+}
+
+fn missing_user_target_error() -> String {
+    "exactly one of --userlist PATH or --config CONFIG is required".into()
 }
 
 fn is_help_arg(arg: &str) -> bool {
     arg == "-h" || arg == "--help"
 }
 
-fn parse_userlist_arg(args: &[String]) -> Result<UserlistArg, String> {
-    let mut userlist = None;
-    let mut invalid = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--userlist" => {
-                let Some(path) = iter.next() else {
-                    return Err("--userlist requires a path".into());
-                };
-                userlist = Some(PathBuf::from(path));
-            }
-            "-h" | "--help" => return Ok(UserlistArg::Help),
-            _ => invalid = true,
-        }
+fn is_user_option_token(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--userlist" | "--config" | "--password-stdin" | "--if-present" | "--json"
+    )
+}
+
+fn user_operation(args: &[String]) -> &'static str {
+    match args.first().map(String::as_str) {
+        Some("add") => "user.add",
+        Some("delete") => "user.delete",
+        Some("list") => "user.list",
+        Some("verify") => "user.verify",
+        _ => "user",
     }
-    if invalid {
-        return Err(user_usage());
-    }
-    userlist
-        .map(UserlistArg::Path)
-        .ok_or_else(|| "--userlist requires a path".into())
 }
 
 fn handle_user(args: Vec<String>) -> ExitCode {
+    let json_requested = args.iter().any(|arg| arg == "--json");
+    let operation = user_operation(&args);
     match parse_user_command(args) {
-        Ok(UserCommand::Add { username, userlist }) => add_user(&username, &userlist),
-        Ok(UserCommand::Delete { username, userlist }) => delete_user(&username, &userlist),
-        Ok(UserCommand::List { userlist }) => list_users(&userlist),
-        Ok(UserCommand::Verify { username, userlist }) => verify_user(&username, &userlist),
+        Ok(UserCommand::Add {
+            username,
+            target,
+            password_stdin,
+            json,
+        }) => add_user(username, target, password_stdin, json),
+        Ok(UserCommand::Delete {
+            username,
+            target,
+            if_present,
+            json,
+        }) => delete_user(username, target, if_present, json),
+        Ok(UserCommand::List { target, json }) => list_users(target, json),
+        Ok(UserCommand::Verify {
+            username,
+            target,
+            password_stdin,
+            json,
+        }) => verify_user(username, target, password_stdin, json),
         Ok(UserCommand::Help) => {
             println!("{}", user_usage());
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("alighieri: {e}");
+        Err(error) if json_requested => management::emit_error(
+            operation,
+            ManagementError::new(ManagementErrorCode::InvalidArguments, error),
+        ),
+        Err(error) => {
+            eprintln!("alighieri: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn add_user(username: &str, userlist: &Path) -> ExitCode {
-    let password = match prompt_password_twice() {
-        Ok(password) => password,
-        Err(e) => {
-            eprintln!("alighieri: {e}");
-            return ExitCode::FAILURE;
+struct ResolvedUserTarget {
+    userlist: PathBuf,
+    config: Option<PathBuf>,
+    creation_policy: UserlistCreationPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserlistCreationPolicy {
+    // Preserve the legacy direct-path behavior for ad-hoc userlists.
+    Private,
+    // The managed installer makes the selected config root:alighieri 0640.
+    // Match that exact identity before bootstrapping so ACL-based or custom
+    // layouts cannot receive a misleading success or broader hash visibility.
+    ConfigBacked {
+        #[cfg(unix)]
+        uid: u32,
+        #[cfg(unix)]
+        gid: u32,
+        #[cfg(unix)]
+        managed_bootstrap: bool,
+    },
+}
+
+#[cfg(target_os = "linux")]
+fn managed_service_group_gid() -> std::io::Result<Option<u32>> {
+    const INITIAL_BUFFER_SIZE: usize = 1_024;
+    const MAX_BUFFER_SIZE: usize = 1_048_576;
+
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0 as libc::c_char; INITIAL_BUFFER_SIZE];
+    loop {
+        let status = unsafe {
+            libc::getgrnam_r(
+                c"alighieri".as_ptr(),
+                &mut group,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == 0 {
+            return if result.is_null() {
+                Ok(None)
+            } else {
+                Ok(Some(group.gr_gid))
+            };
         }
-    };
-    let line = match UserDb::hash_user_line(username, &password) {
-        Ok(line) => line,
-        Err(e) => {
-            eprintln!("alighieri: {e}");
-            return ExitCode::FAILURE;
+        if status != libc::ERANGE {
+            return Err(std::io::Error::from_raw_os_error(status));
         }
-    };
-    if let Err(e) = upsert_userlist_entry(userlist, username, &line) {
-        eprintln!("alighieri: failed to update {}: {e}", userlist.display());
-        return ExitCode::FAILURE;
+        if buffer.len() >= MAX_BUFFER_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "alighieri service group record exceeds the lookup limit",
+            ));
+        }
+        buffer.resize(buffer.len() * 2, 0);
     }
-    println!(
-        "alighieri: updated user '{username}' in {}",
-        userlist.display()
-    );
-    ExitCode::SUCCESS
 }
 
-fn delete_user(username: &str, userlist: &Path) -> ExitCode {
-    match delete_userlist_entry(userlist, username) {
-        Ok(()) => {
-            println!(
-                "alighieri: removed user '{username}' from {}",
-                userlist.display()
-            );
-            ExitCode::SUCCESS
+#[cfg(unix)]
+fn supports_managed_userlist_bootstrap(
+    is_regular_file: bool,
+    has_no_access_acl: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    expected_uid: u32,
+    service_gid: Option<u32>,
+) -> bool {
+    is_regular_file
+        && has_no_access_acl
+        && uid == expected_uid
+        && service_gid == Some(gid)
+        && mode == 0o640
+}
+
+impl UserlistCreationPolicy {
+    fn config_backed(config_path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            #[cfg(target_os = "linux")]
+            let service_gid = managed_service_group_gid().ok().flatten();
+            #[cfg(not(target_os = "linux"))]
+            let service_gid = None;
+
+            Self::config_backed_with_expected_identity(config_path, 0, service_gid)
         }
-        Err(e) if is_user_not_found_error(&e) => {
-            eprintln!(
-                "alighieri: user '{username}' was not found in {}",
-                userlist.display()
-            );
-            ExitCode::FAILURE
+        #[cfg(not(unix))]
+        {
+            let _ = config_path;
+            Ok(Self::ConfigBacked {})
         }
-        Err(e) => {
-            eprintln!("alighieri: failed to update {}: {e}", userlist.display());
-            ExitCode::FAILURE
+    }
+
+    #[cfg(unix)]
+    fn config_backed_with_expected_identity(
+        config_path: &Path,
+        expected_uid: u32,
+        service_gid: Option<u32>,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path_metadata = std::fs::metadata(config_path)?;
+        #[cfg(target_os = "linux")]
+        let (metadata, has_no_access_acl) = if path_metadata.is_file() {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            match options.open(config_path) {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    let has_no_access_acl =
+                        metadata.is_file() && matches!(linux_access_acl(&file), Ok(None));
+                    (metadata, has_no_access_acl)
+                }
+                Err(_) => (path_metadata, false),
+            }
+        } else {
+            // Avoid a blocking second open for FIFOs and other special config
+            // sources. These can never authorize managed userlist creation.
+            (path_metadata, false)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let metadata = path_metadata;
+        let uid = metadata.uid();
+        let gid = metadata.gid();
+        let mode = metadata.permissions().mode() & 0o7777;
+        #[cfg(not(target_os = "linux"))]
+        let has_no_access_acl = false;
+        Ok(Self::ConfigBacked {
+            uid,
+            gid,
+            managed_bootstrap: cfg!(target_os = "linux")
+                && supports_managed_userlist_bootstrap(
+                    metadata.is_file(),
+                    has_no_access_acl,
+                    uid,
+                    gid,
+                    mode,
+                    expected_uid,
+                    service_gid,
+                ),
+        })
+    }
+}
+
+impl ResolvedUserTarget {
+    fn userlist_json(&self) -> String {
+        self.userlist.display().to_string()
+    }
+
+    fn config_json(&self) -> Option<String> {
+        self.config
+            .as_deref()
+            .map(|path| path.display().to_string())
+    }
+}
+
+fn resolve_user_target(target: UserTarget) -> Result<ResolvedUserTarget, ManagementError> {
+    match target {
+        UserTarget::Userlist(userlist) => Ok(ResolvedUserTarget {
+            userlist,
+            config: None,
+            creation_policy: UserlistCreationPolicy::Private,
+        }),
+        UserTarget::Config(config_path) => {
+            let config = Config::load_user_management_facts(&config_path).map_err(|_| {
+                ManagementError::new(
+                    ManagementErrorCode::ConfigLoadFailed,
+                    format!("failed to load configuration {}", config_path.display()),
+                )
+            })?;
+            if !config.username_auth_active {
+                return Err(ManagementError::new(
+                    ManagementErrorCode::UserlistNotActive,
+                    "username/password authentication is not active in the configuration",
+                ));
+            }
+            if config.external_auth_backend {
+                return Err(ManagementError::new(
+                    ManagementErrorCode::ExternalAuthBackend,
+                    "the configuration uses an external authentication backend",
+                ));
+            }
+            let userlist = config.userlist.ok_or_else(|| {
+                ManagementError::new(
+                    ManagementErrorCode::UserlistNotConfigured,
+                    "the configuration does not define a userlist",
+                )
+            })?;
+            if !userlist.is_absolute() {
+                return Err(ManagementError::new(
+                    ManagementErrorCode::RelativeUserlistNotSupported,
+                    "the effective userlist path must be absolute in --config mode",
+                ));
+            }
+            let creation_policy =
+                UserlistCreationPolicy::config_backed(&config_path).map_err(|_| {
+                    ManagementError::new(
+                        ManagementErrorCode::ConfigLoadFailed,
+                        format!("failed to load configuration {}", config_path.display()),
+                    )
+                })?;
+            Ok(ResolvedUserTarget {
+                userlist,
+                config: Some(config_path),
+                creation_policy,
+            })
         }
     }
 }
 
-fn is_user_not_found_error(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(|inner| inner.downcast_ref::<UserNotFound>().is_some())
-}
-
-fn list_users(userlist: &Path) -> ExitCode {
-    let text = match std::fs::read_to_string(userlist) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("alighieri: failed to read {}: {e}", userlist.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let usernames = match userlist_usernames(&text) {
-        Ok(usernames) => usernames,
-        Err(e) => {
-            eprintln!("alighieri: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    for username in usernames {
-        println!("{username}");
-    }
-    ExitCode::SUCCESS
-}
-
-fn verify_user(username: &str, userlist: &Path) -> ExitCode {
-    let db = match UserDb::load(userlist) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("alighieri: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let password = match rpassword::prompt_password("Password: ") {
-        Ok(password) => password,
-        Err(e) => {
-            eprintln!("alighieri: failed to read password: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if db.verify(username, &password) {
-        println!("alighieri: password verified");
-        ExitCode::SUCCESS
+fn user_failure(
+    json: bool,
+    operation: &'static str,
+    error: ManagementError,
+    human_message: String,
+) -> ExitCode {
+    if json {
+        management::emit_error(operation, error)
     } else {
-        eprintln!("alighieri: password verification failed");
+        eprintln!("alighieri: {human_message}");
         ExitCode::FAILURE
     }
 }
 
-fn prompt_password_twice() -> Result<String, String> {
-    let password = rpassword::prompt_password("Password: ")
-        .map_err(|e| format!("failed to read password: {e}"))?;
-    let confirm = rpassword::prompt_password("Confirm password: ")
-        .map_err(|e| format!("failed to read password confirmation: {e}"))?;
-    if password != confirm {
-        return Err("passwords do not match".into());
+fn validate_cli_username(
+    username: &str,
+    json: bool,
+    operation: &'static str,
+) -> Result<(), ExitCode> {
+    UserDb::validate_username(username).map_err(|error| {
+        user_failure(
+            json,
+            operation,
+            ManagementError::new(ManagementErrorCode::InvalidUsername, error.to_string()),
+            error.to_string(),
+        )
+    })
+}
+
+fn resolve_cli_target(
+    target: UserTarget,
+    json: bool,
+    operation: &'static str,
+) -> Result<ResolvedUserTarget, ExitCode> {
+    resolve_user_target(target).map_err(|error| {
+        let human = error.message.clone();
+        user_failure(json, operation, error, human)
+    })
+}
+
+fn read_cli_password(
+    password_stdin: bool,
+    confirm: bool,
+    json: bool,
+    operation: &'static str,
+) -> Result<SecretString, ExitCode> {
+    let password = if password_stdin {
+        management::read_password_stdin()
+    } else if confirm {
+        prompt_password_twice()
+    } else {
+        rpassword::prompt_password("Password: ")
+            .map(SecretString::new)
+            .map_err(|error| {
+                ManagementError::new(
+                    ManagementErrorCode::InternalError,
+                    format!("failed to read password: {error}"),
+                )
+            })
+    };
+    password.map_err(|error| {
+        let human = error.message.clone();
+        user_failure(json, operation, error, human)
+    })
+}
+
+fn add_user(username: String, target: UserTarget, password_stdin: bool, json: bool) -> ExitCode {
+    const OPERATION: &str = "user.add";
+    if let Err(exit) = validate_cli_username(&username, json, OPERATION) {
+        return exit;
+    }
+    let target = match resolve_cli_target(target, json, OPERATION) {
+        Ok(target) => target,
+        Err(exit) => return exit,
+    };
+    let password = match read_cli_password(password_stdin, true, json, OPERATION) {
+        Ok(password) => password,
+        Err(exit) => return exit,
+    };
+    if password.is_empty() {
+        drop(password);
+        return user_failure(
+            json,
+            OPERATION,
+            ManagementError::new(
+                ManagementErrorCode::InvalidPassword,
+                "password must not be empty",
+            ),
+            "password must not be empty".into(),
+        );
+    }
+    if let Err(error) = UserDb::validate_password(password.as_str()) {
+        let human = error.to_string();
+        drop(password);
+        return user_failure(
+            json,
+            OPERATION,
+            ManagementError::new(
+                ManagementErrorCode::InvalidPassword,
+                "password must not exceed 255 bytes",
+            ),
+            human,
+        );
+    }
+    let line = match UserDb::hash_user_line(&username, password.as_str()) {
+        Ok(line) => line,
+        Err(error) => {
+            let human = error.to_string();
+            drop(password);
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::InternalError,
+                    "failed to hash password",
+                ),
+                human,
+            );
+        }
+    };
+    drop(password);
+
+    let outcome =
+        match upsert_userlist_entry(&target.userlist, &username, &line, target.creation_policy) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let code = error.management_code();
+                let action = if code == ManagementErrorCode::UserlistReadFailed {
+                    "read"
+                } else {
+                    "update"
+                };
+                return user_failure(
+                    json,
+                    OPERATION,
+                    ManagementError::new(
+                        code,
+                        format!("failed to {action} userlist {}", target.userlist.display()),
+                    ),
+                    format!("failed to update {}: {error}", target.userlist.display()),
+                );
+            }
+        };
+    if json {
+        management::emit_success(
+            OPERATION,
+            AddResult {
+                username,
+                userlist: target.userlist_json(),
+                config: target.config_json(),
+                action: outcome.as_str(),
+                changed: true,
+            },
+        )
+    } else {
+        println!(
+            "alighieri: updated user '{username}' in {}",
+            target.userlist.display()
+        );
+        ExitCode::SUCCESS
+    }
+}
+
+fn delete_user(username: String, target: UserTarget, if_present: bool, json: bool) -> ExitCode {
+    const OPERATION: &str = "user.delete";
+    if let Err(exit) = validate_cli_username(&username, json, OPERATION) {
+        return exit;
+    }
+    let target = match resolve_cli_target(target, json, OPERATION) {
+        Ok(target) => target,
+        Err(exit) => return exit,
+    };
+    let deleted = match delete_userlist_entry(&target.userlist, &username) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let code = error.management_code();
+            let action = if code == ManagementErrorCode::UserlistReadFailed {
+                "read"
+            } else {
+                "update"
+            };
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    code,
+                    format!("failed to {action} userlist {}", target.userlist.display()),
+                ),
+                format!("failed to update {}: {error}", target.userlist.display()),
+            );
+        }
+    };
+    if !deleted && !if_present {
+        return user_failure(
+            json,
+            OPERATION,
+            ManagementError::new(
+                ManagementErrorCode::UserNotFound,
+                "user was not found in the userlist",
+            ),
+            format!(
+                "user '{username}' was not found in {}",
+                target.userlist.display()
+            ),
+        );
+    }
+    if json {
+        management::emit_success(
+            OPERATION,
+            DeleteResult {
+                username,
+                userlist: target.userlist_json(),
+                config: target.config_json(),
+                deleted,
+                changed: deleted,
+            },
+        )
+    } else {
+        if deleted {
+            println!(
+                "alighieri: removed user '{username}' from {}",
+                target.userlist.display()
+            );
+        } else {
+            println!(
+                "alighieri: user '{username}' was already absent from {}",
+                target.userlist.display()
+            );
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn list_users(target: UserTarget, json: bool) -> ExitCode {
+    const OPERATION: &str = "user.list";
+    let target = match resolve_cli_target(target, json, OPERATION) {
+        Ok(target) => target,
+        Err(exit) => return exit,
+    };
+    let text = match std::fs::read_to_string(&target.userlist) {
+        Ok(text) => text,
+        Err(error) => {
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::UserlistReadFailed,
+                    format!("failed to read userlist {}", target.userlist.display()),
+                ),
+                format!("failed to read {}: {error}", target.userlist.display()),
+            )
+        }
+    };
+    let usernames = match userlist_usernames(&text) {
+        Ok(usernames) => usernames,
+        Err(error) => {
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::UserlistParseFailed,
+                    "userlist is malformed",
+                ),
+                error.to_string(),
+            )
+        }
+    };
+    if json {
+        management::emit_success(
+            OPERATION,
+            ListResult {
+                userlist: target.userlist_json(),
+                config: target.config_json(),
+                count: usernames.len(),
+                users: usernames,
+            },
+        )
+    } else {
+        for username in usernames {
+            println!("{username}");
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn verify_user(username: String, target: UserTarget, password_stdin: bool, json: bool) -> ExitCode {
+    const OPERATION: &str = "user.verify";
+    if let Err(exit) = validate_cli_username(&username, json, OPERATION) {
+        return exit;
+    }
+    let target = match resolve_cli_target(target, json, OPERATION) {
+        Ok(target) => target,
+        Err(exit) => return exit,
+    };
+    let text = match std::fs::read_to_string(&target.userlist) {
+        Ok(text) => text,
+        Err(error) => {
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::UserlistReadFailed,
+                    format!("failed to read userlist {}", target.userlist.display()),
+                ),
+                format!("failed to read {}: {error}", target.userlist.display()),
+            )
+        }
+    };
+    let db = match UserDb::parse(&text) {
+        Ok(db) => db,
+        Err(error) => {
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::UserlistParseFailed,
+                    "userlist is malformed",
+                ),
+                error.to_string(),
+            )
+        }
+    };
+    let password = match read_cli_password(password_stdin, false, json, OPERATION) {
+        Ok(password) => password,
+        Err(exit) => return exit,
+    };
+    if password_stdin {
+        if let Err(error) = UserDb::validate_password(password.as_str()) {
+            let human = error.to_string();
+            drop(password);
+            return user_failure(
+                json,
+                OPERATION,
+                ManagementError::new(
+                    ManagementErrorCode::InvalidPassword,
+                    "password must not exceed 255 bytes",
+                ),
+                human,
+            );
+        }
+    }
+    let verified = db.verify(&username, password.as_str());
+    drop(password);
+    if !verified {
+        return user_failure(
+            json,
+            OPERATION,
+            ManagementError::new(
+                ManagementErrorCode::CredentialsRejected,
+                "password verification failed",
+            ),
+            "password verification failed".into(),
+        );
+    }
+    if json {
+        management::emit_success(
+            OPERATION,
+            VerifyResult {
+                username,
+                userlist: target.userlist_json(),
+                config: target.config_json(),
+                verified: true,
+            },
+        )
+    } else {
+        println!("alighieri: password verified");
+        ExitCode::SUCCESS
+    }
+}
+
+fn prompt_password_twice() -> Result<SecretString, ManagementError> {
+    prompt_password_twice_with(|prompt| {
+        rpassword::prompt_password(prompt).map_err(|error| error.to_string())
+    })
+}
+
+fn prompt_password_twice_with(
+    mut prompt: impl FnMut(&str) -> Result<String, String>,
+) -> Result<SecretString, ManagementError> {
+    let password = SecretString::new(prompt("Password: ").map_err(|error| {
+        ManagementError::new(
+            ManagementErrorCode::InternalError,
+            format!("failed to read password: {error}"),
+        )
+    })?);
+    let confirm = SecretString::new(prompt("Confirm password: ").map_err(|error| {
+        ManagementError::new(
+            ManagementErrorCode::InternalError,
+            format!("failed to read password confirmation: {error}"),
+        )
+    })?);
+    if password.as_str() != confirm.as_str() {
+        return Err(ManagementError::new(
+            ManagementErrorCode::InvalidPassword,
+            "passwords do not match",
+        ));
     }
     if password.is_empty() {
-        return Err("password must not be empty".into());
+        return Err(ManagementError::new(
+            ManagementErrorCode::InvalidPassword,
+            "password must not be empty",
+        ));
     }
     Ok(password)
 }
 
-fn upsert_userlist_entry(userlist: &Path, username: &str, line: &str) -> std::io::Result<()> {
-    if let Some(parent) = userlist.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpsertOutcome {
+    Created,
+    Updated,
+}
+
+impl UpsertOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpsertOutcome::Created => "created",
+            UpsertOutcome::Updated => "updated",
         }
     }
-    let _lock = acquire_userlist_lock(userlist)?;
+}
+
+#[derive(Debug)]
+enum UserlistMutationError {
+    Read(std::io::Error),
+    Update(std::io::Error),
+}
+
+impl UserlistMutationError {
+    fn management_code(&self) -> ManagementErrorCode {
+        match self {
+            UserlistMutationError::Read(_) => ManagementErrorCode::UserlistReadFailed,
+            UserlistMutationError::Update(_) => ManagementErrorCode::UserlistUpdateFailed,
+        }
+    }
+}
+
+impl std::fmt::Display for UserlistMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserlistMutationError::Read(error) | UserlistMutationError::Update(error) => {
+                error.fmt(formatter)
+            }
+        }
+    }
+}
+
+impl std::error::Error for UserlistMutationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            UserlistMutationError::Read(error) | UserlistMutationError::Update(error) => {
+                Some(error)
+            }
+        }
+    }
+}
+
+fn upsert_userlist_entry(
+    userlist: &Path,
+    username: &str,
+    line: &str,
+    creation_policy: UserlistCreationPolicy,
+) -> Result<UpsertOutcome, UserlistMutationError> {
+    // Preserve recursive parent creation for the legacy direct-path workflow.
+    // Config-backed targets must use a pre-provisioned directory: creating that
+    // ancestry with the elevated caller's umask or inherited ACL could leave
+    // the service unable to traverse to the correctly protected userlist.
+    if creation_policy == UserlistCreationPolicy::Private {
+        if let Some(parent) = userlist.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(UserlistMutationError::Update)?;
+            }
+        }
+    }
+    let _lock = acquire_userlist_lock(userlist).map_err(UserlistMutationError::Update)?;
     let (existing, existed) = match std::fs::read_to_string(userlist) {
         Ok(text) => (text, true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
-        Err(e) => return Err(e),
+        Err(error) => return Err(UserlistMutationError::Read(error)),
     };
     let mut replaced = false;
     let mut lines = Vec::new();
@@ -986,12 +1750,18 @@ fn upsert_userlist_entry(userlist: &Path, username: &str, line: &str) -> std::io
     }
     let mut output = lines.join("\n");
     output.push('\n');
-    write_userlist(userlist, output.as_bytes(), existed)
+    write_userlist(userlist, output.as_bytes(), existed, creation_policy)
+        .map_err(UserlistMutationError::Update)?;
+    Ok(if replaced {
+        UpsertOutcome::Updated
+    } else {
+        UpsertOutcome::Created
+    })
 }
 
-fn delete_userlist_entry(userlist: &Path, username: &str) -> std::io::Result<()> {
-    let _lock = acquire_userlist_lock(userlist)?;
-    let existing = std::fs::read_to_string(userlist)?;
+fn delete_userlist_entry(userlist: &Path, username: &str) -> Result<bool, UserlistMutationError> {
+    let _lock = acquire_userlist_lock(userlist).map_err(UserlistMutationError::Update)?;
+    let existing = std::fs::read_to_string(userlist).map_err(UserlistMutationError::Read)?;
     let mut removed = false;
     let mut lines = Vec::new();
     for existing_line in existing.lines() {
@@ -1004,17 +1774,21 @@ fn delete_userlist_entry(userlist: &Path, username: &str) -> std::io::Result<()>
         }
     }
     if !removed {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            UserNotFound,
-        ));
+        return Ok(false);
     }
 
     let mut output = lines.join("\n");
     if !output.is_empty() {
         output.push('\n');
     }
-    write_userlist(userlist, output.as_bytes(), true)
+    write_userlist(
+        userlist,
+        output.as_bytes(),
+        true,
+        UserlistCreationPolicy::Private,
+    )
+    .map_err(UserlistMutationError::Update)?;
+    Ok(true)
 }
 
 fn userlist_usernames(text: &str) -> alighieri::errors::Result<Vec<String>> {
@@ -1033,17 +1807,6 @@ fn userlist_usernames(text: &str) -> alighieri::errors::Result<Vec<String>> {
     }
     Ok(users.into_iter().collect())
 }
-
-#[derive(Debug)]
-struct UserNotFound;
-
-impl std::fmt::Display for UserNotFound {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("user not found")
-    }
-}
-
-impl std::error::Error for UserNotFound {}
 
 #[derive(Debug)]
 struct UserlistLock {
@@ -1194,28 +1957,44 @@ fn unlock_userlist_file(_file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn write_userlist(userlist: &Path, contents: &[u8], existed: bool) -> std::io::Result<()> {
-    write_userlist_atomically(userlist, contents, existed)
+fn write_userlist(
+    userlist: &Path,
+    contents: &[u8],
+    existed: bool,
+    creation_policy: UserlistCreationPolicy,
+) -> std::io::Result<()> {
+    write_userlist_atomically(userlist, contents, existed, creation_policy)
 }
 
 #[cfg(windows)]
-fn write_userlist(userlist: &Path, contents: &[u8], _existed: bool) -> std::io::Result<()> {
-    write_userlist_atomically(userlist, contents, _existed)
+fn write_userlist(
+    userlist: &Path,
+    contents: &[u8],
+    _existed: bool,
+    creation_policy: UserlistCreationPolicy,
+) -> std::io::Result<()> {
+    write_userlist_atomically(userlist, contents, _existed, creation_policy)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_userlist(userlist: &Path, contents: &[u8], _existed: bool) -> std::io::Result<()> {
-    write_userlist_atomically(userlist, contents, _existed)
+fn write_userlist(
+    userlist: &Path,
+    contents: &[u8],
+    _existed: bool,
+    creation_policy: UserlistCreationPolicy,
+) -> std::io::Result<()> {
+    write_userlist_atomically(userlist, contents, _existed, creation_policy)
 }
 
 fn write_userlist_atomically(
     userlist: &Path,
     contents: &[u8],
     existed: bool,
+    creation_policy: UserlistCreationPolicy,
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let (temp_path, mut file) = create_userlist_temp(userlist, existed)?;
+    let (temp_path, mut file) = create_userlist_temp(userlist, existed, creation_policy)?;
     let write_result = file.write_all(contents).and_then(|_| file.sync_all());
     drop(file);
 
@@ -1278,7 +2057,8 @@ fn backup_userlist(userlist: &Path, existed: bool) -> std::io::Result<()> {
     // temp inherits the userlist's mode/uid/gid on Unix (via
     // `create_userlist_temp`); on Windows it inherits the parent directory ACL,
     // as the previous `fs::copy` did.
-    let (temp_path, mut temp_file) = create_userlist_temp(userlist, existed)?;
+    let (temp_path, mut temp_file) =
+        create_userlist_temp(userlist, existed, UserlistCreationPolicy::Private)?;
     let write_result = (|| -> std::io::Result<()> {
         std::io::copy(&mut source, &mut temp_file)?;
         temp_file.sync_all()
@@ -1308,11 +2088,12 @@ fn userlist_backup_path(userlist: &Path) -> PathBuf {
 fn create_userlist_temp(
     userlist: &Path,
     _existed: bool,
+    _creation_policy: UserlistCreationPolicy,
 ) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::fs::OpenOptions;
 
     #[cfg(unix)]
-    let metadata = userlist_unix_metadata(userlist, _existed)?;
+    let metadata = userlist_unix_metadata(userlist, _existed, _creation_policy)?;
 
     for _ in 0..100 {
         let temp_path = next_userlist_temp_path(userlist);
@@ -1328,7 +2109,11 @@ fn create_userlist_temp(
             Ok(file) => {
                 #[cfg(unix)]
                 {
-                    apply_userlist_unix_metadata(&temp_path, &file, metadata)?;
+                    if let Err(error) = apply_userlist_unix_metadata(&temp_path, &file, &metadata) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Err(error);
+                    }
                 }
                 return Ok((temp_path, file));
             }
@@ -1363,30 +2148,140 @@ fn next_userlist_temp_path(userlist: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy)]
 struct UserlistUnixMetadata {
     mode: u32,
     uid: u32,
     gid: u32,
+    #[cfg(target_os = "linux")]
+    access_acl: Option<Vec<u8>>,
 }
 
 #[cfg(unix)]
-fn userlist_unix_metadata(userlist: &Path, existed: bool) -> std::io::Result<UserlistUnixMetadata> {
+fn userlist_unix_metadata(
+    userlist: &Path,
+    existed: bool,
+    creation_policy: UserlistCreationPolicy,
+) -> std::io::Result<UserlistUnixMetadata> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     if existed {
-        let metadata = std::fs::metadata(userlist)?;
+        let file = open_no_follow(userlist)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to update {}: not a regular file",
+                    userlist.display()
+                ),
+            ));
+        }
         Ok(UserlistUnixMetadata {
             mode: metadata.permissions().mode() & 0o777,
             uid: metadata.uid(),
             gid: metadata.gid(),
+            #[cfg(target_os = "linux")]
+            access_acl: linux_access_acl(&file)?,
         })
     } else {
-        Ok(UserlistUnixMetadata {
-            mode: 0o600,
-            uid: u32::MAX,
-            gid: u32::MAX,
-        })
+        match creation_policy {
+            UserlistCreationPolicy::Private => Ok(UserlistUnixMetadata {
+                mode: 0o600,
+                uid: u32::MAX,
+                gid: u32::MAX,
+                #[cfg(target_os = "linux")]
+                access_acl: None,
+            }),
+            UserlistCreationPolicy::ConfigBacked {
+                uid,
+                gid,
+                managed_bootstrap,
+            } => {
+                if !managed_bootstrap {
+                    #[cfg(target_os = "linux")]
+                    let message = "config-backed userlist auto-creation requires a regular config \
+                                   owned by root:alighieri with mode 0640 and no extended access \
+                                   ACL; pre-create the userlist for other ownership or ACL layouts";
+                    #[cfg(not(target_os = "linux"))]
+                    let message = "config-backed userlist auto-creation is supported only on \
+                                   Linux; pre-create the userlist on this platform";
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        message,
+                    ));
+                }
+                Ok(UserlistUnixMetadata {
+                    mode: 0o640,
+                    uid,
+                    gid,
+                    #[cfg(target_os = "linux")]
+                    access_acl: None,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_access_acl(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::io::AsRawFd;
+
+    const XATTR_SIZE_MAX: usize = 65_536;
+
+    let mut value = vec![0_u8; XATTR_SIZE_MAX];
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_access".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if size >= 0 {
+        value.truncate(size as usize);
+        return Ok(Some(value));
+    }
+
+    let error = std::io::Error::last_os_error();
+    if linux_acl_missing_or_unsupported(&error) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_acl_missing_or_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENODATA) || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
+#[cfg(target_os = "linux")]
+fn set_linux_access_acl(file: &std::fs::File, access_acl: Option<&[u8]>) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let status = match access_acl {
+        Some(value) => unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        },
+        None => unsafe {
+            libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_access".as_ptr())
+        },
+    };
+    if status == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if access_acl.is_none() && linux_acl_missing_or_unsupported(&error) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -1394,17 +2289,27 @@ fn userlist_unix_metadata(userlist: &Path, existed: bool) -> std::io::Result<Use
 fn apply_userlist_unix_metadata(
     _temp_path: &Path,
     file: &std::fs::File,
-    metadata: UserlistUnixMetadata,
+    metadata: &UserlistUnixMetadata,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
-    file.set_permissions(std::fs::Permissions::from_mode(metadata.mode))?;
+    #[cfg(target_os = "linux")]
+    set_linux_access_acl(file, None)?;
+
     if metadata.uid != u32::MAX || metadata.gid != u32::MAX {
-        let rc = unsafe { libc::fchown(file.as_raw_fd(), metadata.uid, metadata.gid) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
+        let current = file.metadata()?;
+        if current.uid() != metadata.uid || current.gid() != metadata.gid {
+            let rc = unsafe { libc::fchown(file.as_raw_fd(), metadata.uid, metadata.gid) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(metadata.mode))?;
+    #[cfg(target_os = "linux")]
+    if let Some(access_acl) = metadata.access_acl.as_deref() {
+        set_linux_access_acl(file, Some(access_acl))?;
     }
     Ok(())
 }
@@ -1466,13 +2371,71 @@ fn sync_userlist_parent(_userlist: &Path) -> std::io::Result<()> {
 }
 
 fn user_usage() -> String {
-    "usage: alighieri user add USER --userlist PATH | alighieri user delete USER --userlist PATH | alighieri user list --userlist PATH | alighieri user verify USER --userlist PATH"
+    "usage:\n    alighieri user add USER (--userlist PATH | --config CONFIG) [--password-stdin] [--json]\n    alighieri user delete USER (--userlist PATH | --config CONFIG) [--if-present] [--json]\n    alighieri user list (--userlist PATH | --config CONFIG) [--json]\n    alighieri user verify USER (--userlist PATH | --config CONFIG) [--password-stdin] [--json]"
         .into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn test_posix_acl(owner_permissions: u16, named_uid: u32) -> Vec<u8> {
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+        const ACL_UNDEFINED_ID: u32 = u32::MAX;
+
+        let entries = [
+            (ACL_USER_OBJ, owner_permissions, ACL_UNDEFINED_ID),
+            (ACL_USER, 0o4, named_uid),
+            (ACL_GROUP_OBJ, 0, ACL_UNDEFINED_ID),
+            (ACL_MASK, 0o4, ACL_UNDEFINED_ID),
+            (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+        ];
+        let mut value = Vec::with_capacity(4 + entries.len() * 8);
+        value.extend_from_slice(&2_u32.to_le_bytes());
+        for (tag, permissions, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_test_linux_xattr(
+        file: &std::fs::File,
+        name: &std::ffi::CStr,
+        value: &[u8],
+    ) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+
+        let status = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn acl_test_unavailable(error: &std::io::Error) -> bool {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EPERM | libc::EACCES)
+        )
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1553,6 +2516,16 @@ mod tests {
             command,
             Command::Service {
                 args: vec!["install".into(), "--help".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn capabilities_command_is_routed_before_config_paths() {
+        assert_eq!(
+            parse_args_from(vec!["capabilities".into(), "--json".into()]).unwrap(),
+            Command::Capabilities {
+                args: vec!["--json".into()]
             }
         );
     }
@@ -2027,17 +3000,54 @@ mod tests {
     }
 
     #[test]
-    fn user_command_requires_userlist() {
+    fn user_command_requires_target() {
         let err = parse_user_command(vec!["add".into(), "alice".into()]).unwrap_err();
-        assert_eq!(err, "--userlist requires a path");
+        assert_eq!(
+            err,
+            "exactly one of --userlist PATH or --config CONFIG is required"
+        );
+    }
+
+    #[test]
+    fn user_commands_do_not_consume_option_tokens_as_usernames() {
+        for command in ["add", "delete", "verify"] {
+            for option in [
+                "--userlist",
+                "--config",
+                "--password-stdin",
+                "--if-present",
+                "--json",
+            ] {
+                assert_eq!(
+                    parse_user_command(vec![command.into(), option.into()]).unwrap_err(),
+                    format!("{command} requires USER"),
+                    "{command} consumed {option} as USER"
+                );
+            }
+        }
+
+        assert_eq!(
+            parse_user_command(vec![
+                "add".into(),
+                "--json".into(),
+                "--userlist".into(),
+                "users".into(),
+                "--password-stdin".into(),
+            ])
+            .unwrap_err(),
+            "add requires USER"
+        );
     }
 
     #[test]
     fn user_usage_includes_full_subcommands() {
         let usage = user_usage();
-        assert!(usage.contains("alighieri user delete USER --userlist PATH"));
-        assert!(usage.contains("alighieri user list --userlist PATH"));
-        assert!(usage.contains("alighieri user verify USER --userlist PATH"));
+        assert!(usage.contains("alighieri user delete USER (--userlist PATH | --config CONFIG)"));
+        assert!(usage.contains("alighieri user list (--userlist PATH | --config CONFIG)"));
+        assert!(usage.contains("alighieri user verify USER (--userlist PATH | --config CONFIG)"));
+        assert!(usage.contains("--password-stdin"));
+        assert!(usage.contains("--if-present"));
+        assert!(usage.contains("--json"));
     }
 
     #[test]
@@ -2053,7 +3063,9 @@ mod tests {
             command,
             UserCommand::Add {
                 username: "alice".into(),
-                userlist: PathBuf::from("users.txt")
+                target: UserTarget::Userlist(PathBuf::from("users.txt")),
+                password_stdin: false,
+                json: false,
             }
         );
     }
@@ -2070,7 +3082,9 @@ mod tests {
             .unwrap(),
             UserCommand::Add {
                 username: "--help".into(),
-                userlist: PathBuf::from("-h"),
+                target: UserTarget::Userlist(PathBuf::from("-h")),
+                password_stdin: false,
+                json: false,
             }
         );
         assert_eq!(
@@ -2080,7 +3094,8 @@ mod tests {
         assert_eq!(
             parse_user_command(vec!["list".into(), "--userlist".into(), "--help".into()]).unwrap(),
             UserCommand::List {
-                userlist: PathBuf::from("--help"),
+                target: UserTarget::Userlist(PathBuf::from("--help")),
+                json: false,
             }
         );
         assert_eq!(
@@ -2121,7 +3136,9 @@ mod tests {
             command,
             UserCommand::Delete {
                 username: "alice".into(),
-                userlist: PathBuf::from("users.txt")
+                target: UserTarget::Userlist(PathBuf::from("users.txt")),
+                if_present: false,
+                json: false,
             }
         );
     }
@@ -2134,9 +3151,104 @@ mod tests {
         assert_eq!(
             command,
             UserCommand::List {
-                userlist: PathBuf::from("users.txt")
+                target: UserTarget::Userlist(PathBuf::from("users.txt")),
+                json: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_machine_user_options_and_config_target() {
+        assert_eq!(
+            parse_user_command(vec![
+                "add".into(),
+                "alice".into(),
+                "--config".into(),
+                "alighieri.conf".into(),
+                "--password-stdin".into(),
+                "--json".into(),
+            ])
+            .unwrap(),
+            UserCommand::Add {
+                username: "alice".into(),
+                target: UserTarget::Config(PathBuf::from("alighieri.conf")),
+                password_stdin: true,
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_user_command(vec![
+                "delete".into(),
+                "alice".into(),
+                "--userlist".into(),
+                "users".into(),
+                "--if-present".into(),
+                "--json".into(),
+            ])
+            .unwrap(),
+            UserCommand::Delete {
+                username: "alice".into(),
+                target: UserTarget::Userlist(PathBuf::from("users")),
+                if_present: true,
+                json: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_user_option_combinations() {
+        let invalid = [
+            vec!["list", "--json"],
+            vec!["list", "--userlist", "users", "--config", "config"],
+            vec!["list", "--userlist", "one", "--userlist", "two"],
+            vec!["list", "--userlist", "users", "--json", "--json"],
+            vec!["list", "--userlist", "users", "--password-stdin"],
+            vec!["delete", "alice", "--userlist", "users", "--password-stdin"],
+            vec!["add", "alice", "--userlist", "users", "--if-present"],
+            vec!["verify", "alice", "--userlist", "users", "--if-present"],
+            vec!["list", "--userlist", "users", "--unknown"],
+        ];
+        for args in invalid {
+            assert!(
+                parse_user_command(args.into_iter().map(str::to_string).collect()).is_err(),
+                "invalid command was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_add_prompts_for_password_and_confirmation() {
+        use std::collections::VecDeque;
+
+        let mut responses = VecDeque::from([Ok("secret".into()), Ok("secret".into())]);
+        let mut prompts = Vec::new();
+        let password = prompt_password_twice_with(|prompt| {
+            prompts.push(prompt.to_string());
+            responses
+                .pop_front()
+                .unwrap_or_else(|| Err("unexpected prompt".into()))
+        })
+        .unwrap();
+
+        assert_eq!(prompts, ["Password: ", "Confirm password: "]);
+        assert_eq!(password.as_str(), "secret");
+    }
+
+    #[test]
+    fn interactive_add_rejects_mismatched_and_empty_passwords() {
+        for responses in [
+            [Ok("secret".into()), Ok("different".into())],
+            [Ok(String::new()), Ok(String::new())],
+        ] {
+            let mut responses = responses.into_iter();
+            let error = match prompt_password_twice_with(|_| {
+                responses.next().unwrap_or_else(|| Err("missing".into()))
+            }) {
+                Ok(_) => panic!("invalid interactive password was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, ManagementErrorCode::InvalidPassword);
+        }
     }
 
     #[test]
@@ -2144,9 +3256,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let userlist = dir.path().join("users");
         std::fs::write(&userlist, "# comment\nalice:old\nbob:pw\n").unwrap();
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        assert_eq!(
+            upsert_userlist_entry(
+                &userlist,
+                "alice",
+                "alice:new",
+                UserlistCreationPolicy::Private,
+            )
+            .unwrap(),
+            UpsertOutcome::Updated
+        );
         let updated = std::fs::read_to_string(userlist).unwrap();
         assert_eq!(updated, "# comment\nalice:new\nbob:pw\n");
+    }
+
+    #[test]
+    fn upsert_userlist_entry_reports_creation_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let userlist = dir.path().join("nested").join("users");
+        assert_eq!(
+            upsert_userlist_entry(
+                &userlist,
+                "alice",
+                "alice:new",
+                UserlistCreationPolicy::Private,
+            )
+            .unwrap(),
+            UpsertOutcome::Created
+        );
+        assert_eq!(std::fs::read_to_string(userlist).unwrap(), "alice:new\n");
     }
 
     #[test]
@@ -2155,7 +3293,13 @@ mod tests {
         let userlist = dir.path().join("users");
         std::fs::write(&userlist, "alice:old\n").unwrap();
 
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
 
         let backup = std::fs::read_to_string(userlist_backup_path(&userlist)).unwrap();
         assert_eq!(backup, "alice:old\n");
@@ -2168,7 +3312,13 @@ mod tests {
         let old = UserDb::hash_user_line("alice", "old").unwrap();
         std::fs::write(&userlist, format!("{old}\nbob:pw\n")).unwrap();
 
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
 
         let updated = std::fs::read_to_string(userlist).unwrap();
         assert_eq!(updated, "alice:new\nbob:pw\n");
@@ -2184,7 +3334,13 @@ mod tests {
         )
         .unwrap();
 
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
 
         let updated = std::fs::read_to_string(userlist).unwrap();
         assert_eq!(updated, "alice:new\nbob:pw\n");
@@ -2211,7 +3367,13 @@ mod tests {
         let _ = std::fs::remove_file(&lock);
         let _ = std::fs::remove_file(&backup);
 
-        upsert_userlist_entry(Path::new(&filename), "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            Path::new(&filename),
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
         let updated = std::fs::read_to_string(&userlist).unwrap();
         assert_eq!(updated, "alice:new\n");
     }
@@ -2241,9 +3403,7 @@ mod tests {
         let userlist = dir.path().join("users");
         std::fs::write(&userlist, "bob:pw\n").unwrap();
 
-        let err = delete_userlist_entry(&userlist, "alice").unwrap_err();
-
-        assert!(is_user_not_found_error(&err));
+        assert!(!delete_userlist_entry(&userlist, "alice").unwrap());
         assert_eq!(std::fs::read_to_string(&userlist).unwrap(), "bob:pw\n");
         assert!(!userlist_backup_path(&userlist).exists());
     }
@@ -2255,8 +3415,11 @@ mod tests {
 
         let err = delete_userlist_entry(&userlist, "alice").unwrap_err();
 
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert!(!is_user_not_found_error(&err));
+        assert!(matches!(
+            err,
+            UserlistMutationError::Read(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
@@ -2286,24 +3449,312 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let userlist = dir.path().join("users");
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
         let mode = std::fs::metadata(userlist).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
     #[cfg(unix)]
     #[test]
-    fn existing_userlist_file_mode_is_preserved_on_unix() {
+    fn managed_userlist_bootstrap_requires_the_service_identity_on_unix() {
+        assert!(supports_managed_userlist_bootstrap(
+            true,
+            true,
+            0,
+            4242,
+            0o640,
+            0,
+            Some(4242)
+        ));
+        for (is_regular_file, has_no_access_acl, uid, gid, mode, expected_uid, service_gid) in [
+            (false, true, 0, 4242, 0o640, 0, Some(4242)),
+            (true, false, 0, 4242, 0o640, 0, Some(4242)),
+            (true, true, 1000, 4242, 0o640, 0, Some(4242)),
+            (true, true, 0, 7, 0o640, 0, Some(4242)),
+            (true, true, 0, 4242, 0o600, 0, Some(4242)),
+            (true, true, 0, 4242, 0o644, 0, Some(4242)),
+            (true, true, 0, 4242, 0o660, 0, Some(4242)),
+            (true, true, 0, 4242, 0o4640, 0, Some(4242)),
+            (true, true, 0, 4242, 0o640, 0, None),
+        ] {
+            assert!(!supports_managed_userlist_bootstrap(
+                is_regular_file,
+                has_no_access_acl,
+                uid,
+                gid,
+                mode,
+                expected_uid,
+                service_gid
+            ));
+        }
+
+        let metadata = userlist_unix_metadata(
+            Path::new("unused"),
+            false,
+            UserlistCreationPolicy::ConfigBacked {
+                uid: 0,
+                gid: 4242,
+                managed_bootstrap: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(metadata.mode, 0o640);
+        assert_eq!(metadata.uid, 0);
+        assert_eq!(metadata.gid, 4242);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_backed_bootstrap_rejects_a_fifo_without_opening_it_on_linux() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let config_c = CString::new(config.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(config_c.as_ptr(), 0o640) }, 0);
+        let metadata = std::fs::metadata(&config).unwrap();
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            metadata.uid(),
+            Some(metadata.gid()),
+        )
+        .unwrap();
+        assert!(matches!(
+            policy,
+            UserlistCreationPolicy::ConfigBacked {
+                managed_bootstrap: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_bootstrap_strips_inherited_access_acl_on_linux() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let userlist = dir.path().join("users");
+        std::fs::write(&config, "userlist: users\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let config_metadata = std::fs::metadata(&config).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let default_acl = test_posix_acl(0o7, named_uid);
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        if let Err(error) =
+            set_test_linux_xattr(&directory, c"system.posix_acl_default", &default_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test default ACL: {error}");
+        }
+
+        let control = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o640)
+            .open(dir.path().join("control"))
+            .unwrap();
+        assert!(linux_access_acl(&control).unwrap().is_some());
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            config_metadata.uid(),
+            Some(config_metadata.gid()),
+        )
+        .unwrap();
+        assert_eq!(
+            upsert_userlist_entry(&userlist, "alice", "alice:new", policy).unwrap(),
+            UpsertOutcome::Created
+        );
+
+        let created = open_no_follow(&userlist).unwrap();
+        let created_metadata = created.metadata().unwrap();
+        assert_eq!(created_metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(created_metadata.uid(), config_metadata.uid());
+        assert_eq!(created_metadata.gid(), config_metadata.gid());
+        assert!(linux_access_acl(&created).unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(userlist).unwrap(), "alice:new\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn existing_userlist_access_acl_is_preserved_on_linux() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let userlist = dir.path().join("users");
         std::fs::write(&userlist, "alice:old\n").unwrap();
         std::fs::set_permissions(&userlist, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let access_acl = test_posix_acl(0o6, named_uid);
+        let original = open_no_follow(&userlist).unwrap();
+        if let Err(error) = set_test_linux_xattr(&original, c"system.posix_acl_access", &access_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test access ACL: {error}");
+        }
+        let expected_acl = linux_access_acl(&original).unwrap().unwrap();
+        drop(original);
 
-        upsert_userlist_entry(&userlist, "alice", "alice:new").unwrap();
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::Private,
+        )
+        .unwrap();
 
-        let mode = std::fs::metadata(userlist).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
+        let updated = open_no_follow(&userlist).unwrap();
+        let backup = open_no_follow(&userlist_backup_path(&userlist)).unwrap();
+        assert_eq!(
+            linux_access_acl(&updated).unwrap(),
+            Some(expected_acl.clone())
+        );
+        assert_eq!(linux_access_acl(&backup).unwrap(), Some(expected_acl));
+        assert_eq!(std::fs::read_to_string(&userlist).unwrap(), "alice:new\n");
+        assert_eq!(
+            std::fs::read_to_string(userlist_backup_path(&userlist)).unwrap(),
+            "alice:old\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_backed_bootstrap_rejects_an_extended_config_acl_on_linux() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let userlist = dir.path().join("users");
+        std::fs::write(&config, "userlist: users\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let named_uid = if current_uid == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_uid + 1
+        };
+        let access_acl = test_posix_acl(0o6, named_uid);
+        let config_file = open_no_follow(&config).unwrap();
+        if let Err(error) =
+            set_test_linux_xattr(&config_file, c"system.posix_acl_access", &access_acl)
+        {
+            if acl_test_unavailable(&error) {
+                return;
+            }
+            panic!("failed to install test config ACL: {error}");
+        }
+        let config_metadata = config_file.metadata().unwrap();
+        assert_eq!(config_metadata.permissions().mode() & 0o777, 0o640);
+        drop(config_file);
+
+        let policy = UserlistCreationPolicy::config_backed_with_expected_identity(
+            &config,
+            config_metadata.uid(),
+            Some(config_metadata.gid()),
+        )
+        .unwrap();
+        let error = upsert_userlist_entry(&userlist, "alice", "alice:new", policy).unwrap_err();
+        assert!(matches!(error, UserlistMutationError::Update(_)));
+        assert!(!userlist.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_backed_new_userlist_rejects_unsupported_config_modes_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o644] {
+            let case_dir = dir.path().join(format!("{mode:04o}"));
+            std::fs::create_dir(&case_dir).unwrap();
+            let config = case_dir.join("alighieri.conf");
+            let userlist = case_dir.join("users");
+            std::fs::write(&config, "userlist: users\n").unwrap();
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let error = upsert_userlist_entry(
+                &userlist,
+                "alice",
+                "alice:new",
+                UserlistCreationPolicy::config_backed(&config).unwrap(),
+            )
+            .unwrap_err();
+
+            match error {
+                UserlistMutationError::Update(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    let message = error.to_string();
+                    #[cfg(target_os = "linux")]
+                    {
+                        assert!(message.contains("root:alighieri"), "{message}");
+                        assert!(message.contains("mode 0640"), "{message}");
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    assert!(message.contains("only on Linux"), "{message}");
+                    assert!(message.contains("pre-create"), "{message}");
+                }
+                UserlistMutationError::Read(error) => {
+                    panic!("unexpected userlist read error: {error}")
+                }
+            }
+            assert!(!userlist.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_userlist_file_metadata_is_preserved_on_unix() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        let userlist = dir.path().join("users");
+        std::fs::write(&config, "userlist: users\n").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&userlist, "alice:old\n").unwrap();
+        std::fs::set_permissions(&userlist, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let original_metadata = std::fs::metadata(&userlist).unwrap();
+
+        upsert_userlist_entry(
+            &userlist,
+            "alice",
+            "alice:new",
+            UserlistCreationPolicy::config_backed(&config).unwrap(),
+        )
+        .unwrap();
+
+        let updated_metadata = std::fs::metadata(&userlist).unwrap();
+        assert_eq!(
+            updated_metadata.permissions().mode() & 0o777,
+            original_metadata.permissions().mode() & 0o777
+        );
+        assert_eq!(updated_metadata.uid(), original_metadata.uid());
+        assert_eq!(updated_metadata.gid(), original_metadata.gid());
+        assert_eq!(std::fs::read_to_string(userlist).unwrap(), "alice:new\n");
     }
 }

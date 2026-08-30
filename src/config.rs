@@ -303,6 +303,18 @@ pub struct Config {
     loaded_include_patterns: Vec<LoadedIncludePattern>,
 }
 
+/// Effective authentication settings needed by the local user-management CLI.
+///
+/// This intentionally exposes only target-selection facts, not a partially
+/// runtime-valid [`Config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct UserManagementConfigFacts {
+    pub username_auth_active: bool,
+    pub userlist: Option<PathBuf>,
+    pub external_auth_backend: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct LoadedIncludePattern {
@@ -427,6 +439,26 @@ impl Config {
 
     /// Loads and validates configuration from a file on disk.
     pub fn load(path: &Path) -> Result<Config> {
+        Self::load_builder(path)?.build()
+    }
+
+    /// Loads configuration for resolving a user-management target.
+    ///
+    /// This uses the normal file/include parser and all normal structural
+    /// validation, but allows a `username` method with no configured backend so
+    /// the management CLI can report `userlist_not_configured` precisely. It is
+    /// not suitable for starting the proxy.
+    #[doc(hidden)]
+    pub fn load_user_management_facts(path: &Path) -> Result<UserManagementConfigFacts> {
+        let config = Self::load_builder(path)?.build_for_user_management()?;
+        Ok(UserManagementConfigFacts {
+            username_auth_active: config.socks_methods.contains(&AuthKind::Username),
+            userlist: config.userlist,
+            external_auth_backend: config.auth_command.is_some(),
+        })
+    }
+
+    fn load_builder(path: &Path) -> Result<Builder> {
         let mut builder = Builder::default();
         let mut stack = Vec::new();
         // Resolve first and read through that stable spelling so valid-load
@@ -454,7 +486,7 @@ impl Config {
         let text = fs::read_to_string(&canonical)
             .map_err(|e| Error::Config(format!("failed to read {}: {e}", path.display())))?;
         parse_resolved_config_file(canonical, text, &mut builder, &mut stack)?;
-        builder.build()
+        Ok(builder)
     }
 
     /// Parses and validates configuration from a string.
@@ -662,6 +694,14 @@ struct Builder {
 
 impl Builder {
     fn build(self) -> Result<Config> {
+        self.build_with_auth_backend_required(true)
+    }
+
+    fn build_for_user_management(self) -> Result<Config> {
+        self.build_with_auth_backend_required(false)
+    }
+
+    fn build_with_auth_backend_required(self, auth_backend_required: bool) -> Result<Config> {
         let internal = self
             .internal
             .ok_or_else(|| Error::Config("missing required setting: internal".into()))?;
@@ -672,7 +712,8 @@ impl Builder {
                 "socksmethod must list at least one method".into(),
             ));
         }
-        if socks_methods.contains(&AuthKind::Username)
+        if auth_backend_required
+            && socks_methods.contains(&AuthKind::Username)
             && self.userlist.is_none()
             && self.auth_command.is_none()
         {
@@ -2880,6 +2921,72 @@ socks pass "" { command: connect }"#,
             "internal: 0.0.0.0 port = 1080\nsocksmethod: username\nauth.command: /bin/true"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn user_management_facts_allow_username_auth_without_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        fs::write(&config, "internal: 127.0.0.1:1080\nsocksmethod: username\n").unwrap();
+
+        let facts = Config::load_user_management_facts(&config).unwrap();
+
+        assert!(facts.username_auth_active);
+        assert_eq!(facts.userlist, None);
+        assert!(!facts.external_auth_backend);
+    }
+
+    #[test]
+    fn normal_config_load_still_rejects_username_auth_without_a_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        fs::write(&config, "internal: 127.0.0.1:1080\nsocksmethod: username\n").unwrap();
+
+        let err = Config::load(&config).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("requires a 'userlist' or 'auth.command' setting"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn user_management_facts_report_an_external_auth_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("alighieri.conf");
+        fs::write(
+            &config,
+            "internal: 127.0.0.1:1080\nsocksmethod: username\nauth.command: verifier --ldap\n",
+        )
+        .unwrap();
+
+        let facts = Config::load_user_management_facts(&config).unwrap();
+
+        assert!(facts.username_auth_active);
+        assert_eq!(facts.userlist, None);
+        assert!(facts.external_auth_backend);
+    }
+
+    #[test]
+    fn user_management_facts_honor_includes_and_last_userlist_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("conf.d");
+        fs::create_dir(&fragments).unwrap();
+        let config = dir.path().join("alighieri.conf");
+        fs::write(
+            &config,
+            "internal: 127.0.0.1:1080\nsocksmethod: username\ninclude: conf.d/*.conf\n",
+        )
+        .unwrap();
+        fs::write(fragments.join("10-users.conf"), "userlist: first-users\n").unwrap();
+        fs::write(fragments.join("20-users.conf"), "userlist: final-users\n").unwrap();
+
+        let facts = Config::load_user_management_facts(&config).unwrap();
+
+        assert!(facts.username_auth_active);
+        assert_eq!(facts.userlist, Some(PathBuf::from("final-users")));
+        assert!(!facts.external_auth_backend);
     }
 
     #[test]

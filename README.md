@@ -29,6 +29,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
   - [Rules](#rules)
   - [Userlist format](#userlist-format)
   - [Hot reload](#hot-reload)
+- [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -118,8 +119,13 @@ Manage hashed userlist entries:
 ```sh
 alighieri user add alice --userlist /etc/alighieri/users
 alighieri user list --userlist /etc/alighieri/users
+alighieri user verify alice --userlist /etc/alighieri/users
 alighieri user delete alice --userlist /etc/alighieri/users
 ```
+
+Automation can discover the versioned local management interface with
+`alighieri capabilities --json`; see
+[Machine-readable management CLI](#machine-readable-management-cli).
 
 On Linux, install and start Alighieri as a hardened systemd service (details
 under [Linux service (systemd)](#linux-service-systemd)). From a source
@@ -768,9 +774,21 @@ alighieri user verify alice --userlist /etc/alighieri/users
 alighieri user delete alice --userlist /etc/alighieri/users
 ```
 
+The same operations support versioned JSON responses, password input through
+stdin, and resolution of the effective include-aware userlist from a
+configuration. See the [management CLI protocol](doc/management-cli.md) for the
+complete automation contract and security requirements.
+
 Plaintext `username:password` entries remain supported for compatibility, but
-hashed entries are preferred. The file should be readable only by the user
-running Alighieri (`chmod 600`).
+hashed entries are preferred. Restrict the file to administrators and the
+account running Alighieri. A manual single-user deployment can use owner-only
+mode (`0600`); the managed Linux service requires `root:alighieri` ownership
+and mode `0640` so the unprivileged service can read but not rewrite credentials.
+On Linux, `user add --config` automatically creates a missing userlist only when
+the config is a regular file owned by `root:alighieri` with mode `0640` and no
+extended access ACL. Custom service groups and other ownership or ACL layouts
+must pre-create the userlist with the required metadata; Linux access ACLs on
+existing userlists are preserved across updates.
 
 `user add` and `user delete` update the file under a lock, replace it
 atomically, and keep the previous contents beside it as `<userlist>.bak` when
@@ -850,11 +868,54 @@ settings are reported in the logs and require a restart.
 Tools and local setup UIs can inspect the same distinction with
 `alighieri config metadata --json`.
 
+## Machine-readable management CLI
+
+Alighieri provides a versioned local CLI/stdio contract for administration
+tools, including a future cross-platform manager operating through an existing
+authenticated SSH connection. Discover the exact features supported by a
+binary before using them:
+
+```sh
+alighieri capabilities --json
+alighieri user list --config /etc/alighieri/alighieri.conf --json
+```
+
+User add, delete, list, and verify operations can return one JSON envelope with
+stable protocol-1 error codes. Add and verify accept a single bounded password
+record on stdin, so the secret never needs to appear in argv, an environment
+variable, or JSON:
+
+```sh
+trusted-password-provider | \
+  sudo -n -- /usr/local/bin/alighieri user add alice \
+    --config /etc/alighieri/alighieri.conf \
+    --password-stdin --json
+```
+
+`trusted-password-provider` is a placeholder for a protected process that
+writes exactly one password record without logging it. Production clients
+should write their protected buffer directly to the SSH channel and clear it
+promptly; shell variables can leave additional copies in memory.
+
+When delegating this command through `sudo`, keep the complete transitive
+configuration and include search space administrator-controlled, including
+directories that can supply wildcard matches, or use a root-owned wrapper fixed
+to the intended userlist.
+
+This interface does not open a management port or install a resident agent.
+SSH authentication and host-key verification, operating-system privileges,
+service control, and reloads remain the caller's responsibility. The complete
+[management CLI protocol](doc/management-cli.md) defines compatibility
+negotiation, command and result schemas, stdin framing, error identifiers,
+idempotent deletion, SSH/Rust client flows, and the security boundary.
+
 ## Linux service (systemd)
 
 On Linux, [`scripts/alighieri.sh`](scripts/alighieri.sh) manages the whole
 lifecycle as a hardened systemd service — install, upgrade, uninstall, and
-status.
+status. Mutating commands require `flock`; automatic legacy-unit migration also
+requires the coreutils-compatible `link` utility and fails before detaching the
+live unit when it is unavailable.
 
 **From a Linux release archive:** extract the archive and run the bundled,
 version-matched helper from its root. It finds the archive's binary
@@ -881,7 +942,9 @@ sudo ./scripts/alighieri.sh status
 
 The helper validates the new binary against the live configuration before it
 changes anything, then restarts the service. The status output includes the
-installed version so the result is easy to verify.
+installed version so the result is easy to verify. When status is invoked with
+`sudo`, its version probe runs as the confined `alighieri` service identity and
+reports output only when `--version` succeeds.
 
 **From a checkout:** run it directly — it uses an existing `target/release`
 build if present, otherwise builds one, or takes a binary extracted from a
@@ -902,7 +965,12 @@ Run with no command on an already-installed host to get an interactive menu
 binary with `--check` against the live config, replaces it, and restarts while
 preserving the config. Exact, unmodified units generated by Alighieri 0.1.0
 through 0.4.0 are migrated transactionally to the current hardened unit during
-that upgrade. Customized units and drop-ins are never silently overwritten; if
+that upgrade. Mutating helper invocations are serialized, and the migration
+journal is recovered automatically after an interrupted installer process. A
+successful legacy migration retains the exact old unit at
+`/etc/systemd/system/alighieri.service.pre-migration`; keep it through release
+verification, then remove it when rollback is no longer needed. Customized units
+and drop-ins are never silently overwritten; if
 their effective service sandbox is incompatible, the helper stops with commands
 to inspect the customization. `install` (re-run) intentionally rewrites the
 managed unit and re-applies permissions to installer-managed files. A plain

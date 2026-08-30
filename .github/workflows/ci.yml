@@ -180,6 +180,7 @@ jobs:
             LICENSE
             LICENSING.md
             doc/alighieri.conf
+            doc/management-cli.md
             doc/plugin-sdk.md
             scripts/alighieri.sh
             scripts/install-linux.sh

@@ -3250,6 +3250,15 @@ fn render_public_success(
     });
     let domain_text = form.public_domain.as_deref().unwrap_or("");
     let domain = html_escape(domain_text);
+    let dns_check_command = if cfg!(windows) {
+        format!(
+            "Resolve-DnsName -Name {} -Type A",
+            powershell_single_quoted(domain_text)
+        )
+    } else {
+        format!("dig +short {}", shell_quote_command_argument(domain_text))
+    };
+    let dns_check_command = html_escape(&dns_check_command);
     let userlist_path = form
         .userlist_path
         .clone()
@@ -3507,7 +3516,7 @@ fn render_public_success(
 <li>The userlist above exists and is service-readable before Alighieri starts or restarts.</li>
 </ul>
 <p>Verify the result contains the VPS public IPv4 address rather than unrelated proxy or CDN addresses:</p>
-<pre>dig +short {domain}</pre>
+<pre>{dns_check_command}</pre>
 <p>The wizard does not change DNS records or firewall rules.</p>
 </section>
 <section>
@@ -6041,7 +6050,13 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("DNS A record"));
         assert!(html.contains("DNS only</strong> (gray cloud)"));
         assert!(html.contains("Proxied</strong> mode (orange cloud)"));
-        assert!(html.contains("dig +short proxy.example.com"));
+        if cfg!(windows) {
+            assert!(html.contains("Resolve-DnsName -Name &#39;proxy.example.com&#39; -Type A"));
+            assert!(!html.contains("dig +short"));
+        } else {
+            assert!(html.contains("dig +short proxy.example.com"));
+            assert!(!html.contains("Resolve-DnsName"));
+        }
         assert!(html.contains("0.0.0.0:443"));
         assert!(html.contains("to: 0.0.0.0/0"));
         assert!(html.contains("Alighieri supports IPv6 in other configurations"));

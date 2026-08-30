@@ -6,6 +6,30 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- A versioned, machine-readable local management CLI now provides capability
+  discovery and JSON user add/delete/list/verify operations, with stable
+  protocol-1 error codes, bounded password input through stdin, idempotent
+  deletion, and include-aware effective-userlist targeting through
+  `--config`. The interface is intended for invocation over an existing SSH
+  connection and opens no management listener or resident agent.
+
+### Changed
+
+- The public TLS wizard now renders a native `Resolve-DnsName` A-record check on
+  Windows while retaining `dig` guidance on Linux.
+
+### Fixed
+
+- Privileged Linux status checks no longer execute the installed binary as root,
+  and failed `--version` commands can no longer contribute plausible output.
+- Legacy systemd-unit migration now serializes mutating helper invocations,
+  detects concurrent pathname replacements and observed in-place edits before
+  rollback publication, journals enough state to recover after an untrappable
+  process interruption, and retains the exact pre-migration unit for explicit
+  release rollback.
+
 ## [0.5.2] - 2026-08-30
 
 ### Changed
