@@ -780,8 +780,10 @@ configuration. See the [management CLI protocol](doc/management-cli.md) for the
 complete automation contract and security requirements.
 
 Plaintext `username:password` entries remain supported for compatibility, but
-hashed entries are preferred. The file should be readable only by the user
-running Alighieri (`chmod 600`).
+hashed entries are preferred. Restrict the file to administrators and the
+account running Alighieri. A manual single-user deployment can use owner-only
+mode (`0600`); the managed Linux service requires `root:alighieri` ownership
+and mode `0640` so the unprivileged service can read but not rewrite credentials.
 
 `user add` and `user delete` update the file under a lock, replace it
 atomically, and keep the previous contents beside it as `<userlist>.bak` when
@@ -880,7 +882,7 @@ variable, or JSON:
 
 ```sh
 trusted-password-provider | \
-  sudo -n alighieri user add alice \
+  sudo -n -- /usr/local/bin/alighieri user add alice \
     --config /etc/alighieri/alighieri.conf \
     --password-stdin --json
 ```

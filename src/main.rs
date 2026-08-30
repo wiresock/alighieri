@@ -1606,9 +1606,15 @@ fn upsert_userlist_entry(
     line: &str,
     creation_policy: UserlistCreationPolicy,
 ) -> Result<UpsertOutcome, UserlistMutationError> {
-    if let Some(parent) = userlist.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(UserlistMutationError::Update)?;
+    // Preserve recursive parent creation for the legacy direct-path workflow.
+    // Config-backed targets must use a pre-provisioned directory: creating that
+    // ancestry with the elevated caller's umask or inherited ACL could leave
+    // the service unable to traverse to the correctly protected userlist.
+    if creation_policy == UserlistCreationPolicy::Private {
+        if let Some(parent) = userlist.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(UserlistMutationError::Update)?;
+            }
         }
     }
     let _lock = acquire_userlist_lock(userlist).map_err(UserlistMutationError::Update)?;
@@ -2990,7 +2996,7 @@ mod tests {
     #[test]
     fn upsert_userlist_entry_reports_creation_under_the_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let userlist = dir.path().join("users");
+        let userlist = dir.path().join("nested").join("users");
         assert_eq!(
             upsert_userlist_entry(
                 &userlist,

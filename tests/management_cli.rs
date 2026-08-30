@@ -45,6 +45,7 @@ enum ErrorCode {
     RelativeUserlistNotSupported,
     UserlistReadFailed,
     UserlistParseFailed,
+    UserlistUpdateFailed,
     UserNotFound,
     CredentialsRejected,
 }
@@ -765,6 +766,7 @@ fn config_target_reports_stable_resolution_errors() {
 fn config_target_can_bootstrap_a_missing_absolute_userlist() {
     let dir = tempfile::tempdir().unwrap();
     let userlist = dir.path().join("new").join("users");
+    fs::create_dir(userlist.parent().unwrap()).unwrap();
     let config = dir.path().join("bootstrap.conf");
     write_config(
         &config,
@@ -815,6 +817,38 @@ fn config_target_can_bootstrap_a_missing_absolute_userlist() {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
         assert_eq!((metadata.uid(), metadata.gid()), config_identity);
     }
+}
+
+#[test]
+fn config_target_does_not_create_a_missing_userlist_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing_parent = dir.path().join("missing");
+    let userlist = missing_parent.join("users");
+    let config = dir.path().join("missing-parent.conf");
+    write_config(
+        &config,
+        format!(
+            "internal: 127.0.0.1:1080\nsocksmethod: username\nuserlist: {}\n",
+            userlist.display()
+        ),
+    );
+    let secret = b"missing-parent-secret";
+    let mut input = secret.to_vec();
+    input.push(b'\n');
+
+    let output = invoke(
+        config_user_args(
+            "add",
+            Some("bootstrap-user"),
+            &config,
+            &["--password-stdin", "--json"],
+        ),
+        &input,
+    );
+
+    assert_output_excludes(&output, secret);
+    parse_error(&output, "user.add", ErrorCode::UserlistUpdateFailed);
+    assert!(!missing_parent.exists());
 }
 
 #[test]

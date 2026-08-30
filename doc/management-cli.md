@@ -124,12 +124,16 @@ uses the effective local `userlist` only when all of the following are true:
 
 This focused load does not require TLS certificates or perform full server
 startup validation. In particular, `user add` may create a missing absolute
-userlist so the first authenticated deployment can be bootstrapped. It does not
-canonicalize a file that does not exist yet. On Unix, that config-backed first
-creation inherits the supplied config file's owner and group and uses mode
-`0640`, matching the supported service deployment; existing userlist metadata
-is preserved. A missing userlist selected directly with `--userlist` retains
-the legacy caller-owned `0600` behavior.
+userlist so the first authenticated deployment can be bootstrapped, but its
+parent directory must already exist with the intended service ownership,
+traversal permissions, and ACL. Config-backed mode does not create missing
+directory ancestry because elevated caller defaults may not be usable by the
+service. It does not canonicalize a file that does not exist yet. On Unix, that
+config-backed first creation inherits the supplied config file's owner and
+group and uses mode `0640`, matching the supported service deployment; existing
+userlist metadata is preserved. A missing userlist selected directly with
+`--userlist` retains the legacy caller-owned `0600` behavior, including parent
+directory creation.
 
 Successful JSON results contain both the supplied `config` path and the
 effective `userlist` path. The operating system still controls whether the
@@ -339,7 +343,7 @@ executed without a stdin payload:
 
 ```sh
 ssh -T -o BatchMode=yes server.example \
-  sudo -n alighieri capabilities --json
+  sudo -n -- /usr/local/bin/alighieri capabilities --json
 ```
 
 For a password operation, connect a trusted password provider directly to the
@@ -349,7 +353,7 @@ password record to stdout without logging it:
 ```sh
 trusted-password-provider | \
   ssh -T -o BatchMode=yes server.example \
-    sudo -n alighieri user add alice \
+    sudo -n -- /usr/local/bin/alighieri user add alice \
       --config /etc/alighieri/alighieri.conf \
       --password-stdin --json
 ```
@@ -411,7 +415,8 @@ fn add_user(password_bytes: Vec<u8>) -> Result<Envelope, Box<dyn std::error::Err
             "server.example",
             "sudo",
             "-n",
-            "alighieri",
+            "--",
+            "/usr/local/bin/alighieri",
             "user",
             "add",
             "alice",
@@ -462,9 +467,15 @@ logging either stdin payloads or secret-bearing in-memory objects.
 - JSON mode is a representation, not an authorization boundary. Filesystem,
   service, account, and elevation privileges are enforced by the operating
   system.
-- Use non-interactive `sudo -n` and configure only the narrowly required remote
-  privileges. A manager must not attempt to parse or answer an interactive sudo
-  password prompt.
+- Use non-interactive `sudo -n` and pin delegated privileges to the absolute
+  Alighieri binary, the permitted subcommands and options, and one fixed
+  absolute `--config` or `--userlist` target. Do not grant a generic
+  `alighieri user *` rule: under elevation either target can select files
+  outside the intended deployment. Prefer a fixed root-owned wrapper when the
+  authorization policy cannot express the required argument checks. The
+  delegated account must not be able to modify the selected configuration, its
+  includes, or that wrapper. A manager must not attempt to parse or answer an
+  interactive sudo password prompt.
 - Passwords must be written directly to stdin, removed from client memory as
   soon as practical, and never recorded by command, SSH, diagnostic, telemetry,
   or audit logs.
