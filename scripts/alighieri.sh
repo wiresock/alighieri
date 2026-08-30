@@ -12,10 +12,10 @@
 #
 # Run it from a repository checkout, or from a Linux release archive, which
 # bundles this helper, the matching prebuilt binary, and the default config.
-# Release installs should pass --binary ./alighieri; that path uses only the
-# extracted release payload. A checkout without a prebuilt binary builds with
-# Cargo and may fetch its locked dependencies, but the helper never clones a
-# mutable repository branch or downloads a replacement lifecycle script.
+# In a complete release archive the helper automatically selects the bundled
+# ./alighieri binary. A checkout without a prebuilt binary builds with Cargo and
+# may fetch its locked dependencies, but the helper never clones a mutable
+# repository branch or downloads a replacement lifecycle script.
 #
 # Configuration constants are intentionally NOT read from the environment:
 # this script runs as root, and honouring env overrides would widen the attack
@@ -56,6 +56,7 @@ UNIT_BACKUP=""
 UNIT_TRANSACTION_ACTIVE=0
 UNIT_HAD_ORIGINAL=0
 BINARY_COMMIT_IN_PROGRESS=0
+UPGRADE_LEGACY_UNIT_KIND=""
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd -P)"
@@ -187,9 +188,10 @@ Commands:
                      present), write a hardened systemd unit, then enable and
                      (re)start the service. Re-run to reconfigure.
   upgrade            Replace the installed binary with a newer build and restart
-                     the service. Leaves the unit and config untouched.
+                     the service. Preserves the config; exact unmodified legacy
+                     units are migrated transactionally when required.
   uninstall          Stop and disable the service and remove the unit and binary.
-  status             Show the binary, service, and config state.
+  status             Show the installed version, binary, service, and config state.
   help               Show this help.
 
   With no command: open a management menu if Alighieri is already installed,
@@ -214,10 +216,11 @@ Options:
 
 Examples:
   sudo $0                                   # install, or manage if installed
-  sudo $0 install --binary ./alighieri      # install a prebuilt binary
+  sudo $0 install                            # use the bundled release binary, or build
+  sudo $0 install --binary ./alighieri      # explicitly select a prebuilt binary
   sudo $0 install --config /etc/alighieri/alighieri.conf
                                              # explicitly select the unit config
-  sudo $0 upgrade                            # rebuild from source and restart
+  sudo $0 upgrade                            # use bundled binary, or rebuild, and restart
   sudo $0 upgrade --binary ./alighieri      # swap in a prebuilt binary
   sudo $0 uninstall --purge-all             # remove everything
 EOF
@@ -536,6 +539,211 @@ effective_install_matches() {
     # systemd expansion/quoting characters, so this canonical form is exact.
     effective="$(loaded_exec_start_payload)" || return 1
     [ "$effective" = "$expected_binary $expected_config" ]
+}
+
+# Historical generated units are accepted for automatic migration only when
+# their complete base-unit bytes still match a released template. This narrow
+# fingerprint distinguishes an untouched old Alighieri install from a hand-
+# edited unit whose operational intent the helper must not overwrite.
+render_legacy_unit_v0_1() {
+    local install_bin="$1" config_file="$2"
+    cat <<UNIT
+[Unit]
+Description=Alighieri SOCKS5 proxy server
+Documentation=https://github.com/wiresock/alighieri
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+ExecStart=$install_bin $config_file
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The default config listens on an unprivileged port; to bind a
+# port below 1024, add CAP_NET_BIND_SERVICE to AmbientCapabilities and
+# CapabilityBoundingSet.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=$LOG_DIR
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+render_legacy_unit_v0_2_to_v0_4() {
+    local install_bin="$1" config_file="$2" caps="$3"
+    case "$caps" in '' | CAP_NET_BIND_SERVICE) ;; *) return 1 ;; esac
+    cat <<UNIT
+[Unit]
+Description=Alighieri SOCKS5 proxy server
+Documentation=https://github.com/wiresock/alighieri
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+ExecStart=$install_bin $config_file
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Hardening. CAP_NET_BIND_SERVICE is granted (below) only when the config needs
+# a privileged port — an internal: port under 1024, or ACME, whose TLS-ALPN-01
+# challenge is answered on :443; otherwise all capabilities are dropped.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=$caps
+AmbientCapabilities=$caps
+ReadWritePaths=$LOG_DIR
+# StateDirectory keeps /var/lib/${SERVICE_NAME} writable under
+# ProtectSystem=strict (created on start, owned by the service user); it holds
+# the ACME certificate cache (tls.acme.cache).
+StateDirectory=${SERVICE_NAME}
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+unit_file_is_safe_for_legacy_migration() {
+    local path="${1:-$UNIT_FILE}"
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    local metadata owner mode extra permissions
+    metadata="$(stat -Lc '%u %a' -- "$path" 2>/dev/null)" || return 1
+    read -r owner mode extra <<<"$metadata"
+    [ "$owner" = 0 ] && [ -n "$mode" ] && [ -z "${extra:-}" ] || return 1
+    case "$mode" in *[!0-7]* | '') return 1 ;; esac
+    permissions=$((8#$mode))
+    [ $((permissions & 0022)) -eq 0 ]
+}
+
+loaded_unit_source_is_unoverridden() {
+    local properties
+    properties="$(systemctl show --no-pager \
+        --property=FragmentPath --property=DropInPaths \
+        -- "${SERVICE_NAME}.service" 2>/dev/null)" || return 1
+    printf '%s\n' "$properties" | grep -Fqx -- "FragmentPath=$UNIT_FILE" &&
+        printf '%s\n' "$properties" | grep -Fqx -- 'DropInPaths='
+}
+
+legacy_unit_file_matches_kind() {
+    local path="$1" kind="$2" install_bin="$3" config_file="$4" caps
+    case "$kind" in
+        v0.1.x)
+            cmp -s -- "$path" \
+                <(render_legacy_unit_v0_1 "$install_bin" "$config_file")
+            ;;
+        v0.2.0-v0.4.0)
+            for caps in '' CAP_NET_BIND_SERVICE; do
+                if cmp -s -- "$path" \
+                    <(render_legacy_unit_v0_2_to_v0_4 \
+                        "$install_bin" "$config_file" "$caps"); then
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Print the recognized legacy family. Failure means the loaded service is not
+# backed by an exact, unmodified released template and must remain fail-closed.
+legacy_generated_unit_kind() {
+    command -v cmp >/dev/null 2>&1 || return 2
+    unit_file_is_safe_for_legacy_migration || return 1
+    loaded_unit_source_is_unoverridden || return 1
+
+    local payload value
+    local -a argv=()
+    payload="$(loaded_exec_start_payload 2>/dev/null)" || return 1
+    read -ra argv <<<"$payload"
+    [ "${#argv[@]}" -eq 2 ] || return 1
+    for value in "${argv[@]}"; do
+        case "$value" in
+            /*) ;;
+            *) return 1 ;;
+        esac
+        case "$value" in *[[:space:]%\$\"\'\\]*) return 1 ;; esac
+        [ "$(normalize_path "$value")" = "$value" ] || return 1
+    done
+    [ "$(basename -- "${argv[0]}")" = "$SERVICE_NAME" ] || return 1
+
+    if legacy_unit_file_matches_kind \
+        "$UNIT_FILE" v0.1.x "${argv[0]}" "${argv[1]}"; then
+        printf '%s' 'v0.1.x'
+        return 0
+    fi
+    if legacy_unit_file_matches_kind \
+        "$UNIT_FILE" v0.2.0-v0.4.0 "${argv[0]}" "${argv[1]}"; then
+        printf '%s' 'v0.2.0-v0.4.0'
+        return 0
+    fi
+    return 1
+}
+
+# Decide whether upgrade can keep the current unit or should migrate a released
+# legacy template. Exact legacy recognition comes first so semantically compatible
+# v0.2-v0.4 units are refreshed too; every edited unit and every drop-in remains
+# subject to the normal effective-sandbox guard.
+prepare_upgrade_unit_migration() {
+    local install_bin="$1" config_file="$2" expected_exec_start="$3" \
+          kind status description
+    UPGRADE_LEGACY_UNIT_KIND=""
+
+    if kind="$(legacy_generated_unit_kind 2>/dev/null)"; then
+        [ "$expected_exec_start" = "$install_bin $config_file" ] ||
+            die "effective systemd ExecStart changed while identifying the legacy unit; review the unit/drop-ins, then retry"
+        UPGRADE_LEGACY_UNIT_KIND="$kind"
+        case "$kind" in
+            v0.1.x) description="v0.1-era" ;;
+            v0.2.0-v0.4.0) description="v0.2-v0.4-era" ;;
+            *) description="legacy" ;;
+        esac
+        info "recognized an untouched Alighieri $description systemd unit template; upgrade will migrate it to the current hardened unit"
+        return 0
+    else
+        status=$?
+        [ "$status" -ne 2 ] ||
+            die "cmp not found; install a coreutils-compatible cmp command before checking or migrating a legacy systemd unit"
+    fi
+
+    effective_service_sandbox_matches && return 0
+    die "effective systemd service settings differ from the managed unit, and the base unit is not an exact unmodified Alighieri legacy template. Inspect it with: systemctl show ${SERVICE_NAME}.service --no-pager -p FragmentPath -p DropInPaths; systemctl cat ${SERVICE_NAME}.service. After reviewing any deliberate customization, use 'sudo $0 install' to regenerate the managed unit."
 }
 
 # Effective identity and filesystem-view properties after systemd merges the
@@ -902,6 +1110,21 @@ require_safe_binary_directory() {
     fi
 }
 
+# Status is intentionally available before the root/systemd gates, so never run
+# a binary merely because a hand-edited unit names it. Query --version only for
+# the same physical, root-controlled shape the installer itself maintains.
+installed_binary_is_safe_for_status() {
+    local path="$1" directory metadata owner mode extra
+    case "$path" in /*) ;; *) return 1 ;; esac
+    [ "$(normalize_path "$path")" = "$path" ] || return 1
+    [ -f "$path" ] && [ -x "$path" ] && [ ! -L "$path" ] || return 1
+    directory="$(dirname -- "$path")" || return 1
+    (require_safe_binary_directory "$directory") >/dev/null 2>&1 || return 1
+    metadata="$(stat -Lc '%u %a' -- "$path" 2>/dev/null)" || return 1
+    read -r owner mode extra <<<"$metadata"
+    [ -z "${extra:-}" ] && binary_directory_metadata_is_safe "$owner" "$mode"
+}
+
 require_safe_service_file_directory() {
     local directory="$1" description="$2" remediation="$3" physical
     case "$directory" in
@@ -1150,21 +1373,39 @@ in_checkout() {
     [ -f "${REPO_ROOT}/Cargo.toml" ] && [ -f "${REPO_ROOT}/doc/alighieri.conf" ]
 }
 
+# True when this helper is running from the root layout produced by the Linux
+# release workflow. Keeping the binary, helper, and default config together is
+# the archive's provenance boundary; unlike the retired standalone mode, this
+# never fetches executable content while running as root.
+in_release_archive() {
+    [ ! -f "${REPO_ROOT}/Cargo.toml" ] &&
+        [ -f "${REPO_ROOT}/${SERVICE_NAME}" ] &&
+        [ -f "${REPO_ROOT}/doc/alighieri.conf" ] &&
+        [ -f "${REPO_ROOT}/README.md" ] &&
+        [ -f "${REPO_ROOT}/CHANGELOG.md" ]
+}
+
 # Refuse to obtain executable source dynamically in a root process. Source
 # builds must come from the checkout containing this script; Linux release
 # archives instead carry a matching binary and default config.
 require_checkout() {
     in_checkout ||
-        die "source checkout not found; run this helper from an Alighieri checkout, or use a Linux release archive and pass --binary ./alighieri"
+        die "no matching binary found; extract the complete Linux release archive, run from an Alighieri checkout, or pass --binary PATH"
 }
 
-# Locate the binary to install/upgrade from: an explicit --binary, a prebuilt
-# target/release build, or a fresh cargo build from the checkout.
+# Locate the binary to install/upgrade from: an explicit --binary, the binary
+# bundled beside this helper in a release archive, a prebuilt checkout binary,
+# or a fresh Cargo build from the checkout.
 resolve_source_binary() {
     if [ -n "$BINARY" ]; then
         # A regular file is enough; install sets mode 755 on the destination, so
         # the source need not already carry the exec bit (e.g. unzipped artifact).
         [ -f "$BINARY" ] || die "binary not found: $BINARY"
+        return
+    fi
+    if in_release_archive; then
+        BINARY="${REPO_ROOT}/${SERVICE_NAME}"
+        info "using bundled release binary $BINARY"
         return
     fi
     if [ -x "${REPO_ROOT}/target/release/${SERVICE_NAME}" ]; then
@@ -3707,6 +3948,480 @@ run_selftest() {
     fi
     unset -f _check_fresh_install_transaction
 
+    _check_release_archive_binary_selection() {
+        local archive_tmp explicit
+        archive_tmp="$(mktemp -d)"
+        explicit="$archive_tmp/operator-selected"
+        command mkdir -p -- "$archive_tmp/doc"
+        printf '%s\n' bundled >"$archive_tmp/alighieri"
+        printf '%s\n' explicit >"$explicit"
+        printf '%s\n' config >"$archive_tmp/doc/alighieri.conf"
+        printf '%s\n' readme >"$archive_tmp/README.md"
+        printf '%s\n' changelog >"$archive_tmp/CHANGELOG.md"
+
+        _check_release_archive_binary_case() {
+            local REPO_ROOT="$1" BINARY="$2" expected="$3"
+            resolve_source_binary 2>/dev/null
+            [ "$BINARY" = "$expected" ]
+        }
+        if _check_release_archive_binary_case \
+            "$archive_tmp" '' "$archive_tmp/alighieri" &&
+            _check_release_archive_binary_case \
+                "$archive_tmp" "$explicit" "$explicit"; then
+            printf 'ok   release archive auto-selects its binary and honours explicit --binary\n'
+        else
+            printf 'FAIL release archive binary selection\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$archive_tmp/alighieri" "$explicit" \
+            "$archive_tmp/doc/alighieri.conf" "$archive_tmp/README.md" \
+            "$archive_tmp/CHANGELOG.md"
+        command rmdir -- "$archive_tmp/doc" "$archive_tmp"
+        unset -f _check_release_archive_binary_case
+    }
+    _check_release_archive_binary_selection
+    unset -f _check_release_archive_binary_selection
+
+    _check_userlist_bootstrap_guidance() {
+        local guidance_tmp existing missing output
+        guidance_tmp="$(mktemp -d)"
+        existing="$guidance_tmp/existing-users"
+        missing="$guidance_tmp/missing-users"
+        output="$guidance_tmp/output"
+        printf '%s\n' alice >"$existing"
+
+        if (
+            followup_elevation() { printf '%s' sudo; }
+            followup_install_command() { printf '%s' 'sudo ./scripts/alighieri.sh install'; }
+            service_runtime_path() { printf '%s' "$1"; }
+            print_userlist_bootstrap_guidance "$existing" \
+                /usr/local/bin/alighieri
+        ) >"$output" 2>&1 && [ ! -s "$output" ]; then
+            printf 'ok   existing userlist suppresses redundant credential bootstrap guidance\n'
+        else
+            printf 'FAIL existing userlist bootstrap guidance suppression\n'
+            failures=$((failures + 1))
+        fi
+
+        if (
+            followup_elevation() { printf '%s' sudo; }
+            followup_install_command() { printf '%s' 'sudo ./scripts/alighieri.sh install'; }
+            service_runtime_path() { printf '%s' "$1"; }
+            print_userlist_bootstrap_guidance "$missing" \
+                /usr/local/bin/alighieri
+        ) >"$output" 2>&1 &&
+            grep -Fq -- 'Create the first proxy user' "$output" &&
+            grep -Fq -- "--userlist $missing" "$output"; then
+            printf 'ok   missing userlist receives first-user bootstrap guidance\n'
+        else
+            printf 'FAIL missing userlist bootstrap guidance\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$existing" "$output"
+        command rmdir -- "$guidance_tmp"
+    }
+    _check_userlist_bootstrap_guidance
+    unset -f _check_userlist_bootstrap_guidance
+
+    _check_status_version() {
+        local status_tmp binary output marker
+        status_tmp="$(mktemp -d)"
+        binary="$status_tmp/alighieri"
+        output="$status_tmp/output"
+        marker="$status_tmp/executed"
+        # These are literal lines of the temporary test executable.
+        # shellcheck disable=SC2016
+        printf '%s\n' \
+            '#!/usr/bin/env sh' \
+            'if [ -n "${ALIGHIERI_STATUS_TEST_MARKER:-}" ]; then' \
+            '    printf "%s\n" executed >"$ALIGHIERI_STATUS_TEST_MARKER"' \
+            'fi' \
+            'printf "%s\n" "alighieri 9.8.7"' >"$binary"
+        command chmod 755 -- "$binary"
+
+        if (
+            require_safe_binary_directory() { :; }
+            stat() { printf '%s\n' '0 755'; }
+            installed_binary_is_safe_for_status "$binary" || exit 1
+            stat() { printf '%s\n' '1000 755'; }
+            ! installed_binary_is_safe_for_status "$binary" || exit 1
+            stat() { printf '%s\n' '0 777'; }
+            ! installed_binary_is_safe_for_status "$binary"
+        ); then
+            printf 'ok   status version query requires root-owned, non-writable binary metadata\n'
+        else
+            printf 'FAIL status binary metadata guard\n'
+            failures=$((failures + 1))
+        fi
+
+        if (
+            UNIT_FILE="$status_tmp/missing.service"
+            installed_binary_path() { printf '%s' "$binary"; }
+            installed_config_path() { printf '%s' "$status_tmp/missing.conf"; }
+            installed_binary_is_safe_for_status() { :; }
+            do_status
+        ) >"$output" 2>&1 &&
+            grep -Fq -- 'Version:  alighieri 9.8.7' "$output"; then
+            printf 'ok   deployment status reports the installed binary version\n'
+        else
+            printf 'FAIL deployment status version output\n'
+            failures=$((failures + 1))
+        fi
+
+        if (
+            UNIT_FILE="$status_tmp/missing.service"
+            installed_binary_path() { printf '%s' "$binary"; }
+            installed_config_path() { printf '%s' "$status_tmp/missing.conf"; }
+            installed_binary_is_safe_for_status() { return 1; }
+            export ALIGHIERI_STATUS_TEST_MARKER="$marker"
+            do_status
+        ) >"$output" 2>&1 && [ ! -e "$marker" ] &&
+            grep -Fq -- 'Version:  not queried' "$output"; then
+            printf 'ok   deployment status never executes an untrusted unit binary\n'
+        else
+            printf 'FAIL deployment status executed an untrusted unit binary\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$binary" "$output" "$marker"
+        command rmdir -- "$status_tmp"
+    }
+    _check_status_version
+    unset -f _check_status_version
+
+    _check_legacy_unit_recognition() {
+        local legacy_tmp unit install_bin config_file
+        legacy_tmp="$(mktemp -d)"
+        unit="$legacy_tmp/alighieri.service"
+        install_bin="/usr/local/bin/alighieri"
+        config_file="/etc/alighieri/alighieri.conf"
+
+        if (
+            UNIT_FILE="$unit"
+            unit_file_is_safe_for_legacy_migration() { :; }
+            loaded_unit_source_is_unoverridden() { :; }
+            loaded_exec_start_payload() {
+                printf '%s' "$install_bin $config_file"
+            }
+
+            render_legacy_unit_v0_1 "$install_bin" "$config_file" >"$unit"
+            [ "$(legacy_generated_unit_kind)" = v0.1.x ] || exit 1
+
+            render_legacy_unit_v0_2_to_v0_4 \
+                "$install_bin" "$config_file" '' >"$unit"
+            [ "$(legacy_generated_unit_kind)" = v0.2.0-v0.4.0 ] || exit 1
+
+            render_legacy_unit_v0_2_to_v0_4 "$install_bin" "$config_file" \
+                CAP_NET_BIND_SERVICE >"$unit"
+            [ "$(legacy_generated_unit_kind)" = v0.2.0-v0.4.0 ] || exit 1
+
+            write_unit "$install_bin" "$config_file" 0 "$unit"
+            ! legacy_generated_unit_kind >/dev/null 2>&1 || exit 1
+
+            render_legacy_unit_v0_1 "$install_bin" "$config_file" >"$unit"
+            printf '%s\n' '# operator customization' >>"$unit"
+            ! legacy_generated_unit_kind >/dev/null 2>&1 || exit 1
+
+            render_legacy_unit_v0_1 "$install_bin" "$config_file" >"$unit"
+            loaded_exec_start_payload() {
+                printf '%s' "$install_bin $config_file --extra"
+            }
+            ! legacy_generated_unit_kind >/dev/null 2>&1 || exit 1
+
+            loaded_exec_start_payload() {
+                printf '%s' "$install_bin $config_file"
+            }
+            loaded_unit_source_is_unoverridden() { return 1; }
+            ! legacy_generated_unit_kind >/dev/null 2>&1
+        ); then
+            printf 'ok   exact v0.1-v0.4 units are recognized; current, edited, and overridden units are not\n'
+        else
+            printf 'FAIL legacy generated-unit recognition\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$unit"
+        command rmdir -- "$legacy_tmp"
+    }
+    _check_legacy_unit_recognition
+    unset -f _check_legacy_unit_recognition
+
+    _check_legacy_unit_metadata() {
+        local metadata_tmp unit
+        metadata_tmp="$(mktemp -d)"
+        unit="$metadata_tmp/alighieri.service"
+        printf '%s\n' unit >"$unit"
+
+        if (
+            UNIT_FILE="$unit"
+            stat() { printf '%s\n' '0 644'; }
+            unit_file_is_safe_for_legacy_migration || exit 1
+            stat() { printf '%s\n' '0 664'; }
+            ! unit_file_is_safe_for_legacy_migration || exit 1
+            stat() { printf '%s\n' '1000 644'; }
+            ! unit_file_is_safe_for_legacy_migration || exit 1
+            command rm -f -- "$unit"
+            if command ln -s -- "$metadata_tmp/target" "$unit" 2>/dev/null; then
+                stat() { printf '%s\n' '0 644'; }
+                ! unit_file_is_safe_for_legacy_migration
+            fi
+        ); then
+            printf 'ok   legacy migration requires a root-owned, non-writable physical unit\n'
+        else
+            printf 'FAIL legacy unit metadata guard\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$unit"
+        command rmdir -- "$metadata_tmp"
+    }
+    _check_legacy_unit_metadata
+    unset -f _check_legacy_unit_metadata
+
+    _check_upgrade_unit_selection() {
+        local selection_tmp output
+        selection_tmp="$(mktemp -d)"
+        output="$selection_tmp/output"
+
+        if (
+            UPGRADE_LEGACY_UNIT_KIND=""
+            legacy_generated_unit_kind() { printf '%s' v0.1.x; }
+            effective_service_sandbox_matches() { return 1; }
+            info() { :; }
+            prepare_upgrade_unit_migration /usr/local/bin/alighieri \
+                /etc/alighieri/alighieri.conf \
+                '/usr/local/bin/alighieri /etc/alighieri/alighieri.conf'
+            [ "$UPGRADE_LEGACY_UNIT_KIND" = v0.1.x ]
+        ) && (
+            UPGRADE_LEGACY_UNIT_KIND="stale"
+            legacy_generated_unit_kind() { return 1; }
+            effective_service_sandbox_matches() { :; }
+            prepare_upgrade_unit_migration /usr/local/bin/alighieri \
+                /etc/alighieri/custom.conf \
+                '/usr/local/bin/alighieri /etc/alighieri/custom.conf'
+            [ -z "$UPGRADE_LEGACY_UNIT_KIND" ]
+        ); then
+            printf 'ok   upgrade selects exact legacy migration and preserves compatible custom units\n'
+        else
+            printf 'FAIL upgrade unit selection\n'
+            failures=$((failures + 1))
+        fi
+
+        if (
+            legacy_generated_unit_kind() { return 1; }
+            effective_service_sandbox_matches() { return 1; }
+            prepare_upgrade_unit_migration /usr/local/bin/alighieri \
+                /etc/alighieri/alighieri.conf \
+                '/usr/local/bin/alighieri /etc/alighieri/alighieri.conf'
+        ) >"$output" 2>&1; then
+            printf 'FAIL customized unsafe unit was accepted for upgrade\n'
+            failures=$((failures + 1))
+        elif grep -Fq -- 'not an exact unmodified Alighieri legacy template' "$output" &&
+            grep -Fq -- 'systemctl cat alighieri.service' "$output"; then
+            printf 'ok   customized unsafe unit receives precise inspection guidance\n'
+        else
+            printf 'FAIL customized unsafe unit diagnostic\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$output"
+        command rmdir -- "$selection_tmp"
+    }
+    _check_upgrade_unit_selection
+    unset -f _check_upgrade_unit_selection
+
+    _check_legacy_upgrade_transaction() {
+        local upgrade_tmp unit config source bin_dir installed calls output \
+              failure_mode UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR BIN_DIR \
+              BINARY STAGED_BIN STAGED_UNIT UNIT_BACKUP UNIT_TRANSACTION_ACTIVE \
+              UNIT_HAD_ORIGINAL BINARY_COMMIT_IN_PROGRESS \
+              UPGRADE_LEGACY_UNIT_KIND RESTART_ON_UPGRADE
+        upgrade_tmp="$(mktemp -d)"
+        unit="$upgrade_tmp/alighieri.service"
+        config="$upgrade_tmp/alighieri.conf"
+        source="$upgrade_tmp/candidate-alighieri"
+        bin_dir="$upgrade_tmp/bin"
+        installed="$bin_dir/alighieri"
+        calls="$upgrade_tmp/calls"
+        output="$upgrade_tmp/output"
+        command mkdir -p -- "$bin_dir"
+        printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
+        printf '%s\n' candidate >"$source"
+
+        UNIT_FILE="$unit"
+        CONFIG_DIR="$upgrade_tmp/etc"
+        CONFIG_FILE="$config"
+        LOG_DIR="$upgrade_tmp/log"
+        BIN_DIR="$bin_dir"
+        BINARY="$source"
+        STAGED_BIN=""
+        STAGED_UNIT=""
+        UNIT_BACKUP=""
+        UNIT_TRANSACTION_ACTIVE=0
+        UNIT_HAD_ORIGINAL=0
+        BINARY_COMMIT_IN_PROGRESS=0
+        UPGRADE_LEGACY_UNIT_KIND=""
+        RESTART_ON_UPGRADE=1
+
+        if (
+            require_service_sandbox() { :; }
+            installed_binary_path() { printf '%s' "$installed"; }
+            installed_config_path() { printf '%s' "$config"; }
+            existing_install_directory_for_binary() { dirname -- "$1"; }
+            require_safe_binary_directory() { :; }
+            require_safe_service_config_directory() { :; }
+            require_secure_service_config_file() { :; }
+            reject_hidden_service_path() { :; }
+            resolve_source_binary() { :; }
+            stage_executable_copy() {
+                command cp -- "$1" "$2" && command chmod 755 -- "$2"
+            }
+            loaded_exec_start_payload() {
+                printf '%s' "$installed $config"
+            }
+            unit_file_is_safe_for_legacy_migration() {
+                if [ "$failure_mode" = backup-metadata ] && [ "$#" -gt 0 ]; then
+                    return 1
+                fi
+            }
+            loaded_unit_source_is_unoverridden() {
+                if [ "$failure_mode" = override-after-begin ] &&
+                    [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ]; then
+                    return 1
+                fi
+            }
+            effective_install_matches() { :; }
+            effective_service_sandbox_matches() { :; }
+            require_effective_service_sandbox() {
+                printf 'sandbox-guard|' >>"$calls"
+                [ "$failure_mode" != validation ] ||
+                    die "simulated migrated-unit validation failure"
+            }
+            run_in_service_sandbox() {
+                printf 'preflight|' >>"$calls"
+                if [ "$failure_mode" = unit-race ]; then
+                    printf '%s\n' '# concurrent operator edit' >>"$unit"
+                fi
+                printf '%s\n' '{"ok":true,"userlist":""}'
+            }
+            validate_service_config_sources() { :; }
+            validate_service_userlist() { :; }
+            service_capability_mask() { printf '%s' 0; }
+            move_file_command() {
+                if [ "$failure_mode" = binary-move ] &&
+                    [ "${3:-}" = "$STAGED_BIN" ]; then
+                    return 1
+                fi
+                command mv "$@"
+            }
+            systemctl() {
+                printf '%s|' "$*" >>"$calls"
+            }
+
+            failure_mode=success
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if ! (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = candidate ] || exit 1
+            grep -Fq -- 'WorkingDirectory=/' "$unit" || exit 1
+            grep -Fq -- 'StateDirectory=alighieri' "$unit" || exit 1
+            grep -Fq -- 'restart alighieri.service|' "$calls" || exit 1
+            [ ! -e "${unit}.previous.$$" ] || exit 1
+
+            failure_mode=validation
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = installed ] || exit 1
+            legacy_unit_file_matches_kind "$unit" v0.1.x \
+                "$installed" "$config" || exit 1
+            [ ! -e "${unit}.previous.$$" ] || exit 1
+            grep -Fq -- 'simulated migrated-unit validation failure' "$output" || exit 1
+
+            failure_mode='backup-metadata'
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = installed ] || exit 1
+            legacy_unit_file_matches_kind "$unit" v0.1.x \
+                "$installed" "$config" || exit 1
+            grep -Fq -- 'content or metadata changed' "$output" || exit 1
+
+            failure_mode=override-after-begin
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = installed ] || exit 1
+            legacy_unit_file_matches_kind "$unit" v0.1.x \
+                "$installed" "$config" || exit 1
+            grep -Fq -- 'override appeared during migration' "$output" || exit 1
+
+            failure_mode='binary-move'
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = installed ] || exit 1
+            legacy_unit_file_matches_kind "$unit" v0.1.x \
+                "$installed" "$config" || exit 1
+            grep -Fq -- 'could not replace the installed binary' "$output" || exit 1
+
+            failure_mode=no-restart
+            RESTART_ON_UPGRADE=0
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if ! (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = candidate ] || exit 1
+            grep -Fq -- 'WorkingDirectory=/' "$unit" || exit 1
+            ! grep -Fq -- 'restart alighieri.service|' "$calls" || exit 1
+            grep -Fq -- 'not restarted (--no-restart)' "$output" || exit 1
+            RESTART_ON_UPGRADE=1
+
+            failure_mode='unit-race'
+            : >"$calls"
+            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
+            printf '%s\n' installed >"$installed"
+            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
+                exit 1
+            fi
+            [ "$(<"$installed")" = installed ] || exit 1
+            grep -Fq -- '# concurrent operator edit' "$unit" || exit 1
+            grep -Fq -- 'legacy systemd unit changed during upgrade' "$output" || exit 1
+            [ ! -e "${unit}.previous.$$" ]
+        ); then
+            printf 'ok   legacy upgrade commits atomically and rolls back every staged failure\n'
+        else
+            printf 'FAIL legacy upgrade transaction\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$unit" "$config" "$source" "$installed" "$calls" \
+            "$output" "${installed}.new.$$" "${unit}.new.$$" \
+            "${unit}.previous.$$"
+        command rmdir -- "$bin_dir" "$upgrade_tmp"
+    }
+    _check_legacy_upgrade_transaction
+    unset -f _check_legacy_upgrade_transaction
+
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
               expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|restart|' \
@@ -3730,8 +4445,12 @@ run_selftest() {
         STAGED_BIN=""
         require_service_sandbox() { :; }
         require_safe_binary_directory() { :; }
+        prepare_upgrade_unit_migration() {
+            printf 'guard:storage|' >>"$order"
+            UPGRADE_LEGACY_UNIT_KIND=""
+        }
         require_effective_service_sandbox() {
-            printf 'guard:%s|' "${1:-storage}" >>"$order"
+            printf 'guard:%s|' "$1" >>"$order"
         }
         loaded_exec_start_payload() {
             [ "$invalid_exec_start" -eq 0 ] || return 1
@@ -3821,7 +4540,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an ExecStart change before binary replacement\n'
@@ -3844,7 +4563,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|'
+        expected='reload|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = "installed" ]; then
             printf 'ok   upgrade refuses an expandable ExecStart before binary replacement\n'
@@ -3867,7 +4586,7 @@ run_selftest() {
         if (do_upgrade >/dev/null 2>&1); then succeeded=1; fi
         got="$(<"$order")"
         installed_contents="$(<"$installed")"
-        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|guard:0|'
+        expected='reload|guard:storage|config-dir|config-file|preflight|config-sources|reload|'
         if [ "$succeeded" -eq 0 ] && [ "$got" = "$expected" ] &&
             [ "$installed_contents" = installed ]; then
             printf 'ok   --no-restart upgrade refuses an ExecStart race before replacement\n'
@@ -4011,6 +4730,32 @@ activate_prevalidated_service() {
 activate_installed_service() {
     reload_and_validate_installed_service "$@"
     activate_prevalidated_service
+}
+
+print_userlist_bootstrap_guidance() {
+    local effective_userlist="$1" install_bin="$2" elevation followup_install \
+          quoted_install_bin quoted_userlist runtime_userlist
+    [ -n "$effective_userlist" ] || return 0
+
+    runtime_userlist="$(service_runtime_path "$effective_userlist")"
+    # A normal started install already rejects a missing userlist. With
+    # --no-start, show bootstrap steps only when the configured file really is
+    # absent; never tell an existing authenticated deployment to recreate
+    # credentials it has just validated successfully.
+    if [ -e "$runtime_userlist" ] || [ -L "$runtime_userlist" ]; then
+        return 0
+    fi
+
+    elevation="$(followup_elevation)"
+    followup_install="$(followup_install_command)"
+    printf -v quoted_install_bin '%q' "$install_bin"
+    printf -v quoted_userlist '%q' "$runtime_userlist"
+    cat <<DONE >&2
+Create the first proxy user, then complete installation:
+  ${elevation:+$elevation }$quoted_install_bin user add alice --userlist $quoted_userlist
+  ${elevation:+$elevation }chown root:$SERVICE_USER -- $quoted_userlist && ${elevation:+$elevation }chmod 640 -- $quoted_userlist
+  $followup_install
+DONE
 }
 
 do_install() {
@@ -4199,11 +4944,7 @@ do_install() {
     BINARY_COMMIT_IN_PROGRESS=0
 
     activate_prevalidated_service
-    local elevation followup_install quoted_install_bin quoted_userlist \
-          effective_userlist runtime_userlist
-    elevation="$(followup_elevation)"
-    followup_install="$(followup_install_command)"
-    printf -v quoted_install_bin '%q' "$install_bin"
+    local effective_userlist
     effective_userlist="$(printf '%s\n' "$check_summary" | json_string_field userlist)"
     cat <<DONE >&2
   Config:   $config_file   (edit, then: systemctl reload $SERVICE_NAME)
@@ -4213,21 +4954,10 @@ do_install() {
   Stop:     systemctl stop $SERVICE_NAME
 DONE
 
-    # Only print credential bootstrap guidance when the parsed config actually
-    # has a userlist. Use its effective include-aware/last-wins value, and make a
-    # relative setting absolute exactly as the unit's WorkingDirectory=/ does,
-    # so a command copied from another shell directory cannot create the wrong
-    # file.
-    if [ -n "$effective_userlist" ]; then
-        runtime_userlist="$(service_runtime_path "$effective_userlist")"
-        printf -v quoted_userlist '%q' "$runtime_userlist"
-        cat <<DONE >&2
-If the config uses username authentication, create the userlist now, e.g.:
-  ${elevation:+$elevation }$quoted_install_bin user add alice --userlist $quoted_userlist
-  ${elevation:+$elevation }chown root:$SERVICE_USER $quoted_userlist && ${elevation:+$elevation }chmod 640 $quoted_userlist
-  $followup_install
-DONE
-    fi
+    # Use the parser's effective include-aware/last-wins value. Relative paths
+    # are resolved exactly as the unit's WorkingDirectory=/ does, so a command
+    # copied from another shell directory cannot create the wrong file.
+    print_userlist_bootstrap_guidance "$effective_userlist" "$install_bin"
 }
 
 do_upgrade() {
@@ -4239,9 +4969,8 @@ do_upgrade() {
     # or removed BindPaths (for example) could look different on disk while
     # restart still uses stale loaded state.
     systemctl daemon-reload
-    require_effective_service_sandbox
     local install_bin install_dir config_file config_dir capability_mask \
-          expected_exec_start current_exec_start
+          expected_exec_start current_exec_start current_legacy_kind
     expected_exec_start="$(loaded_exec_start_payload)" ||
         die "effective systemd ExecStart is empty or unsupported; fix the unit before upgrading"
     install_bin="$(installed_binary_path)"
@@ -4249,6 +4978,8 @@ do_upgrade() {
     require_safe_binary_directory "$install_dir"
     config_file="$(installed_config_path)"
     config_dir="$(dirname -- "$config_file")"
+    prepare_upgrade_unit_migration \
+        "$install_bin" "$config_file" "$expected_exec_start"
     # Upgrade replaces an existing binary. Require a regular file at that path so
     # a malformed unit (ExecStart pointing at a directory, or under a missing
     # directory) fails clearly here instead of install/mv misbehaving — e.g. mv
@@ -4292,24 +5023,65 @@ do_upgrade() {
     # so a drop-in changed during that window cannot evade validation and alter
     # the command or sandbox used by the next activation.
     systemctl daemon-reload
-    require_effective_service_sandbox "$capability_mask"
     current_exec_start="$(loaded_exec_start_payload 2>/dev/null || true)"
     if [ "$current_exec_start" != "$expected_exec_start" ]; then
         [ -n "$current_exec_start" ] || current_exec_start="<empty>"
         die "effective systemd ExecStart changed during upgrade (now $current_exec_start); no binary was replaced and the service was not restarted; review the unit/drop-ins, then retry"
     fi
 
+    if [ -n "$UPGRADE_LEGACY_UNIT_KIND" ]; then
+        # Re-recognize the exact template after the potentially long build and
+        # preflight window. Then stage the current unit transactionally and verify
+        # the backup itself before accepting the replacement, closing the
+        # recognition-to-copy race without ever treating a customized unit as ours.
+        current_legacy_kind="$(legacy_generated_unit_kind 2>/dev/null || true)"
+        [ "$current_legacy_kind" = "$UPGRADE_LEGACY_UNIT_KIND" ] ||
+            die "the legacy systemd unit changed during upgrade; no binary was replaced and the service was not restarted; review the unit/drop-ins, then retry"
+        STAGED_UNIT="${UNIT_FILE}.new.$$"
+        info "staging legacy systemd unit migration at $STAGED_UNIT"
+        write_unit "$install_bin" "$config_file" "$capability_mask" "$STAGED_UNIT" ||
+            die "could not render the staged systemd unit at $STAGED_UNIT"
+        chmod 644 "$STAGED_UNIT" ||
+            die "could not set safe permissions on the staged systemd unit at $STAGED_UNIT"
+        begin_unit_transaction
+        if ! unit_file_is_safe_for_legacy_migration "$UNIT_BACKUP" ||
+            ! legacy_unit_file_matches_kind "$UNIT_BACKUP" \
+                "$UPGRADE_LEGACY_UNIT_KIND" "$install_bin" "$config_file"; then
+            die "the legacy systemd unit content or metadata changed while it was being staged; the previous unit will be restored"
+        fi
+        reload_and_validate_installed_service \
+            "$install_bin" "$config_file" "$capability_mask"
+        loaded_unit_source_is_unoverridden ||
+            die "a systemd unit override appeared during migration; the previous unit will be restored"
+    else
+        require_effective_service_sandbox "$capability_mask"
+    fi
+
     info "upgrading binary at $install_bin"
-    replace_file_atomically "$STAGED_BIN" "$install_bin" ||
-        die "could not replace the installed binary at $install_bin"
+    BINARY_COMMIT_IN_PROGRESS=1
+    if ! replace_file_atomically "$STAGED_BIN" "$install_bin"; then
+        BINARY_COMMIT_IN_PROGRESS=0
+        die "could not replace the installed binary at $install_bin; the previous unit will be restored"
+    fi
+    commit_unit_transaction
     STAGED_BIN=""
+    BINARY_COMMIT_IN_PROGRESS=0
 
     if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then
         systemctl restart "${SERVICE_NAME}.service"
-        ok "Upgraded and restarted $SERVICE_NAME."
+        if [ -n "$UPGRADE_LEGACY_UNIT_KIND" ]; then
+            ok "Upgraded $SERVICE_NAME, migrated its legacy systemd unit, and restarted it."
+        else
+            ok "Upgraded and restarted $SERVICE_NAME."
+        fi
     else
-        ok "Upgraded $SERVICE_NAME binary."
-        warn "not restarted (--no-restart); apply with: systemctl restart $SERVICE_NAME"
+        if [ -n "$UPGRADE_LEGACY_UNIT_KIND" ]; then
+            ok "Upgraded $SERVICE_NAME binary and migrated its legacy systemd unit."
+            warn "not restarted (--no-restart); apply the new binary and unit together with: systemctl restart $SERVICE_NAME"
+        else
+            ok "Upgraded $SERVICE_NAME binary."
+            warn "not restarted (--no-restart); apply with: systemctl restart $SERVICE_NAME"
+        fi
     fi
 }
 
@@ -4380,13 +5152,23 @@ do_uninstall() {
 }
 
 do_status() {
-    local install_bin config_file
+    local install_bin config_file version
     install_bin="$(installed_binary_path)"
     config_file="$(installed_config_path)"
 
     printf 'Alighieri deployment status\n'
     if [ -x "$install_bin" ]; then
         printf '  Binary:   %s (installed)\n' "$install_bin"
+        if installed_binary_is_safe_for_status "$install_bin"; then
+            version="$("$install_bin" --version 2>/dev/null || true)"
+            if [ -n "$version" ]; then
+                printf '  Version:  %s\n' "$version"
+            else
+                printf '  Version:  unknown (--version failed)\n'
+            fi
+        else
+            printf '  Version:  not queried (binary is not safely root-controlled)\n'
+        fi
     else
         printf '  Binary:   %s (missing)\n' "$install_bin"
     fi
@@ -4459,16 +5241,8 @@ manage_menu() {
                 warn "journalctl is not available on this system"
             fi
             ;;
-        3)
-            in_checkout ||
-                die "upgrade from a release layout requires an explicit artifact; re-run: sudo $0 upgrade --binary /path/to/alighieri"
-            do_upgrade
-            ;;
-        4)
-            in_checkout ||
-                die "reconfigure from a release layout requires an explicit artifact; re-run: sudo $0 install --binary /path/to/alighieri"
-            do_install
-            ;;
+        3) do_upgrade ;;
+        4) do_install ;;
         5) uninstall_menu ;;
         6) exit 0 ;;
     esac
