@@ -21,13 +21,19 @@ domain **on port 443**.
 ## Prerequisites
 
 1. A VPS with a **public IP** and root (or `sudo`).
-2. A DNS **A record** for a domain you control, pointing at the VPS — e.g.
-   `proxy.example.com → 203.0.113.10` — and **propagated**
-   (`dig +short proxy.example.com` returns the VPS IP). Publish **AAAA** only
-   when Alighieri also accepts IPv6 TCP 443 at that address. [Let's Encrypt
-   prefers IPv6](https://letsencrypt.org/ca/docs/ipv6-support/) when both records
-   exist, so an unreachable or wrong AAAA record can break validation; the
-   wizard's `0.0.0.0:443` public profile is IPv4-only.
+2. A DNS **A record** for a domain you control, pointing directly at the VPS —
+   e.g. `proxy.example.com → 203.0.113.10` — and **propagated**. Verify
+   `dig +short proxy.example.com` contains the VPS public IPv4 address rather
+   than unrelated proxy or CDN addresses. If Cloudflare manages the zone, set
+   the record to **DNS only** (gray cloud), not standard **Proxied** mode
+   (orange cloud); specialized Cloudflare TCP proxy products are outside this
+   guide. Publish **AAAA** only when Alighieri also accepts IPv6 TCP 443 at that
+   address and compatible rules have been separately configured and tested.
+   [Let's Encrypt prefers IPv6](https://letsencrypt.org/ca/docs/ipv6-support/)
+   when both records exist, so an unreachable or wrong AAAA record can break
+   validation. Alighieri supports IPv6 generally, but the wizard's ready-made
+   `0.0.0.0:443` listener and `to: 0.0.0.0/0` destination ACL are deliberately
+   IPv4-only for this walkthrough.
 3. Inbound **TCP 443 open** in both the cloud firewall/security group *and* the
    host firewall (`ufw allow 443/tcp`), with **nothing else listening on 443**
    (stop nginx/apache/etc.).
@@ -62,6 +68,39 @@ userlist and final configuration are ready below.
 
 (Or use the container image — see the README "Container image" section — and run
 it with `--network host` so it can bind 443 and be reached on it.)
+
+## Running the wizard on a remote VPS
+
+After Step 1, you can generate the ready-made public profile without exposing
+the loopback-only wizard. From the operator's local computer, open one SSH
+session with local forwarding:
+
+```sh
+ssh -o ExitOnForwardFailure=yes \
+    -L 8080:127.0.0.1:8080 \
+    user@vps-address
+```
+
+Inside that same SSH session, on the VPS:
+
+```sh
+sudo alighieri config wizard \
+    --listen 127.0.0.1:8080 \
+    --output /etc/alighieri/alighieri.conf
+```
+
+Keep the SSH session open and paste the tokenized URL printed by Alighieri into
+the local browser. Because local port 8080 is forwarded to VPS loopback port
+8080, the printed `http://127.0.0.1:8080/?token=...` URL works locally. Keep the
+wizard bound to `127.0.0.1`, do **not** open TCP 8080 in the VPS firewall, and
+do not post or share the tokenized URL. If 8080 is occupied, choose another
+matching port in both the `ssh -L` command and `--listen`.
+
+Choose **Public SOCKS5-over-TLS (ProxiFyre)** in the wizard and follow its
+completion page to create the userlist and install the service. The hand-written
+configuration below remains a generic ACME exercise and intentionally supports
+options beyond that narrower IPv4-only profile. If you use the wizard path, do
+not overwrite its generated configuration in Step 2.
 
 ## Step 2 — Write the config
 
@@ -216,9 +255,51 @@ Once the staging flow works, get a production certificate:
 Now the certificate is publicly trusted, so clients can validate its chain and
 hostname normally.
 
-[ProxiFyre 2.4.0 or later](https://github.com/wiresock/proxifyre/releases/tag/v2.4.0)
-can now connect directly with normal certificate validation. Its default SOCKS5
-transport is plaintext, so explicitly select TLS in `app-config.json`:
+Install [ProxiFyre 2.5.0 or later](https://github.com/wiresock/proxifyre/releases/latest)
+using the current architecture-matched online `*-setup.exe`. Windows may show
+**Unknown publisher** because the first-party installer is unsigned;
+before approving elevation, verify the download against its matching `.sha256`
+sidecar from the official release. Normal Windows certificate-chain and
+hostname validation should now succeed; a production ACME certificate needs
+neither an invalid-certificate bypass nor a fingerprint pin. A staging
+certificate is deliberately untrusted, so finish the server-side staging
+exercise and switch to production before this client test.
+
+Use the [ProxiFyre GUI](https://github.com/wiresock/proxifyre/blob/main/docs/gui.md)
+as the recommended editor:
+
+| Setting | Value |
+| --- | --- |
+| Proxy type | SOCKS5 |
+| Server and port | `proxy.example.com:443` |
+| Username and password | the values created with `alighieri user add` |
+| Transport | TLS |
+| TLS server name | `proxy.example.com` (or the default from the endpoint hostname) |
+| Certificate validation | enabled; keep **Allow invalid certificate** disabled |
+| Certificate pin | not required for the publicly trusted production certificate |
+| Protocols | TCP, plus UDP only when UDP ASSOCIATE is enabled |
+| Destination families | IPv4 and IPv6 for this guide's generic dual-family rule; IPv4 only for the ready-made wizard profile |
+
+Open ProxiFyre from the Start Menu, add a routing rule for one Windows
+application, enter the values above, and select TLS. Keep normal certificate
+and hostname validation enabled. Select the protocols enabled in Alighieri and
+the address families allowed by the chosen server rule. Choose **Validate**,
+then **Apply & Restart**, and confirm that the header reports **Running**. Use
+the **Logs** tab for connection or routing-rule diagnosis. See the official
+[configuration reference](https://github.com/wiresock/proxifyre/blob/main/docs/configuration.md)
+for advanced fields.
+
+<details>
+<summary>Advanced/manual app-config.json</summary>
+
+For automation, managed deployment, or intentional manual editing, use the
+equivalent configuration below. Replace `appNames`, the domain, username, and
+password; the password is the one entered at `alighieri user add`. Remove `UDP`
+when UDP ASSOCIATE is disabled. Manual configuration must explicitly select TLS
+because the format otherwise defaults to plaintext SOCKS5. The installed
+directory normally requires elevation; credentials remain plaintext in this
+file, so restrict access to it and restart `ProxiFyreService` after manual
+changes.
 
 ```json
 {
@@ -240,14 +321,13 @@ transport is plaintext, so explicitly select TLS in `app-config.json`:
 }
 ```
 
-Remove `UDP` when UDP ASSOCIATE is disabled. This guide's rule omits `to:`, so
-it permits both IPv4 and IPv6 destinations; the upstream ProxiFyre endpoint
-still uses the domain's A record. The wizard's stricter profile instead uses
+</details>
+
+This guide's generic rule omits `to:`, so it permits both IPv4 and IPv6
+destinations; the upstream ProxiFyre endpoint still requires the domain's A
+record. The wizard's stricter profile instead uses
 `supportedAddressFamilies: ["IPv4"]` to match its IPv4-only destination ACL.
-Replace `appNames`, the domain, username, and password; the password is the one
-entered at `alighieri user add`. Do not set `tlsAllowInvalidCertificate` to
-`true`; this direct configuration is for the production certificate obtained
-in this step.
+Keep `tlsAllowInvalidCertificate` false.
 
 For the stunnel wrapper, turn on verification in `stunnel.conf`:
 `verifyChain = yes` checks the chain and `checkHost` checks the hostname (the
@@ -282,6 +362,20 @@ new order.
 
 ## Troubleshooting
 
+- **Wizard reports `bind: address already in use`** — another local process is
+  using port 8080 on the VPS. Choose another VPS loopback port and use that
+  same port in both `ssh -L PORT:127.0.0.1:PORT` and
+  `--listen 127.0.0.1:PORT`.
+- **SSH forwarding fails** — keep `-o ExitOnForwardFailure=yes` so SSH reports
+  the failure immediately, then check that the client-side local port is free
+  and the SSH server permits TCP forwarding. Do not work around it by opening
+  the wizard publicly.
+- **The tokenized URL stopped working** — the SSH connection must remain open
+  for the lifetime of the one-shot wizard. Reconnect, start a new wizard, and
+  use its newly printed tokenized URL.
+- **The browser cannot reach the VPS's `127.0.0.1`** — VPS loopback is local to
+  the VPS. Open the printed `127.0.0.1` URL on the operator's computer only
+  while the matching SSH local-forwarding session is active.
 - **`acme error` / order keeps failing** — Let's Encrypt could not reach the
   listener on 443. Check: `dig +short proxy.example.com` is the VPS IP; the
   cloud security group and host firewall allow inbound 443; nothing else holds

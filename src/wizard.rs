@@ -2938,7 +2938,7 @@ fn render_wizard_form(
 </section>
 <section id="public-profile"{public_hidden}>
 <h2>Public TLS endpoint</h2>
-<label>Public domain <input class="public-only" name="public_domain" value="{public_domain}" placeholder="proxy.example.com" autocomplete="off"{public_required}{public_disabled}><span class="help">Exactly one DNS hostname with an A record for this VPS. This profile is IPv4-only; publish AAAA only when IPv6 TCP 443 is forwarded to Alighieri. Do not include a scheme, path, wildcard, or IP address.</span></label>
+<label>Public domain <input class="public-only" name="public_domain" value="{public_domain}" placeholder="proxy.example.com" autocomplete="off"{public_required}{public_disabled}><span class="help">Exactly one DNS hostname whose A record resolves directly to this VPS. With Cloudflare, select DNS only (gray cloud), not Proxied (orange cloud). This ready-made profile is IPv4-only; do not publish AAAA unless IPv6 TCP 443 and compatible rules are separately configured and tested. Do not include a scheme, path, wildcard, or IP address.</span></label>
 <label>ACME account email (optional) <input class="public-only" name="acme_email" value="{acme_email}" placeholder="admin@example.com" autocomplete="off"{public_disabled}></label>
 <label>Initial username (optional) <input class="public-only" name="initial_username" value="{initial_username}" placeholder="proxyuser" autocomplete="off"{public_disabled}><span class="help">Used only in the completion-page command. The wizard never asks for or stores a password.</span></label>
 <label>ACME cache path <input class="public-only" name="acme_cache" value="{acme_cache}" autocomplete="off"{public_required}{public_disabled}><span class="help">Absolute path for persisted certificates and account state. The default is writable by the supported service installation.</span></label>
@@ -3260,7 +3260,9 @@ fn render_public_success(
     let proxifyre_username = form
         .initial_username
         .as_deref()
-        .map_or_else(String::new, |value| {
+        .map_or_else(|| {
+            "<dt>Username</dt><dd><code>USERNAME</code> (replace with the username used in <code>alighieri user add</code>)</dd>\n".to_string()
+        }, |value| {
             format!(
                 "<dt>Username</dt><dd><code>{}</code></dd>\n",
                 html_escape(value)
@@ -3454,10 +3456,15 @@ fn render_public_success(
     } else {
         String::new()
     };
-    let udp_value = if form.udp_enabled {
-        "enabled"
+    let proxifyre_protocols = if form.udp_enabled {
+        "TCP and UDP"
     } else {
-        "disabled"
+        "TCP only"
+    };
+    let proxifyre_protocol_step = if form.udp_enabled {
+        "Select <strong>TCP</strong> and <strong>UDP</strong>."
+    } else {
+        "Select <strong>TCP</strong> only; do not enable UDP for this Alighieri profile."
     };
     let staging_warning = if form.acme_staging {
         "<section class=\"warning\"><strong>ACME staging is enabled.</strong> The issued certificate will not be trusted by normal clients. Switch staging off and obtain a production certificate before normal use.</section>"
@@ -3492,12 +3499,15 @@ fn render_public_success(
 <section>
 <h2>VPS prerequisites</h2>
 <ul>
-<li><code>{domain}</code> has a DNS A record for this VPS. Because this profile listens on IPv4, publish an AAAA record only when IPv6 TCP 443 is forwarded to this listener.</li>
+<li><code>{domain}</code> has a DNS A record that resolves directly to this VPS's public IPv4 address. With Cloudflare, use <strong>DNS only</strong> (gray cloud), not the standard <strong>Proxied</strong> mode (orange cloud); specialized Cloudflare TCP proxy products are outside this walkthrough.</li>
+<li>This ready-made profile listens on <code>0.0.0.0:443</code> and uses the destination ACL <code>to: 0.0.0.0/0</code>, so this documented flow is deliberately IPv4-only. Alighieri supports IPv6 in other configurations, but do not publish an AAAA record for this hostname unless IPv6 TCP 443 and compatible rules are separately configured and tested. An incorrect or unreachable AAAA record can interfere with ACME validation.</li>
 <li>Inbound TCP 443 is allowed, and no other service occupies TCP 443.</li>
 <li>Outbound TCP 443 is allowed for ACME communication.</li>
 {udp_firewall}
 <li>The userlist above exists and is service-readable before Alighieri starts or restarts.</li>
 </ul>
+<p>Verify the result contains the VPS public IPv4 address rather than unrelated proxy or CDN addresses:</p>
+<pre>dig +short {domain}</pre>
 <p>The wizard does not change DNS records or firewall rules.</p>
 </section>
 <section>
@@ -3506,18 +3516,44 @@ fn render_public_success(
 <p>{service_note}</p>
 </section>
 <section>
-<h2>ProxiFyre settings</h2>
+<h2>Configure ProxiFyre 2.5+</h2>
+<p>Use <a href="https://github.com/wiresock/proxifyre/releases/latest" target="_blank" rel="noopener noreferrer">ProxiFyre 2.5.0 or later</a> and follow its <a href="https://github.com/wiresock/proxifyre/blob/main/docs/gui.md" target="_blank" rel="noopener noreferrer">Windows GUI guide</a>. Install the current architecture-matched online <code>*-setup.exe</code>.</p>
+<p>ProxiFyre's first-party installer is unsigned and Windows may show <strong>Unknown publisher</strong>. Before approving elevation, verify the download against its matching <code>.sha256</code> sidecar from the official release.</p>
+{proxifyre_staging_note}
 <dl>
 <dt>Proxy type</dt><dd>SOCKS5</dd>
 <dt>Server</dt><dd><code>{domain}</code></dd>
 <dt>Port</dt><dd>443</dd>
-<dt>TLS</dt><dd>enabled</dd>
+<dt>Transport</dt><dd>TLS</dd>
 {proxifyre_username}<dt>Password</dt><dd>the password entered through <code>alighieri user add</code></dd>
-<dt>UDP</dt><dd>{udp_value}</dd>
+<dt>TLS server name</dt><dd><code>{domain}</code> (ProxiFyre can default it from the endpoint hostname)</dd>
+<dt>Certificate validation</dt><dd>enabled (normal Windows certificate-chain and hostname validation)</dd>
+<dt>Allow invalid certificate</dt><dd>disabled</dd>
+<dt>Certificate pin</dt><dd>not required for the normal publicly trusted production ACME certificate</dd>
+<dt>Protocols</dt><dd>{proxifyre_protocols}</dd>
+<dt>Destination address family</dt><dd>IPv4</dd>
 </dl>
-<p>Use ProxiFyre 2.4.0 or later. Save a configuration like this as <code>app-config.json</code> next to <code>ProxiFyre.exe</code>, replacing <code>appNames</code> and the password placeholder. The explicit TLS transport is required because ProxiFyre otherwise defaults to plaintext SOCKS5:</p>
+<ol>
+<li>Install the current architecture-matched online ProxiFyre <code>*-setup.exe</code>.</li>
+<li>Open ProxiFyre from the Start Menu.</li>
+<li>Add a routing rule.</li>
+<li>Select or enter the Windows application that should use the proxy.</li>
+<li>Enter the server, port, username, and password shown above.</li>
+<li>Select <strong>TLS</strong> as the SOCKS5 transport.</li>
+<li>Leave normal certificate and hostname validation enabled; keep <strong>Allow invalid certificate</strong> disabled.</li>
+<li>{proxifyre_protocol_step}</li>
+<li>Select <strong>IPv4</strong> as the destination address family.</li>
+<li>Choose <strong>Validate</strong>.</li>
+<li>Choose <strong>Apply &amp; Restart</strong>.</li>
+<li>Confirm that the header reports <strong>Running</strong>.</li>
+<li>Use the <strong>Logs</strong> tab when connection or routing-rule diagnosis is needed.</li>
+</ol>
+<details id="proxifyre-manual">
+<summary>Advanced/manual app-config.json</summary>
+<p>For automation, managed deployment, or intentional manual configuration, save a configuration like this as <code>app-config.json</code> next to <code>ProxiFyre.exe</code>. Replace <code>appNames</code> and the password placeholder. The explicit TLS transport is required because the manual format otherwise defaults to plaintext SOCKS5:</p>
 <pre>{proxifyre_config}</pre>
-{proxifyre_staging_note}
+<p>The installed directory is normally protected, so edit it from an elevated process. Credentials remain plaintext in this file; restrict access to it. Restart <code>ProxiFyreService</code> after manual changes.</p>
+</details>
 <p>Normal certificate and hostname validation remains enabled. This IPv4-only destination-family setting matches the generated <code>to: 0.0.0.0/0</code> access policy; the upstream endpoint separately uses the domain's A record.</p>
 <p>This endpoint is an application proxy, not a full IP-level VPN.</p>
 </section>
@@ -5135,6 +5171,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(input_tag(&public_html, "trusted_client").contains("readonly"));
         assert!(input_tag(&public_html, "udp_port_range").contains("required"));
         assert!(!input_tag(&public_html, "udp_port_range").contains("disabled"));
+        assert!(!public_html.contains(r#"name="password""#));
     }
 
     #[test]
@@ -6002,7 +6039,13 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("Inbound TCP 443"));
         assert!(html.contains("Outbound TCP 443"));
         assert!(html.contains("DNS A record"));
-        assert!(html.contains("AAAA record only when IPv6 TCP 443"));
+        assert!(html.contains("DNS only</strong> (gray cloud)"));
+        assert!(html.contains("Proxied</strong> mode (orange cloud)"));
+        assert!(html.contains("dig +short proxy.example.com"));
+        assert!(html.contains("0.0.0.0:443"));
+        assert!(html.contains("to: 0.0.0.0/0"));
+        assert!(html.contains("Alighieri supports IPv6 in other configurations"));
+        assert!(html.contains("incorrect or unreachable AAAA record"));
         assert!(html.contains("inbound UDP <code>40000-40099</code>"));
         assert!(html.contains("--check --config"));
         #[cfg(not(windows))]
@@ -6038,16 +6081,49 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             assert!(source_final < source_block_end && source_block_end < release_final);
             assert!(!html.contains("raw.githubusercontent.com"));
         }
-        assert!(html.contains("ProxiFyre settings"));
+        assert!(html.contains("Configure ProxiFyre 2.5+"));
+        assert!(html.contains("ProxiFyre 2.5.0 or later"));
+        assert!(!html.contains("ProxiFyre 2.4.0"));
+        assert!(html.contains("Unknown publisher"));
+        assert!(html.contains("<code>.sha256</code> sidecar"));
+        assert!(html.contains(
+            "href=\"https://github.com/wiresock/proxifyre/releases/latest\" target=\"_blank\" rel=\"noopener noreferrer\""
+        ));
+        assert!(html.contains(
+            "href=\"https://github.com/wiresock/proxifyre/blob/main/docs/gui.md\" target=\"_blank\" rel=\"noopener noreferrer\""
+        ));
         assert!(html.contains("<dt>Server</dt><dd><code>proxy.example.com</code>"));
         assert!(html.contains("<dt>Port</dt><dd>443</dd>"));
-        assert!(html.contains("<dt>TLS</dt><dd>enabled</dd>"));
-        assert!(html.contains("<dt>UDP</dt><dd>enabled</dd>"));
-        assert!(html.contains("ProxiFyre 2.4.0 or later"));
+        assert!(html.contains("<dt>Transport</dt><dd>TLS</dd>"));
+        assert!(html.contains("<dt>Certificate validation</dt><dd>enabled"));
+        assert!(html.contains("<dt>Allow invalid certificate</dt><dd>disabled</dd>"));
+        assert!(html.contains("<dt>Certificate pin</dt><dd>not required"));
+        assert!(html.contains("<dt>Protocols</dt><dd>TCP and UDP</dd>"));
+        assert!(html.contains("<dt>Destination address family</dt><dd>IPv4</dd>"));
+        assert!(html.contains("Select <strong>TCP</strong> and <strong>UDP</strong>"));
+        assert!(html.contains("<strong>Validate</strong>"));
+        assert!(html.contains("<strong>Apply &amp; Restart</strong>"));
+        assert!(html.contains("header reports <strong>Running</strong>"));
+        assert!(html.contains("<strong>Logs</strong> tab"));
+        let gui = html.find("Configure ProxiFyre 2.5+").unwrap();
+        let details = html.find("<details id=\"proxifyre-manual\">").unwrap();
+        let manual = html
+            .find("<summary>Advanced/manual app-config.json</summary>")
+            .unwrap();
+        let manual_end = html[manual..].find("</details>").unwrap() + manual;
+        let json = html
+            .find("&quot;socks5Transport&quot;: &quot;TLS&quot;")
+            .unwrap();
+        assert!(gui < details && details < manual && manual < json && json < manual_end);
+        assert!(!html[details..manual].contains(" open"));
+        assert!(!html[..manual].contains("&quot;socks5Transport&quot;"));
         assert!(html.contains("&quot;socks5Transport&quot;: &quot;TLS&quot;"));
         assert!(html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;, &quot;UDP&quot;]"));
         assert!(html.contains("&quot;supportedAddressFamilies&quot;: [&quot;IPv4&quot;]"));
         assert!(html.contains("&quot;tlsAllowInvalidCertificate&quot;: false"));
+        assert!(!html.contains("&quot;tlsAllowInvalidCertificate&quot;: true"));
+        assert!(html.contains("REPLACE_WITH_USER_ADD_PASSWORD"));
+        assert!(!html.contains(r#"name="password""#));
         assert!(html.contains("not a full IP-level VPN"));
         assert!(html.contains("alighieri.conf.bak"));
         assert!(!html.contains("ACME staging is enabled"));
@@ -6077,14 +6153,19 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("will not be trusted by normal clients"));
         assert!(html.contains("will connect only after you switch to a production certificate"));
         assert!(html.contains("Do not disable certificate validation"));
-        assert!(html.contains("<dt>UDP</dt><dd>disabled</dd>"));
+        assert!(html.contains("<dt>Protocols</dt><dd>TCP only</dd>"));
+        assert!(html.contains("Select <strong>TCP</strong> only"));
+        assert!(!html.contains("Select <strong>TCP</strong> and <strong>UDP</strong>"));
         assert!(html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;]"));
         assert!(
             !html.contains("&quot;supportedProtocols&quot;: [&quot;TCP&quot;, &quot;UDP&quot;]")
         );
         assert!(!html.contains("inbound UDP"));
         assert!(!html.contains(PUBLIC_UDP_RANGE));
-        assert!(!html.contains("<dt>Username</dt>"));
+        assert!(html.contains(
+            "<dt>Username</dt><dd><code>USERNAME</code> (replace with the username used in"
+        ));
+        assert!(!html.contains("&quot;tlsAllowInvalidCertificate&quot;: true"));
     }
 
     #[test]
@@ -6122,6 +6203,21 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let markup_html = render_success(&write_report(), &markup, &completion_context());
         assert!(!markup_html.contains("<img src=x"));
         assert!(markup_html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+    }
+
+    #[test]
+    fn public_success_page_escapes_proxifyre_domain_and_username() {
+        let mut form = public_tls_form();
+        form.public_domain = Some("<script>alert(1)</script>.example.com".into());
+        form.initial_username = Some("<b>proxyuser</b>".into());
+
+        let html = render_success(&write_report(), &form, &completion_context());
+
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<b>proxyuser</b>"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;.example.com"));
+        assert!(html.contains("&lt;b&gt;proxyuser&lt;/b&gt;"));
+        assert!(html.contains("REPLACE_WITH_USER_ADD_PASSWORD"));
     }
 
     #[test]
