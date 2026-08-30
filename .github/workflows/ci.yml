@@ -41,12 +41,11 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy (all targets, warnings denied)
         run: cargo clippy --all-targets --locked -- -D warnings
-      # The plugin SDK is behind an off-by-default `plugins` feature, so the
-      # default steps never compile it. Lint and test it explicitly on both
-      # platforms so the feature-gated module and its core call sites cannot
-      # bitrot. The default steps stay too, proving the stock build is unchanged.
-      - name: Clippy (plugins feature, warnings denied)
-        run: cargo clippy --all-targets --locked --features plugins -- -D warnings
+      # The plugin SDK and Linux installer companion are both off by default.
+      # Exercise all features on both platforms so the companion's non-Linux
+      # fail-closed stub and every feature-gated module stay buildable.
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --locked --all-features -- -D warnings
       - name: Test (lib, bins, integration, examples)
         run: cargo test --all-targets --locked
         env:
@@ -55,10 +54,22 @@ jobs:
           # apply the DACL could report green while never verifying it. Empty on
           # Linux (the tests are Windows-only), where it has no effect.
           ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
-      - name: Test (plugins feature)
-        run: cargo test --all-targets --locked --features plugins
+      - name: Test (all features)
+        run: cargo test --all-targets --locked --all-features
         env:
           ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
+      - name: Build installer filesystem companion for contract tests
+        if: runner.os == 'Linux'
+        run: cargo build --locked --features installer-fs --bin alighieri-installer-fs
+      - name: Test installer and companion contract
+        if: runner.os == 'Linux'
+        run: bash scripts/alighieri.sh __selftest
+        env:
+          # Test-only override: production resolves the version-matched helper
+          # from the source checkout or extracted Linux release archive.
+          ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN: target/debug/alighieri-installer-fs
+      - name: Cargo run selects the service binary
+        run: cargo run --locked -- --version
       - name: Doctests
         run: cargo test --doc --locked
 
@@ -75,8 +86,10 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             linker: gcc-aarch64-linux-gnu
+            features: --features installer-fs
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+            features: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -97,7 +110,7 @@ jobs:
             echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
           } >> "$GITHUB_ENV"
       - name: Cross-compile (release, build-only)
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
 
   # Formatting is platform-independent, so check it once.
   rustfmt:
@@ -142,10 +155,10 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build all targets on the MSRV toolchain
         run: cargo build --all-targets --locked
-      # Verify the feature-gated plugin SDK (and its extra dependency,
-      # async-trait) also builds on the MSRV toolchain.
-      - name: Build with the plugins feature on the MSRV toolchain
-        run: cargo build --all-targets --locked --features plugins
+      # Verify every non-default target, including the Linux installer
+      # companion, also builds on the MSRV toolchain.
+      - name: Build with all features on the MSRV toolchain
+        run: cargo build --all-targets --locked --all-features
 
   # Exercise the exact source archive that crates.io will receive. This catches
   # allowlist mistakes, missing docs/examples, and dependencies on repository
@@ -175,6 +188,8 @@ jobs:
             Cargo.lock
             src/lib.rs
             src/main.rs
+            src/bin/alighieri-installer-fs.rs
+            src/platform/linux.rs
             README.md
             CHANGELOG.md
             LICENSE
@@ -234,6 +249,7 @@ jobs:
           "$install_root/bin/alighieri" --version
           "$install_root/bin/alighieri" --help
           "$install_root/bin/alighieri" --check "$CRATE_DIR/doc/alighieri.conf"
+          test ! -e "$install_root/bin/alighieri-installer-fs"
 
   # There is no registry baseline until the manual 0.4.0 publication. Probe for
   # that exact version so this job is harmless before the first release and

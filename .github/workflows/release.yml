@@ -106,13 +106,17 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: --features installer-fs
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             linker: gcc-aarch64-linux-gnu
+            features: --features installer-fs
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: ''
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+            features: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -131,8 +135,8 @@ jobs:
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
             echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
           } >> "$GITHUB_ENV"
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Package (Linux)
         if: runner.os != 'Windows'
@@ -140,6 +144,9 @@ jobs:
           dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$dir/scripts" "$dir/doc/templates"
           install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
+          install -m 755 \
+            "target/${{ matrix.target }}/release/alighieri-installer-fs" \
+            "$dir/alighieri-installer-fs"
           install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
           install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
           install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
@@ -148,10 +155,12 @@ jobs:
             doc/templates/public-tls-proxifyre.conf \
             "$dir/doc/templates/public-tls-proxifyre.conf"
           install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
+          test -x "$dir/alighieri-installer-fs"
           test -x "$dir/scripts/alighieri.sh"
           test -f "$dir/doc/alighieri.conf"
           tar czf "$dir.tar.gz" "$dir"
           archive_contents="$(tar tzf "$dir.tar.gz")"
+          grep -Fqx "$dir/alighieri-installer-fs" <<< "$archive_contents"
           grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
           grep -Fqx "$dir/doc/management-cli.md" <<< "$archive_contents"
           grep -Fqx \
@@ -181,6 +190,15 @@ jobs:
           foreach ($path in $expectedArchiveFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
               throw "Required release archive file is missing: $path"
+            }
+          }
+          $unexpectedHelperPaths = @(
+            (Join-Path $archiveCheckDir "$dir/alighieri-installer-fs"),
+            (Join-Path $archiveCheckDir "$dir/alighieri-installer-fs.exe")
+          )
+          foreach ($path in $unexpectedHelperPaths) {
+            if (Test-Path -LiteralPath $path) {
+              throw "Linux-only installer companion is present in Windows archive: $path"
             }
           }
           "ASSET=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append

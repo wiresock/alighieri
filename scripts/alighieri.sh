@@ -26,6 +26,8 @@
 set -euo pipefail
 
 SERVICE_NAME="alighieri"
+INSTALLER_FS_HELPER_NAME="alighieri-installer-fs"
+INSTALLER_FS_HELPER_PROTOCOL="alighieri-installer-fs-v1"
 SERVICE_USER="alighieri"
 CONFIG_DIR="/etc/alighieri"
 LOG_DIR="/var/log/alighieri"
@@ -40,6 +42,7 @@ PREFIX="/usr/local"
 PREFIX_EXPLICIT=0
 BINARY=""
 BINARY_EXPLICIT=0
+INSTALLER_FS_HELPER_SOURCE=""
 INSTALL_CONFIG=""
 CONFIG_EXPLICIT=0
 RESTART_ON_UPGRADE=1
@@ -51,14 +54,20 @@ PURGE_USER=0
 ACTION="auto"
 COMMAND_SEEN=0
 STAGED_BIN=""
+STAGED_FS_HELPER=""
 STAGED_UNIT=""
+UNIT_CANDIDATE_GUARD=""
 UNIT_CANDIDATE_SNAPSHOT=""
+UNIT_CANDIDATE_WITNESS=""
 UNIT_BACKUP=""
 UNIT_TRANSACTION_DIR=""
 UNIT_RETAINED_BACKUP=""
 UNIT_TRANSACTION_ACTIVE=0
 UNIT_HAD_ORIGINAL=0
 UNIT_TRANSACTION_USES_STAGED_LINK=0
+UNIT_TRANSACTION_EXCHANGE_V1=0
+UNIT_CANDIDATE_PUBLISHED=0
+UNIT_REJECTED=""
 UNIT_ROLLBACK_CONFLICT_COPY=""
 UNIT_ROLLBACK_RELOAD_FAILED=0
 BINARY_COMMIT_IN_PROGRESS=0
@@ -333,6 +342,11 @@ release_lifecycle_lock() {
 
 prepare_mutating_lifecycle_command() {
     acquire_lifecycle_lock
+    if [ -e "${UNIT_FILE}.migration" ] || [ -L "${UNIT_FILE}.migration" ]; then
+        resolve_installer_fs_helper_source
+        stage_installer_fs_helper "/run/${SERVICE_NAME}" ||
+            die "could not stage the privileged installer companion for transaction recovery"
+    fi
     recover_interrupted_legacy_unit_transaction
 }
 
@@ -1018,15 +1032,29 @@ select_install_config_path() {
 install_file_command() { command install "$@"; }
 copy_file_command() { command cp "$@"; }
 move_file_command() { command mv "$@"; }
-link_file_command() { command link "$@"; }
+link_file_command() {
+    [ -n "$STAGED_FS_HELPER" ] || return 127
+    "$STAGED_FS_HELPER" hard-link "$1" "$2"
+}
+exchange_file_command() {
+    [ -n "$STAGED_FS_HELPER" ] || return 127
+    "$STAGED_FS_HELPER" exchange "$1" "$2"
+}
+rename_noreplace_file_command() {
+    [ -n "$STAGED_FS_HELPER" ] || return 127
+    "$STAGED_FS_HELPER" rename-noreplace "$1" "$2"
+}
 
 hardlink_utility_available() {
-    command -v link >/dev/null 2>&1
+    [ -n "$STAGED_FS_HELPER" ] &&
+        [ -f "$STAGED_FS_HELPER" ] && [ ! -L "$STAGED_FS_HELPER" ] &&
+        [ "$("$STAGED_FS_HELPER" protocol-version 2>/dev/null)" = \
+            "$INSTALLER_FS_HELPER_PROTOCOL" ]
 }
 
 require_hardlink_utility() {
     hardlink_utility_available ||
-        die "legacy-unit migration requires the coreutils-compatible 'link' utility; install it before retrying"
+        die "legacy-unit migration requires its current privileged filesystem companion"
 }
 
 stage_executable_copy() {
@@ -1035,6 +1063,35 @@ stage_executable_copy() {
     [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
     install_file_command -m 755 -- "$source" "$destination" || return 1
     [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+}
+
+# The filesystem companion is sourced only from this checkout or its matching
+# release archive. Stage it in a root-controlled directory with no access for
+# non-root users, and prove its script/CLI protocol before any unit pathname is
+# mutated. Cleanup retains it until journal recovery or rollback is complete.
+stage_installer_fs_helper() {
+    local destination_base="$1" metadata protocol destination_parent
+    if [ -n "$STAGED_FS_HELPER" ]; then
+        hardlink_utility_available
+        return
+    fi
+    if [ -z "$INSTALLER_FS_HELPER_SOURCE" ] ||
+        [ ! -f "$INSTALLER_FS_HELPER_SOURCE" ] ||
+        [ -L "$INSTALLER_FS_HELPER_SOURCE" ]; then
+        return 1
+    fi
+    destination_parent="$(dirname -- "$destination_base")" || return 1
+    require_safe_binary_directory "$destination_parent"
+    STAGED_FS_HELPER="${destination_base}.installer-fs.$$"
+    [ ! -e "$STAGED_FS_HELPER" ] && [ ! -L "$STAGED_FS_HELPER" ] || return 1
+    install_file_command -o root -g root -m 700 -- \
+        "$INSTALLER_FS_HELPER_SOURCE" "$STAGED_FS_HELPER" || return 1
+    [ -f "$STAGED_FS_HELPER" ] && [ ! -L "$STAGED_FS_HELPER" ] || return 1
+    metadata="$(command stat -L -c '%u %g %a' -- "$STAGED_FS_HELPER" 2>/dev/null)" ||
+        return 1
+    [ "$metadata" = "0 0 700" ] || return 1
+    protocol="$("$STAGED_FS_HELPER" protocol-version 2>/dev/null)" || return 1
+    [ "$protocol" = "$INSTALLER_FS_HELPER_PROTOCOL" ]
 }
 
 copy_regular_file_to_absent_path() {
@@ -1057,6 +1114,47 @@ link_regular_file_to_absent_path() {
     [ -f "$source" ] && [ ! -L "$source" ] &&
         [ -f "$destination" ] && [ ! -L "$destination" ] &&
         [ "$source" -ef "$destination" ]
+}
+
+# Exchange two exact sibling entries in one renameat2(RENAME_EXCHANGE). The
+# entry that was live at the syscall boundary remains recoverable at SOURCE.
+exchange_regular_files_atomically() {
+    local source="$1" destination="$2"
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [ -f "$destination" ] && [ ! -L "$destination" ] || return 1
+    exchange_file_command "$source" "$destination" || return 1
+    [ -f "$source" ] && [ ! -L "$source" ] &&
+        [ -f "$destination" ] && [ ! -L "$destination" ]
+}
+
+# Rollback can encounter an operator-created symlink, directory, or special file
+# at the live name. The companion exchanges the allowlisted directory entries
+# themselves without following either object.
+exchange_transaction_entries_atomically() {
+    local source="$1" destination="$2"
+    { [ -e "$source" ] || [ -L "$source" ]; } &&
+        { [ -e "$destination" ] || [ -L "$destination" ]; } || return 1
+    exchange_file_command "$source" "$destination" || return 1
+    { [ -e "$source" ] || [ -L "$source" ]; } &&
+        { [ -e "$destination" ] || [ -L "$destination" ]; }
+}
+
+detach_regular_file_to_absent_path() {
+    local source="$1" destination="$2"
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+    rename_noreplace_file_command "$source" "$destination" || return 1
+    [ ! -e "$source" ] && [ ! -L "$source" ] &&
+        [ -f "$destination" ] && [ ! -L "$destination" ]
+}
+
+restore_transaction_entry_to_absent_path() {
+    local source="$1" destination="$2"
+    { [ -e "$source" ] || [ -L "$source" ]; } || return 1
+    [ ! -e "$destination" ] && [ ! -L "$destination" ] || return 1
+    rename_noreplace_file_command "$source" "$destination" || return 1
+    [ ! -e "$source" ] && [ ! -L "$source" ] &&
+        { [ -e "$destination" ] || [ -L "$destination" ]; }
 }
 
 binary_directory_metadata_is_safe() {
@@ -1373,6 +1471,170 @@ regular_files_match_for_rollback() {
     [ "$left_metadata" = "$right_metadata" ]
 }
 
+unit_transaction_file_matches_snapshot() {
+    regular_files_match_for_rollback "$1" "$2"
+}
+
+unit_transaction_candidate_is_current() {
+    local path="$1" guard="${UNIT_CANDIDATE_GUARD:-$UNIT_CANDIDATE_SNAPSHOT}"
+    [ -n "$UNIT_CANDIDATE_WITNESS" ] &&
+        [ -f "$UNIT_CANDIDATE_WITNESS" ] && [ ! -L "$UNIT_CANDIDATE_WITNESS" ] ||
+        return 1
+    [ -f "$path" ] && [ ! -L "$path" ] &&
+        [ "$path" -ef "$UNIT_CANDIDATE_WITNESS" ] || return 1
+    [ -n "$guard" ] && unit_transaction_file_matches_snapshot "$path" "$guard"
+}
+
+unit_transaction_previous_is_current() {
+    [ "$UNIT_HAD_ORIGINAL" -eq 1 ] || return 0
+    [ -n "$STAGED_UNIT" ] || return 1
+    # Before the independent snapshot is written, the exchanged-out exact entry
+    # itself is still sufficient for rollback. No binary commit is allowed until
+    # begin_unit_transaction has created and verified UNIT_BACKUP.
+    if [ -z "$UNIT_BACKUP" ]; then
+        [ -e "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]
+        return
+    fi
+    unit_transaction_file_matches_snapshot "$STAGED_UNIT" "$UNIT_BACKUP"
+}
+
+remove_unit_candidate_artifacts() {
+    local artifact
+    for artifact in "$UNIT_CANDIDATE_GUARD" "$UNIT_CANDIDATE_WITNESS" "$UNIT_REJECTED"; do
+        [ -n "$artifact" ] || continue
+        command rm -f -- "$artifact" 2>/dev/null || true
+    done
+    UNIT_CANDIDATE_GUARD=""
+    UNIT_CANDIDATE_WITNESS=""
+    UNIT_REJECTED=""
+}
+
+reload_after_unit_transaction() {
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        warn "could not reload systemd after the unit transaction; PID 1 may retain the rejected candidate (run: systemctl daemon-reload)"
+    fi
+}
+
+finish_clean_flat_unit_rollback() {
+    UNIT_TRANSACTION_ACTIVE=0
+    UNIT_HAD_ORIGINAL=0
+    UNIT_CANDIDATE_PUBLISHED=0
+    if [ -n "$UNIT_BACKUP" ]; then
+        command rm -f -- "$UNIT_BACKUP" 2>/dev/null ||
+            warn "could not remove obsolete unit backup $UNIT_BACKUP"
+    fi
+    UNIT_BACKUP=""
+    if [ -n "$STAGED_UNIT" ]; then
+        command rm -f -- "$STAGED_UNIT" 2>/dev/null || true
+        STAGED_UNIT=""
+    fi
+    remove_unit_candidate_artifacts
+    reload_after_unit_transaction
+}
+
+leave_flat_unit_transaction_for_manual_recovery() {
+    local reason="$1" recovery=""
+    UNIT_TRANSACTION_ACTIVE=0
+    UNIT_HAD_ORIGINAL=0
+    UNIT_CANDIDATE_PUBLISHED=0
+    if [ -n "$UNIT_BACKUP" ] &&
+        { [ -e "$UNIT_BACKUP" ] || [ -L "$UNIT_BACKUP" ]; }; then
+        recovery="; previous-unit snapshot retained at $UNIT_BACKUP"
+    fi
+    if [ -n "$UNIT_REJECTED" ] &&
+        { [ -e "$UNIT_REJECTED" ] || [ -L "$UNIT_REJECTED" ]; }; then
+        recovery="$recovery; exchanged unit retained at $UNIT_REJECTED"
+        UNIT_REJECTED=""
+    fi
+    if [ -n "$STAGED_UNIT" ] &&
+        { [ -e "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; } &&
+        ! unit_transaction_candidate_is_current "$STAGED_UNIT"; then
+        recovery="$recovery; exchanged-out unit retained at $STAGED_UNIT"
+        STAGED_UNIT=""
+    fi
+    remove_unit_candidate_artifacts
+    warn "$reason$recovery; inspect the unit paths before starting the service"
+    reload_after_unit_transaction
+}
+
+rollback_existing_flat_unit_transaction() {
+    # Candidate still staged means publication did not occur (or rollback did).
+    if unit_transaction_candidate_is_current "$STAGED_UNIT"; then
+        finish_clean_flat_unit_rollback
+        return 0
+    fi
+    if ! unit_transaction_candidate_is_current "$UNIT_FILE"; then
+        leave_flat_unit_transaction_for_manual_recovery \
+            "systemd unit changed concurrently; preserving the current $UNIT_FILE"
+        return 0
+    fi
+    if [ -z "$STAGED_UNIT" ] ||
+        { [ ! -e "$STAGED_UNIT" ] && [ ! -L "$STAGED_UNIT" ]; }; then
+        leave_flat_unit_transaction_for_manual_recovery \
+            "exchanged-out systemd unit is unavailable; refusing an unsafe rollback"
+        return 0
+    fi
+
+    exchange_transaction_entries_atomically "$STAGED_UNIT" "$UNIT_FILE" || true
+    if unit_transaction_candidate_is_current "$STAGED_UNIT"; then
+        if [ -z "$UNIT_BACKUP" ] ||
+            unit_transaction_file_matches_snapshot "$UNIT_FILE" "$UNIT_BACKUP"; then
+            finish_clean_flat_unit_rollback
+        else
+            leave_flat_unit_transaction_for_manual_recovery \
+                "a changed systemd unit was restored by atomic rollback; preserving it"
+        fi
+        return 0
+    fi
+
+    # A writer can replace live after the candidate check and before exchange.
+    # In that orientation the operation captured the writer at STAGED_UNIT and
+    # put our previous unit live. Exchange back when that orientation is proven.
+    if { [ -z "$UNIT_BACKUP" ] ||
+            unit_transaction_file_matches_snapshot "$UNIT_FILE" "$UNIT_BACKUP"; } &&
+        { [ -e "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; }; then
+        exchange_transaction_entries_atomically "$STAGED_UNIT" "$UNIT_FILE" || true
+    fi
+    leave_flat_unit_transaction_for_manual_recovery \
+        "systemd unit changed during atomic rollback; all recovery entries were retained"
+}
+
+rollback_fresh_flat_unit_transaction() {
+    if [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
+        if ! unit_transaction_candidate_is_current "$UNIT_FILE"; then
+            leave_flat_unit_transaction_for_manual_recovery \
+                "systemd unit changed concurrently; preserving the current $UNIT_FILE"
+            return 0
+        fi
+        if [ -z "$UNIT_REJECTED" ] ||
+            [ -e "$UNIT_REJECTED" ] || [ -L "$UNIT_REJECTED" ]; then
+            leave_flat_unit_transaction_for_manual_recovery \
+                "rejected-unit recovery path is occupied; refusing an unsafe rollback"
+            return 0
+        fi
+        detach_regular_file_to_absent_path "$UNIT_FILE" "$UNIT_REJECTED" || true
+        if unit_transaction_candidate_is_current "$UNIT_REJECTED" &&
+            [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ]; then
+            finish_clean_flat_unit_rollback
+            return 0
+        fi
+        if { [ -e "$UNIT_REJECTED" ] || [ -L "$UNIT_REJECTED" ]; } &&
+            { [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ]; }; then
+            restore_transaction_entry_to_absent_path \
+                "$UNIT_REJECTED" "$UNIT_FILE" || true
+        fi
+        leave_flat_unit_transaction_for_manual_recovery \
+            "systemd unit changed during fresh-install rollback; preserving the concurrent replacement"
+        return 0
+    fi
+    if [ "$UNIT_CANDIDATE_PUBLISHED" -eq 1 ]; then
+        leave_flat_unit_transaction_for_manual_recovery \
+            "systemd unit was removed concurrently; preserving the current absence of $UNIT_FILE"
+    else
+        finish_clean_flat_unit_rollback
+    fi
+}
+
 remove_retained_backup_if_expected() {
     local expected="$1"
     [ -n "$UNIT_RETAINED_BACKUP" ] || return 0
@@ -1518,7 +1780,8 @@ rollback_linked_unit_transaction() {
         UNIT_ROLLBACK_CONFLICT_COPY="$rollback_live"
         return 1
     fi
-    if ! replace_file_atomically "$UNIT_FILE" "$rollback_live" 2>/dev/null; then
+    if ! detach_regular_file_to_absent_path \
+        "$UNIT_FILE" "$rollback_live" 2>/dev/null; then
         if [ -e "$rollback_live" ] || [ -L "$rollback_live" ]; then
             UNIT_ROLLBACK_CONFLICT_COPY="$rollback_live"
         fi
@@ -1528,11 +1791,148 @@ rollback_linked_unit_transaction() {
     rollback_linked_unit_transaction
 }
 
+remove_exchange_v1_journal_after_rollback() {
+    local artifact cleanup_ok=1 \
+        rollback_marker="${UNIT_TRANSACTION_DIR}/exchange-v1-rolled-back"
+    # Persist the completed rollback before deleting anything required to
+    # interpret exchange-v1. If cleanup is interrupted, startup recovery can
+    # finish removing the journal without attempting another exchange.
+    create_unit_commit_marker "$rollback_marker" || {
+        warn "could not mark the completed exchange rollback at $rollback_marker"
+        return 1
+    }
+    remove_retained_backup_if_expected "$UNIT_FILE"
+    for artifact in "$STAGED_UNIT" "$UNIT_CANDIDATE_WITNESS" \
+        "$UNIT_CANDIDATE_SNAPSHOT" "$UNIT_BACKUP" \
+        "${UNIT_TRANSACTION_DIR}/previous.staged" \
+        "${UNIT_TRANSACTION_DIR}/exchange-v1" \
+        "${UNIT_TRANSACTION_DIR}/committed" \
+        "${UNIT_TRANSACTION_DIR}/binary-commit-intent" \
+        "${UNIT_TRANSACTION_DIR}/binary-commit-intent.staged" \
+        "${UNIT_TRANSACTION_DIR}/binary-rollback" \
+        "${UNIT_TRANSACTION_DIR}/binary-rollback-untrusted"; do
+        [ -n "$artifact" ] || continue
+        if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+            if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
+                warn "preserved unsafe exchange journal artifact $artifact"
+                cleanup_ok=0
+            elif ! command rm -f -- "$artifact" 2>/dev/null; then
+                warn "could not remove exchange journal artifact $artifact"
+                cleanup_ok=0
+            fi
+        fi
+    done
+    if [ "$cleanup_ok" -eq 1 ]; then
+        command rm -f -- "$rollback_marker" 2>/dev/null || cleanup_ok=0
+    fi
+    if [ "$cleanup_ok" -eq 1 ]; then
+        command rmdir -- "$UNIT_TRANSACTION_DIR" 2>/dev/null || cleanup_ok=0
+    fi
+    [ "$cleanup_ok" -eq 1 ]
+}
+
+# Roll back the durable exchange-v1 journal. Candidate orientation is inferred
+# from its inode witness, so a signal after renameat2 but before the shell sees
+# success is indistinguishable from an ordinary successful exchange. A writer
+# racing the rollback is exchanged back and preserved at the live pathname.
+rollback_exchange_v1_unit_transaction() {
+    if unit_transaction_candidate_is_current "$STAGED_UNIT"; then
+        # Exchange never occurred, or a previous recovery already completed it.
+        :
+    elif unit_transaction_candidate_is_current "$UNIT_FILE"; then
+        if [ -z "$STAGED_UNIT" ] ||
+            { [ ! -e "$STAGED_UNIT" ] && [ ! -L "$STAGED_UNIT" ]; }; then
+            return 1
+        fi
+        exchange_transaction_entries_atomically "$STAGED_UNIT" "$UNIT_FILE" || true
+        if ! unit_transaction_candidate_is_current "$STAGED_UNIT"; then
+            # The live pathname changed after our orientation check. Undo this
+            # exchange while both exact entries remain named, then stop.
+            if { [ -e "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; } &&
+                { [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; }; then
+                exchange_transaction_entries_atomically \
+                    "$STAGED_UNIT" "$UNIT_FILE" || true
+            fi
+            return 2
+        fi
+    else
+        return 2
+    fi
+
+    if [ ! -f "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
+        # A non-regular entry can win the live pathname immediately before the
+        # original publication exchange. The rollback exchange above restores
+        # that exact operator entry to live; never exchange the candidate back
+        # over it while preserving the journal for manual inspection.
+        return 2
+    fi
+    if [ -n "$UNIT_BACKUP" ] &&
+        { [ -e "$UNIT_BACKUP" ] || [ -L "$UNIT_BACKUP" ]; } &&
+        ! unit_transaction_file_matches_snapshot "$UNIT_FILE" "$UNIT_BACKUP"; then
+        # A root writer replaced live after rollback. Never delete the retained
+        # exact old inode or the independent snapshot in this orientation.
+        return 2
+    fi
+    return 0
+}
+
 # Restore the previous base unit while an install validation transaction is
 # active. This is intentionally best-effort and safe under the EXIT trap: leave
 # the backup in place if restoration itself fails so an operator can recover it.
 rollback_unit_transaction() {
     [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+
+    if [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 0 ]; then
+        if [ "$UNIT_HAD_ORIGINAL" -eq 1 ]; then
+            rollback_existing_flat_unit_transaction
+        else
+            rollback_fresh_flat_unit_transaction
+        fi
+        return 0
+    fi
+
+    if [ "$UNIT_TRANSACTION_EXCHANGE_V1" -eq 1 ]; then
+        local exchange_result=0
+        rollback_exchange_v1_unit_transaction || exchange_result=$?
+        # Any attempted orientation change must be reflected in PID 1 before
+        # journal cleanup or diagnostics.
+        if ! systemctl daemon-reload >/dev/null 2>&1; then
+            UNIT_ROLLBACK_RELOAD_FAILED=1
+            warn "daemon-reload failed after the exchange-v1 rollback attempt; preserving the migration journal"
+            exchange_result=1
+        fi
+        if [ "$exchange_result" -eq 0 ]; then
+            if remove_exchange_v1_journal_after_rollback; then
+                UNIT_TRANSACTION_ACTIVE=0
+                UNIT_HAD_ORIGINAL=0
+                UNIT_TRANSACTION_USES_STAGED_LINK=0
+                UNIT_TRANSACTION_EXCHANGE_V1=0
+                UNIT_CANDIDATE_PUBLISHED=0
+                STAGED_UNIT=""
+                UNIT_CANDIDATE_WITNESS=""
+                UNIT_CANDIDATE_SNAPSHOT=""
+                UNIT_BACKUP=""
+                UNIT_TRANSACTION_DIR=""
+                UNIT_RETAINED_BACKUP=""
+                return 0
+            fi
+            exchange_result=1
+        fi
+        UNIT_TRANSACTION_ACTIVE=0
+        UNIT_HAD_ORIGINAL=0
+        UNIT_TRANSACTION_USES_STAGED_LINK=0
+        UNIT_TRANSACTION_EXCHANGE_V1=0
+        warn "could not safely roll back the exchange-v1 unit migration; preserved $UNIT_TRANSACTION_DIR for manual recovery"
+        # Clear in-memory cleanup handles so the EXIT trap cannot remove the
+        # durable evidence after this path deliberately gives up.
+        STAGED_UNIT=""
+        UNIT_CANDIDATE_WITNESS=""
+        UNIT_CANDIDATE_SNAPSHOT=""
+        UNIT_BACKUP=""
+        UNIT_TRANSACTION_DIR=""
+        UNIT_RETAINED_BACKUP=""
+        return 0
+    fi
 
     local restored=0 conflict=0 rollback_result=0 \
           linked_transaction="$UNIT_TRANSACTION_USES_STAGED_LINK"
@@ -1597,38 +1997,93 @@ rollback_unit_transaction() {
 }
 
 begin_unit_transaction() {
-    if [ -z "$STAGED_UNIT" ] || [ ! -f "$STAGED_UNIT" ]; then
-        die "staged systemd unit is missing; refusing to modify $UNIT_FILE"
+    local unit_artifact exchange_succeeded=0
+    if [ -z "$STAGED_UNIT" ] || [ ! -f "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; then
+        die "staged systemd unit is missing or unsafe; refusing to modify $UNIT_FILE"
     fi
+    require_hardlink_utility
+    command -v cmp >/dev/null 2>&1 ||
+        die "cmp is required to guard the staged systemd unit"
 
     UNIT_BACKUP="${UNIT_FILE}.previous.$$"
+    UNIT_CANDIDATE_GUARD="${STAGED_UNIT}.guard"
+    UNIT_CANDIDATE_WITNESS="${STAGED_UNIT}.candidate"
+    UNIT_REJECTED="${UNIT_FILE}.rejected.$$"
     UNIT_HAD_ORIGINAL=0
     UNIT_TRANSACTION_USES_STAGED_LINK=0
+    UNIT_TRANSACTION_EXCHANGE_V1=0
+    UNIT_CANDIDATE_PUBLISHED=0
     UNIT_CANDIDATE_SNAPSHOT=""
     UNIT_TRANSACTION_DIR=""
     UNIT_RETAINED_BACKUP=""
+    for unit_artifact in "$UNIT_BACKUP" "$UNIT_CANDIDATE_GUARD" \
+        "$UNIT_CANDIDATE_WITNESS" "$UNIT_REJECTED"; do
+        if [ -e "$unit_artifact" ] || [ -L "$unit_artifact" ]; then
+            UNIT_BACKUP="" UNIT_CANDIDATE_GUARD=""
+            UNIT_CANDIDATE_WITNESS="" UNIT_REJECTED=""
+            die "temporary unit transaction path already exists: $unit_artifact"
+        fi
+    done
+    copy_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_CANDIDATE_GUARD" ||
+        die "could not create an independent guard for the staged systemd unit"
+    link_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_CANDIDATE_WITNESS" ||
+        die "could not create an inode witness for the staged systemd unit"
+
     if [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
         if [ ! -f "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
             die "systemd unit path $UNIT_FILE is not a regular file; refusing to replace it"
         fi
-        if [ -e "$UNIT_BACKUP" ] || [ -L "$UNIT_BACKUP" ]; then
-            die "temporary unit backup path already exists: $UNIT_BACKUP"
-        fi
-        copy_regular_file_to_absent_path "$UNIT_FILE" "$UNIT_BACKUP" ||
-            die "could not preserve the existing systemd unit at $UNIT_BACKUP"
         UNIT_HAD_ORIGINAL=1
-    else
-        UNIT_BACKUP=""
+        UNIT_TRANSACTION_ACTIVE=1
+        if exchange_regular_files_atomically "$STAGED_UNIT" "$UNIT_FILE"; then
+            exchange_succeeded=1
+        fi
+        if unit_transaction_candidate_is_current "$UNIT_FILE"; then
+            exchange_succeeded=1
+        fi
+        # Snapshot only the entry captured by the exchange. This avoids reading
+        # through a raced live symlink/FIFO before the kernel operation.
+        if unit_transaction_candidate_is_current "$UNIT_FILE" &&
+            { [ -e "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; } &&
+            [ -f "$STAGED_UNIT" ] && [ ! -L "$STAGED_UNIT" ] &&
+            copy_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_BACKUP" &&
+            unit_transaction_previous_is_current; then
+            UNIT_CANDIDATE_PUBLISHED=1
+            return 0
+        fi
+        rollback_unit_transaction
+        if [ "$exchange_succeeded" -eq 1 ]; then
+            die "systemd unit changed during atomic publication; no binary was replaced and the concurrent unit was preserved"
+        fi
+        die "atomic systemd unit exchange is unavailable or failed; no binary was replaced"
     fi
 
-    # Set the guard before the atomic replacement so cleanup also handles an
-    # interrupted/failed move. The old unit remains recoverable in UNIT_BACKUP.
+    UNIT_BACKUP=""
     UNIT_TRANSACTION_ACTIVE=1
-    if ! replace_file_atomically "$STAGED_UNIT" "$UNIT_FILE"; then
-        rollback_unit_transaction
-        die "could not stage the new systemd unit at $UNIT_FILE"
+    detach_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_FILE" || true
+    if unit_transaction_candidate_is_current "$UNIT_FILE" &&
+        [ ! -e "$STAGED_UNIT" ] && [ ! -L "$STAGED_UNIT" ]; then
+        UNIT_CANDIDATE_PUBLISHED=1
+        return 0
     fi
-    STAGED_UNIT=""
+    rollback_unit_transaction
+    die "could not publish the staged systemd unit with an atomic no-replace rename; no binary was replaced"
+}
+
+require_unit_transaction_candidate_current() {
+    [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+    if [ "$UNIT_TRANSACTION_EXCHANGE_V1" -eq 1 ]; then
+        unit_transaction_candidate_is_current "$UNIT_FILE" ||
+            die "systemd unit changed concurrently during validation; no binary was replaced and the service was not restarted"
+        if [ ! -f "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; then
+            die "the exchanged-out systemd unit changed during validation; no binary was replaced and the service was not restarted"
+        fi
+    elif [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 0 ]; then
+        unit_transaction_candidate_is_current "$UNIT_FILE" ||
+            die "systemd unit changed concurrently during validation; no binary was replaced and the service was not restarted"
+        unit_transaction_previous_is_current ||
+            die "the exchanged-out systemd unit changed during validation; no binary was replaced and the service was not restarted"
+    fi
 }
 
 # A recognized legacy unit is operator-customizable, so migration must not copy
@@ -1637,8 +2092,8 @@ begin_unit_transaction() {
 # absent semantics. The staged hard link remains as an inode guard until commit
 # or rollback; if another unit appears, rollback preserves both files.
 begin_legacy_unit_transaction() {
-    local expected_kind="$1" install_bin="$2" config_file="$3" concurrent_unit=0 \
-          transaction_candidate link_probe
+    local expected_kind="$1" install_bin="$2" config_file="$3" \
+          transaction_candidate exchange_marker backup_staged
     if [ -z "$STAGED_UNIT" ] || [ ! -f "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ]; then
         die "staged systemd unit is missing; refusing to modify $UNIT_FILE"
     fi
@@ -1658,55 +2113,61 @@ begin_legacy_unit_transaction() {
     command mkdir -m 700 -- "$UNIT_TRANSACTION_DIR" ||
         die "could not create legacy-unit transaction directory $UNIT_TRANSACTION_DIR"
 
-    # Keep every transaction artifact under one deterministic directory so the
-    # next privileged invocation can recover after an untrappable process exit.
+    # Keep every transaction artifact under one deterministic directory. First
+    # move the staged entry under the journal with RENAME_NOREPLACE, then create
+    # both an independent content guard and an inode witness before arming the
+    # exchange. Every crash prefix is distinguishable on the next invocation.
     transaction_candidate="${UNIT_TRANSACTION_DIR}/candidate"
-    replace_file_atomically "$STAGED_UNIT" "$transaction_candidate" ||
+    detach_regular_file_to_absent_path "$STAGED_UNIT" "$transaction_candidate" ||
         die "could not journal the staged unit at $transaction_candidate"
     STAGED_UNIT="$transaction_candidate"
     UNIT_CANDIDATE_SNAPSHOT="${UNIT_TRANSACTION_DIR}/candidate.snapshot"
     copy_regular_file_to_absent_path \
         "$STAGED_UNIT" "$UNIT_CANDIDATE_SNAPSHOT" ||
         die "could not preserve the staged unit snapshot at $UNIT_CANDIDATE_SNAPSHOT"
-    # Exercise the exact hard-link primitive on the unit filesystem before the
-    # live legacy pathname is detached. BusyBox-only hosts commonly lack `link`.
-    link_probe="${UNIT_TRANSACTION_DIR}/link.probe"
-    link_regular_file_to_absent_path "$STAGED_UNIT" "$link_probe" ||
-        die "could not create a hard link in $(dirname -- "$UNIT_FILE"); legacy-unit migration was not started"
-    command rm -f -- "$link_probe" ||
-        die "could not remove legacy-unit hard-link probe $link_probe"
+    UNIT_CANDIDATE_WITNESS="${UNIT_TRANSACTION_DIR}/candidate.witness"
+    link_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_CANDIDATE_WITNESS" ||
+        die "could not create the migration candidate inode witness"
+    exchange_marker="${UNIT_TRANSACTION_DIR}/exchange-v1"
+    create_unit_commit_marker "$exchange_marker" ||
+        die "could not arm the atomic unit exchange journal at $exchange_marker"
     UNIT_BACKUP="${UNIT_TRANSACTION_DIR}/previous"
 
     UNIT_HAD_ORIGINAL=1
     UNIT_TRANSACTION_USES_STAGED_LINK=1
+    UNIT_TRANSACTION_EXCHANGE_V1=1
+    UNIT_CANDIDATE_PUBLISHED=0
     UNIT_TRANSACTION_ACTIVE=1
-    if ! replace_file_atomically "$UNIT_FILE" "$UNIT_BACKUP"; then
+    exchange_regular_files_atomically "$STAGED_UNIT" "$UNIT_FILE" || true
+    if ! unit_transaction_candidate_is_current "$UNIT_FILE"; then
         rollback_unit_transaction
-        die "could not detach the legacy systemd unit to $UNIT_BACKUP"
+        die "atomic legacy-unit exchange failed or raced; no binary was replaced and every observed unit entry was preserved"
     fi
+    UNIT_CANDIDATE_PUBLISHED=1
 
-    if ! unit_file_is_safe_for_legacy_migration "$UNIT_BACKUP" ||
-        ! legacy_unit_file_matches_kind "$UNIT_BACKUP" \
+    # Only after the exchange inspect the exact entry the kernel displaced. This
+    # avoids copying through a live pathname that could be swapped to a symlink,
+    # FIFO, or device between a precheck and open. Validate it, snapshot it, and
+    # verify the exact entry did not change while the snapshot was made.
+    if ! unit_file_is_safe_for_legacy_migration "$STAGED_UNIT" ||
+        ! legacy_unit_file_matches_kind "$STAGED_UNIT" \
             "$expected_kind" "$install_bin" "$config_file"; then
-        die "the legacy systemd unit content or metadata changed while it was being staged; the exact displaced unit will be restored"
+        die "the legacy systemd unit changed at the atomic exchange boundary; the exact displaced unit will be restored"
     fi
-    link_regular_file_to_absent_path "$UNIT_BACKUP" "$UNIT_RETAINED_BACKUP" ||
+    # Publish the independent snapshot only after a complete copy has been
+    # verified. A crash or disk-full error can leave `previous.staged`, but
+    # recovery never mistakes that partial file for the completed snapshot.
+    backup_staged="${UNIT_BACKUP}.staged"
+    copy_regular_file_to_absent_path "$STAGED_UNIT" "$backup_staged" ||
+        die "could not stage the exact displaced legacy-unit snapshot at $backup_staged"
+    unit_transaction_file_matches_snapshot "$STAGED_UNIT" "$backup_staged" ||
+        die "the displaced legacy unit changed while its snapshot was being staged; it will be restored"
+    detach_regular_file_to_absent_path "$backup_staged" "$UNIT_BACKUP" ||
+        die "could not publish the exact displaced legacy-unit snapshot at $UNIT_BACKUP"
+    unit_transaction_file_matches_snapshot "$STAGED_UNIT" "$UNIT_BACKUP" ||
+        die "the displaced legacy unit changed while it was being snapshotted; it will be restored"
+    link_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_RETAINED_BACKUP" ||
         die "could not retain the displaced legacy unit at $UNIT_RETAINED_BACKUP"
-
-    if ! link_regular_file_to_absent_path "$STAGED_UNIT" "$UNIT_FILE"; then
-        if [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
-            if [ ! -f "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ] ||
-                [ ! -f "$STAGED_UNIT" ] || [ -L "$STAGED_UNIT" ] ||
-                [ ! "$STAGED_UNIT" -ef "$UNIT_FILE" ]; then
-                concurrent_unit=1
-            fi
-        fi
-        rollback_unit_transaction
-        if [ "$concurrent_unit" -eq 1 ]; then
-            die "the systemd unit changed during migration publication; no binary was replaced; review $UNIT_FILE and the recovery copy at $UNIT_BACKUP"
-        fi
-        die "could not publish the migrated systemd unit at $UNIT_FILE; the previous unit was restored and no binary was replaced"
-    fi
 }
 
 create_unit_commit_marker() {
@@ -1779,8 +2240,11 @@ mark_binary_transaction_for_rollback() {
 finalize_committed_legacy_unit_transaction() {
     local marker="${UNIT_TRANSACTION_DIR}/committed" artifact cleanup_ok=1
     for artifact in "$UNIT_BACKUP" "$UNIT_CANDIDATE_SNAPSHOT" "$STAGED_UNIT" \
+        "$UNIT_CANDIDATE_WITNESS" \
+        "${UNIT_TRANSACTION_DIR}/previous.staged" \
         "${UNIT_TRANSACTION_DIR}/rollback.displaced" \
         "${UNIT_TRANSACTION_DIR}/link.probe" \
+        "${UNIT_TRANSACTION_DIR}/exchange-v1" \
         "${UNIT_TRANSACTION_DIR}/binary-commit-intent" \
         "${UNIT_TRANSACTION_DIR}/binary-commit-intent.staged" \
         "${UNIT_TRANSACTION_DIR}/binary-rollback" \
@@ -1809,6 +2273,27 @@ finalize_committed_legacy_unit_transaction() {
 }
 
 commit_unit_transaction() {
+    [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] || return 0
+    if [ "$UNIT_TRANSACTION_EXCHANGE_V1" -eq 1 ] ||
+        [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 0 ]; then
+        if ! unit_transaction_candidate_is_current "$UNIT_FILE" ||
+            ! unit_transaction_previous_is_current; then
+            if [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 0 ]; then
+                leave_flat_unit_transaction_for_manual_recovery \
+                    "systemd unit changed after final validation; refusing to discard recovery artifacts"
+            else
+                warn "systemd unit changed after final validation; preserving $UNIT_TRANSACTION_DIR"
+                UNIT_TRANSACTION_ACTIVE=0
+                STAGED_UNIT=""
+                UNIT_CANDIDATE_WITNESS=""
+                UNIT_CANDIDATE_SNAPSHOT=""
+                UNIT_BACKUP=""
+                UNIT_TRANSACTION_DIR=""
+                UNIT_RETAINED_BACKUP=""
+            fi
+            return 1
+        fi
+    fi
     if [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 1 ]; then
         local marker="${UNIT_TRANSACTION_DIR}/committed"
         if ! create_unit_commit_marker "$marker"; then
@@ -1830,6 +2315,7 @@ commit_unit_transaction() {
             command rm -f -- "$STAGED_UNIT" 2>/dev/null ||
                 warn "could not remove obsolete staged unit link $STAGED_UNIT"
         fi
+        remove_unit_candidate_artifacts
         if [ -n "$UNIT_TRANSACTION_DIR" ]; then
             command rmdir -- "$UNIT_TRANSACTION_DIR" 2>/dev/null ||
                 warn "could not remove obsolete unit transaction directory $UNIT_TRANSACTION_DIR"
@@ -1841,8 +2327,13 @@ commit_unit_transaction() {
     UNIT_TRANSACTION_ACTIVE=0
     UNIT_HAD_ORIGINAL=0
     UNIT_TRANSACTION_USES_STAGED_LINK=0
+    UNIT_TRANSACTION_EXCHANGE_V1=0
+    UNIT_CANDIDATE_PUBLISHED=0
     UNIT_BACKUP=""
+    UNIT_CANDIDATE_GUARD=""
     UNIT_CANDIDATE_SNAPSHOT=""
+    UNIT_CANDIDATE_WITNESS=""
+    UNIT_REJECTED=""
     STAGED_UNIT=""
     UNIT_TRANSACTION_DIR=""
     UNIT_RETAINED_BACKUP=""
@@ -1852,6 +2343,23 @@ commit_unit_transaction() {
 # Remove any staged install/upgrade artifacts and roll back an uncommitted unit.
 cleanup() {
     local preserve_journal=0
+    # `exchange-v1` is the durable hand-off between journal construction and
+    # the in-memory transaction guard. If a signal lands after the marker's
+    # O_EXCL create but before begin_legacy_unit_transaction sets ACTIVE, infer
+    # the transaction from the exact artifact paths so cleanup rolls it back
+    # instead of deleting its candidate/witness and orphaning the marker.
+    if [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+        [ -n "$UNIT_TRANSACTION_DIR" ] &&
+        [ "$STAGED_UNIT" = "${UNIT_TRANSACTION_DIR}/candidate" ] &&
+        [ "$UNIT_CANDIDATE_WITNESS" = \
+            "${UNIT_TRANSACTION_DIR}/candidate.witness" ] &&
+        [ -f "${UNIT_TRANSACTION_DIR}/exchange-v1" ] &&
+        [ ! -L "${UNIT_TRANSACTION_DIR}/exchange-v1" ]; then
+        UNIT_TRANSACTION_ACTIVE=1
+        UNIT_HAD_ORIGINAL=1
+        UNIT_TRANSACTION_USES_STAGED_LINK=1
+        UNIT_TRANSACTION_EXCHANGE_V1=1
+    fi
     # Best-effort: a failing rm must not abort the EXIT trap (under errexit) or
     # change the script's original exit status, so swallow any error.
     # The staged binary lives beside its destination, so mv uses one atomic
@@ -1912,6 +2420,7 @@ cleanup() {
     fi
     if [ "$preserve_journal" -eq 0 ]; then
         if [ -n "$STAGED_UNIT" ]; then rm -f -- "$STAGED_UNIT" 2>/dev/null || true; fi
+        remove_unit_candidate_artifacts
         if [ -n "$UNIT_CANDIDATE_SNAPSHOT" ]; then
             rm -f -- "$UNIT_CANDIDATE_SNAPSHOT" 2>/dev/null || true
         fi
@@ -1920,6 +2429,10 @@ cleanup() {
                 UNIT_TRANSACTION_DIR=""
             fi
         fi
+    fi
+    if [ -n "$STAGED_FS_HELPER" ]; then
+        command rm -f -- "$STAGED_FS_HELPER" 2>/dev/null || true
+        STAGED_FS_HELPER=""
     fi
     return 0
 }
@@ -1938,16 +2451,25 @@ legacy_transaction_directory_is_safe() {
 # action, roll an incomplete migration back with the same no-replace logic.
 recover_interrupted_legacy_unit_transaction() {
     local transaction_dir="${UNIT_FILE}.migration" candidate snapshot backup \
-          displaced marker intent staged_intent binary_rollback artifact \
+          witness exchange_marker rollback_finalized displaced marker intent staged_intent binary_rollback artifact \
           untrusted_rollback decision_file="" decision_kind="" \
           decision_record_trusted=0 recovery_staged_bin="" recovery_result=0
     local -a intent_lines=()
     [ ! -e "$transaction_dir" ] && [ ! -L "$transaction_dir" ] && return 0
     legacy_transaction_directory_is_safe "$transaction_dir" ||
         die "unfinished legacy-unit transaction directory is unsafe: $transaction_dir"
+    # The last cleanup step removes the final state marker immediately before
+    # rmdir. A crash in that tiny window leaves only an empty trusted directory.
+    if command rmdir -- "$transaction_dir" 2>/dev/null; then
+        warn "cleared an empty legacy-unit transaction directory"
+        return 0
+    fi
 
     candidate="${transaction_dir}/candidate"
     snapshot="${transaction_dir}/candidate.snapshot"
+    witness="${transaction_dir}/candidate.witness"
+    exchange_marker="${transaction_dir}/exchange-v1"
+    rollback_finalized="${transaction_dir}/exchange-v1-rolled-back"
     backup="${transaction_dir}/previous"
     displaced="${transaction_dir}/rollback.displaced"
     marker="${transaction_dir}/committed"
@@ -1955,6 +2477,11 @@ recover_interrupted_legacy_unit_transaction() {
     staged_intent="${intent}.staged"
     binary_rollback="${transaction_dir}/binary-rollback"
     untrusted_rollback="${transaction_dir}/binary-rollback-untrusted"
+
+    if { [ -e "$rollback_finalized" ] || [ -L "$rollback_finalized" ]; } &&
+        { [ -e "$marker" ] || [ -L "$marker" ]; }; then
+        die "legacy-unit journal contains conflicting commit and rollback markers: $transaction_dir"
+    fi
 
     if [ -e "$marker" ] || [ -L "$marker" ]; then
         if [ ! -f "$marker" ] || [ -L "$marker" ]; then
@@ -1966,18 +2493,27 @@ recover_interrupted_legacy_unit_transaction() {
         if [ -f "$snapshot" ] && [ ! -L "$snapshot" ]; then
             UNIT_CANDIDATE_SNAPSHOT="$snapshot"
         fi
+        if [ -f "$witness" ] && [ ! -L "$witness" ]; then
+            UNIT_CANDIDATE_WITNESS="$witness"
+        fi
         UNIT_BACKUP="$backup"
         UNIT_TRANSACTION_DIR="$transaction_dir"
         UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
         UNIT_TRANSACTION_USES_STAGED_LINK=1
+        UNIT_TRANSACTION_EXCHANGE_V1=0
+        if [ -f "$exchange_marker" ] && [ ! -L "$exchange_marker" ]; then
+            UNIT_TRANSACTION_EXCHANGE_V1=1
+        fi
         finalize_committed_legacy_unit_transaction ||
             die "could not finalize committed legacy-unit transaction $transaction_dir"
         STAGED_UNIT=""
         UNIT_CANDIDATE_SNAPSHOT=""
+        UNIT_CANDIDATE_WITNESS=""
         UNIT_BACKUP=""
         UNIT_TRANSACTION_DIR=""
         UNIT_RETAINED_BACKUP=""
         UNIT_TRANSACTION_USES_STAGED_LINK=0
+        UNIT_TRANSACTION_EXCHANGE_V1=0
         ok "Finalized the committed legacy systemd unit migration journal."
         warn "service activation may have been interrupted; if the upgrade was meant to restart Alighieri, run: systemctl restart $SERVICE_NAME"
         return 0
@@ -2043,20 +2579,29 @@ recover_interrupted_legacy_unit_transaction() {
             if [ -f "$snapshot" ] && [ ! -L "$snapshot" ]; then
                 UNIT_CANDIDATE_SNAPSHOT="$snapshot"
             fi
+            if [ -f "$witness" ] && [ ! -L "$witness" ]; then
+                UNIT_CANDIDATE_WITNESS="$witness"
+            fi
             UNIT_BACKUP="$backup"
             UNIT_TRANSACTION_DIR="$transaction_dir"
             UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
             UNIT_TRANSACTION_USES_STAGED_LINK=1
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            if [ -f "$exchange_marker" ] && [ ! -L "$exchange_marker" ]; then
+                UNIT_TRANSACTION_EXCHANGE_V1=1
+            fi
             create_unit_commit_marker "$marker" ||
                 die "could not record the recovered binary commit at $marker"
             finalize_committed_legacy_unit_transaction ||
                 die "could not finalize recovered committed transaction $transaction_dir"
             STAGED_UNIT=""
             UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_CANDIDATE_WITNESS=""
             UNIT_BACKUP=""
             UNIT_TRANSACTION_DIR=""
             UNIT_RETAINED_BACKUP=""
             UNIT_TRANSACTION_USES_STAGED_LINK=0
+            UNIT_TRANSACTION_EXCHANGE_V1=0
             ok "Recovered the committed binary and finalized its systemd unit migration."
             warn "service activation may have been interrupted; if the upgrade was meant to restart Alighieri, run: systemctl restart $SERVICE_NAME"
             return 0
@@ -2081,6 +2626,99 @@ recover_interrupted_legacy_unit_transaction() {
         fi
     fi
 
+    if [ -e "$rollback_finalized" ] || [ -L "$rollback_finalized" ]; then
+        if [ ! -f "$rollback_finalized" ] || [ -L "$rollback_finalized" ]; then
+            die "legacy-unit completed-rollback marker is unsafe: $rollback_finalized"
+        fi
+        if [ -e "$marker" ] || [ -L "$marker" ]; then
+            die "legacy-unit journal contains conflicting commit and rollback markers: $transaction_dir"
+        fi
+        if ! systemctl daemon-reload; then
+            UNIT_ROLLBACK_RELOAD_FAILED=1
+            die "could not reload systemd while finalizing the completed exchange rollback"
+        fi
+        if [ -n "$recovery_staged_bin" ] &&
+            { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
+            if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
+                die "completed exchange rollback preserved unsafe staged binary $recovery_staged_bin"
+            fi
+            command rm -f -- "$recovery_staged_bin" ||
+                die "could not remove the rolled-back staged binary $recovery_staged_bin"
+        fi
+        STAGED_UNIT="$candidate"
+        UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+        UNIT_CANDIDATE_WITNESS="$witness"
+        UNIT_BACKUP="$backup"
+        UNIT_TRANSACTION_DIR="$transaction_dir"
+        UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
+        remove_exchange_v1_journal_after_rollback ||
+            die "could not finalize the completed exchange rollback at $transaction_dir"
+        STAGED_UNIT=""
+        UNIT_CANDIDATE_SNAPSHOT=""
+        UNIT_CANDIDATE_WITNESS=""
+        UNIT_BACKUP=""
+        UNIT_TRANSACTION_DIR=""
+        UNIT_RETAINED_BACKUP=""
+        UNIT_ROLLBACK_RELOAD_FAILED=0
+        ok "Finalized the completed exchange-v1 systemd unit rollback."
+        return 0
+    fi
+
+    if [ -e "$exchange_marker" ] || [ -L "$exchange_marker" ]; then
+        if [ ! -f "$exchange_marker" ] || [ -L "$exchange_marker" ]; then
+            die "legacy-unit exchange journal marker is unsafe: $exchange_marker"
+        fi
+        if [ ! -f "$candidate" ] || [ -L "$candidate" ] ||
+            [ ! -f "$snapshot" ] || [ -L "$snapshot" ] ||
+            [ ! -f "$witness" ] || [ -L "$witness" ]; then
+            die "exchange-v1 journal is missing a safe candidate, snapshot, or inode witness: $transaction_dir"
+        fi
+        STAGED_UNIT="$candidate"
+        UNIT_CANDIDATE_GUARD=""
+        UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+        UNIT_CANDIDATE_WITNESS="$witness"
+        UNIT_BACKUP="$backup"
+        UNIT_TRANSACTION_DIR="$transaction_dir"
+        UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
+        UNIT_HAD_ORIGINAL=1
+        UNIT_TRANSACTION_USES_STAGED_LINK=1
+        UNIT_TRANSACTION_EXCHANGE_V1=1
+        UNIT_TRANSACTION_ACTIVE=1
+
+        rollback_exchange_v1_unit_transaction || recovery_result=$?
+        if ! systemctl daemon-reload; then
+            UNIT_ROLLBACK_RELOAD_FAILED=1
+            die "exchange-v1 recovery changed or inspected the live unit but daemon-reload failed; the journal was preserved"
+        fi
+        UNIT_ROLLBACK_RELOAD_FAILED=0
+        if [ "$recovery_result" -ne 0 ]; then
+            UNIT_TRANSACTION_ACTIVE=0
+            die "a concurrent systemd unit was preserved while recovering $transaction_dir; review $UNIT_FILE and the journal before retrying"
+        fi
+        if [ -n "$recovery_staged_bin" ] &&
+            { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
+            if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
+                die "restored $UNIT_FILE but preserved unsafe staged binary $recovery_staged_bin"
+            fi
+            command rm -f -- "$recovery_staged_bin" ||
+                die "restored $UNIT_FILE but could not remove staged binary $recovery_staged_bin"
+        fi
+        remove_exchange_v1_journal_after_rollback ||
+            die "restored $UNIT_FILE but could not finalize $transaction_dir"
+        UNIT_TRANSACTION_ACTIVE=0
+        UNIT_HAD_ORIGINAL=0
+        UNIT_TRANSACTION_USES_STAGED_LINK=0
+        UNIT_TRANSACTION_EXCHANGE_V1=0
+        STAGED_UNIT=""
+        UNIT_CANDIDATE_SNAPSHOT=""
+        UNIT_CANDIDATE_WITNESS=""
+        UNIT_BACKUP=""
+        UNIT_TRANSACTION_DIR=""
+        UNIT_RETAINED_BACKUP=""
+        ok "Recovered the interrupted exchange-v1 systemd unit migration."
+        return 0
+    fi
+
     require_hardlink_utility
     if [ ! -e "$backup" ] && [ ! -L "$backup" ]; then
         if [ -e "$displaced" ] || [ -L "$displaced" ]; then
@@ -2103,7 +2741,9 @@ recover_interrupted_legacy_unit_transaction() {
             command rm -f -- "$recovery_staged_bin" ||
                 die "could not remove incomplete staged binary $recovery_staged_bin"
         fi
-        for artifact in "$candidate" "$snapshot" "${transaction_dir}/link.probe" \
+        for artifact in "$candidate" "$snapshot" "$witness" \
+            "${transaction_dir}/previous.staged" \
+            "${transaction_dir}/link.probe" \
             "$intent" "$staged_intent" "$binary_rollback" "$untrusted_rollback"; do
             if [ -e "$artifact" ] || [ -L "$artifact" ]; then
                 if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
@@ -2169,7 +2809,7 @@ recover_interrupted_legacy_unit_transaction() {
             die "restored $UNIT_FILE but could not remove staged binary $recovery_staged_bin"
     fi
     for artifact in "$binary_rollback" "$untrusted_rollback" "$intent" "$staged_intent" \
-        "${transaction_dir}/link.probe"; do
+        "${transaction_dir}/previous.staged" "${transaction_dir}/link.probe"; do
         if [ -e "$artifact" ] || [ -L "$artifact" ]; then
             if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
                 die "restored $UNIT_FILE but preserved unsafe journal artifact $artifact"
@@ -2207,6 +2847,7 @@ in_checkout() {
 in_release_archive() {
     [ ! -f "${REPO_ROOT}/Cargo.toml" ] &&
         [ -f "${REPO_ROOT}/${SERVICE_NAME}" ] &&
+        [ -f "${REPO_ROOT}/${INSTALLER_FS_HELPER_NAME}" ] &&
         [ -f "${REPO_ROOT}/doc/alighieri.conf" ] &&
         [ -f "${REPO_ROOT}/README.md" ] &&
         [ -f "${REPO_ROOT}/CHANGELOG.md" ]
@@ -2217,7 +2858,7 @@ in_release_archive() {
 # archives instead carry a matching binary and default config.
 require_checkout() {
     in_checkout ||
-        die "no matching binary found; extract the complete Linux release archive, run from an Alighieri checkout, or pass --binary PATH"
+        die "no matching binary found; extract the complete Linux release archive or run from an Alighieri checkout (an explicit --binary still requires one of those for the installer companion)"
 }
 
 # Locate the binary to install/upgrade from: an explicit --binary, the binary
@@ -2242,6 +2883,24 @@ resolve_source_binary() {
     require_checkout
     build_from_source
     BINARY="${REPO_ROOT}/target/release/${SERVICE_NAME}"
+}
+
+resolve_installer_fs_helper_source() {
+    if in_release_archive; then
+        INSTALLER_FS_HELPER_SOURCE="${REPO_ROOT}/${INSTALLER_FS_HELPER_NAME}"
+    elif in_checkout; then
+        INSTALLER_FS_HELPER_SOURCE="${REPO_ROOT}/target/release/${INSTALLER_FS_HELPER_NAME}"
+        # Never trust a stale target artifact from an earlier checkout. Build the
+        # narrow helper from the source containing this script whenever it is
+        # actually needed; ordinary non-migrating upgrades remain helper-free.
+        build_installer_fs_helper_from_source
+    else
+        die "the privileged installer companion is unavailable; run this script from a complete Linux release archive or an Alighieri checkout"
+    fi
+    if [ ! -f "$INSTALLER_FS_HELPER_SOURCE" ] ||
+        [ -L "$INSTALLER_FS_HELPER_SOURCE" ]; then
+        die "installer companion not found or unsafe: $INSTALLER_FS_HELPER_SOURCE"
+    fi
 }
 
 # Build the release binary in REPO_ROOT. cargo runs dependency build scripts and
@@ -2271,7 +2930,7 @@ build_from_source() {
         [ -n "$user_home" ] || user_home="/home/$build_user"
         # shellcheck disable=SC2016  # $1 is expanded by the inner login shell, not here
         runuser -u "$build_user" -- env "HOME=$user_home" \
-            bash -lc 'cd -- "$1" && cargo build --release --locked' alighieri-build "$REPO_ROOT" ||
+            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs' alighieri-build "$REPO_ROOT" ||
             die "cargo build failed as $build_user; ensure they have a Rust toolchain, or pass --binary"
         return
     fi
@@ -2281,8 +2940,36 @@ build_from_source() {
     if [ "$(id -u)" -eq 0 ]; then
         warn "building from source as root; cargo runs third-party build scripts — prefer a prebuilt binary via --binary"
     fi
-    info "building release binary with cargo..."
-    ( cd -- "$REPO_ROOT" && cargo build --release --locked )
+    info "building release binary and installer companion with cargo..."
+    ( cd -- "$REPO_ROOT" && cargo build --release --locked --features installer-fs )
+}
+
+build_installer_fs_helper_from_source() {
+    local build_user="" invoker="${SUDO_USER:-}" user_home
+    if [ "$(id -u)" -eq 0 ] && [ -n "$invoker" ] && [ "$invoker" != "root" ] &&
+        command -v runuser >/dev/null 2>&1; then
+        build_user="$invoker"
+    fi
+    if [ -n "$build_user" ]; then
+        user_home="$(getent passwd "$build_user" 2>/dev/null | cut -d: -f6 || true)"
+        [ -n "$user_home" ] || user_home="/home/$build_user"
+        info "building the installer filesystem companion as $build_user (not root)..."
+        # shellcheck disable=SC2016  # $1 is expanded by the inner login shell.
+        runuser -u "$build_user" -- env "HOME=$user_home" \
+            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs --bin alighieri-installer-fs' \
+            alighieri-helper-build "$REPO_ROOT" ||
+            die "installer companion build failed as $build_user"
+        return
+    fi
+    command -v cargo >/dev/null 2>&1 ||
+        die "cargo is required to build the current installer filesystem companion"
+    if [ "$(id -u)" -eq 0 ]; then
+        warn "building the installer companion as root; prefer the version-matched prebuilt Linux release archive"
+    fi
+    info "building the current installer filesystem companion with cargo..."
+    ( cd -- "$REPO_ROOT" &&
+        cargo build --release --locked --features installer-fs \
+            --bin "$INSTALLER_FS_HELPER_NAME" )
 }
 
 ensure_user() {
@@ -2944,6 +3631,39 @@ followup_install_command() {
 run_selftest() {
     local failures=0 sandbox_call hidden_path visible_path expected_arg
 
+    if [ -n "${ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN:-}" ]; then
+        local helper_test_bin="$ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN" helper_protocol="" \
+            helper_live="/etc/systemd/system/alighieri.service" \
+            helper_candidate="/etc/systemd/system/alighieri.service.migration/candidate" \
+            helper_witness="/etc/systemd/system/alighieri.service.migration/candidate.witness" \
+            helper_previous="/etc/systemd/system/alighieri.service.migration/previous" \
+            helper_previous_staged="/etc/systemd/system/alighieri.service.migration/previous.staged" \
+            helper_displaced="/etc/systemd/system/alighieri.service.migration/rollback.displaced"
+        if [ -f "$helper_test_bin" ] && [ ! -L "$helper_test_bin" ] &&
+            helper_protocol="$("$helper_test_bin" protocol-version 2>/dev/null)" &&
+            [ "$helper_protocol" = "$INSTALLER_FS_HELPER_PROTOCOL" ] &&
+            "$helper_test_bin" validate-request hard-link \
+                "$helper_candidate" "$helper_witness" >/dev/null 2>&1 &&
+            "$helper_test_bin" validate-request exchange \
+                "$helper_candidate" "$helper_live" >/dev/null 2>&1 &&
+            "$helper_test_bin" validate-request rename-noreplace \
+                "$helper_live" "$helper_displaced" >/dev/null 2>&1 &&
+            "$helper_test_bin" validate-request rename-noreplace \
+                "$helper_previous_staged" "$helper_previous" >/dev/null 2>&1 &&
+            ! "$helper_test_bin" validate-request hard-link \
+                "$helper_live" "$helper_candidate" >/dev/null 2>&1 &&
+            ! "$helper_test_bin" validate-request exchange \
+                "$helper_candidate" >/dev/null 2>&1 &&
+            ! "$helper_test_bin" unknown-operation >/dev/null 2>&1; then
+            printf 'ok   installer filesystem helper protocol %s and request allowlist\n' \
+                "$helper_protocol"
+        else
+            printf 'FAIL installer filesystem helper protocol/allowlist [%s]\n' \
+                "$helper_protocol"
+            failures=$((failures + 1))
+        fi
+    fi
+
     _check_norm() { # input expected
         local got
         got="$(normalize_path "$1")"
@@ -3298,6 +4018,7 @@ run_selftest() {
             for arg in "$@"; do case "$arg" in -*T*) return 97 ;; esac; done
             command mv "$@"
         }
+        link_file_command() { command ln -- "$1" "$2"; }
 
         stage_executable_copy "$source" "$staged" || result=1
         if [ "$mode_checked" -eq 1 ]; then
@@ -3334,6 +4055,10 @@ run_selftest() {
         # Restore the production wrappers after these dynamically-scoped mocks.
         install_file_command() { command install "$@"; }
         copy_file_command() { command cp "$@"; }
+        link_file_command() {
+            [ -n "$STAGED_FS_HELPER" ] || return 127
+            "$STAGED_FS_HELPER" hard-link "$1" "$2"
+        }
         move_file_command() { command mv "$@"; }
         command rm -f -- "$source" "$staged" "$installed" "$backup" "$linked" "$blocked" "$mode_probe" \
             "$symlink_path" "$destination_dir/$(basename -- "$source")" \
@@ -4440,6 +5165,23 @@ run_selftest() {
                 require_service_sandbox() { :; }
                 prepare_binary_directory() { command mkdir -p -- "$1"; }
                 resolve_source_binary() { :; }
+                resolve_installer_fs_helper_source() { :; }
+                stage_installer_fs_helper() {
+                    STAGED_FS_HELPER="$tx_tmp/installer-fs"
+                    : >"$STAGED_FS_HELPER"
+                }
+                hardlink_utility_available() { :; }
+                link_file_command() { command ln -- "$1" "$2"; }
+                exchange_file_command() {
+                    local temporary="${1}.exchange.$$"
+                    command mv -- "$1" "$temporary" &&
+                        command mv -- "$2" "$1" &&
+                        command mv -- "$temporary" "$2"
+                }
+                rename_noreplace_file_command() {
+                    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                    command mv -- "$1" "$2"
+                }
                 ensure_user() { :; }
                 installed_config_path() { printf '%s' "$config"; }
                 reject_hidden_service_path() { :; }
@@ -4616,9 +5358,30 @@ run_selftest() {
             UNIT_FILE="$fresh_unit"
             STAGED_UNIT="$fresh_staged"
             UNIT_BACKUP=""
+            UNIT_CANDIDATE_GUARD=""
+            UNIT_CANDIDATE_WITNESS=""
+            UNIT_REJECTED=""
+            UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_TRANSACTION_DIR=""
+            UNIT_RETAINED_BACKUP=""
             UNIT_TRANSACTION_ACTIVE=0
             UNIT_HAD_ORIGINAL=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            UNIT_CANDIDATE_PUBLISHED=0
             systemctl() { printf 'daemon-reload|' >>"$fresh_calls"; }
+            hardlink_utility_available() { :; }
+            link_file_command() { command ln -- "$1" "$2"; }
+            exchange_file_command() {
+                local temporary="${1}.exchange.$$"
+                command mv -- "$1" "$temporary" &&
+                    command mv -- "$2" "$1" &&
+                    command mv -- "$temporary" "$2"
+            }
+            rename_noreplace_file_command() {
+                [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                command mv -- "$1" "$2"
+            }
             trap cleanup EXIT
             begin_unit_transaction
             [ "$(<"$UNIT_FILE")" = "candidate-unit" ]
@@ -4649,10 +5412,31 @@ run_selftest() {
             STAGED_UNIT="$signal_staged_unit"
             STAGED_BIN="$signal_staged_bin"
             UNIT_BACKUP=""
+            UNIT_CANDIDATE_GUARD=""
+            UNIT_CANDIDATE_WITNESS=""
+            UNIT_REJECTED=""
+            UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_TRANSACTION_DIR=""
+            UNIT_RETAINED_BACKUP=""
             UNIT_TRANSACTION_ACTIVE=0
             UNIT_HAD_ORIGINAL=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            UNIT_CANDIDATE_PUBLISHED=0
             BINARY_COMMIT_IN_PROGRESS=0
             systemctl() { printf 'daemon-reload|' >>"$signal_calls"; }
+            hardlink_utility_available() { :; }
+            link_file_command() { command ln -- "$1" "$2"; }
+            exchange_file_command() {
+                local temporary="${1}.exchange.$$"
+                command mv -- "$1" "$temporary" &&
+                    command mv -- "$2" "$1" &&
+                    command mv -- "$temporary" "$2"
+            }
+            rename_noreplace_file_command() {
+                [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                command mv -- "$1" "$2"
+            }
             begin_unit_transaction
             BINARY_COMMIT_IN_PROGRESS=1
             replace_file_atomically "$STAGED_BIN" "$signal_installed"
@@ -4729,6 +5513,23 @@ run_selftest() {
                 require_service_sandbox() { :; }
                 prepare_binary_directory() { command mkdir -p -- "$1"; }
                 resolve_source_binary() { :; }
+                resolve_installer_fs_helper_source() { :; }
+                stage_installer_fs_helper() {
+                    STAGED_FS_HELPER="$fresh_tmp/installer-fs"
+                    : >"$STAGED_FS_HELPER"
+                }
+                hardlink_utility_available() { :; }
+                link_file_command() { command ln -- "$1" "$2"; }
+                exchange_file_command() {
+                    local temporary="${1}.exchange.$$"
+                    command mv -- "$1" "$temporary" &&
+                        command mv -- "$2" "$1" &&
+                        command mv -- "$temporary" "$2"
+                }
+                rename_noreplace_file_command() {
+                    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                    command mv -- "$1" "$2"
+                }
                 ensure_user() { :; }
                 reject_hidden_service_path() { :; }
                 require_safe_service_config_directory() { :; }
@@ -4825,27 +5626,33 @@ run_selftest() {
         explicit="$archive_tmp/operator-selected"
         command mkdir -p -- "$archive_tmp/doc"
         printf '%s\n' bundled >"$archive_tmp/alighieri"
+        printf '%s\n' companion >"$archive_tmp/alighieri-installer-fs"
         printf '%s\n' explicit >"$explicit"
         printf '%s\n' config >"$archive_tmp/doc/alighieri.conf"
         printf '%s\n' readme >"$archive_tmp/README.md"
         printf '%s\n' changelog >"$archive_tmp/CHANGELOG.md"
 
         _check_release_archive_binary_case() {
-            local REPO_ROOT="$1" BINARY="$2" expected="$3"
+            local REPO_ROOT="$1" BINARY="$2" expected="$3" \
+                INSTALLER_FS_HELPER_SOURCE=""
             resolve_source_binary 2>/dev/null
-            [ "$BINARY" = "$expected" ]
+            resolve_installer_fs_helper_source 2>/dev/null
+            [ "$BINARY" = "$expected" ] &&
+                [ "$INSTALLER_FS_HELPER_SOURCE" = \
+                    "$archive_tmp/alighieri-installer-fs" ]
         }
         if _check_release_archive_binary_case \
             "$archive_tmp" '' "$archive_tmp/alighieri" &&
             _check_release_archive_binary_case \
                 "$archive_tmp" "$explicit" "$explicit"; then
-            printf 'ok   release archive auto-selects its binary and honours explicit --binary\n'
+            printf 'ok   release archive selects its companion and honours explicit --binary\n'
         else
-            printf 'FAIL release archive binary selection\n'
+            printf 'FAIL release archive binary or companion selection\n'
             failures=$((failures + 1))
         fi
 
-        command rm -f -- "$archive_tmp/alighieri" "$explicit" \
+        command rm -f -- "$archive_tmp/alighieri" \
+            "$archive_tmp/alighieri-installer-fs" "$explicit" \
             "$archive_tmp/doc/alighieri.conf" "$archive_tmp/README.md" \
             "$archive_tmp/CHANGELOG.md"
         command rmdir -- "$archive_tmp/doc" "$archive_tmp"
@@ -5168,628 +5975,375 @@ run_selftest() {
     _check_upgrade_unit_selection
     unset -f _check_upgrade_unit_selection
 
-    _check_legacy_upgrade_transaction() {
-        local upgrade_tmp unit config source bin_dir installed calls output \
-              transaction_dir retained_backup \
-              failure_mode UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR BIN_DIR \
-              BINARY STAGED_BIN STAGED_UNIT UNIT_CANDIDATE_SNAPSHOT UNIT_BACKUP \
-              UNIT_TRANSACTION_DIR UNIT_RETAINED_BACKUP UNIT_TRANSACTION_ACTIVE \
-              UNIT_HAD_ORIGINAL UNIT_TRANSACTION_USES_STAGED_LINK \
-              UNIT_ROLLBACK_CONFLICT_COPY BINARY_COMMIT_IN_PROGRESS \
-              UPGRADE_LEGACY_UNIT_KIND RESTART_ON_UPGRADE
-        upgrade_tmp="$(mktemp -d)"
-        unit="$upgrade_tmp/alighieri.service"
-        config="$upgrade_tmp/alighieri.conf"
-        source="$upgrade_tmp/candidate-alighieri"
-        bin_dir="$upgrade_tmp/bin"
-        installed="$bin_dir/alighieri"
-        calls="$upgrade_tmp/calls"
-        output="$upgrade_tmp/output"
-        transaction_dir="${unit}.migration"
-        retained_backup="${unit}.pre-migration"
-        command mkdir -p -- "$bin_dir"
-        printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
-        printf '%s\n' candidate >"$source"
-
-        UNIT_FILE="$unit"
-        CONFIG_DIR="$upgrade_tmp/etc"
-        CONFIG_FILE="$config"
-        LOG_DIR="$upgrade_tmp/log"
-        BIN_DIR="$bin_dir"
-        BINARY="$source"
-        STAGED_BIN=""
-        STAGED_UNIT=""
-        UNIT_CANDIDATE_SNAPSHOT=""
-        UNIT_BACKUP=""
-        UNIT_TRANSACTION_DIR=""
-        UNIT_RETAINED_BACKUP=""
-        UNIT_TRANSACTION_ACTIVE=0
-        UNIT_HAD_ORIGINAL=0
-        UNIT_TRANSACTION_USES_STAGED_LINK=0
-        UNIT_ROLLBACK_CONFLICT_COPY=""
-        BINARY_COMMIT_IN_PROGRESS=0
-        UPGRADE_LEGACY_UNIT_KIND=""
-        RESTART_ON_UPGRADE=1
-
-        if (
-            require_service_sandbox() { :; }
-            installed_binary_path() { printf '%s' "$installed"; }
-            installed_config_path() { printf '%s' "$config"; }
-            existing_install_directory_for_binary() { dirname -- "$1"; }
-            require_safe_binary_directory() { :; }
-            require_safe_service_config_directory() { :; }
-            require_secure_service_config_file() { :; }
-            reject_hidden_service_path() { :; }
-            resolve_source_binary() { :; }
-            stage_executable_copy() {
-                command cp -- "$1" "$2" && command chmod 755 -- "$2"
-            }
-            loaded_exec_start_payload() {
-                printf '%s' "$installed $config"
-            }
-            unit_file_is_safe_for_legacy_migration() {
-                if [ "$failure_mode" = backup-metadata ] && [ "$#" -gt 0 ]; then
-                    return 1
-                fi
-            }
-            hardlink_utility_available() {
-                [ "$failure_mode" != hardlink-missing ]
-            }
-            loaded_unit_source_is_unoverridden() {
-                if [ "$failure_mode" = override-after-begin ] &&
-                    [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ]; then
-                    return 1
-                fi
-            }
-            effective_install_matches() { :; }
-            effective_service_sandbox_matches() { :; }
-            require_effective_service_sandbox() {
-                printf 'sandbox-guard|' >>"$calls"
-                case "$failure_mode" in
-                    validation | unit-rollback-race | unit-rollback-in-place)
-                        die "simulated migrated-unit validation failure"
-                        ;;
-                esac
-            }
-            run_in_service_sandbox() {
-                printf 'preflight|' >>"$calls"
-                if [ "$failure_mode" = unit-race ]; then
-                    printf '%s\n' '# concurrent operator edit' >>"$unit"
-                fi
-                printf '%s\n' '{"ok":true,"userlist":""}'
-            }
-            validate_service_config_sources() { :; }
-            validate_service_userlist() { :; }
-            service_capability_mask() { printf '%s' 0; }
-            move_file_command() {
-                if [ "$failure_mode" = unit-detach-race ] &&
-                    [ "${3:-}" = "$UNIT_FILE" ] && [ "${4:-}" = "$UNIT_BACKUP" ]; then
-                    printf '%s\n' '# concurrent operator edit at detach' >>"$UNIT_FILE"
-                fi
-                if [ "${4:-}" = "${UNIT_TRANSACTION_DIR}/rollback.displaced" ]; then
-                    if [ "$failure_mode" = unit-rollback-race ]; then
-                        printf '%s\n' \
-                            '[Unit]' \
-                            'Description=Concurrent rollback replacement' \
-                            >"${UNIT_FILE}.operator"
-                        command mv -f -- "${UNIT_FILE}.operator" "$UNIT_FILE"
-                    elif [ "$failure_mode" = unit-rollback-in-place ]; then
-                        printf '%s\n' '# concurrent in-place rollback edit' >>"$UNIT_FILE"
-                    fi
-                fi
-                if [ "$failure_mode" = binary-move ] &&
-                    [ "${3:-}" = "$STAGED_BIN" ]; then
-                    return 1
-                fi
-                if [ "$failure_mode" = backup-open-write ] &&
-                    [ "${3:-}" = "$STAGED_BIN" ]; then
-                    printf '%s\n' '# late write through displaced unit inode' >>"$UNIT_BACKUP"
-                fi
-                command mv "$@"
-            }
-            link_file_command() {
-                if [ "$failure_mode" = unit-publish-race ] &&
-                    [ "${1:-}" = "$STAGED_UNIT" ] && [ "${2:-}" = "$UNIT_FILE" ]; then
-                    printf '%s\n' \
-                        '[Unit]' \
-                        'Description=Concurrent operator replacement' >"$UNIT_FILE"
-                fi
-                command link "$@"
-            }
-            systemctl() {
-                printf '%s|' "$*" >>"$calls"
-            }
-
-            failure_mode=success
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if ! (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = candidate ] || exit 1
-            grep -Fq -- 'WorkingDirectory=/' "$unit" || exit 1
-            grep -Fq -- 'StateDirectory=alighieri' "$unit" || exit 1
-            grep -Fq -- 'restart alighieri.service|' "$calls" || exit 1
-            [ ! -e "$transaction_dir" ] || exit 1
-            legacy_unit_file_matches_kind "$retained_backup" v0.1.x \
-                "$installed" "$config" || exit 1
-            command rm -f -- "$retained_backup"
-
-            failure_mode='backup-open-write'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if ! (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = candidate ] || exit 1
-            grep -Fq -- '# late write through displaced unit inode' \
-                "$retained_backup" || exit 1
-            [ ! -e "$transaction_dir" ] || exit 1
-            command rm -f -- "$retained_backup"
-
-            failure_mode=validation
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained_backup" ] || exit 1
-            grep -Fq -- 'simulated migrated-unit validation failure' "$output" || exit 1
-
-            failure_mode='hardlink-missing'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained_backup" ] || exit 1
-            grep -Fq -- "'link' utility" "$output" || exit 1
-
-            failure_mode='backup-metadata'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            grep -Fq -- 'content or metadata changed' "$output" || exit 1
-
-            failure_mode=override-after-begin
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            grep -Fq -- 'override appeared during migration' "$output" || exit 1
-
-            failure_mode='binary-move'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            grep -Fq -- 'could not replace the installed binary' "$output" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained_backup" ] &&
-                [ ! -e "${installed}.new.$$" ] || exit 1
-
-            failure_mode=no-restart
-            RESTART_ON_UPGRADE=0
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if ! (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = candidate ] || exit 1
-            grep -Fq -- 'WorkingDirectory=/' "$unit" || exit 1
-            ! grep -Fq -- 'restart alighieri.service|' "$calls" || exit 1
-            grep -Fq -- 'not restarted (--no-restart)' "$output" || exit 1
-            legacy_unit_file_matches_kind "$retained_backup" v0.1.x \
-                "$installed" "$config" || exit 1
-            command rm -f -- "$retained_backup"
-            RESTART_ON_UPGRADE=1
-
-            failure_mode='unit-rollback-race'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            grep -Fq -- 'Description=Concurrent rollback replacement' "$unit" || exit 1
-            legacy_unit_file_matches_kind "${transaction_dir}/previous" v0.1.x \
-                "$installed" "$config" || exit 1
-            grep -Fq -- 'did not overwrite the concurrently changed systemd unit' \
-                "$output" || exit 1
-            command rm -f -- "$retained_backup" "${transaction_dir}/previous" \
-                "${transaction_dir}/candidate" "${transaction_dir}/candidate.snapshot" \
-                "${transaction_dir}/rollback.displaced" \
-                "${transaction_dir}/binary-commit-intent" \
-                "${transaction_dir}/binary-commit-intent.staged" \
-                "${transaction_dir}/binary-rollback"
-            command rmdir -- "$transaction_dir"
-
-            failure_mode='unit-rollback-in-place'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            grep -Fq -- '# concurrent in-place rollback edit' "$unit" || exit 1
-            legacy_unit_file_matches_kind "${transaction_dir}/previous" v0.1.x \
-                "$installed" "$config" || exit 1
-            grep -Fq -- 'did not overwrite the concurrently changed systemd unit' \
-                "$output" || exit 1
-            command rm -f -- "$retained_backup" "${transaction_dir}/previous" \
-                "${transaction_dir}/candidate" "${transaction_dir}/candidate.snapshot" \
-                "${transaction_dir}/rollback.displaced" \
-                "${transaction_dir}/binary-commit-intent" \
-                "${transaction_dir}/binary-commit-intent.staged" \
-                "${transaction_dir}/binary-rollback"
-            command rmdir -- "$transaction_dir"
-
-            failure_mode='unit-detach-race'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            grep -Fq -- '# concurrent operator edit at detach' "$unit" || exit 1
-            grep -Fq -- 'content or metadata changed' "$output" || exit 1
-            [ ! -e "$transaction_dir" ] || exit 1
-
-            failure_mode='unit-race'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            grep -Fq -- '# concurrent operator edit' "$unit" || exit 1
-            grep -Fq -- 'legacy systemd unit changed during upgrade' "$output" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained_backup" ] || exit 1
-
-            failure_mode='unit-publish-race'
-            : >"$calls"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            printf '%s\n' installed >"$installed"
-            if (trap cleanup EXIT; do_upgrade) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$installed")" = installed ] || exit 1
-            grep -Fq -- 'Description=Concurrent operator replacement' "$unit" || exit 1
-            ! grep -Fq -- 'WorkingDirectory=/' "$unit" || exit 1
-            legacy_unit_file_matches_kind "${transaction_dir}/previous" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "${unit}.new.$$" ] || exit 1
-            grep -Fq -- 'changed during migration publication' "$output" || exit 1
-            grep -Fq -- "recovery copy at ${transaction_dir}/previous" "$output" || exit 1
-            [ -f "$retained_backup" ]
-        ); then
-            printf 'ok   legacy upgrade commits atomically and rolls back every staged failure\n'
-        else
-            printf 'FAIL legacy upgrade transaction\n'
-            failures=$((failures + 1))
-        fi
-
-        command rm -f -- "$unit" "${unit}.operator" "$config" "$source" "$installed" "$calls" \
-            "$output" "${installed}.new.$$" "${unit}.new.$$" \
-            "$retained_backup" "${transaction_dir}/candidate" \
-            "${transaction_dir}/candidate.snapshot" "${transaction_dir}/previous" \
-            "${transaction_dir}/rollback.displaced" \
-            "${transaction_dir}/binary-commit-intent" \
-            "${transaction_dir}/binary-commit-intent.staged" \
-            "${transaction_dir}/binary-rollback" \
-            "${transaction_dir}/binary-rollback-untrusted" \
-            "${transaction_dir}/committed" \
-            "${transaction_dir}/link.probe"
-        command rmdir -- "$transaction_dir" 2>/dev/null || true
-        command rmdir -- "$bin_dir" "$upgrade_tmp"
-    }
-    _check_legacy_upgrade_transaction
-    unset -f _check_legacy_upgrade_transaction
-
-    _check_legacy_transaction_recovery() {
-        local recovery_tmp unit transaction_dir candidate snapshot backup retained \
-              displaced intent rollback_marker committed staged_binary output \
-              installed config calls reload_fail UNIT_FILE STAGED_UNIT UNIT_CANDIDATE_SNAPSHOT \
+    _check_exchange_v1_transactions() (
+        local tx_tmp unit staged transaction candidate snapshot witness backup previous_staged retained \
+              marker rollback_finalized intent staged_binary output UNIT_FILE STAGED_UNIT \
+              UNIT_CANDIDATE_GUARD UNIT_CANDIDATE_SNAPSHOT UNIT_CANDIDATE_WITNESS \
               UNIT_BACKUP UNIT_TRANSACTION_DIR UNIT_RETAINED_BACKUP \
               UNIT_TRANSACTION_ACTIVE UNIT_HAD_ORIGINAL \
-              UNIT_TRANSACTION_USES_STAGED_LINK UNIT_ROLLBACK_CONFLICT_COPY \
-              UNIT_ROLLBACK_RELOAD_FAILED
-        recovery_tmp="$(mktemp -d)"
-        unit="$recovery_tmp/alighieri.service"
-        transaction_dir="${unit}.migration"
-        candidate="${transaction_dir}/candidate"
-        snapshot="${transaction_dir}/candidate.snapshot"
-        backup="${transaction_dir}/previous"
+              UNIT_TRANSACTION_USES_STAGED_LINK UNIT_TRANSACTION_EXCHANGE_V1 \
+              UNIT_CANDIDATE_PUBLISHED UNIT_ROLLBACK_RELOAD_FAILED STAGED_FS_HELPER \
+              STAGED_BIN BINARY_COMMIT_IN_PROGRESS \
+              test_result=0
+        tx_tmp="$(mktemp -d)"
+        unit="$tx_tmp/alighieri.service"
+        staged="${unit}.new.$$"
+        transaction="${unit}.migration"
+        candidate="${transaction}/candidate"
+        snapshot="${transaction}/candidate.snapshot"
+        witness="${transaction}/candidate.witness"
+        backup="${transaction}/previous"
+        previous_staged="${backup}.staged"
         retained="${unit}.pre-migration"
-        displaced="${transaction_dir}/rollback.displaced"
-        intent="${transaction_dir}/binary-commit-intent"
-        rollback_marker="${transaction_dir}/binary-rollback"
-        committed="${transaction_dir}/committed"
-        staged_binary="$recovery_tmp/alighieri.new.123"
-        output="$recovery_tmp/output"
-        installed="$recovery_tmp/alighieri"
-        config="$recovery_tmp/alighieri.conf"
-        calls="$recovery_tmp/calls"
-        printf '%s\n' installed >"$installed"
-        printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
+        marker="${transaction}/exchange-v1"
+        rollback_finalized="${transaction}/exchange-v1-rolled-back"
+        intent="${transaction}/binary-commit-intent"
+        staged_binary="$tx_tmp/alighieri.new.123"
+        output="$tx_tmp/output"
+        UNIT_FILE="$unit"
+        STAGED_FS_HELPER="$tx_tmp/mock-helper"
+        : >"$STAGED_FS_HELPER"
 
-        if (
-            UNIT_FILE="$unit"
+        hardlink_utility_available() { :; }
+        link_file_command() { command ln -- "$1" "$2"; }
+        rename_noreplace_file_command() {
+            [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+            command mv -- "$1" "$2"
+        }
+        exchange_file_command() {
+            local temporary="${1}.exchange"
+            command mv -- "$1" "$temporary" &&
+                command mv -- "$2" "$1" &&
+                command mv -- "$temporary" "$2"
+        }
+        systemctl() { :; }
+        legacy_transaction_directory_is_safe() { :; }
+        unit_file_is_safe_for_legacy_migration() { [ "$1" = "$candidate" ]; }
+        legacy_unit_file_matches_kind() { [ "$(<"$1")" = old-unit ]; }
+
+        _reset_exchange_globals() {
             STAGED_UNIT=""
+            UNIT_CANDIDATE_GUARD=""
             UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_CANDIDATE_WITNESS=""
             UNIT_BACKUP=""
             UNIT_TRANSACTION_DIR=""
             UNIT_RETAINED_BACKUP=""
             UNIT_TRANSACTION_ACTIVE=0
             UNIT_HAD_ORIGINAL=0
             UNIT_TRANSACTION_USES_STAGED_LINK=0
-            UNIT_ROLLBACK_CONFLICT_COPY=""
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            UNIT_CANDIDATE_PUBLISHED=0
             UNIT_ROLLBACK_RELOAD_FAILED=0
-            reload_fail=0
-            legacy_transaction_directory_is_safe() { :; }
-            systemctl() {
-                printf '%s|' "$*" >>"$calls"
-                if [ "$reload_fail" -eq 1 ] && [ "${1:-}" = daemon-reload ]; then
-                    return 1
-                fi
-            }
+            STAGED_BIN=""
+            BINARY_COMMIT_IN_PROGRESS=0
+        }
 
-            # Crash before detach: the original live unit is authoritative and
-            # the deterministic journal can be discarded safely.
-            render_legacy_unit_v0_1 "$installed" "$config" >"$unit"
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] || exit 1
+        if (
+            _reset_exchange_globals || exit 1
+            printf '%s\n' old-unit >"$unit" || exit 1
+            printf '%s\n' new-unit >"$staged" || exit 1
+            STAGED_UNIT="$staged"
+            begin_legacy_unit_transaction legacy ignored ignored || exit 1
+            {
+                [ "$(<"$unit")" = new-unit ] &&
+                    [ "$(<"$candidate")" = old-unit ] &&
+                    [ "$unit" -ef "$witness" ] &&
+                    [ "$candidate" -ef "$retained" ] &&
+                    [ "$(<"$backup")" = old-unit ] &&
+                    [ ! -e "$previous_staged" ]
+            } || exit 1
+            rollback_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
 
-            # Crash after detach but before publication: restore the journaled
-            # exact unit with create-if-absent semantics.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
+            # The durable exchange marker is created before the in-memory ACTIVE
+            # flag. Exercise cleanup in that signal window with both possible
+            # inode orientations so it adopts and rolls back the journal.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' old-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' new-unit >"$candidate" || exit 1
+            command cp -p -- "$candidate" "$snapshot" || exit 1
+            command ln -- "$candidate" "$witness" || exit 1
+            : >"$marker" || exit 1
+            STAGED_UNIT="$candidate"
+            UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+            UNIT_CANDIDATE_WITNESS="$witness"
+            UNIT_BACKUP="$backup"
+            UNIT_TRANSACTION_DIR="$transaction"
+            UNIT_RETAINED_BACKUP="$retained"
+            [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] || exit 1
+            cleanup || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # Crash after publication: classify the live candidate against its
-            # independent snapshot, then roll the exact previous unit back.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
-            grep -Fq -- 'daemon-reload|' "$calls" || exit 1
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            : >"$marker" || exit 1
+            STAGED_UNIT="$candidate"
+            UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+            UNIT_CANDIDATE_WITNESS="$witness"
+            UNIT_BACKUP="$backup"
+            UNIT_TRANSACTION_DIR="$transaction"
+            UNIT_RETAINED_BACKUP="$retained"
+            [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] || exit 1
+            cleanup || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # Crash after publishing the old recovery link but before removing
-            # `previous`: recognize the shared inode and finish idempotently.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$backup" "$unit"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
+            # A live replacement after publication must win. Recovery evidence
+            # remains durable instead of exchanging the operator's unit away.
+            printf '%s\n' old-unit >"$unit" || exit 1
+            printf '%s\n' new-unit >"$staged" || exit 1
+            STAGED_UNIT="$staged"
+            begin_legacy_unit_transaction legacy ignored ignored || exit 1
+            printf '%s\n' operator-unit >"${unit}.operator" || exit 1
+            command mv -f -- "${unit}.operator" "$unit" || exit 1
+            rollback_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = operator-unit ] &&
+                    [ -d "$transaction" ] &&
+                    [ "$(<"$candidate")" = old-unit ]
+            } || exit 1
+            command rm -f -- "$candidate" "$snapshot" "$witness" "$backup" \
+                "$retained" "$marker" || exit 1
+            command rmdir -- "$transaction" || exit 1
 
-            # Crash after moving the live candidate into the deterministic
-            # journal: resume classification and restore the previous inode.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$displaced"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
+            # A symlink that wins the live pathname at the original exchange
+            # boundary must be restored live exactly once. The generated
+            # candidate stays journaled, and repeated recovery remains stable.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            printf '%s\n' operator-unit >"${unit}.operator" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            command ln -s -- "${unit}.operator" "$candidate" || exit 1
+            command cp -p -- "$unit" "$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            : >"$marker" || exit 1
+            STAGED_UNIT="$candidate"
+            UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+            UNIT_CANDIDATE_WITNESS="$witness"
+            UNIT_BACKUP="$backup"
+            UNIT_TRANSACTION_DIR="$transaction"
+            UNIT_RETAINED_BACKUP="$retained"
+            UNIT_TRANSACTION_ACTIVE=1
+            UNIT_HAD_ORIGINAL=1
+            UNIT_TRANSACTION_USES_STAGED_LINK=1
+            UNIT_TRANSACTION_EXCHANGE_V1=1
+            UNIT_CANDIDATE_PUBLISHED=1
+            rollback_unit_transaction || exit 1
+            {
+                [ -L "$unit" ] &&
+                    [ "$(readlink -- "$unit")" = "${unit}.operator" ] &&
+                    [ "$(<"$unit")" = operator-unit ] &&
+                    [ "$(<"$candidate")" = new-unit ]
+            } || exit 1
+            ! (recover_interrupted_legacy_unit_transaction) || exit 1
+            {
+                [ -L "$unit" ] &&
+                    [ "$(readlink -- "$unit")" = "${unit}.operator" ] &&
+                    [ "$(<"$candidate")" = new-unit ]
+            } || exit 1
+            command rm -f -- "$unit" "${unit}.operator" "$candidate" \
+                "$snapshot" "$witness" "$marker" || exit 1
+            command rmdir -- "$transaction" || exit 1
 
-            # Published intent + existing source means the binary rename never
-            # committed. Persist rollback, restore the unit, then remove source.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            printf '%s\n' staged >"$staged_binary"
-            printf '%s\n%s\n' "$staged_binary" complete >"$intent"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] &&
-                [ ! -e "$staged_binary" ] || exit 1
+            # The same exchange-boundary rule applies to an operator-created
+            # directory. Keep it live across the first rollback and every
+            # later recovery attempt instead of republishing the candidate.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            command mkdir -- "$candidate" || exit 1
+            command cp -p -- "$unit" "$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            : >"$marker" || exit 1
+            STAGED_UNIT="$candidate"
+            UNIT_CANDIDATE_SNAPSHOT="$snapshot"
+            UNIT_CANDIDATE_WITNESS="$witness"
+            UNIT_BACKUP="$backup"
+            UNIT_TRANSACTION_DIR="$transaction"
+            UNIT_RETAINED_BACKUP="$retained"
+            UNIT_TRANSACTION_ACTIVE=1
+            UNIT_HAD_ORIGINAL=1
+            UNIT_TRANSACTION_USES_STAGED_LINK=1
+            UNIT_TRANSACTION_EXCHANGE_V1=1
+            UNIT_CANDIDATE_PUBLISHED=1
+            rollback_unit_transaction || exit 1
+            {
+                [ -d "$unit" ] &&
+                    [ "$(<"$candidate")" = new-unit ]
+            } || exit 1
+            ! (recover_interrupted_legacy_unit_transaction) || exit 1
+            {
+                [ -d "$unit" ] &&
+                    [ "$(<"$candidate")" = new-unit ]
+            } || exit 1
+            command rmdir -- "$unit" || exit 1
+            command rm -f -- "$candidate" "$snapshot" "$witness" "$marker" || exit 1
+            command rmdir -- "$transaction" || exit 1
 
-            # Published intent + absent source means the atomic binary rename
-            # committed. Finalize the candidate and retain the exact old unit.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit" "$staged_binary"
-            command link "$candidate" "$unit"
-            printf '%s\n%s\n' "$staged_binary" complete >"$intent"
-            recover_interrupted_legacy_unit_transaction
-            [ "$(<"$unit")" = candidate ] || exit 1
-            legacy_unit_file_matches_kind "$retained" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ ! -e "$transaction_dir" ] || exit 1
-            command rm -f -- "$unit" "$retained"
+            # A crash after the inode witness but before the exchange marker is
+            # armed leaves a distinguishable pre-exchange journal. Recovery
+            # must remove every journal artifact, including the witness.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' old-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' new-unit >"$candidate" || exit 1
+            command cp -p -- "$candidate" "$snapshot" || exit 1
+            command ln -- "$candidate" "$witness" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # A failed reload keeps the journal after disk rollback. The next
-            # invocation retries reload before removing the recovery evidence.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command link "$candidate" "$unit"
-            reload_fail=1
-            if (recover_interrupted_legacy_unit_transaction) >"$output" 2>&1; then
-                exit 1
-            fi
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ -d "$transaction_dir" ] || exit 1
-            reload_fail=0
-            recover_interrupted_legacy_unit_transaction
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
+            # A failed or interrupted copy can leave only previous.staged.
+            # Recovery restores the exact displaced inode and removes the
+            # incomplete snapshot without treating it as authoritative.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            printf '%s\n' partial >"$previous_staged" || exit 1
+            : >"$marker" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # A displaced operator unit is republished without replacement and
-            # PID 1 is reloaded before recovery reports the conflict.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            printf '%s\n' operator-unit >"$displaced"
-            command rm -f -- "$unit"
-            : >"$calls"
-            if (recover_interrupted_legacy_unit_transaction) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$(<"$unit")" = operator-unit ] && [ -f "$backup" ] || exit 1
-            grep -Fq -- 'daemon-reload|' "$calls" || exit 1
-            command rm -f -- "$unit" "$candidate" "$snapshot" "$backup" \
-                "$retained" "$displaced" "$intent" "${intent}.staged" \
-                "$rollback_marker" "${transaction_dir}/binary-rollback-untrusted"
-            command rmdir -- "$transaction_dir"
+            # Crash before exchange: witness orientation proves live was never
+            # changed, so recovery only removes the armed journal.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' old-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' new-unit >"$candidate" || exit 1
+            command cp -p -- "$candidate" "$snapshot" || exit 1
+            command ln -- "$candidate" "$witness" || exit 1
+            : >"$marker" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # Dependency failure is detected before an existing journal or live
-            # unit is mutated, leaving a later supported recovery possible.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            if (mock_hardlink_result=1; \
-                hardlink_utility_available() { return "$mock_hardlink_result"; }; \
-                recover_interrupted_legacy_unit_transaction) >"$output" 2>&1; then
-                exit 1
-            fi
-            [ "$unit" -ef "$candidate" ] && [ -f "$backup" ] || exit 1
-            grep -Fq -- "'link' utility" "$output" || exit 1
-            recover_interrupted_legacy_unit_transaction
-            [ ! -e "$transaction_dir" ] && [ ! -e "$retained" ] || exit 1
+            # Crash immediately after exchange, before previous exists: the
+            # exact old entry at candidate is enough for atomic rollback.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            : >"$marker" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
 
-            # Torn unpublished/rollback records unambiguously mean rollback but
-            # must never authorize deletion of a partially recorded path.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            : >"${intent}.staged"
-            recover_interrupted_legacy_unit_transaction
-            [ "$(<"$installed")" = installed ] && [ ! -e "$transaction_dir" ] || exit 1
+            # Binary intent plus an absent staged source records a committed
+            # exchange: keep candidate live and retain the exact displaced inode.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            printf '%s\n%s\n' "$staged_binary" complete >"$intent" || exit 1
+            command rm -f -- "$staged_binary" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = new-unit ] &&
+                    [ "$(<"$retained")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+            command rm -f -- "$unit" "$retained" || exit 1
 
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            printf '%s\n' "$installed" >"${intent}.staged"
-            recover_interrupted_legacy_unit_transaction
-            [ "$(<"$installed")" = installed ] && [ ! -e "$transaction_dir" ] || exit 1
+            # Backward compatibility: an old #155 detach/publish journal has no
+            # exchange marker and is recovered with exact helper operations.
+            _reset_exchange_globals || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' new-unit >"$candidate" || exit 1
+            command cp -p -- "$candidate" "$snapshot" || exit 1
+            printf '%s\n' old-unit >"$backup" || exit 1
+            command ln -- "$backup" "$retained" || exit 1
+            command ln -- "$candidate" "$unit" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
 
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            command link "$backup" "$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            printf '%s\n' "$installed" >"$rollback_marker"
-            recover_interrupted_legacy_unit_transaction
-            [ "$(<"$installed")" = installed ] && [ ! -e "$transaction_dir" ] || exit 1
+            # A crash after marking an exchange rollback complete can leave some
+            # journal artifacts. Recovery must clean them without exchanging the
+            # already-restored live unit a second time.
+            _reset_exchange_globals || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' new-unit >"$candidate" || exit 1
+            command cp -p -- "$candidate" "$snapshot" || exit 1
+            command ln -- "$candidate" "$witness" || exit 1
+            printf '%s\n' old-unit >"$backup" || exit 1
+            command ln -- "$unit" "$retained" || exit 1
+            : >"$marker" || exit 1
+            : >"$rollback_finalized" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
 
-            # A root operator may win the documented retained-backup pathname
-            # race. Roll back the unit without unlinking that different inode.
-            command mkdir -m 700 -- "$transaction_dir"
-            printf '%s\n' candidate >"$candidate"
-            command cp -p -- "$candidate" "$snapshot"
-            render_legacy_unit_v0_1 "$installed" "$config" >"$backup"
-            printf '%s\n' operator-retained >"$retained"
-            command rm -f -- "$unit"
-            command link "$candidate" "$unit"
-            recover_interrupted_legacy_unit_transaction
-            legacy_unit_file_matches_kind "$unit" v0.1.x \
-                "$installed" "$config" || exit 1
-            [ "$(<"$retained")" = operator-retained ] &&
-                [ ! -e "$transaction_dir" ] || exit 1
-            command rm -f -- "$retained"
-        ); then
-            printf 'ok   persistent legacy migration journal recovers every recorded crash boundary\n'
+            # The rollback marker is removed immediately before rmdir. If a
+            # crash lands in that window, an empty trusted directory is benign.
+            _reset_exchange_globals || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+        ) >"$output" 2>&1; then
+            printf 'ok   exchange-v1 unit transaction handles races, crash prefixes, cleanup recovery, and old journals\n'
         else
-            printf 'FAIL persistent legacy migration recovery\n'
-            failures=$((failures + 1))
+            printf 'FAIL exchange-v1 unit transaction: %s\n' "$(<"$output")"
+            test_result=1
         fi
 
-        command rm -f -- "$unit" "$candidate" "$snapshot" "$backup" "$retained" \
-            "$displaced" "$intent" "${intent}.staged" "$rollback_marker" \
-            "${transaction_dir}/binary-rollback-untrusted" "$committed" \
-            "${transaction_dir}/link.probe" "$staged_binary" "$output" \
-            "$installed" "$config" "$calls"
-        command rmdir -- "$transaction_dir" 2>/dev/null || true
-        command rmdir -- "$recovery_tmp"
-    }
-    _check_legacy_transaction_recovery
-    unset -f _check_legacy_transaction_recovery
+        command rm -f -- "$unit" "${unit}.operator" "$staged" "$candidate" \
+            "$snapshot" "$witness" "$backup" "$previous_staged" "$retained" "$marker" \
+            "$rollback_finalized" "$intent" \
+            "$staged_binary" "$output" "$STAGED_FS_HELPER"
+        command rmdir -- "$transaction" 2>/dev/null || true
+        command rmdir -- "$tx_tmp"
+        unset -f _reset_exchange_globals
+        return "$test_result"
+    )
+    if ! _check_exchange_v1_transactions; then
+        failures=$((failures + 1))
+    fi
+    unset -f _check_exchange_v1_transactions
 
     _check_upgrade_reload_order() {
         local upgrade_tmp unit config source installed order got installed_contents \
@@ -6153,11 +6707,14 @@ do_install() {
     fi
 
     resolve_source_binary
+    resolve_installer_fs_helper_source
     ensure_user
 
     local install_bin
     install_bin="$(join_path_child "$BIN_DIR" "$SERVICE_NAME")"
     prepare_binary_directory "$BIN_DIR"
+    stage_installer_fs_helper "$install_bin" ||
+        die "could not stage the privileged installer companion in $BIN_DIR"
     # Keep the active executable untouched until every failure-prone config and
     # userlist preflight has succeeded. Staging beside the destination also
     # keeps the final move atomic and lets the EXIT trap clean up any rejection.
@@ -6298,6 +6855,7 @@ do_install() {
         "$install_bin" "$config_file" "$capability_mask"
 
     info "installing validated binary to $install_bin"
+    require_unit_transaction_candidate_current
     # The checked replacement refuses an unexpected directory destination
     # instead of moving the staged executable inside it under another basename.
     # Arm cleanup to distinguish a signal before the atomic rename (source still
@@ -6371,6 +6929,11 @@ do_upgrade() {
     require_secure_service_config_file "$config_file"
     reject_hidden_service_path "config path" "$config_file"
     resolve_source_binary
+    if [ -n "$UPGRADE_LEGACY_UNIT_KIND" ]; then
+        resolve_installer_fs_helper_source
+        stage_installer_fs_helper "$install_bin" ||
+            die "could not stage the privileged installer companion in $install_dir"
+    fi
 
     # Stage the new binary beside the destination first. install -m 755 gives it
     # the exec bit even when the --binary source is a non-executable artifact,
@@ -6428,6 +6991,7 @@ do_upgrade() {
     fi
 
     info "upgrading binary at $install_bin"
+    require_unit_transaction_candidate_current
     journal_binary_commit_intent "$STAGED_BIN" ||
         die "could not journal the pending binary replacement; the previous unit will be restored"
     BINARY_COMMIT_IN_PROGRESS=1

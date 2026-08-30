@@ -22,6 +22,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
+- Legacy systemd-unit migration now uses a version-matched, narrowly scoped
+  Linux companion for exact-path hard links and kernel-atomic no-replace
+  renames and exchanges, closing pathname replacement races during unit
+  publication and rollback without executing an operator-selected service
+  binary as root.
 - Privileged Linux status checks no longer execute the installed binary as root,
   and failed `--version` commands can no longer contribute plausible output.
 - Legacy systemd-unit migration now serializes mutating helper invocations,

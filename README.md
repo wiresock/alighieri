@@ -914,8 +914,8 @@ idempotent deletion, SSH/Rust client flows, and the security boundary.
 On Linux, [`scripts/alighieri.sh`](scripts/alighieri.sh) manages the whole
 lifecycle as a hardened systemd service — install, upgrade, uninstall, and
 status. Mutating commands require `flock`; automatic legacy-unit migration also
-requires the coreutils-compatible `link` utility and fails before detaching the
-live unit when it is unavailable.
+requires the version-matched `alighieri-installer-fs` companion and fails before
+detaching the live unit when the companion is unavailable or incompatible.
 
 **From a Linux release archive:** extract the archive and run the bundled,
 version-matched helper from its root. It finds the archive's binary
@@ -925,11 +925,15 @@ automatically, so no Rust toolchain is required:
 sudo ./scripts/alighieri.sh install
 ```
 
-The Linux archives include `scripts/alighieri.sh` and `doc/alighieri.conf`.
-The helper selects the archive-root `alighieri` binary, so the installed binary,
-lifecycle logic, and initial config all come from the same release. It never
-clones a mutable repository branch or downloads a replacement helper. An
-explicit `--binary PATH` remains available for an intentionally selected
+The Linux archives include `scripts/alighieri.sh`, `doc/alighieri.conf`, and the
+narrowly path-scoped `alighieri-installer-fs` companion used for atomic systemd
+unit transactions. The lifecycle script stages that companion privately from
+the same archive; it never executes the service payload selected by `--binary`
+as root for those filesystem operations. The lifecycle script selects the
+archive-root `alighieri` binary, so the installed binary, lifecycle logic,
+companion, and initial config all come from the same release. It never clones a
+mutable repository branch or downloads a replacement helper. An explicit
+`--binary PATH` remains available for an intentionally selected service
 artifact and takes precedence over auto-detection.
 
 To upgrade an existing Linux service, extract the newer archive, change into
