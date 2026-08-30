@@ -6,6 +6,20 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-30
+
+### Changed
+
+- The public TLS wizard completion page and documentation now lead with the
+  ProxiFyre 2.5+ Windows GUI instead of requiring manual `app-config.json`
+  editing.
+- Manual ProxiFyre JSON configuration remains available as a collapsed
+  advanced option.
+- Remote VPS documentation now explains how to access the loopback-only wizard
+  through SSH port forwarding.
+- Public TLS prerequisites now clarify Cloudflare DNS-only operation and the
+  IPv4/AAAA limitations of the ready-made profile.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added
@@ -699,7 +713,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/wiresock/alighieri/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wiresock/alighieri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/wiresock/alighieri/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/wiresock/alighieri/compare/v0.3.0...v0.3.1
