@@ -25,6 +25,7 @@ include = [
     "/doc/alighieri.conf",
     "/doc/acme-tls-test.md",
     "/doc/benchmarks.md",
+    "/doc/management-cli.md",
     "/doc/plugin-sdk.md",
     "/doc/roadmap.md",
     "/doc/windows-service.md",
@@ -59,6 +60,9 @@ anyhow = "1"
 thiserror = "2"
 password-hash = { version = "0.5", features = ["rand_core"] }
 rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
 # PEM parsing for the TLS listener. The std feature provides the reader/file
 # PEM helpers; this replaces the now-unmaintained rustls-pemfile crate.
 rustls-pki-types = { version = "1", features = ["std"] }

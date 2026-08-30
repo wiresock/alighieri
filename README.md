@@ -29,6 +29,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
   - [Rules](#rules)
   - [Userlist format](#userlist-format)
   - [Hot reload](#hot-reload)
+- [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -118,8 +119,13 @@ Manage hashed userlist entries:
 ```sh
 alighieri user add alice --userlist /etc/alighieri/users
 alighieri user list --userlist /etc/alighieri/users
+alighieri user verify alice --userlist /etc/alighieri/users
 alighieri user delete alice --userlist /etc/alighieri/users
 ```
+
+Automation can discover the versioned local management interface with
+`alighieri capabilities --json`; see
+[Machine-readable management CLI](#machine-readable-management-cli).
 
 On Linux, install and start Alighieri as a hardened systemd service (details
 under [Linux service (systemd)](#linux-service-systemd)). From a source
@@ -768,6 +774,11 @@ alighieri user verify alice --userlist /etc/alighieri/users
 alighieri user delete alice --userlist /etc/alighieri/users
 ```
 
+The same operations support versioned JSON responses, password input through
+stdin, and resolution of the effective include-aware userlist from a
+configuration. See the [management CLI protocol](doc/management-cli.md) for the
+complete automation contract and security requirements.
+
 Plaintext `username:password` entries remain supported for compatibility, but
 hashed entries are preferred. The file should be readable only by the user
 running Alighieri (`chmod 600`).
@@ -849,6 +860,42 @@ settings are reported in the logs and require a restart.
 
 Tools and local setup UIs can inspect the same distinction with
 `alighieri config metadata --json`.
+
+## Machine-readable management CLI
+
+Alighieri provides a versioned local CLI/stdio contract for administration
+tools, including a future cross-platform manager operating through an existing
+authenticated SSH connection. Discover the exact features supported by a
+binary before using them:
+
+```sh
+alighieri capabilities --json
+alighieri user list --config /etc/alighieri/alighieri.conf --json
+```
+
+User add, delete, list, and verify operations can return one JSON envelope with
+stable protocol-1 error codes. Add and verify accept a single bounded password
+record on stdin, so the secret never needs to appear in argv, an environment
+variable, or JSON:
+
+```sh
+trusted-password-provider | \
+  sudo -n alighieri user add alice \
+    --config /etc/alighieri/alighieri.conf \
+    --password-stdin --json
+```
+
+`trusted-password-provider` is a placeholder for a protected process that
+writes exactly one password record without logging it. Production clients
+should write their protected buffer directly to the SSH channel and clear it
+promptly; shell variables can leave additional copies in memory.
+
+This interface does not open a management port or install a resident agent.
+SSH authentication and host-key verification, operating-system privileges,
+service control, and reloads remain the caller's responsibility. The complete
+[management CLI protocol](doc/management-cli.md) defines compatibility
+negotiation, command and result schemas, stdin framing, error identifiers,
+idempotent deletion, SSH/Rust client flows, and the security boundary.
 
 ## Linux service (systemd)
 

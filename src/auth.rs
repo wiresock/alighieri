@@ -47,7 +47,9 @@ const MAX_CONCURRENT_AUTH_COMMANDS: usize = 64;
 /// this only guards against one briefly stuck uninterruptibly, after which the
 /// `Child` handle is dropped and tokio's orphan queue reaps anything slower.
 const REAP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const RFC1929_FIELD_MAX: usize = u8::MAX as usize;
+/// Maximum byte length of an RFC 1929 username or password field.
+#[doc(hidden)]
+pub const RFC1929_FIELD_MAX_BYTES: usize = u8::MAX as usize;
 const MAX_VERIFIED_CACHE_ENTRIES: usize = 1024;
 /// Cache tags use a deliberately cheap Argon2 instance (microseconds): the
 /// full-cost hash already ran once before anything is cached, and the
@@ -156,6 +158,13 @@ impl UserDb {
     #[doc(hidden)]
     pub fn validate_username(username: &str) -> Result<()> {
         validate_username(username)
+    }
+
+    /// Applies the password field-length rule shared by SOCKS authentication
+    /// and noninteractive user management.
+    #[doc(hidden)]
+    pub fn validate_password(password: &str) -> Result<()> {
+        validate_password(password)
     }
 
     /// Returns the username represented by a userlist line, if it is an entry.
@@ -674,7 +683,7 @@ fn validate_username(username: &str) -> Result<()> {
             "username must not contain ':', CR, LF, or NUL".into(),
         ));
     }
-    if username.len() > RFC1929_FIELD_MAX {
+    if username.len() > RFC1929_FIELD_MAX_BYTES {
         return Err(Error::Config(
             "username must not exceed 255 bytes for SOCKS5 username/password authentication".into(),
         ));
@@ -683,7 +692,7 @@ fn validate_username(username: &str) -> Result<()> {
 }
 
 fn validate_password(password: &str) -> Result<()> {
-    if password.len() > RFC1929_FIELD_MAX {
+    if password.len() > RFC1929_FIELD_MAX_BYTES {
         return Err(Error::Config(
             "password must not exceed 255 bytes for SOCKS5 username/password authentication".into(),
         ));

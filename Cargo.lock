@@ -23,6 +23,8 @@ dependencies = [
  "rpassword",
  "rustls-acme",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "socket2",
  "tempfile",
  "thiserror 2.0.19",
@@ -33,6 +35,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

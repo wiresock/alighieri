@@ -6,6 +6,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- A versioned, machine-readable local management CLI now provides capability
+  discovery and JSON user add/delete/list/verify operations, with stable
+  protocol-1 error codes, bounded password input through stdin, idempotent
+  deletion, and include-aware effective-userlist targeting through
+  `--config`. The interface is intended for invocation over an existing SSH
+  connection and opens no management listener or resident agent.
+
 ## [0.5.2] - 2026-08-30
 
 ### Changed
