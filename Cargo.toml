@@ -2,6 +2,7 @@
 name = "alighieri"
 version = "0.5.2"
 edition = "2021"
+default-run = "alighieri"
 # Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009
 # patched `time` (>=0.3.47) requires rustc 1.88.
 rust-version = "1.88"
@@ -44,6 +45,11 @@ features = ["plugins"]
 name = "alighieri"
 path = "src/main.rs"
 
+[[bin]]
+name = "alighieri-installer-fs"
+path = "src/bin/alighieri-installer-fs.rs"
+required-features = ["installer-fs"]
+
 [lib]
 name = "alighieri"
 path = "src/lib.rs"
@@ -80,6 +86,9 @@ async-trait = { version = "0.1", optional = true }
 
 [features]
 default = []
+# Build the narrowly scoped Linux systemd-installer filesystem companion. It is
+# off by default so `cargo install alighieri` installs only the service binary.
+installer-fs = []
 # The plugin SDK (`alighieri::plugin`). Off by default: a stock build carries no
 # plugin code, no extra dependencies, and no added attack surface.
 plugins = ["dep:async-trait"]
