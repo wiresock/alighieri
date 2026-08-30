@@ -17,7 +17,7 @@ Enable the SDK and add Tokio for the host runtime:
 
 ```toml
 [dependencies]
-alighieri = { version = "0.4", features = ["plugins"] }
+alighieri = { version = "0.5", features = ["plugins"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 ```
 
@@ -106,7 +106,7 @@ impl Plugin for PrivateTargetGuard {
 
 The core DNS-deny policy and ACL remain the primary authorization boundary. A
 plugin receives the already resolved destination and cannot retarget the flow.
-In version 0.4, `on_flow` and the paired `on_flow_end` notification apply to TCP
+`on_flow` and the paired `on_flow_end` notification apply to TCP
 `CONNECT`; UDP uses the hooks described below.
 
 ## TCP interception
@@ -293,8 +293,8 @@ ends it when the control connection closes or the association idles out.
 An empty host is the fast path. The `plugins` feature is off by default, so a
 stock build includes neither dispatch code nor its optional macro dependency.
 
-The documented SDK follows the `0.4.x` compatibility policy: patch releases
-preserve compatible APIs, and intentional breaking changes require `0.5.0`.
+The documented SDK follows the `0.5.x` compatibility policy: patch releases
+preserve compatible APIs, and intentional breaking changes require `0.6.0`.
 Context and vocabulary types are non-exhaustive or opaque so fields, variants,
 and implementation details can evolve. Match non-exhaustive enums with a
 wildcard arm and construct non-exhaustive contexts through their public

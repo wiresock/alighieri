@@ -981,11 +981,11 @@ inspection, stop, and uninstall, see
 
 ## Rust API and plugin SDK
 
-Version 0.4 supports the configuration model and parser, crate-wide
+Version 0.5 supports the configuration model and parser, crate-wide
 `Error`/`Result`, `Server` lifecycle, runtime shutdown/reload drivers, and the
-feature-gated plugin SDK as its public Rust API. Patch releases in the `0.4.x`
+feature-gated plugin SDK as its public Rust API. Patch releases in the `0.5.x`
 line preserve compatibility for those documented interfaces; an intentional
-breaking API or SDK change requires `0.5.0`. Engine, wire-protocol, relay,
+breaking API or SDK change requires `0.6.0`. Engine, wire-protocol, relay,
 platform, and CLI-support internals are not part of that compatibility
 contract. See the complete [API documentation](https://docs.rs/alighieri).
 
@@ -993,7 +993,7 @@ The `plugins` feature adds an in-process SDK:
 
 ```toml
 [dependencies]
-alighieri = { version = "0.4", features = ["plugins"] }
+alighieri = { version = "0.5", features = ["plugins"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 ```
 
@@ -1148,7 +1148,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | developing (current release v0.4.0) | decades in production |
+| Maturity | developing (current release v0.5.0) | decades in production |
 
 **Which to choose**
 
