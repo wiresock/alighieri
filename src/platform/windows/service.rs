@@ -17,10 +17,10 @@ use windows_service::service_dispatcher;
 
 use crate::config::Config;
 use crate::platform::windows::event_log::{self, EventLevel};
-use crate::platform::windows::service_manager::{default_config_path, default_log_dir};
-use crate::runtime::{
-    init_file_logging, init_service_logging, run_bound_server_reloading_until_shutdown,
+use crate::platform::windows::service_manager::{
+    default_config_path, default_log_dir, service_config_marker_path,
 };
+use crate::runtime::{init_service_logging, run_bound_windows_service_reloading_until_shutdown};
 use crate::server::Server;
 
 pub const SERVICE_NAME: &str = "Alighieri";
@@ -71,14 +71,13 @@ fn run_service() -> windows_service::Result<()> {
     let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(e) => {
-            // The guard flushes queued records when this error path returns.
-            let _log_guard = match init_file_logging(&default_log_dir()) {
-                Ok((_, guard)) => Some(guard),
-                Err(log_error) => {
-                    eprintln!("failed to initialise service file logging: {log_error}");
-                    None
-                }
-            };
+            // No valid Config exists yet, so no file path can be proven disjoint
+            // from every partially parsed service artifact. Report the complete
+            // load error only through channels that cannot overwrite those files.
+            eprintln!(
+                "Failed to load service configuration '{}': {e}",
+                config_path.display()
+            );
             event_log::report(
                 EventLevel::Error,
                 event_log::EVENT_SERVICE_CONFIG_ERROR,
@@ -94,8 +93,14 @@ fn run_service() -> windows_service::Result<()> {
     };
 
     // Held for the life of the service; dropping it flushes queued records.
-    let _log_guard = match init_service_logging(&config, &default_log_dir()) {
-        Ok((_, guard)) => guard,
+    let active_log_rotate_keep = config.log_rotate_keep;
+    let (active_log_path, _log_guard) = match init_service_logging(
+        &config,
+        &config_path,
+        &default_log_dir(),
+        &service_config_marker_path(),
+    ) {
+        Ok(logging) => logging,
         Err(e) => {
             eprintln!("failed to initialise service file logging: {e}");
             event_log::report(
@@ -163,7 +168,17 @@ fn run_service() -> windows_service::Result<()> {
         let shutdown = async move {
             let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
         };
-        run_bound_server_reloading_until_shutdown(server, config_path, shutdown, reload_rx).await
+        run_bound_windows_service_reloading_until_shutdown(
+            server,
+            config_path,
+            shutdown,
+            reload_rx,
+            active_log_path,
+            active_log_rotate_keep,
+            default_log_dir(),
+            service_config_marker_path(),
+        )
+        .await
     });
 
     status_handle.set_service_status(service_status(

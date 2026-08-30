@@ -141,13 +141,21 @@ impl UserDb {
 
     /// Builds a userlist line with an Argon2id hash for `password`.
     pub fn hash_user_line(username: &str, password: &str) -> Result<String> {
-        validate_username(username)?;
+        Self::validate_username(username)?;
         validate_password(password)?;
         let hash = hash_password(password)?;
         Ok(format!(
             "{ARGON2_DIRECTIVE_PREFIX}{}:{hash}",
             hex_encode(username.as_bytes())
         ))
+    }
+
+    /// Validates a username accepted by the user-management CLI and RFC 1929
+    /// authentication. Binary support code such as the configuration wizard
+    /// uses this entry point so it cannot drift from `user add` validation.
+    #[doc(hidden)]
+    pub fn validate_username(username: &str) -> Result<()> {
+        validate_username(username)
     }
 
     /// Returns the username represented by a userlist line, if it is an entry.
@@ -631,7 +639,7 @@ fn hex_decode_utf8(encoded: &str) -> std::result::Result<String, String> {
         return Err("encoded username must have an even number of hex digits".into());
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.as_bytes().chunks_exact(2) {
+    for pair in encoded.as_bytes().as_chunks::<2>().0 {
         let high = hex_value(pair[0])?;
         let low = hex_value(pair[1])?;
         bytes.push((high << 4) | low);
@@ -657,9 +665,13 @@ fn validate_username(username: &str) -> Result<()> {
             "username must not contain leading or trailing whitespace".into(),
         ));
     }
-    if username.contains(':') || username.contains('\n') || username.contains('\r') {
+    if username.contains(':')
+        || username.contains('\n')
+        || username.contains('\r')
+        || username.contains('\0')
+    {
         return Err(Error::Config(
-            "username must not contain ':', CR, or LF".into(),
+            "username must not contain ':', CR, LF, or NUL".into(),
         ));
     }
     if username.len() > RFC1929_FIELD_MAX {
@@ -804,6 +816,29 @@ mod tests {
     fn hash_user_line_rejects_bad_username() {
         let err = UserDb::hash_user_line("bad:name", "pw").unwrap_err();
         assert!(err.to_string().contains("must not contain"));
+    }
+
+    #[test]
+    fn shared_username_validator_rejects_invalid_usernames() {
+        for invalid in [
+            "",
+            "   ",
+            " alice",
+            "alice ",
+            "bad:name",
+            "bad\rname",
+            "bad\nname",
+            "bad\0name",
+        ] {
+            assert!(
+                UserDb::validate_username(invalid).is_err(),
+                "expected invalid username to be rejected: {invalid:?}"
+            );
+        }
+
+        assert!(UserDb::validate_username("alice").is_ok());
+        assert!(UserDb::validate_username(&"a".repeat(255)).is_ok());
+        assert!(UserDb::validate_username(&"a".repeat(256)).is_err());
     }
 
     #[test]

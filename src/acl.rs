@@ -175,8 +175,8 @@ impl RuleSet {
     }
 
     /// Whether a `UdpAssociate` from this client could be authorised for some
-    /// destination, evaluated with the same first-match-wins ordering as
-    /// [`Self::evaluate_socks`] but ignoring the not-yet-known datagram
+    /// destination, evaluated with the same first-match-wins ordering as normal
+    /// SOCKS request authorization but ignoring the not-yet-known datagram
     /// destination.
     ///
     /// Used to reject a UDP ASSOCIATE up front — before binding sockets and
@@ -190,15 +190,15 @@ impl RuleSet {
     /// ASSOCIATE from this client decides:
     /// - a `pass` rule means UDP is reachable (to at least its destination
     ///   range);
-    /// - a `block` rule with a [match-all](crate::net::AddrSpec::matches_all)
-    ///   `to:` denies the client categorically;
+    /// - a `block` rule with a match-all `to:` denies the client categorically;
     /// - a narrower `block` only rules out some destinations, so a later rule can
     ///   still apply.
     ///
     /// The match-all check is conservative (single-family or port-restricted
     /// blocks are not treated as categorical), so this never falsely rejects a
     /// client that the per-datagram checks would have allowed.
-    pub(crate) fn udp_associate_reachable(
+    #[doc(hidden)]
+    pub fn udp_associate_reachable(
         &self,
         client_ip: IpAddr,
         client_port: u16,

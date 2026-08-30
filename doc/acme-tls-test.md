@@ -21,15 +21,25 @@ domain **on port 443**.
 ## Prerequisites
 
 1. A VPS with a **public IP** and root (or `sudo`).
-2. A DNS **A record** (and **AAAA** if you use IPv6) for a domain you control,
-   pointing at the VPS — e.g. `proxy.example.com → 203.0.113.10` — and
-   **propagated** (`dig +short proxy.example.com` returns the VPS IP).
+2. A DNS **A record** for a domain you control, pointing at the VPS — e.g.
+   `proxy.example.com → 203.0.113.10` — and **propagated**
+   (`dig +short proxy.example.com` returns the VPS IP). Publish **AAAA** only
+   when Alighieri also accepts IPv6 TCP 443 at that address. [Let's Encrypt
+   prefers IPv6](https://letsencrypt.org/ca/docs/ipv6-support/) when both records
+   exist, so an unreachable or wrong AAAA record can break validation; the
+   wizard's `0.0.0.0:443` public profile is IPv4-only.
 3. Inbound **TCP 443 open** in both the cloud firewall/security group *and* the
    host firewall (`ufw allow 443/tcp`), with **nothing else listening on 443**
    (stop nginx/apache/etc.).
 4. Outbound **TCP 443** allowed (Alighieri talks to the Let's Encrypt API).
 
 Throughout, replace `proxy.example.com` and `you@example.com` with your own.
+
+For a production-oriented starting point, the configuration wizard offers the
+**Public SOCKS5-over-TLS (ProxiFyre)** profile. Its reviewed static counterpart
+is [`templates/public-tls-proxifyre.conf`](templates/public-tls-proxifyre.conf).
+The rest of this guide remains useful for exercising issuance and diagnosing
+ACME failures.
 
 ## Step 1 — Install Alighieri
 
@@ -40,9 +50,15 @@ tarball for the latest release from the
 ```sh
 curl -fsSLO <paste-the-tarball-url>     # e.g. alighieri-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 tar xzf alighieri-*.tar.gz
-sudo install alighieri-*/alighieri /usr/local/bin/alighieri
+cd alighieri-vX.Y.Z-x86_64-unknown-linux-gnu  # use the directory you extracted
+sudo ./scripts/alighieri.sh install --binary ./alighieri --no-start
 alighieri --version
 ```
+
+The preparation command installs the binary, creates the dedicated
+`alighieri` account and service directories, and writes the unit without
+enabling or starting it. The authenticated service is started only after the
+userlist and final configuration are ready below.
 
 (Or use the container image — see the README "Container image" section — and run
 it with `--network host` so it can bind 443 and be reached on it.)
@@ -96,6 +112,8 @@ Create a test user and validate the config:
 
 ```sh
 sudo alighieri user add testuser --userlist /etc/alighieri/users   # prompts for a password
+sudo chown root:alighieri -- /etc/alighieri/users
+sudo chmod 640 -- /etc/alighieri/users
 sudo alighieri --check /etc/alighieri/alighieri.conf               # validate (no side effects)
 ```
 
@@ -114,8 +132,13 @@ port below 1024), automatically grants `CAP_NET_BIND_SERVICE` so the non-root
 service can bind 443 and provisions a writable `StateDirectory=` for the ACME
 cache. So with ACME configured you can simply:
 
+Linux release archives bundle the version-matched lifecycle helper and default
+config. From the extracted archive root used in Step 1, install the bundled
+binary and explicitly select the configuration created above:
+
 ```sh
-sudo ./scripts/alighieri.sh        # or `install` to reconfigure an existing unit
+sudo ./scripts/alighieri.sh install --binary ./alighieri \
+  --config /etc/alighieri/alighieri.conf
 ```
 
 (If you hand-write your own unit, replicate the three settings the installer
@@ -145,8 +168,9 @@ If instead you see repeated `acme error: ...` lines, jump to Troubleshooting.
 
 ## Step 5 — Proxy a request through the TLS listener
 
-No mainstream SOCKS client speaks SOCKS5-over-TLS directly, so wrap it on the
-client with a local TLS terminator. With **stunnel** (on your client machine):
+The listener currently has an untrusted staging certificate. Test it through a
+local TLS terminator that is explicitly limited to this staging step. With
+**stunnel** (on your client machine):
 
 ```ini
 # stunnel.conf
@@ -173,6 +197,13 @@ That should print the **VPS's IP**, proving the request was relayed through the
 proxy over TLS. (`socat TCP-LISTEN:1080,fork,reuseaddr OPENSSL:proxy.example.com:443,verify=0`
 is a quick one-liner alternative to stunnel.)
 
+This walkthrough exercises TCP CONNECT. SOCKS5 authentication, the control
+connection, and relayed TCP traffic use TLS, but UDP ASSOCIATE relay datagrams
+travel through separate UDP sockets and are not encapsulated in the TLS stream.
+If you enable UDP for a public deployment, configure a fixed `udp.portrange`,
+open that inbound UDP range, and rely on the application protocol (for example
+QUIC) for any UDP payload encryption it requires.
+
 ## Step 6 — Switch to a real (trusted) certificate
 
 Once the staging flow works, get a production certificate:
@@ -182,10 +213,45 @@ Once the staging flow works, get a production certificate:
    `sudo rm -rf /var/lib/alighieri/acme/*`
 3. Restart Alighieri and watch the log issue a new cert.
 
-Now the certificate is publicly trusted, so verify it on the client. Turn on
-verification in `stunnel.conf` — `verifyChain = yes` checks the chain and
-`checkHost` checks the hostname (the chain alone does not), pointed at a CA
-bundle (paths below):
+Now the certificate is publicly trusted, so clients can validate its chain and
+hostname normally.
+
+[ProxiFyre 2.4.0 or later](https://github.com/wiresock/proxifyre/releases/tag/v2.4.0)
+can now connect directly with normal certificate validation. Its default SOCKS5
+transport is plaintext, so explicitly select TLS in `app-config.json`:
+
+```json
+{
+  "logLevel": "Error",
+  "proxies": [
+    {
+      "appNames": ["chrome"],
+      "socks5ProxyEndpoint": "proxy.example.com:443",
+      "username": "testuser",
+      "password": "REPLACE_WITH_USER_ADD_PASSWORD",
+      "socks5Transport": "TLS",
+      "tlsServerName": "proxy.example.com",
+      "tlsAllowInvalidCertificate": false,
+      "supportedProtocols": ["TCP", "UDP"],
+      "supportedAddressFamilies": ["IPv4", "IPv6"]
+    }
+  ],
+  "excludes": []
+}
+```
+
+Remove `UDP` when UDP ASSOCIATE is disabled. This guide's rule omits `to:`, so
+it permits both IPv4 and IPv6 destinations; the upstream ProxiFyre endpoint
+still uses the domain's A record. The wizard's stricter profile instead uses
+`supportedAddressFamilies: ["IPv4"]` to match its IPv4-only destination ACL.
+Replace `appNames`, the domain, username, and password; the password is the one
+entered at `alighieri user add`. Do not set `tlsAllowInvalidCertificate` to
+`true`; this direct configuration is for the production certificate obtained
+in this step.
+
+For the stunnel wrapper, turn on verification in `stunnel.conf`:
+`verifyChain = yes` checks the chain and `checkHost` checks the hostname (the
+chain alone does not), pointed at a CA bundle (paths below):
 
 ```ini
 # stunnel.conf

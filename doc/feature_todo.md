@@ -72,8 +72,9 @@ detects cycles and reports file/line context.
 
 ### Local Configuration Wizard
 
-Status: MVP implemented as a short-lived localhost web UI for operators who do
-not want to handwrite the Dante-inspired config syntax at first:
+Status: implemented as a short-lived localhost web UI for operators who do not
+want to handwrite the Dante-inspired config syntax at first. It includes Local
+no-auth, LAN username/password, and public ACME-backed SOCKS5-over-TLS profiles:
 
 ```text
 alighieri config wizard
@@ -90,24 +91,21 @@ Useful first-step support work:
 
 - expose machine-readable config validation output (status: implemented with
   `alighieri --check --json CONFIG`),
-- collect safe starter templates for common deployments (status: started under
-  `doc/templates/`),
-- reuse existing userlist tooling for credential creation,
+- collect safe starter templates for common deployments (status: implemented
+  for the three wizard profiles under `doc/templates/`),
+- reuse existing userlist tooling for credential creation (status: implemented;
+  the wizard never handles a plaintext password),
 - expose machine-readable restart-vs-reload metadata (status: implemented with
   `alighieri config metadata --json`).
 
-Useful follow-up work:
-
-- improve the form with richer browser-side field validation,
-- add explicit userlist creation guidance after username/password generation.
-
 Import/edit support is implemented: `alighieri config wizard --import PATH`
 parses an existing configuration, pre-fills the form with the fields the
-templates model (listener, trusted client, userlist, log file), and lists any
-settings the templates cannot reproduce — TLS, metrics, rate limits, custom
-timeouts/DNS, or extra ACL rules — which a save would drop. Without an explicit
-`--output`, the import path is also the save target (edit in place); the prior
-file is kept as a `.bak` backup.
+templates model, and lists settings a save would drop. Representable public
+profiles preserve the modeled ACME, userlist, and UDP settings. Certificate-file
+TLS, custom TLS or UDP behavior, metrics, unmodeled rate limits, custom
+timeouts/DNS, logging, and extra ACL rules remain loss-aware. Without an
+explicit `--output`, the import path is also the save target (edit in place);
+the prior file is kept as a `.bak` backup.
 
 ### DNS Policy Controls
 

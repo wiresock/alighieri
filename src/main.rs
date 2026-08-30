@@ -221,10 +221,14 @@ async fn main() -> ExitCode {
 
 /// Success JSON for `--check --json`. Beyond `ok`/`path`/`message` it reports
 /// the effective `listen` address (`internal:` is last-wins), whether `acme` is
-/// enabled, and the resolved `acme_cache` directory (empty when ACME is off), so
-/// tooling — e.g. the systemd installer deciding whether to grant
-/// `CAP_NET_BIND_SERVICE`, or checking the ACME cache against the unit's writable
-/// StateDirectory — can read the resolved facts without reparsing config.
+/// enabled, the resolved `acme_cache` directory (empty when ACME is off), and the
+/// effective `userlist` setting (empty when unset), so tooling — e.g. the systemd
+/// installer deciding whether to grant `CAP_NET_BIND_SERVICE`, or checking paths
+/// from included/last-wins settings as the service account — can read the parsed
+/// facts without reparsing config. The declared and canonical configuration
+/// source and wildcard-pattern arrays let the installer validate both include
+/// spellings, every parsed physical file, and directories that could supply a
+/// new wildcard match on reload.
 fn check_ok_json(config_path: &Path, config: &Config) -> String {
     let acme = matches!(config.tls, Some(TlsConfig::Acme(_)));
     let acme_cache = match &config.tls {
@@ -240,14 +244,66 @@ fn check_ok_json(config_path: &Path, config: &Config) -> String {
         (true, Some(path)) => path.display().to_string(),
         _ => String::new(),
     };
+    // Keep the parser's effective value verbatim. Relative userlist paths are
+    // intentionally resolved by the process working directory at runtime (not
+    // relative to the config file), and the file may not exist yet during a
+    // `--no-start` deployment bootstrap, so canonicalising here would both alter
+    // semantics and reject a supported workflow.
+    let userlist = config
+        .userlist
+        .as_deref()
+        .map_or_else(String::new, |path| path.display().to_string());
+    let declared_config_sources = json_path_array(
+        config
+            .loaded_config_sources()
+            .iter()
+            .map(|source| source.declared_path()),
+    );
+    let canonical_config_sources = json_path_array(
+        config
+            .loaded_config_sources()
+            .iter()
+            .map(|source| source.canonical_path()),
+    );
+    let declared_config_include_patterns = json_path_array(
+        config
+            .loaded_include_patterns()
+            .iter()
+            .map(|pattern| pattern.declared_path()),
+    );
+    let canonical_config_include_patterns = json_path_array(
+        config
+            .loaded_include_patterns()
+            .iter()
+            .map(|pattern| pattern.canonical_path()),
+    );
     format!(
-        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\"}}",
+        "{{\"ok\":true,\"path\":\"{}\",\"message\":\"configuration is valid\",\"listen\":\"{}\",\"acme\":{},\"acme_cache\":\"{}\",\"log_file\":\"{}\",\"userlist\":\"{}\",\"declared_config_sources\":{},\"canonical_config_sources\":{},\"declared_config_include_patterns\":{},\"canonical_config_include_patterns\":{}}}",
         json_escape(&config_path.display().to_string()),
         json_escape(&config.internal.to_string()),
         acme,
         json_escape(&acme_cache),
-        json_escape(&log_file)
+        json_escape(&log_file),
+        json_escape(&userlist),
+        declared_config_sources,
+        canonical_config_sources,
+        declared_config_include_patterns,
+        canonical_config_include_patterns,
     )
+}
+
+fn json_path_array<'a>(paths: impl IntoIterator<Item = &'a Path>) -> String {
+    let mut json = String::from("[");
+    for (index, path) in paths.into_iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(&json_escape(&path.display().to_string()));
+        json.push('"');
+    }
+    json.push(']');
+    json
 }
 
 fn validate_config(config_path: &Path, format: CheckOutputFormat) -> ExitCode {
@@ -701,19 +757,27 @@ enum UserCommand {
 }
 
 fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        return Ok(UserCommand::Help);
-    }
     let Some(command) = args.first().map(String::as_str) else {
         return Err(user_usage());
     };
+    if is_help_arg(command) {
+        return Ok(UserCommand::Help);
+    }
     match command {
         "add" | "delete" | "verify" => {
             let username = args
                 .get(1)
                 .cloned()
                 .ok_or_else(|| format!("{command} requires USER"))?;
-            let userlist = parse_userlist_arg(&args[2..])?;
+            // With no following option this is conventional subcommand help;
+            // once the command is otherwise complete, the same spelling is a
+            // valid positional username.
+            if args.len() == 2 && is_help_arg(&username) {
+                return Ok(UserCommand::Help);
+            }
+            let UserlistArg::Path(userlist) = parse_userlist_arg(&args[2..])? else {
+                return Ok(UserCommand::Help);
+            };
             match command {
                 "add" => Ok(UserCommand::Add { username, userlist }),
                 "delete" => Ok(UserCommand::Delete { username, userlist }),
@@ -721,15 +785,27 @@ fn parse_user_command(args: Vec<String>) -> Result<UserCommand, String> {
                 _ => unreachable!(),
             }
         }
-        "list" => Ok(UserCommand::List {
-            userlist: parse_userlist_arg(&args[1..])?,
-        }),
+        "list" => match parse_userlist_arg(&args[1..])? {
+            UserlistArg::Path(userlist) => Ok(UserCommand::List { userlist }),
+            UserlistArg::Help => Ok(UserCommand::Help),
+        },
+        _ if args.iter().skip(1).any(|arg| is_help_arg(arg)) => Ok(UserCommand::Help),
         _ => Err(user_usage()),
     }
 }
 
-fn parse_userlist_arg(args: &[String]) -> Result<PathBuf, String> {
+enum UserlistArg {
+    Path(PathBuf),
+    Help,
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
+}
+
+fn parse_userlist_arg(args: &[String]) -> Result<UserlistArg, String> {
     let mut userlist = None;
+    let mut invalid = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -739,10 +815,16 @@ fn parse_userlist_arg(args: &[String]) -> Result<PathBuf, String> {
                 };
                 userlist = Some(PathBuf::from(path));
             }
-            _ => return Err(user_usage()),
+            "-h" | "--help" => return Ok(UserlistArg::Help),
+            _ => invalid = true,
         }
     }
-    userlist.ok_or_else(|| "--userlist requires a path".into())
+    if invalid {
+        return Err(user_usage());
+    }
+    userlist
+        .map(UserlistArg::Path)
+        .ok_or_else(|| "--userlist requires a path".into())
 }
 
 fn handle_user(args: Vec<String>) -> ExitCode {
@@ -824,7 +906,14 @@ fn list_users(userlist: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for username in userlist_usernames(&text) {
+    let usernames = match userlist_usernames(&text) {
+        Ok(usernames) => usernames,
+        Err(e) => {
+            eprintln!("alighieri: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for username in usernames {
         println!("{username}");
     }
     ExitCode::SUCCESS
@@ -928,16 +1017,21 @@ fn delete_userlist_entry(userlist: &Path, username: &str) -> std::io::Result<()>
     write_userlist(userlist, output.as_bytes(), true)
 }
 
-fn userlist_usernames(text: &str) -> Vec<String> {
+fn userlist_usernames(text: &str) -> alighieri::errors::Result<Vec<String>> {
     use std::collections::BTreeSet;
 
+    // Parse with the same loader used at server startup before producing the
+    // friendly sorted view. In particular, do not let `user list` silently
+    // skip malformed plaintext lines or invalid Argon2 directives: lifecycle
+    // tooling uses this non-interactive command as its startup preflight.
+    UserDb::parse(text)?;
     let mut users = BTreeSet::new();
     for line in text.lines() {
         if let Some(username) = UserDb::entry_username(line) {
             users.insert(username);
         }
     }
-    users.into_iter().collect()
+    Ok(users.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -1649,9 +1743,9 @@ mod tests {
     }
 
     #[test]
-    fn check_json_reports_listen_and_acme() {
+    fn check_json_reports_effective_runtime_paths() {
         let config = Config::parse(
-            "internal: 0.0.0.0:443\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme",
+            "internal: 0.0.0.0:443\nsocksmethod: username\nuserlist: /etc/alighieri/users\ntls.acme.domains: x.example.com\ntls.acme.cache: /tmp/acme",
         )
         .unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
@@ -1659,6 +1753,20 @@ mod tests {
         assert!(json.contains("\"acme\":true"), "{json}");
         assert!(json.contains("\"acme_cache\":\"/tmp/acme\""), "{json}");
         assert!(json.contains("\"log_file\":\"\""), "{json}");
+        assert!(
+            json.contains("\"userlist\":\"/etc/alighieri/users\""),
+            "{json}"
+        );
+        assert!(json.contains("\"declared_config_sources\":[]"), "{json}");
+        assert!(json.contains("\"canonical_config_sources\":[]"), "{json}");
+        assert!(
+            json.contains("\"declared_config_include_patterns\":[]"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"canonical_config_include_patterns\":[]"),
+            "{json}"
+        );
 
         let config = Config::parse("internal: 127.0.0.1:1080").unwrap();
         let json = check_ok_json(Path::new("test.conf"), &config);
@@ -1666,6 +1774,7 @@ mod tests {
         assert!(json.contains("\"acme\":false"), "{json}");
         assert!(json.contains("\"acme_cache\":\"\""), "{json}");
         assert!(json.contains("\"log_file\":\"\""), "{json}");
+        assert!(json.contains("\"userlist\":\"\""), "{json}");
 
         // File logging reports the configured logfile path.
         let config = Config::parse(
@@ -1676,6 +1785,171 @@ mod tests {
         assert!(
             json.contains("\"log_file\":\"/var/log/alighieri/app.log\""),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn check_json_reports_last_userlist_from_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("conf.d");
+        std::fs::create_dir(&fragments).unwrap();
+        std::fs::write(
+            dir.path().join("alighieri.conf"),
+            "internal: 127.0.0.1:1080\ninclude: conf.d/*.conf\n",
+        )
+        .unwrap();
+        std::fs::write(fragments.join("10-users.conf"), "userlist: first-users\n").unwrap();
+        std::fs::write(fragments.join("20-users.conf"), "userlist: final-users\n").unwrap();
+
+        let config = Config::load(&dir.path().join("alighieri.conf")).unwrap();
+        let json = check_ok_json(Path::new("test.conf"), &config);
+
+        assert!(json.contains("\"userlist\":\"final-users\""), "{json}");
+    }
+
+    #[test]
+    fn check_json_reports_declared_and_canonical_config_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main config.conf");
+        let include = dir.path().join("policy fragment.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: policy fragment.conf\n",
+        )
+        .unwrap();
+        std::fs::write(&include, "socks pass { command: connect }\n").unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let canonical_include = std::fs::canonicalize(&include).unwrap();
+        let declared_include = canonical_main
+            .parent()
+            .unwrap()
+            .join("policy fragment.conf");
+
+        assert!(
+            json.contains(&format!(
+                "\"declared_config_sources\":[\"{}\",\"{}\"]",
+                json_escape(&main.display().to_string()),
+                json_escape(&declared_include.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"canonical_config_sources\":[\"{}\",\"{}\"]",
+                json_escape(&canonical_main.display().to_string()),
+                json_escape(&canonical_include.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"declared_config_include_patterns\":[]"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"canonical_config_include_patterns\":[]"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn check_json_reports_declared_and_canonical_include_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("policy fragments");
+        std::fs::create_dir(&fragments).unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: policy fragments/*.conf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fragments.join("current safe.conf"),
+            "socks pass { command: connect }\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let declared_pattern = canonical_main
+            .parent()
+            .unwrap()
+            .join("policy fragments/*.conf");
+        let canonical_pattern = std::fs::canonicalize(&fragments).unwrap().join("*.conf");
+
+        assert!(
+            json.contains(&format!(
+                "\"declared_config_include_patterns\":[\"{}\"]",
+                json_escape(&declared_pattern.display().to_string())
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"canonical_config_include_patterns\":[\"{}\"]",
+                json_escape(&canonical_pattern.display().to_string())
+            )),
+            "{json}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_json_keeps_symlinked_include_spellings_separate_from_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragments = dir.path().join("real-fragments");
+        let fragments_alias = dir.path().join("fragments-alias");
+        std::fs::create_dir(&fragments).unwrap();
+        std::os::unix::fs::symlink(&fragments, &fragments_alias).unwrap();
+        let included = fragments.join("policy.conf");
+        std::fs::write(&included, "socks pass { command: connect }\n").unwrap();
+        let main = dir.path().join("main.conf");
+        std::fs::write(
+            &main,
+            "internal: 127.0.0.1:1080\ninclude: fragments-alias/*.conf\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&main).unwrap();
+        let json = check_ok_json(&main, &config);
+        let canonical_main = std::fs::canonicalize(&main).unwrap();
+        let declared_parent = canonical_main.parent().unwrap().join("fragments-alias");
+        let canonical_parent = std::fs::canonicalize(&fragments).unwrap();
+        let canonical_included = std::fs::canonicalize(&included).unwrap();
+
+        assert!(
+            json.contains(&json_escape(
+                &declared_parent.join("policy.conf").display().to_string()
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(&canonical_included.display().to_string())),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(
+                &declared_parent.join("*.conf").display().to_string()
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&json_escape(
+                &canonical_parent.join("*.conf").display().to_string()
+            )),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn json_path_array_preserves_spaces_quotes_and_backslashes() {
+        let path = Path::new("config dir/part \"quoted\"\\tail.conf");
+        assert_eq!(
+            json_path_array([path]),
+            r#"["config dir/part \"quoted\"\\tail.conf"]"#
         );
     }
 
@@ -1781,6 +2055,56 @@ mod tests {
                 username: "alice".into(),
                 userlist: PathBuf::from("users.txt")
             }
+        );
+    }
+
+    #[test]
+    fn user_help_tokens_are_valid_positional_values_in_a_complete_command() {
+        assert_eq!(
+            parse_user_command(vec![
+                "add".into(),
+                "--help".into(),
+                "--userlist".into(),
+                "-h".into(),
+            ])
+            .unwrap(),
+            UserCommand::Add {
+                username: "--help".into(),
+                userlist: PathBuf::from("-h"),
+            }
+        );
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "--help".into()]).unwrap(),
+            UserCommand::Help
+        );
+        assert_eq!(
+            parse_user_command(vec!["list".into(), "--userlist".into(), "--help".into()]).unwrap(),
+            UserCommand::List {
+                userlist: PathBuf::from("--help"),
+            }
+        );
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "--help".into(), "--userlist".into()])
+                .unwrap_err(),
+            "--userlist requires a path"
+        );
+    }
+
+    #[test]
+    fn unconsumed_user_help_tokens_show_help() {
+        assert_eq!(
+            parse_user_command(vec!["add".into(), "alice".into(), "--help".into()]).unwrap(),
+            UserCommand::Help
+        );
+        assert_eq!(
+            parse_user_command(vec![
+                "list".into(),
+                "--userlist".into(),
+                "users.txt".into(),
+                "-h".into(),
+            ])
+            .unwrap(),
+            UserCommand::Help
         );
     }
 
@@ -1938,9 +2262,21 @@ mod tests {
     #[test]
     fn userlist_usernames_are_sorted_and_deduplicated() {
         let hashed = UserDb::hash_user_line("alice", "pw").unwrap();
-        let users = userlist_usernames(&format!("bob:pw\n{hashed}\nbob:other\n# comment\n"));
+        let users =
+            userlist_usernames(&format!("bob:pw\n{hashed}\nbob:other\n# comment\n")).unwrap();
 
         assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn userlist_usernames_reject_malformed_runtime_entries() {
+        for malformed in [
+            "missing-colon\n",
+            "# alighieri:user:argon2:616c696365:$argon2id$not-a-valid-phc\n",
+        ] {
+            let err = userlist_usernames(malformed).unwrap_err();
+            assert!(err.to_string().contains("userlist line 1"), "{err}");
+        }
     }
 
     #[cfg(unix)]

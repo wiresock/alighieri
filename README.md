@@ -122,10 +122,18 @@ alighieri user delete alice --userlist /etc/alighieri/users
 ```
 
 On Linux, install and start Alighieri as a hardened systemd service (details
-under [Linux service (systemd)](#linux-service-systemd)):
+under [Linux service (systemd)](#linux-service-systemd)). From a source
+checkout:
 
 ```sh
 sudo ./scripts/alighieri.sh           # install, or open the management menu if already installed
+```
+
+From the root of an extracted Linux release archive, select its bundled binary
+explicitly:
+
+```sh
+sudo ./scripts/alighieri.sh install --binary ./alighieri
 ```
 
 On Windows, install and start Alighieri as a native Windows Service:
@@ -175,27 +183,139 @@ token, and exits as soon as one configuration is saved. It is configuration
 - the URL carries a random per-run token, and requests without it are refused;
 - it never exposes runtime control, credential browsing, or service management.
 
-Two built-in templates seed the form:
+Three built-in templates seed the form:
 
 - **Local, no auth** — a loopback listener for apps on the same machine.
 - **LAN, username/password** — a `0.0.0.0` listener backed by an Argon2id
   userlist.
+- **Public SOCKS5-over-TLS (ProxiFyre)** — an authenticated public endpoint on
+  TCP 443 with automatic ACME certificates and optional fixed-range UDP relay,
+  intended for ProxiFyre or another TLS-capable SOCKS5 client.
 
 Whatever you choose, the result is validated with the real parser before it is
 written, saved atomically, and the previous file (if any) is preserved as
 `<name>.bak`.
 
+### Public SOCKS5-over-TLS deployment
+
+The public profile fixes the listener at `0.0.0.0:443`, offers only the
+`username` authentication method, enables TCP CONNECT, applies an
+authentication-failure rate limit, and keeps private, link-local, loopback, and
+reserved destinations blocked. It obtains and renews a standard publicly
+trusted certificate through the existing ACME TLS-ALPN-01 listener. The wizard
+does not ask for, generate, display, or store a plaintext password.
+
+Before starting the service:
+
+- create a DNS A record pointing the selected domain at the VPS and wait for it
+  to resolve; publish an AAAA record only if IPv6 TCP 443 is actually forwarded
+  to this IPv4 listener;
+- allow inbound TCP 443 in the host firewall and cloud security group, allow
+  outbound TCP 443 for ACME, and ensure no other service occupies TCP 443;
+- if UDP ASSOCIATE is enabled, allow its selected inbound UDP range (the default
+  is `40000-40099`); and
+- create the selected userlist before starting or restarting Alighieri.
+
+TLS-ALPN-01 requires public TCP port 443 but does **not** require opening HTTP
+port 80. The reviewed
+[`public-tls-proxifyre.conf`](doc/templates/public-tls-proxifyre.conf) template
+shows the same defaults, and the [ACME test guide](doc/acme-tls-test.md) covers
+issuance and troubleshooting in detail.
+
+On a fresh Linux VPS, prepare the supported installation with `--no-start`;
+this creates the `alighieri` account, directories, binary, and systemd unit but
+does not enable or start it before credentials exist. Existing installations
+can skip that first command. Generate directly to the service's configuration
+path, then create the first user and make the resulting file service-readable
+before running the normal installer. That final run derives the port-443
+`CAP_NET_BIND_SERVICE` capability and starts the service:
+
+The commands below use the helper from a source checkout. Linux release
+archives contain the same `scripts/alighieri.sh` path, the matching binary, and
+the default config. When working from an extracted release archive, add
+`--binary ./alighieri` to both installer invocations.
+
+```sh
+sudo ./scripts/alighieri.sh install --no-start  # fresh VPS only
+sudo alighieri config wizard --output /etc/alighieri/alighieri.conf
+sudo alighieri user add proxyuser --userlist /etc/alighieri/users
+sudo chown root:alighieri -- /etc/alighieri/users
+sudo chmod 640 -- /etc/alighieri/users
+sudo alighieri --check --config /etc/alighieri/alighieri.conf
+sudo ./scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf
+systemctl status alighieri
+journalctl -u alighieri -f
+```
+
+`user add` prompts for the password securely and stores an Argon2id hash.
+The public profile requires absolute userlist and ACME-cache paths so the
+operator shell and service cannot resolve the same text to different files. On
+Linux, its userlist must be a direct file in the installer-managed
+`/etc/alighieri` directory (for example `/etc/alighieri/users`), which remains
+reachable inside the hardened systemd sandbox.
+On Windows those defaults are under `%ProgramData%\Alighieri`; the completion
+page provides an elevated-PowerShell bootstrap that hardens this directory,
+atomically installs the generated configuration at its canonical service path
+with a backup, creates the user, and only then installs and starts the service.
+
+Use [ProxiFyre 2.4.0 or later](https://github.com/wiresock/proxifyre/releases/tag/v2.4.0);
+earlier versions do not support native SOCKS5-over-TLS. Its
+[configuration](https://github.com/wiresock/proxifyre/blob/main/docs/configuration.md#socks5-over-tls)
+defaults to plaintext SOCKS5, so the
+`socks5Transport` field must explicitly be `TLS`. For example, save the
+following as `app-config.json` next to `ProxiFyre.exe`, replace the application
+names and credentials, and remove `UDP` from `supportedProtocols` when the
+wizard's UDP option is disabled:
+
+```json
+{
+  "logLevel": "Error",
+  "proxies": [
+    {
+      "appNames": ["chrome"],
+      "socks5ProxyEndpoint": "proxy.example.com:443",
+      "username": "proxyuser",
+      "password": "REPLACE_WITH_USER_ADD_PASSWORD",
+      "socks5Transport": "TLS",
+      "tlsServerName": "proxy.example.com",
+      "tlsAllowInvalidCertificate": false,
+      "supportedProtocols": ["TCP", "UDP"],
+      "supportedAddressFamilies": ["IPv4"]
+    }
+  ],
+  "excludes": []
+}
+```
+
+The explicit `IPv4` destination family matches this profile's
+`to: 0.0.0.0/0` ACL; the upstream endpoint separately uses the domain's A
+record. Keep normal certificate validation enabled: the production ACME
+certificate is publicly trusted, so neither a fingerprint pin nor
+`tlsAllowInvalidCertificate: true` is appropriate.
+
+The endpoint is an application proxy, not a full IP-level VPN. TLS protects the
+SOCKS5 control connection, authentication, and relayed TCP CONNECT traffic, but
+UDP relay datagrams use separate sockets and are not encapsulated in the TLS
+stream. Applications such as QUIC, voice clients, and games may provide their
+own UDP payload encryption. Selecting ACME staging is useful for issuance
+testing, but its certificate is not trusted by normal clients.
+
 ### Editing an existing configuration
 
 `--import PATH` loads an existing file into the form and, unless `--output`
-overrides it, writes back to the same path. The form only models the fields the
-two templates expose — listener, trusted-client range, auth method, userlist,
-and log file — so importing a richer configuration is **loss-aware**: before you
-save, the wizard lists every setting it cannot reproduce, both on the console
-and in a banner above the form. Flagged areas include the TLS listener, the
-metrics endpoint, rate limits, custom timeouts or DNS policy, the auth cache
-TTL, and any extra or customised ACL rules. The original is still kept as
-`<name>.bak`, so a dropped setting can be restored.
+overrides it, writes back to the same path. Representable public configurations
+with an ACME-backed TLS listener, username-only authentication, and compatible
+TCP/UDP rules are recognised as the public profile; their modeled domain,
+e-mail, cache, staging, userlist, UDP range, and advertised host are pre-filled
+and preserved on regeneration. A LAN username configuration is still imported
+as the LAN profile rather than being mistaken for public TLS.
+
+Import remains **loss-aware**: before saving, the wizard lists every setting it
+cannot reproduce, both on the console and in a banner above the form.
+Certificate-file/key-file TLS, custom TLS or UDP behavior, metrics, unmodeled
+rate limits, custom timeouts or DNS policy, logging, and extra or customised ACL
+rules continue to produce warnings. The original is kept as `<name>.bak`, so a
+dropped setting can be restored.
 
 ## Configuration
 
@@ -362,6 +482,11 @@ which blocks a co-located attacker on the same host but a different port (notabl
 on shared hosts or loopback). Set `udp.strictreply: false` to relax the match to
 host-only (any source port on a contacted host) for servers that legitimately
 answer from a different port (e.g. TFTP) — at the cost of that protection.
+
+On a TLS listener, TLS protects the SOCKS5 control connection, authentication,
+and relayed TCP CONNECT traffic. UDP relay datagrams travel through separate UDP
+sockets and are not encapsulated in the TLS stream; any payload confidentiality
+for UDP comes from the application protocol itself (for example QUIC).
 
 When `metrics.listen` is set, Alighieri serves Prometheus-style text metrics at
 `/metrics`. The endpoint is unauthenticated and exposes operational counters and
@@ -614,7 +739,11 @@ no quoting — so a program path that itself contains spaces (for example
 `C:\Program Files\...`) cannot be expressed directly. Point `auth.command` at a
 space-free wrapper script (the usual pattern anyway, since the verifier
 typically shells out to `ldapsearch`, `curl`, `pamtester`, and the like) and put
-the real path inside it.
+the real path inside it. Windows Service mode additionally requires the first
+value to be an explicit filesystem path, such as
+`C:\Alighieri\verify-user.cmd`; it rejects a bare program name resolved through
+`PATH` so service logging can prove that its rotation files do not overlap the
+authentication helper.
 
 ### Hot reload
 
@@ -650,19 +779,18 @@ On Linux, [`scripts/alighieri.sh`](scripts/alighieri.sh) manages the whole
 lifecycle as a hardened systemd service — install, upgrade, uninstall, and
 status.
 
-**Standalone (download just the script):**
+**From a Linux release archive:** extract the archive and run the bundled,
+version-matched helper from its root. Passing the bundled binary avoids a Rust
+toolchain requirement:
 
 ```sh
-curl -O https://raw.githubusercontent.com/wiresock/alighieri/main/scripts/alighieri.sh
-chmod +x alighieri.sh
-sudo ./alighieri.sh
+sudo ./scripts/alighieri.sh install --binary ./alighieri
 ```
 
-When run outside a checkout it shallow-clones the repository into a temporary
-directory to build the binary and read the default config, so the single file
-is enough (needs `git` and a Rust toolchain on the host; or add
-`--binary ./alighieri` to install a prebuilt binary and skip the build). The
-clone is removed when the script exits.
+The Linux archives include `scripts/alighieri.sh` and `doc/alighieri.conf`.
+With `--binary ./alighieri`, the helper uses only that archive, so the installed
+binary, lifecycle logic, and initial config all come from the same release. It
+never clones a mutable repository branch or downloads a replacement helper.
 
 **From a checkout:** run it directly — it uses an existing `target/release`
 build if present, otherwise builds one, or takes a binary extracted from a
@@ -671,6 +799,7 @@ build if present, otherwise builds one, or takes a binary extracted from a
 ```sh
 sudo ./scripts/alighieri.sh                        # install, or manage if already installed
 sudo ./scripts/alighieri.sh install --binary ./alighieri  # install a prebuilt binary
+sudo ./scripts/alighieri.sh install --no-start     # prepare unit/files without first start
 sudo ./scripts/alighieri.sh upgrade                # rebuild/replace the binary and restart
 sudo ./scripts/alighieri.sh status                 # show binary, service, and config state
 sudo ./scripts/alighieri.sh uninstall              # remove the service and binary
@@ -681,15 +810,42 @@ Run with no command on an already-installed host to get an interactive menu
 (status, logs, upgrade, reconfigure, uninstall). `upgrade` swaps in the new
 binary — pre-flighting it with `--check` against the live config first — and
 restarts, leaving your unit and config untouched; `install` (re-run) also
-rewrites the unit and re-applies permissions. (The older
+rewrites the unit and re-applies permissions to installer-managed files. A plain
+reconfigure preserves the config path already recorded in the unit; pass
+`install --config /absolute/path` to select a different one explicitly. A
+custom config must already be owned by `root:alighieri` with mode `0640`, and
+every directory in its physical path must be root-owned and not group- or
+world-writable. On a fresh host, run the default `install --no-start` preparation
+first so the service account and group exist, harden the custom file, and then
+rerun `install --config /absolute/path`. (The older
 [`scripts/install-linux.sh`](scripts/install-linux.sh) remains as a thin
 compatibility shim that forwards to `alighieri.sh`.)
+
+The menu can build upgrades and reconfigurations only from a source checkout.
+From an extracted release, keep the archive and explicitly identify the trusted
+artifact on those operations, for example `upgrade --binary ./alighieri` or
+`install --binary ./alighieri`; status, logs, and uninstall need no source.
 
 The installer puts the binary at `/usr/local/bin/alighieri`, creates a
 dedicated unprivileged `alighieri` system user, installs a default config to
 `/etc/alighieri/alighieri.conf` (kept if it already exists; either way set to
 `root:alighieri` mode `640`, readable only by the service user), and writes
-`/etc/systemd/system/alighieri.service` before enabling and starting it.
+`/etc/systemd/system/alighieri.service` before enabling and starting it. With
+`install --no-start`, it finishes after writing and daemon-reloading the unit;
+it neither enables nor starts a fresh service, which lets you create a required
+userlist before the first authenticated launch.
+
+Before rewriting or restarting the managed unit, the installer validates the
+configuration inside a transient sandbox with the same service account,
+working directory, and path-hiding protections (including `ProtectHome`,
+`PrivateTmp`, and `PrivateDevices`). When starting an authenticated deployment,
+it also requires the effective userlist to be a physical file below a
+root-controlled directory chain, owned by `root:alighieri` with mode `0640`, and
+fully parses it there. This rejects credentials the service could rewrite,
+custom paths the root account can read but the service cannot traverse or see,
+and malformed entries; `--no-start` exempts only a genuinely missing userlist
+for first-time credential bootstrap. The final install enforces the complete
+policy before starting the service.
 
 The unit runs as the `alighieri` user with `NoNewPrivileges`,
 `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a capability set restricted
@@ -716,8 +872,10 @@ writable `StateDirectory=` (`/var/lib/alighieri`) for the ACME certificate
 cache, so `tls.acme.cache: /var/lib/alighieri/acme` works under
 `ProtectSystem=strict`. Because the capability is baked into the unit at install
 time, after switching to a privileged port or enabling ACME in an existing
-deployment re-run `sudo ./scripts/alighieri.sh install` to regenerate the unit —
-a plain `systemctl reload` keeps the old capability set.
+deployment re-run `sudo ./scripts/alighieri.sh install` from a source checkout,
+or `sudo ./scripts/alighieri.sh install --binary ./alighieri` from the extracted
+release archive, to regenerate the unit — a plain `systemctl reload` keeps the
+old capability set.
 
 ### Tuning for sustained high-rate UDP
 
@@ -769,7 +927,10 @@ The installed service uses:
 - display name: `Alighieri SOCKS5 Proxy Server`
 - startup type: automatic
 - account: `NT AUTHORITY\LocalService`
-- log file: `C:\ProgramData\Alighieri\logs\alighieri.log`
+- default log file: `C:\ProgramData\Alighieri\logs\alighieri.log` (a configured
+  `logfile` is honored; ordinary relative paths resolve against the active
+  configuration file's directory, and that location must be writable by
+  `LocalService`)
 - Event Log source: `Alighieri` in the Windows Application log
 - recovery: restart on crash (after 5s, then 30s, then 60s; failure count resets
   after an hour), the Windows equivalent of systemd's `Restart=on-failure`
@@ -782,7 +943,10 @@ The installer validates the configuration before creating the service and the
 start and reload commands validate the installed configuration before asking
 the Service Control Manager to act on the service. Credentials stay in the
 configured `userlist` file; the service command line stores only the
-configuration file path. Service file logs rotate with the same
+configuration file path. Service file logs use the configured `logfile` when
+present and otherwise use the default ProgramData path. An ordinary relative
+configured path resolves against the active configuration file's directory,
+which must be writable by `LocalService`. Service logs rotate with the same
 `logrotate.size`, `logrotate.keep`, and `logformat` settings as console file
 logging.
 

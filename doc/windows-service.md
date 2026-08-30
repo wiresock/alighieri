@@ -52,13 +52,26 @@ The installed service uses:
 machine privileges. Use tighter file ACLs on `alighieri.conf` and the userlist
 file so only administrators and the service account can read them.
 
+When `auth.command` is configured, its program must be an explicit filesystem
+path in Windows Service mode rather than a bare name resolved through `PATH`.
+This lets startup and reload validation keep the helper executable disjoint
+from every configured log-rotation target. If the configuration cannot be
+loaded, the service reports the complete error to stderr and the Windows Event
+Log without opening a file logger, because no valid configuration exists from
+which all protected artifact paths can be proven.
+
 ## Logging
 
-Service mode writes logs to:
+Service mode writes logs to the configured `logfile`, or to this default when
+`logfile` is omitted:
 
 ```text
 C:\ProgramData\Alighieri\logs\alighieri.log
 ```
+
+Ordinary relative configured `logfile` paths resolve against the active
+configuration file's directory. Custom log directories must be writable by
+`LocalService` and protected from untrusted local users.
 
 Service install registers the `Alighieri` Event Log source. Service mode writes
 startup, stop, reload-request, and startup/runtime failure events to the Windows

@@ -18,6 +18,7 @@ use crate::platform::windows::event_log;
 use crate::platform::windows::service::{
     run_service_dispatcher, SERVICE_DISPLAY_NAME, SERVICE_NAME, SERVICE_RELOAD_CONTROL,
 };
+use crate::runtime::validate_windows_service_logging_paths;
 use crate::tls;
 
 const DEFAULT_CONFIG: &str = r"C:\ProgramData\Alighieri\alighieri.conf";
@@ -85,7 +86,12 @@ pub fn handle_service_cli(args: Vec<String>) -> ServiceCliResult<String> {
 }
 
 pub fn parse_service_command(args: Vec<String>) -> ServiceCliResult<ServiceCommand> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    // Keep subcommand help convenient without stealing a quoted config path
+    // whose complete positional role is unambiguous (for example a file named
+    // `--help` supplied after `--config`).
+    if args.first().is_some_and(|arg| is_help_arg(arg))
+        || args.get(1..).is_some_and(has_unconsumed_help_arg)
+    {
         return Ok(ServiceCommand::Help);
     }
     let Some(command) = args.first().map(String::as_str) else {
@@ -97,17 +103,41 @@ pub fn parse_service_command(args: Vec<String>) -> ServiceCliResult<ServiceComma
             let config_path = parse_config_arg(&args[1..])?.unwrap_or_else(default_config_path);
             Ok(ServiceCommand::Install { config_path })
         }
-        "uninstall" => Ok(ServiceCommand::Uninstall),
-        "start" => Ok(ServiceCommand::Start),
-        "stop" => Ok(ServiceCommand::Stop),
-        "reload" => Ok(ServiceCommand::Reload),
-        "status" => Ok(ServiceCommand::Status),
+        "uninstall" if args.len() == 1 => Ok(ServiceCommand::Uninstall),
+        "start" if args.len() == 1 => Ok(ServiceCommand::Start),
+        "stop" if args.len() == 1 => Ok(ServiceCommand::Stop),
+        "reload" if args.len() == 1 => Ok(ServiceCommand::Reload),
+        "status" if args.len() == 1 => Ok(ServiceCommand::Status),
+        "uninstall" | "start" | "stop" | "reload" | "status" => {
+            Err(ServiceCliError::Usage(service_usage()))
+        }
         "run" => {
             let config_path = parse_config_arg(&args[1..])?;
             Ok(ServiceCommand::Run { config_path })
         }
         _ => Err(ServiceCliError::Usage(service_usage())),
     }
+}
+
+fn is_help_arg(arg: &str) -> bool {
+    arg == "-h" || arg == "--help"
+}
+
+/// Finds help switches that are options rather than the value consumed by
+/// `--config`. Lifecycle commands still reject `--config --help` as an invalid
+/// extra argument; they must never turn malformed input into a state change.
+fn has_unconsumed_help_arg(args: &[String]) -> bool {
+    let mut consume_as_config_path = false;
+    for arg in args {
+        if consume_as_config_path {
+            consume_as_config_path = false;
+        } else if arg == "--config" {
+            consume_as_config_path = true;
+        } else if is_help_arg(arg) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn execute_service_command<C: ServiceController>(
@@ -200,7 +230,17 @@ pub fn default_log_dir() -> PathBuf {
     default_base_dir().join("logs")
 }
 
-fn config_marker_path() -> PathBuf {
+/// Returns the log file used by Windows Service mode when the configuration
+/// does not select an explicit file.
+#[doc(hidden)]
+pub fn default_service_log_path() -> PathBuf {
+    default_log_dir().join("alighieri.log")
+}
+
+/// Returns the marker in which service installation records the effective
+/// configuration path.
+#[doc(hidden)]
+pub fn service_config_marker_path() -> PathBuf {
     default_base_dir().join(SERVICE_CONFIG_MARKER)
 }
 
@@ -212,7 +252,7 @@ fn absolute_config_path(config_path: &Path) -> ServiceCliResult<PathBuf> {
 }
 
 fn installed_config_path() -> ServiceCliResult<PathBuf> {
-    read_installed_config_path(&config_marker_path())
+    read_installed_config_path(&service_config_marker_path())
 }
 
 /// Resolves the config path recorded at install time from `marker`. A genuinely
@@ -720,7 +760,10 @@ fn secure_path_acl(path: &Path) -> std::io::Result<()> {
 }
 
 fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
-    write_marker_atomically(&config_marker_path(), &config_path.display().to_string())?;
+    write_marker_atomically(
+        &service_config_marker_path(),
+        &config_path.display().to_string(),
+    )?;
     Ok(())
 }
 
@@ -730,7 +773,8 @@ fn write_config_marker(config_path: &Path) -> ServiceCliResult<()> {
 /// makes the CLI validate the wrong (or default) config; with the rename, readers
 /// always see a complete old-or-new file (the rename also replaces a destination
 /// link rather than writing through it). Mirrors the atomic persistence used for
-/// the userlist/config writes; separated from `config_marker_path` for testing.
+/// the userlist/config writes; separated from `service_config_marker_path` for
+/// testing.
 fn write_marker_atomically(marker: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -821,17 +865,27 @@ fn finalize_install<C: ServiceController>(
 }
 
 fn validate_config(config_path: &Path) -> ServiceCliResult<()> {
-    Config::load(config_path)
-        .and_then(|config| {
-            // Mirror the checks `Server::bind` runs at startup (same order as the
-            // `check` command) so `service install`/`start`/`reload` reject a
-            // config that would otherwise fail the moment the service binds —
-            // e.g. an unauthenticated public metrics endpoint.
-            config.validate_startup()?;
-            tls::validate_config(&config)?;
-            Ok(())
-        })
-        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))
+    let config = Config::load(config_path)
+        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
+    // Mirror the checks `Server::bind` runs at startup (same order as the
+    // `check` command) so `service install`/`start`/`reload` reject a config that
+    // would otherwise fail the moment the service binds — e.g. an
+    // unauthenticated public metrics endpoint.
+    config
+        .validate_startup()
+        .and_then(|()| tls::validate_config(&config))
+        .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
+    // Service mode always writes a file log. Validate the resolved active path
+    // and every rotation before asking SCM to install/start/reload, and repeat
+    // the same check inside the service immediately before opening the writer.
+    validate_windows_service_logging_paths(
+        &config,
+        config_path,
+        &default_log_dir(),
+        &service_config_marker_path(),
+    )
+    .map(|_| ())
+    .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))
 }
 
 fn service_usage() -> String {
@@ -1224,11 +1278,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_config_rejects_a_logfile_that_is_the_active_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &path,
+            format!(
+                "internal: 127.0.0.1 port = 1080\nlogfile: {}\n",
+                path.display()
+            ),
+        )
+        .unwrap();
+
+        let error = validate_config(&path).unwrap_err();
+
+        assert!(
+            error.to_string().contains("active configuration"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("separate logfile"), "{error}");
+    }
+
+    #[test]
     fn parses_service_help() {
         assert_eq!(
             parse_service_command(vec!["install".into(), "--help".into()]).unwrap(),
             ServiceCommand::Help
         );
+        assert_eq!(
+            parse_service_command(vec!["install".into(), "--config".into(), "--help".into(),])
+                .unwrap(),
+            ServiceCommand::Install {
+                config_path: PathBuf::from("--help"),
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_commands_reject_extras_and_unconsumed_help_wins() {
+        for command in ["uninstall", "start", "stop", "reload", "status"] {
+            assert!(parse_service_command(vec![command.into(), "junk".into()]).is_err());
+            assert_eq!(
+                parse_service_command(vec![command.into(), "junk".into(), "--help".into(),])
+                    .unwrap(),
+                ServiceCommand::Help
+            );
+            assert!(parse_service_command(vec![
+                command.into(),
+                "--config".into(),
+                "--help".into(),
+            ])
+            .is_err());
+        }
     }
 
     #[test]
@@ -1237,6 +1338,9 @@ mod tests {
         assert!(config.ends_with(Path::new("Alighieri").join("alighieri.conf")));
         let logs = default_log_dir();
         assert!(logs.ends_with(Path::new("Alighieri").join("logs")));
+        assert_eq!(default_service_log_path(), logs.join("alighieri.log"));
+        assert!(service_config_marker_path()
+            .ends_with(Path::new("Alighieri").join("service-config-path.txt")));
     }
 
     #[test]

@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -286,11 +287,109 @@ pub struct Config {
     pub rate_limits: RateLimits,
     /// The access-control rule set.
     pub rules: RuleSet,
+    /// Canonical paths of the entrypoint and every successfully loaded include.
+    /// Kept private because this is load provenance rather than a runtime
+    /// setting; the Windows Service host uses it to protect configuration
+    /// sources from logfile rotation.
+    loaded_source_paths: Vec<PathBuf>,
+    /// The spelling used to reach each successfully loaded configuration file
+    /// together with the canonical file whose bytes were parsed. The Linux
+    /// installer uses both sides of this provenance to validate include paths
+    /// without letting a writable symlink disguise a trusted target.
+    loaded_config_sources: Vec<LoadedConfigSource>,
+    /// Resolved wildcard includes whose future matches also become
+    /// configuration sources on reload.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    loaded_include_patterns: Vec<LoadedIncludePattern>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LoadedIncludePattern {
+    declared_path: PathBuf,
+    path: PathBuf,
+}
+
+/// A configuration file consumed by [`Config::load`].
+///
+/// `declared_path` is the entrypoint path supplied to `load`, or an include
+/// path after resolving it relative to its containing configuration file.
+/// `canonical_path` identifies the file whose bytes were actually parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct LoadedConfigSource {
+    declared_path: PathBuf,
+    canonical_path: PathBuf,
+}
+
+impl LoadedConfigSource {
+    /// Returns the include spelling resolved against its containing file, or
+    /// the entrypoint spelling supplied to [`Config::load`].
+    pub fn declared_path(&self) -> &Path {
+        &self.declared_path
+    }
+
+    /// Returns the canonical path of the file whose bytes were parsed.
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl LoadedIncludePattern {
+    /// Returns the include pattern spelling resolved against its containing
+    /// configuration file, before canonicalising its parent directory.
+    pub fn declared_path(&self) -> &Path {
+        &self.declared_path
+    }
+
+    /// Returns the pattern under its canonical parent directory.
+    pub fn canonical_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn parent(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    pub(crate) fn matches_file_name(&self, file_name: &OsStr) -> bool {
+        let Some(pattern) = self.path.file_name() else {
+            return false;
+        };
+        wildcard_match(&pattern.to_string_lossy(), &file_name.to_string_lossy())
+    }
 }
 
 impl Config {
     pub fn uses_file_logging(&self) -> bool {
         self.log_outputs.contains(&LogOutput::File)
+    }
+
+    /// Returns canonical paths of configuration files consumed by [`Config::load`].
+    /// Configurations created with [`Config::parse`] have no filesystem sources.
+    #[doc(hidden)]
+    pub fn loaded_source_paths(&self) -> &[PathBuf] {
+        &self.loaded_source_paths
+    }
+
+    /// Returns the declared and canonical paths of every configuration file
+    /// consumed by [`Config::load`], in parse order. Configurations created
+    /// with [`Config::parse`] have no filesystem sources.
+    #[doc(hidden)]
+    pub fn loaded_config_sources(&self) -> &[LoadedConfigSource] {
+        &self.loaded_config_sources
+    }
+
+    /// Returns every wildcard include pattern reached by [`Config::load`], in
+    /// parse order. Each entry retains both its declared, resolved spelling and
+    /// its canonical parent spelling.
+    #[doc(hidden)]
+    pub fn loaded_include_patterns(&self) -> &[LoadedIncludePattern] {
+        &self.loaded_include_patterns
     }
 
     /// True when the no-authentication (`none`) SOCKS method is offered on a
@@ -330,10 +429,30 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let mut builder = Builder::default();
         let mut stack = Vec::new();
-        let text = fs::read_to_string(path)
+        // Resolve first and read through that stable spelling so valid-load
+        // provenance always identifies the file whose bytes were parsed. If
+        // resolution fails, retain the established, more useful missing-file
+        // diagnostic by probing the original path only for its read error.
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(resolve_error) => match fs::read_to_string(path) {
+                Err(read_error) => {
+                    return Err(Error::Config(format!(
+                        "failed to read {}: {read_error}",
+                        path.display()
+                    )))
+                }
+                Ok(_) => {
+                    return Err(Error::Config(format!(
+                        "failed to resolve {}: {resolve_error}",
+                        path.display()
+                    )))
+                }
+            },
+        };
+        record_loaded_source_path(&mut builder, path.to_path_buf(), canonical.clone());
+        let text = fs::read_to_string(&canonical)
             .map_err(|e| Error::Config(format!("failed to read {}: {e}", path.display())))?;
-        let canonical = fs::canonicalize(path)
-            .map_err(|e| Error::Config(format!("failed to resolve {}: {e}", path.display())))?;
         parse_resolved_config_file(canonical, text, &mut builder, &mut stack)?;
         builder.build()
     }
@@ -373,9 +492,23 @@ impl ParseSource {
 fn parse_config_file(path: &Path, builder: &mut Builder, stack: &mut Vec<PathBuf>) -> Result<()> {
     let canonical = fs::canonicalize(path)
         .map_err(|e| Error::Config(format!("failed to resolve {}: {e}", path.display())))?;
+    record_loaded_source_path(builder, path.to_path_buf(), canonical.clone());
     let text = fs::read_to_string(&canonical)
         .map_err(|e| Error::Config(format!("failed to read {}: {e}", canonical.display())))?;
     parse_resolved_config_file(canonical, text, builder, stack)
+}
+
+fn record_loaded_source_path(builder: &mut Builder, declared: PathBuf, canonical: PathBuf) {
+    if !builder.loaded_source_paths.contains(&canonical) {
+        builder.loaded_source_paths.push(canonical.clone());
+    }
+    let source = LoadedConfigSource {
+        declared_path: declared,
+        canonical_path: canonical,
+    };
+    if !builder.loaded_config_sources.contains(&source) {
+        builder.loaded_config_sources.push(source);
+    }
 }
 
 fn parse_resolved_config_file(
@@ -522,6 +655,9 @@ struct Builder {
     rate_concurrent: Option<usize>,
     rate_bytes: Option<RateLimit>,
     rules: Vec<Rule>,
+    loaded_source_paths: Vec<PathBuf>,
+    loaded_config_sources: Vec<LoadedConfigSource>,
+    loaded_include_patterns: Vec<LoadedIncludePattern>,
 }
 
 impl Builder {
@@ -658,6 +794,9 @@ impl Builder {
                 byte_rate: self.rate_bytes,
             },
             rules: RuleSet::new(self.rules),
+            loaded_source_paths: self.loaded_source_paths,
+            loaded_config_sources: self.loaded_config_sources,
+            loaded_include_patterns: self.loaded_include_patterns,
         })
     }
 }
@@ -762,10 +901,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
             b.shutdown_drain_timeout = Some(Duration::from_secs(secs));
         }
         "userlist" => {
-            if vals.is_empty() {
-                return Err(cfg_err(lineno, "userlist requires a path"));
-            }
-            b.userlist = Some(PathBuf::from(vals.join(" ")));
+            b.userlist = Some(parse_path(vals, lineno, "userlist")?);
         }
         "maxconnections" | "max.connections" => {
             let value = parse_usize_positive(vals, lineno, "maxconnections")?;
@@ -779,10 +915,7 @@ fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> 
         }
         "logoutput" => b.log_outputs = Some(parse_log_outputs(vals, lineno)?),
         "logfile" | "log.file" => {
-            if vals.is_empty() {
-                return Err(cfg_err(lineno, "logfile requires a path"));
-            }
-            b.log_file = Some(PathBuf::from(vals.join(" ")));
+            b.log_file = Some(parse_path(vals, lineno, "logfile")?);
         }
         "logformat" | "log.format" => b.log_format = Some(parse_log_format(vals, lineno)?),
         "logrotatesize" | "logrotate.size" | "log.rotate.size" => {
@@ -963,7 +1096,14 @@ fn parse_path(vals: &[String], lineno: usize, setting: &str) -> Result<PathBuf> 
     if vals.is_empty() {
         return Err(cfg_err(lineno, &format!("{setting} requires a path")));
     }
-    Ok(PathBuf::from(vals.join(" ")))
+    let path = vals.join(" ");
+    if path.chars().any(char::is_control) {
+        return Err(cfg_err(
+            lineno,
+            &format!("{setting} path must not contain control characters"),
+        ));
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Parses a `usize` setting (zero allowed), rejecting a value too large for the
@@ -1607,6 +1747,26 @@ fn parse_include(
         ));
     }
 
+    if path_has_wildcards(&pattern) {
+        let parent = pattern.parent().unwrap_or_else(|| Path::new("."));
+        let canonical_parent = fs::canonicalize(parent).map_err(|e| {
+            cfg_err_at(
+                source,
+                lineno,
+                &format!("include '{raw_pattern}' failed: {e}"),
+            )
+        })?;
+        if let Some(file_name) = pattern.file_name() {
+            let loaded_pattern = LoadedIncludePattern {
+                declared_path: pattern.clone(),
+                path: canonical_parent.join(file_name),
+            };
+            if !builder.loaded_include_patterns.contains(&loaded_pattern) {
+                builder.loaded_include_patterns.push(loaded_pattern);
+            }
+        }
+    }
+
     for include_path in include_paths {
         parse_config_file(&include_path, builder, stack).map_err(|e| {
             cfg_err_at(
@@ -2227,6 +2387,25 @@ ratelimit.bytes: 64KiB/30
     }
 
     #[test]
+    fn filesystem_paths_reject_control_characters() {
+        for setting in [
+            "userlist",
+            "logfile",
+            "tls.certfile",
+            "tls.keyfile",
+            "tls.acme.cache",
+        ] {
+            let text = format!("internal: 127.0.0.1:1080\n{setting}: /tmp/\u{1b}hidden");
+            let err = Config::parse(&text).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("path must not contain control characters"),
+                "{setting}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn metrics_public_bind_requires_allowpublic() {
         let head = "internal: 127.0.0.1 port = 1080\n";
 
@@ -2794,6 +2973,64 @@ socks pass "" { command: connect }"#,
         assert_eq!(cfg.rules.rules.len(), 2);
         assert_eq!(cfg.rules.rules[0].verdict, Verdict::Block);
         assert_eq!(cfg.rules.rules[1].verdict, Verdict::Pass);
+        let patterns = cfg.loaded_include_patterns();
+        assert_eq!(patterns.len(), 1);
+        let canonical_main = fs::canonicalize(dir.path().join("alighieri.conf")).unwrap();
+        assert_eq!(
+            patterns[0].declared_path(),
+            canonical_main.parent().unwrap().join("conf.d/*.conf")
+        );
+        assert_eq!(
+            patterns[0].canonical_path(),
+            fs::canonicalize(&conf_dir).unwrap().join("*.conf")
+        );
+        assert_eq!(patterns[0].parent(), fs::canonicalize(&conf_dir).unwrap());
+        assert!(patterns[0].matches_file_name(OsStr::new("30-future.conf")));
+        assert!(!patterns[0].matches_file_name(OsStr::new("30-future.txt")));
+    }
+
+    #[test]
+    fn load_records_canonical_entrypoint_and_include_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("alighieri.conf");
+        let first = dir.path().join("first.conf");
+        let nested = dir.path().join("nested.conf");
+        fs::write(&main, "internal: 127.0.0.1:1080\ninclude: first.conf\n").unwrap();
+        fs::write(&first, "include: nested.conf\n").unwrap();
+        fs::write(&nested, "socks pass { command: connect }\n").unwrap();
+
+        let cfg = Config::load(&main).unwrap();
+
+        assert_eq!(
+            cfg.loaded_source_paths(),
+            [
+                fs::canonicalize(&main).unwrap(),
+                fs::canonicalize(&first).unwrap(),
+                fs::canonicalize(&nested).unwrap(),
+            ]
+        );
+        let canonical_main = fs::canonicalize(&main).unwrap();
+        let canonical_first = fs::canonicalize(&first).unwrap();
+        let canonical_nested = fs::canonicalize(&nested).unwrap();
+        let sources = cfg.loaded_config_sources();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].declared_path(), main);
+        assert_eq!(sources[0].canonical_path(), canonical_main);
+        assert_eq!(
+            sources[1].declared_path(),
+            canonical_main.parent().unwrap().join("first.conf")
+        );
+        assert_eq!(sources[1].canonical_path(), canonical_first);
+        assert_eq!(
+            sources[2].declared_path(),
+            canonical_first.parent().unwrap().join("nested.conf")
+        );
+        assert_eq!(sources[2].canonical_path(), canonical_nested);
+
+        let parsed = Config::parse("internal: 127.0.0.1:1080").unwrap();
+        assert!(parsed.loaded_source_paths().is_empty());
+        assert!(parsed.loaded_config_sources().is_empty());
+        assert!(cfg.loaded_include_patterns().is_empty());
     }
 
     #[test]
