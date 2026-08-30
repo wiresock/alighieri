@@ -201,15 +201,24 @@ written, saved atomically, and the previous file (if any) is preserved as
 The public profile fixes the listener at `0.0.0.0:443`, offers only the
 `username` authentication method, enables TCP CONNECT, applies an
 authentication-failure rate limit, and keeps private, link-local, loopback, and
-reserved destinations blocked. It obtains and renews a standard publicly
-trusted certificate through the existing ACME TLS-ALPN-01 listener. The wizard
-does not ask for, generate, display, or store a plaintext password.
+reserved destinations blocked. Its generated destination ACL is
+`to: 0.0.0.0/0`, so this ready-made deployment flow is deliberately IPv4-only.
+Alighieri supports IPv6 in other configurations; this narrower profile keeps
+the server, ACL, and client choices aligned. It obtains and renews a standard
+publicly trusted certificate through the existing ACME TLS-ALPN-01 listener.
+The wizard does not ask for, generate, display, or store a plaintext password.
 
 Before starting the service:
 
-- create a DNS A record pointing the selected domain at the VPS and wait for it
-  to resolve; publish an AAAA record only if IPv6 TCP 443 is actually forwarded
-  to this IPv4 listener;
+- create a DNS A record pointing the selected domain directly at the VPS public
+  IPv4 address and wait for `dig +short proxy.example.com` to return that
+  address rather than unrelated proxy or CDN addresses;
+- if Cloudflare manages the zone, set that A record to **DNS only** (gray
+  cloud), not the standard **Proxied** mode (orange cloud). Specialized
+  Cloudflare TCP proxy products are outside this walkthrough;
+- do not publish an AAAA record for this hostname unless IPv6 TCP 443 and
+  compatible Alighieri rules are separately configured and tested. An
+  incorrect or unreachable AAAA record can interfere with ACME validation;
 - allow inbound TCP 443 in the host firewall and cloud security group, allow
   outbound TCP 443 for ACME, and ensure no other service occupies TCP 443;
 - if UDP ASSOCIATE is enabled, allow its selected inbound UDP range (the default
@@ -222,22 +231,55 @@ port 80. The reviewed
 shows the same defaults, and the [ACME test guide](doc/acme-tls-test.md) covers
 issuance and troubleshooting in detail.
 
-On a fresh Linux VPS, prepare the supported installation with `--no-start`;
-this creates the `alighieri` account, directories, binary, and systemd unit but
-does not enable or start it before credentials exist. Existing installations
-can skip that first command. Generate directly to the service's configuration
-path, then create the first user and make the resulting file service-readable
-before running the normal installer. That final run derives the port-443
-`CAP_NET_BIND_SERVICE` capability and starts the service:
+#### Running the wizard on a remote VPS
 
-The commands below use the helper from a source checkout. Linux release
-archives contain the same `scripts/alighieri.sh` path, the matching binary, and
-the default config. When working from an extracted release archive, add
-`--binary ./alighieri` to both installer invocations.
+Keep the wizard loopback-only and reach it through one SSH session. From the
+operator's local computer:
 
 ```sh
-sudo ./scripts/alighieri.sh install --no-start  # fresh VPS only
-sudo alighieri config wizard --output /etc/alighieri/alighieri.conf
+ssh -o ExitOnForwardFailure=yes \
+    -L 8080:127.0.0.1:8080 \
+    user@vps-address
+```
+
+Inside that SSH session, change to the source checkout or extracted release
+archive. On a fresh VPS, prepare the supported installation before starting the
+wizard. From a source checkout:
+
+```sh
+sudo ./scripts/alighieri.sh install --no-start
+```
+
+From an extracted Linux release archive, run this instead:
+
+```sh
+sudo ./scripts/alighieri.sh install --binary ./alighieri --no-start
+```
+
+Either preparation command creates the `alighieri` account, service
+directories, binary, and systemd unit without enabling or starting the service.
+Existing installations can skip it. Then, inside the same SSH session, run:
+
+```sh
+sudo alighieri config wizard \
+    --listen 127.0.0.1:8080 \
+    --output /etc/alighieri/alighieri.conf
+```
+
+Keep SSH open and open the printed tokenized
+`http://127.0.0.1:8080/?token=...` URL in the local browser. The tunnel maps
+local port 8080 to the VPS loopback listener, so do **not** open TCP 8080 in the
+VPS firewall and do not bind the wizard publicly. If 8080 is occupied, choose
+another port in both commands. Do not post or share the tokenized URL.
+
+After the wizard writes the service configuration, create the first user and
+make the resulting file service-readable before running the normal installer.
+That final run derives the port-443 `CAP_NET_BIND_SERVICE` capability and starts
+the service. These commands use the helper from a source checkout; from an
+extracted release archive, add `--binary ./alighieri` to the final installer
+command:
+
+```sh
 sudo alighieri user add proxyuser --userlist /etc/alighieri/users
 sudo chown root:alighieri -- /etc/alighieri/users
 sudo chmod 640 -- /etc/alighieri/users
@@ -258,14 +300,48 @@ page provides an elevated-PowerShell bootstrap that hardens this directory,
 atomically installs the generated configuration at its canonical service path
 with a backup, creates the user, and only then installs and starts the service.
 
-Use [ProxiFyre 2.4.0 or later](https://github.com/wiresock/proxifyre/releases/tag/v2.4.0);
-earlier versions do not support native SOCKS5-over-TLS. Its
-[configuration](https://github.com/wiresock/proxifyre/blob/main/docs/configuration.md#socks5-over-tls)
-defaults to plaintext SOCKS5, so the
-`socks5Transport` field must explicitly be `TLS`. For example, save the
-following as `app-config.json` next to `ProxiFyre.exe`, replace the application
-names and credentials, and remove `UDP` from `supportedProtocols` when the
-wizard's UDP option is disabled:
+#### Configure ProxiFyre 2.5+
+
+Install [ProxiFyre 2.5.0 or later](https://github.com/wiresock/proxifyre/releases/latest)
+using the current architecture-matched online `*-setup.exe`, then use the
+[ProxiFyre GUI](https://github.com/wiresock/proxifyre/blob/main/docs/gui.md) as
+the recommended editor. ProxiFyre's first-party installer is unsigned and
+Windows may show **Unknown publisher**; before approving elevation, verify the
+download against its matching `.sha256` sidecar from the official release.
+
+| Setting | Value |
+| --- | --- |
+| Proxy type | SOCKS5 |
+| Server | the public-profile domain, such as `proxy.example.com` |
+| Port | `443` |
+| Transport | TLS |
+| Username and password | the username and password created with `alighieri user add` |
+| TLS server name | the same domain (or ProxiFyre's default from the endpoint hostname) |
+| Certificate validation | enabled; keep **Allow invalid certificate** disabled |
+| Certificate pin | not required for a normal publicly trusted production ACME certificate |
+| Protocols | TCP, plus UDP only when UDP ASSOCIATE was enabled in Alighieri |
+| Destination address family | IPv4 |
+
+Open ProxiFyre from the Start Menu, add a routing rule, and select or enter the
+Windows application that should use it. Enter the values above, select TLS,
+keep normal certificate and hostname validation enabled, select TCP and only
+the conditionally enabled UDP option, and select IPv4. Choose **Validate**, then
+**Apply & Restart**, and confirm that the header reports **Running**. Use the
+**Logs** tab for connection or routing-rule diagnosis. The official
+[configuration reference](https://github.com/wiresock/proxifyre/blob/main/docs/configuration.md)
+covers advanced fields.
+
+<details>
+<summary>Advanced/manual app-config.json</summary>
+
+For automation, managed deployment, or intentional manual editing, save the
+following as `app-config.json` next to `ProxiFyre.exe`. Replace the application
+name and credentials. Remove `UDP` from `supportedProtocols` when UDP ASSOCIATE
+was not enabled in the Alighieri wizard. Manual configuration must explicitly
+select TLS because the format otherwise defaults to plaintext SOCKS5. The
+installed directory normally requires elevation; credentials remain plaintext
+in this file, so restrict access to it and restart `ProxiFyreService` after
+manual changes.
 
 ```json
 {
@@ -287,11 +363,13 @@ wizard's UDP option is disabled:
 }
 ```
 
+</details>
+
 The explicit `IPv4` destination family matches this profile's
-`to: 0.0.0.0/0` ACL; the upstream endpoint separately uses the domain's A
-record. Keep normal certificate validation enabled: the production ACME
-certificate is publicly trusted, so neither a fingerprint pin nor
-`tlsAllowInvalidCertificate: true` is appropriate.
+`to: 0.0.0.0/0` ACL; the upstream ProxiFyre endpoint separately requires the
+domain's A record. Keep normal certificate validation enabled: the production
+ACME certificate is publicly trusted, so neither a fingerprint pin nor an
+invalid-certificate bypass is appropriate.
 
 The endpoint is an application proxy, not a full IP-level VPN. TLS protects the
 SOCKS5 control connection, authentication, and relayed TCP CONNECT traffic, but
@@ -1148,7 +1226,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | developing (current release v0.5.0) | decades in production |
+| Maturity | developing (current release v0.5.1) | decades in production |
 
 **Which to choose**
 
