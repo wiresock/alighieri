@@ -41,9 +41,9 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Clippy (all targets, warnings denied)
         run: cargo clippy --all-targets --locked -- -D warnings
-      # The plugin SDK and Linux installer companion are both off by default.
-      # Exercise all features on both platforms so the companion's non-Linux
-      # fail-closed stub and every feature-gated module stay buildable.
+      # The plugin SDK, Linux installer companion, and Windows RDP transport are
+      # off by default. Exercise every feature on both platforms so target-gated
+      # modules and their fail-closed non-native stubs stay buildable.
       - name: Clippy (all features, warnings denied)
         run: cargo clippy --all-targets --locked --all-features -- -D warnings
       - name: Test (lib, bins, integration, examples)
@@ -58,6 +58,22 @@ jobs:
         run: cargo test --all-targets --locked --all-features
         env:
           ALIGHIERI_REQUIRE_DACL_TESTS: ${{ matrix.os == 'windows-latest' && '1' || '' }}
+      - name: Build all-feature Windows binaries
+        if: runner.os == 'Windows'
+        run: cargo build --locked --all-features --bins
+      - name: Assert Windows RDP helper binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $required = @(
+            "target/debug/alighieri-rdp-transport.exe",
+            "target/debug/alighieri-rdp-agent.exe"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required RDP helper binary is missing: $path"
+            }
+          }
       - name: Build installer filesystem companion for contract tests
         if: runner.os == 'Linux'
         run: cargo build --locked --features installer-fs --bin alighieri-installer-fs
@@ -89,7 +105,7 @@ jobs:
             features: --features installer-fs
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            features: ''
+            features: --features rdp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -111,6 +127,17 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Cross-compile (release, build-only)
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+      - name: Assert cross-compiled Windows RDP helpers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $releaseDir = "target/${{ matrix.target }}/release"
+          foreach ($name in @("alighieri-rdp-transport.exe", "alighieri-rdp-agent.exe")) {
+            $path = Join-Path $releaseDir $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required cross-compiled RDP helper is missing: $path"
+            }
+          }
 
   # Formatting is platform-independent, so check it once.
   rustfmt:
@@ -189,6 +216,9 @@ jobs:
             src/lib.rs
             src/main.rs
             src/bin/alighieri-installer-fs.rs
+            src/bin/alighieri-rdp-agent.rs
+            src/bin/alighieri-rdp-transport.rs
+            src/rdp/protocol.rs
             src/platform/linux.rs
             README.md
             CHANGELOG.md
@@ -197,6 +227,7 @@ jobs:
             doc/alighieri.conf
             doc/management-cli.md
             doc/plugin-sdk.md
+            doc/rdp-transport.md
             scripts/alighieri.sh
             scripts/install-linux.sh
           )

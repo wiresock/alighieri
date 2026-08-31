@@ -6,6 +6,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- An optional Windows `rdp` feature adds TCP CONNECT egress through an existing
+  Microsoft Remote Desktop Dynamic Virtual Channel. Windows distributions now
+  include a per-user COM LocalServer transport helper and an interactive remote
+  agent; SOCKS policy and remote-DNS candidate authorization remain local, and
+  the bounded multiplexed protocol supports IPv4, IPv6, concurrent streams,
+  half-close, flow control, and clean generation reset after RDP reconnects.
+
 ## [0.5.3] - 2026-08-31
 
 ### Added

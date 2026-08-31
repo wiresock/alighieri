@@ -2297,6 +2297,9 @@ fn config_loss_warnings(original: &Config, regenerated: &Config) -> Vec<String> 
                 .to_string(),
         );
     }
+    if original.egress != regenerated.egress {
+        lost.push("outbound transport (egress)".to_string());
+    }
     if original.external != regenerated.external {
         lost.push("outbound source address (external)".to_string());
     }
@@ -5702,6 +5705,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
     fn import_flags_settings_the_wizard_cannot_represent() {
         let config = Config::parse(
             "internal: 127.0.0.1 port = 1080\n\
+             egress: rdp\n\
              external: 0.0.0.0\n\
              socksmethod: none\n\
              metrics.listen: 127.0.0.1:9090\n\
@@ -5721,6 +5725,10 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         );
         assert!(
             warnings.iter().any(|w| w.contains("rate limits")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("egress")),
             "{warnings:?}"
         );
     }

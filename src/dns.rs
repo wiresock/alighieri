@@ -162,7 +162,7 @@ impl DnsResolver {
         dest: &TargetAddr,
         policy: &DnsPolicy,
     ) -> io::Result<Vec<SocketAddr>> {
-        let mut addrs = match dest {
+        let addrs = match dest {
             TargetAddr::Ip(sa) => vec![*sa],
             // `policy.timeout` bounds resolution inside `resolve_domain` (around
             // the singleflight leader's lookup), so a slow or wedged resolver
@@ -172,10 +172,7 @@ impl DnsResolver {
                     .await?
             }
         };
-        canonicalize_addrs(&mut addrs);
-        order_addresses(&mut addrs, policy.preference);
-        addrs.retain(|addr| address_allowed(addr.ip(), policy));
-        Ok(addrs)
+        Ok(apply_policy(addrs, policy))
     }
 
     /// Returns the first policy-allowed address for UDP-style forwarding.
@@ -381,6 +378,18 @@ impl DnsResolver {
         }
         negative.insert(key, now);
     }
+}
+
+/// Canonicalizes, orders, and filters resolver results using the same
+/// post-resolution policy as [`DnsResolver::resolve_all`]. Duplicate candidates
+/// are deliberately preserved to retain the direct resolver's established
+/// `dns.tryall` retry semantics. RDP agent responses are already deduplicated by
+/// the ALRD protocol before they reach this helper.
+pub(crate) fn apply_policy(mut addrs: Vec<SocketAddr>, policy: &DnsPolicy) -> Vec<SocketAddr> {
+    canonicalize_addrs(&mut addrs);
+    order_addresses(&mut addrs, policy.preference);
+    addrs.retain(|addr| address_allowed(addr.ip(), policy));
+    addrs
 }
 
 enum Flight<'a> {
@@ -1246,6 +1255,17 @@ mod tests {
         ];
         order_addresses(&mut addrs, DnsPreference::Ipv6);
         assert!(addrs[0].is_ipv6());
+    }
+
+    #[test]
+    fn post_resolution_policy_preserves_duplicate_candidates() {
+        let address = SocketAddr::from(([192, 0, 2, 1], 443));
+        let policy = policy(DnsPreference::System, Vec::new());
+
+        assert_eq!(
+            apply_policy(vec![address, address], &policy),
+            vec![address, address]
+        );
     }
 
     #[test]
