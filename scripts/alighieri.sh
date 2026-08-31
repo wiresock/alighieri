@@ -2930,7 +2930,7 @@ build_from_source() {
         [ -n "$user_home" ] || user_home="/home/$build_user"
         # shellcheck disable=SC2016  # $1 is expanded by the inner login shell, not here
         runuser -u "$build_user" -- env "HOME=$user_home" \
-            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs' alighieri-build "$REPO_ROOT" ||
+            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs' alighieri-build "$REPO_ROOT" 9>&- ||
             die "cargo build failed as $build_user; ensure they have a Rust toolchain, or pass --binary"
         return
     fi
@@ -2941,7 +2941,7 @@ build_from_source() {
         warn "building from source as root; cargo runs third-party build scripts — prefer a prebuilt binary via --binary"
     fi
     info "building release binary and installer companion with cargo..."
-    ( cd -- "$REPO_ROOT" && cargo build --release --locked --features installer-fs )
+    ( cd -- "$REPO_ROOT" && cargo build --release --locked --features installer-fs 9>&- )
 }
 
 build_installer_fs_helper_from_source() {
@@ -2957,7 +2957,7 @@ build_installer_fs_helper_from_source() {
         # shellcheck disable=SC2016  # $1 is expanded by the inner login shell.
         runuser -u "$build_user" -- env "HOME=$user_home" \
             bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs --bin alighieri-installer-fs' \
-            alighieri-helper-build "$REPO_ROOT" ||
+            alighieri-helper-build "$REPO_ROOT" 9>&- ||
             die "installer companion build failed as $build_user"
         return
     fi
@@ -2969,7 +2969,7 @@ build_installer_fs_helper_from_source() {
     info "building the current installer filesystem companion with cargo..."
     ( cd -- "$REPO_ROOT" &&
         cargo build --release --locked --features installer-fs \
-            --bin "$INSTALLER_FS_HELPER_NAME" )
+            --bin "$INSTALLER_FS_HELPER_NAME" 9>&- )
 }
 
 ensure_user() {
@@ -4116,6 +4116,61 @@ run_selftest() {
     }
     _check_lifecycle_lock
     unset -f _check_lifecycle_lock
+
+    _check_build_children_close_lifecycle_lock() {
+        local build_tmp lock SUDO_USER="builder"
+        build_tmp="$(mktemp -d)"
+        lock="$build_tmp/management.lock"
+
+        if (
+            local competing_fd
+            LIFECYCLE_LOCK_FILE="$lock"
+            acquire_lifecycle_lock
+
+            # Exercise both direct Cargo call sites. The mock fails if the
+            # lifecycle descriptor is visible inside the build child.
+            (
+                id() { printf '%s\n' 1000; }
+                cargo() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                }
+                local REPO_ROOT="$build_tmp"
+                build_from_source || exit 1
+                build_installer_fs_helper_from_source || exit 1
+            ) >/dev/null 2>&1 || exit 1
+
+            # Exercise both privilege-dropped call sites at the runuser
+            # boundary, before an untrusted login shell or Cargo can run.
+            (
+                id() { printf '%s\n' 0; }
+                getent() { printf '%s\n' 'builder:x:1000:1000::/home/builder:/bin/bash'; }
+                runuser() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                }
+                local REPO_ROOT="$build_tmp"
+                build_from_source || exit 1
+                build_installer_fs_helper_from_source || exit 1
+            ) >/dev/null 2>&1 || exit 1
+
+            # Redirection on each child must leave the parent descriptor and
+            # its lock intact until the lifecycle operation releases them.
+            { : >&9; } 2>/dev/null
+            exec {competing_fd}>"$lock"
+            if flock_command -n "$competing_fd"; then exit 1; fi
+            release_lifecycle_lock
+            flock_command -n "$competing_fd"
+        ) >/dev/null 2>&1; then
+            printf 'ok   source-build children cannot inherit or release the lifecycle lock\n'
+        else
+            printf 'FAIL source-build lifecycle lock descriptor isolation\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$lock"
+        command rmdir -- "$build_tmp"
+    }
+    _check_build_children_close_lifecycle_lock
+    unset -f _check_build_children_close_lifecycle_lock
 
     _check_hidden() { # path want(hidden|visible)
         local got

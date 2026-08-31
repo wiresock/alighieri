@@ -34,6 +34,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   rollback publication, journals enough state to recover after an untrappable
   process interruption, and retains the exact pre-migration unit for explicit
   release rollback.
+- Privilege-dropped and direct source builds no longer inherit the privileged
+  lifecycle-lock descriptor into Cargo, build scripts, or proc macros.
+- Management password input now bypasses Rust's process-global stdin buffer and
+  reads directly into bounded zeroizing storage on supported platforms.
 
 ## [0.5.2] - 2026-08-30
 
