@@ -1502,15 +1502,24 @@ close_binary_commit_descriptor() {
 binary_commit_reached_open_descriptor() {
     local source="$1" destination="$2"
     [ "$BINARY_COMMIT_FD_OPEN" -eq 1 ] || return 1
-    [ ! -e "$source" ] && [ ! -L "$source" ] || return 1
+    # A different entry may legitimately recreate the staged pathname after the
+    # rename. Reject only when SOURCE still names the candidate inode, which
+    # proves the rename did not consume that link.
+    if [ -f "$source" ] && [ ! -L "$source" ] &&
+        [[ "$source" -ef /proc/self/fd/8 ]]; then
+        return 1
+    fi
     [[ -f /proc/self/fd/8 && -f "$destination" &&
         ! -L "$destination" && "$destination" -ef /proc/self/fd/8 ]]
 }
 
 binary_commit_reached_persistent_witness() {
     local source="$1" destination="$2" witness="$3"
-    [ ! -e "$source" ] && [ ! -L "$source" ] || return 1
     [ -f "$witness" ] && [ ! -L "$witness" ] || return 1
+    if [ -f "$source" ] && [ ! -L "$source" ] &&
+        [ "$source" -ef "$witness" ]; then
+        return 1
+    fi
     [ -f "$destination" ] && [ ! -L "$destination" ] &&
         [ "$destination" -ef "$witness" ]
 }
@@ -2582,11 +2591,15 @@ cleanup() {
     # retain the validated unit only when the exact destination still has the
     # candidate inode recorded before mv. Source disappearance alone is not
     # proof: portable mv can consume it inside a raced directory destination.
-    if [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] &&
-        [ "$BINARY_COMMIT_IN_PROGRESS" -eq 1 ] && [ -n "$STAGED_BIN" ] &&
+    if [ "$BINARY_COMMIT_IN_PROGRESS" -eq 1 ] &&
+        [ -n "$BINARY_COMMIT_SOURCE" ] &&
         [ -n "$BINARY_COMMIT_DESTINATION" ] &&
         binary_commit_reached_open_descriptor \
-            "$STAGED_BIN" "$BINARY_COMMIT_DESTINATION"; then
+            "$BINARY_COMMIT_SOURCE" "$BINARY_COMMIT_DESTINATION"; then
+        # Destination identity is authoritative. A concurrent writer may have
+        # recreated STAGED_BIN with a different entry after the rename; clear
+        # our cleanup handle before finalizing so EXIT never removes that entry.
+        STAGED_BIN=""
         if ! commit_unit_transaction; then
             warn "could not finalize the committed legacy-unit transaction"
             preserve_journal=1
@@ -2866,13 +2879,6 @@ recover_interrupted_legacy_unit_transaction() {
             warn "binary decision record is incomplete; rolling the unit back without deleting an external staged path"
         fi
         if [ "$decision_record_trusted" -eq 1 ] &&
-            { [ -L "$recovery_staged_bin" ] ||
-                { [ -e "$recovery_staged_bin" ] && [ ! -f "$recovery_staged_bin" ]; }; }; then
-            warn "binary decision source is unsafe; rolling the unit back without deleting $recovery_staged_bin"
-            recovery_staged_bin=""
-            decision_record_trusted=0
-        fi
-        if [ "$decision_record_trusted" -eq 1 ] &&
             [ "$decision_kind" = intent ] && [ -n "$recovery_witness" ] &&
             binary_commit_reached_persistent_witness \
                 "$recovery_staged_bin" "$recovery_destination" \
@@ -2915,6 +2921,16 @@ recover_interrupted_legacy_unit_transaction() {
             ok "Recovered the committed binary and finalized its systemd unit migration."
             warn "service activation may have been interrupted; if the upgrade was meant to restart Alighieri, run: systemctl restart $SERVICE_NAME"
             return 0
+        fi
+        # Exact destination identity is authoritative even if a different file,
+        # symlink, or directory recreated the old staged pathname. Only reject
+        # that source shape after the committed orientation has been ruled out.
+        if [ "$decision_record_trusted" -eq 1 ] &&
+            { [ -L "$recovery_staged_bin" ] ||
+                { [ -e "$recovery_staged_bin" ] && [ ! -f "$recovery_staged_bin" ]; }; }; then
+            warn "binary decision source is unsafe; rolling the unit back without deleting $recovery_staged_bin"
+            recovery_staged_bin=""
+            decision_record_trusted=0
         fi
         if [ "$decision_record_trusted" -eq 1 ] &&
             [ "$decision_kind" = intent ] &&
@@ -3246,7 +3262,10 @@ build_from_source() {
         warn "building from source as root; cargo runs third-party build scripts — prefer a prebuilt binary via --binary"
     fi
     info "building release binary and installer companion with cargo..."
-    ( cd -- "$REPO_ROOT" && cargo build --release --locked --features installer-fs 9>&- )
+    (
+        cd -- "$REPO_ROOT" &&
+            cargo build --release --locked --features installer-fs
+    ) 9>&-
 }
 
 build_installer_fs_helper_from_source() {
@@ -3272,9 +3291,11 @@ build_installer_fs_helper_from_source() {
         warn "building the installer companion as root; prefer the version-matched prebuilt Linux release archive"
     fi
     info "building the current installer filesystem companion with cargo..."
-    ( cd -- "$REPO_ROOT" &&
-        cargo build --release --locked --features installer-fs \
-            --bin "$INSTALLER_FS_HELPER_NAME" 9>&- )
+    (
+        cd -- "$REPO_ROOT" &&
+            cargo build --release --locked --features installer-fs \
+                --bin "$INSTALLER_FS_HELPER_NAME"
+    ) 9>&-
 }
 
 ensure_user() {
@@ -4437,10 +4458,15 @@ run_selftest() {
             LIFECYCLE_LOCK_FILE="$lock"
             acquire_lifecycle_lock
 
-            # Exercise both direct Cargo call sites. The mock fails if the
-            # lifecycle descriptor is visible inside the build child.
+            # Exercise both direct Cargo call sites. The mocks fail if the
+            # lifecycle descriptor is visible either in the wrapper subshell
+            # (before Cargo starts) or in the build child itself.
             (
                 id() { printf '%s\n' 1000; }
+                cd() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                    builtin cd "$@"
+                }
                 cargo() {
                     if { : >&9; } 2>/dev/null; then return 1; fi
                 }
@@ -5476,6 +5502,7 @@ run_selftest() {
               fresh_unit fresh_staged fresh_calls \
               signal_unit signal_staged_unit signal_staged_bin signal_installed \
               signal_witness signal_calls signal_status raced_unit raced_staged_unit \
+              plain_staged_bin plain_installed plain_status \
               raced_staged_bin raced_installed raced_witness raced_calls \
               raced_nested fresh_raced_unit fresh_raced_staged_unit \
               fresh_raced_staged_bin fresh_raced_witness \
@@ -5774,9 +5801,10 @@ run_selftest() {
             test_failures=$((test_failures + 1))
         fi
 
-        # Simulate EXIT landing in the instruction window immediately after the
-        # same-filesystem binary rename. The exact destination inode proves the
-        # atomic commit completed, so cleanup must retain the validated unit.
+        # Simulate EXIT landing immediately after the same-filesystem binary
+        # rename and after another writer recreated the staged pathname. The
+        # exact destination inode proves commit, so cleanup must retain the
+        # validated unit without deleting the unrelated recreated entry.
         signal_unit="$tx_tmp/signal.service"
         signal_staged_unit="${signal_unit}.new.$$"
         signal_staged_bin="$tx_tmp/signal-bin.new.$$"
@@ -5828,12 +5856,15 @@ run_selftest() {
             journal_binary_commit_intent "$STAGED_BIN" "$signal_installed"
             BINARY_COMMIT_IN_PROGRESS=1
             replace_file_atomically "$STAGED_BIN" "$signal_installed"
+            printf '%s\n' 'concurrent-binary' >"$STAGED_BIN"
+            STAGED_BIN=""
             kill -TERM "$BASHPID"
             exit 99
         ) || signal_status=$?
         if [ "$signal_status" -eq 143 ] &&
             [ "$(<"$signal_unit")" = "new-unit" ] &&
             [ "$(<"$signal_installed")" = "new-binary" ] &&
+            [ "$(<"$signal_staged_bin")" = "concurrent-binary" ] &&
             [ ! -s "$signal_calls" ] &&
             [ ! -e "$signal_staged_unit" ] &&
             [ ! -e "${signal_unit}.previous.$$" ] &&
@@ -5843,6 +5874,41 @@ run_selftest() {
             printf 'FAIL TERM cleanup rolled back after the binary rename had completed\n'
             test_failures=$((test_failures + 1))
         fi
+
+        # An ordinary upgrade has no unit transaction. Its signal cleanup must
+        # still recognize the exact binary commit and leave a concurrently
+        # recreated staged pathname alone.
+        plain_installed="$tx_tmp/plain-bin"
+        plain_staged_bin="${plain_installed}.new.$$"
+        printf '%s\n' 'new-binary' >"$plain_staged_bin"
+        plain_status=0
+        (
+            STAGED_BIN="$plain_staged_bin"
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
+            trap 'exit_for_signal TERM' TERM
+            trap cleanup EXIT
+            journal_binary_commit_intent "$STAGED_BIN" "$plain_installed"
+            BINARY_COMMIT_IN_PROGRESS=1
+            replace_file_atomically "$STAGED_BIN" "$plain_installed"
+            printf '%s\n' 'concurrent-binary' >"$STAGED_BIN"
+            kill -TERM "$BASHPID"
+            exit 99
+        ) || plain_status=$?
+        if [ "$plain_status" -eq 143 ] &&
+            [ "$(<"$plain_installed")" = "new-binary" ] &&
+            [ "$(<"$plain_staged_bin")" = "concurrent-binary" ]; then
+            printf 'ok   TERM cleanup preserves a recreated source after an ordinary upgrade commit\n'
+        else
+            printf 'FAIL TERM cleanup removed a recreated ordinary-upgrade source\n'
+            test_failures=$((test_failures + 1))
+        fi
+        command rm -f -- "$plain_staged_bin" "$plain_installed"
 
         # Portable mv treats a directory that appears after the helper's shape
         # check as a container. Even though this consumes the staged source,
@@ -6588,8 +6654,9 @@ run_selftest() {
         legacy_unit_file_matches_kind() { [ "$(<"$1")" = old-unit ]; }
 
         # A destination that is already a hard link to the staged inode is not
-        # proof that rename consumed SOURCE. Both live and recovery predicates
-        # must stay false until the staged pathname itself is absent.
+        # proof that rename consumed SOURCE. Both predicates stay false while
+        # SOURCE still names that inode, but an unrelated entry recreated at the
+        # same pathname must not mask the exact destination commit.
         printf '%s\n' new-binary >"$staged_binary" || exit 1
         command ln -- "$staged_binary" "$installed_binary" || exit 1
         command ln -- "$staged_binary" "$commit_witness" || exit 1
@@ -6603,12 +6670,15 @@ run_selftest() {
             exit 1
         fi
         command rm -f -- "$staged_binary" || exit 1
+        printf '%s\n' concurrent-binary >"$staged_binary" || exit 1
         binary_commit_reached_open_descriptor \
             "$staged_binary" "$installed_binary" || exit 1
         binary_commit_reached_persistent_witness \
             "$staged_binary" "$installed_binary" "$commit_witness" || exit 1
+        [ "$(<"$staged_binary")" = concurrent-binary ] || exit 1
         close_binary_commit_descriptor || exit 1
-        command rm -f -- "$installed_binary" "$commit_witness" || exit 1
+        command rm -f -- "$staged_binary" "$installed_binary" \
+            "$commit_witness" || exit 1
 
         _reset_exchange_globals() {
             close_binary_commit_descriptor || true
@@ -6935,7 +7005,8 @@ run_selftest() {
             command rm -f -- "$unit" || exit 1
 
             # A current binary intent records the exact staged inode. Recovery
-            # commits only when that inode reached the requested destination.
+            # commits when that inode reached the requested destination even if
+            # another entry recreated the old staged pathname meanwhile.
             _reset_exchange_globals || exit 1
             printf '%s\n' new-unit >"$unit" || exit 1
             command mkdir -m 700 -- "$transaction" || exit 1
@@ -6950,15 +7021,19 @@ run_selftest() {
             printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
                 "$commit_witness" complete >"$intent" || exit 1
             command mv -- "$staged_binary" "$installed_binary" || exit 1
+            command ln -s -- "$installed_binary" "$staged_binary" || exit 1
             recover_interrupted_legacy_unit_transaction || exit 1
             {
                 [ "$(<"$unit")" = new-unit ] &&
                     [ "$(<"$installed_binary")" = new-binary ] &&
+                    [ -L "$staged_binary" ] &&
+                    [ "$(readlink -- "$staged_binary")" = "$installed_binary" ] &&
                     [ "$(<"$retained")" = old-unit ] &&
                     [ ! -e "$commit_witness" ] &&
                     [ ! -e "$transaction" ]
             } || exit 1
-            command rm -f -- "$unit" "$retained" "$installed_binary" || exit 1
+            command rm -f -- "$unit" "$retained" "$staged_binary" \
+                "$installed_binary" || exit 1
 
             # A crash after the durable unit-commit marker but before journal
             # cleanup must recover the external binary witness from the intent
@@ -7657,6 +7732,9 @@ do_install() {
         BINARY_COMMIT_IN_PROGRESS=0
         die "could not install the validated binary at $install_bin; the previous unit will be restored"
     fi
+    # The exact destination inode proves commit even if another entry recreated
+    # the staged pathname. Stop cleanup from treating that entry as ours.
+    STAGED_BIN=""
     commit_unit_transaction ||
         die "the binary was installed, but the unit transaction could not be finalized"
     if ! remove_binary_commit_witness; then
@@ -7670,7 +7748,6 @@ do_install() {
     close_binary_commit_descriptor ||
         warn "could not close the binary commit descriptor"
     BINARY_COMMIT_IN_PROGRESS=0
-    STAGED_BIN=""
 
     activate_prevalidated_service
     local effective_userlist
@@ -7796,6 +7873,9 @@ do_upgrade() {
         BINARY_COMMIT_IN_PROGRESS=0
         die "could not replace the installed binary at $install_bin; the previous unit will be restored"
     fi
+    # The exact destination inode proves commit even if another entry recreated
+    # the staged pathname. Stop cleanup from treating that entry as ours.
+    STAGED_BIN=""
     commit_unit_transaction ||
         die "the binary was replaced, but the unit transaction could not be finalized"
     if ! remove_binary_commit_witness; then
@@ -7809,7 +7889,6 @@ do_upgrade() {
     close_binary_commit_descriptor ||
         warn "could not close the binary commit descriptor"
     BINARY_COMMIT_IN_PROGRESS=0
-    STAGED_BIN=""
 
     if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then
         systemctl restart "${SERVICE_NAME}.service"
