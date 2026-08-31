@@ -6,6 +6,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-31
+
 ### Added
 
 - A versioned, machine-readable local management CLI now provides capability
@@ -34,6 +36,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   rollback publication, journals enough state to recover after an untrappable
   process interruption, and retains the exact pre-migration unit for explicit
   release rollback.
+- Privilege-dropped and direct source builds no longer inherit the privileged
+  lifecycle-lock descriptor into Cargo, build scripts, or proc macros.
+- Binary installation now pins the staged inode on an open descriptor and
+  verifies the exact destination before committing its systemd-unit transaction;
+  crash-recoverable legacy migrations also journal an exact hard-link witness.
+  A raced directory can no longer turn a failed move into a false commit.
+- Management password input now bypasses Rust's process-global stdin buffer and
+  reads directly into bounded zeroizing storage on supported platforms.
 
 ## [0.5.2] - 2026-08-30
 
@@ -763,7 +773,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/wiresock/alighieri/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wiresock/alighieri/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/wiresock/alighieri/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wiresock/alighieri/compare/v0.4.0...v0.5.0

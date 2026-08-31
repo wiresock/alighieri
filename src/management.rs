@@ -207,24 +207,68 @@ impl SecretString {
     }
 }
 
+#[cfg(any(unix, windows))]
 pub(crate) fn read_password_stdin() -> Result<SecretString, ManagementError> {
-    let stdin = std::io::stdin();
-    read_password_record(&mut stdin.lock())
+    let mut stdin = unbuffered_stdin().map_err(|_| password_stdin_read_error())?;
+    read_password_record(&mut stdin)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn read_password_stdin() -> Result<SecretString, ManagementError> {
+    // Do not fall back to Stdin::lock(): its process-global buffer is not
+    // zeroized. Unix and Windows are the supported management CLI targets.
+    Err(password_stdin_read_error())
+}
+
+#[cfg(unix)]
+fn unbuffered_stdin() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+
+    // Stdin::lock() reads through a process-global BufReader whose consumed
+    // bytes are not zeroized. Duplicate the descriptor and read through File
+    // so the bounded Zeroizing buffer below is the only userspace read buffer
+    // owned by this process.
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(Into::into)
+}
+
+#[cfg(windows)]
+fn unbuffered_stdin() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+
+    // As on Unix, File reads the duplicated standard handle directly instead
+    // of routing the password through std's process-global stdin buffer.
+    std::io::stdin()
+        .as_handle()
+        .try_clone_to_owned()
+        .map(Into::into)
+}
+
+fn password_stdin_read_error() -> ManagementError {
+    ManagementError::new(
+        ManagementErrorCode::PasswordStdinReadFailed,
+        "failed to read password from stdin",
+    )
 }
 
 fn read_password_record(reader: &mut impl Read) -> Result<SecretString, ManagementError> {
     // Read at most one byte beyond the largest valid frame. This both detects
     // excess input and keeps allocation bounded before the password is parsed.
-    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_FRAME_BYTES + 1));
-    reader
-        .take((MAX_PASSWORD_FRAME_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            ManagementError::new(
-                ManagementErrorCode::PasswordStdinReadFailed,
-                "failed to read password from stdin",
-            )
-        })?;
+    // Every read targets zeroizing storage directly; no temporary userspace
+    // buffer ever owns the password bytes.
+    let mut bytes = Zeroizing::new(vec![0_u8; MAX_PASSWORD_FRAME_BYTES + 1]);
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(password_stdin_read_error()),
+        }
+    }
+    bytes.truncate(filled);
 
     if bytes.len() > MAX_PASSWORD_FRAME_BYTES {
         return Err(ManagementError::new(
@@ -332,6 +376,56 @@ mod tests {
         };
         assert_eq!(error.code, ManagementErrorCode::PasswordStdinReadFailed);
         assert_eq!(error.message, "failed to read password from stdin");
+    }
+
+    #[test]
+    fn password_record_retries_interrupted_chunked_reads() {
+        struct InterruptedChunkedReader<'a> {
+            remaining: &'a [u8],
+            interrupted_once: bool,
+            read_calls: usize,
+            requested: Vec<usize>,
+        }
+
+        impl Read for InterruptedChunkedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.read_calls += 1;
+                self.requested.push(buffer.len());
+                if !self.interrupted_once {
+                    self.interrupted_once = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.remaining.is_empty() {
+                    return Ok(0);
+                }
+
+                let count = self.remaining.len().min(buffer.len()).min(2);
+                let (chunk, remaining) = self.remaining.split_at(count);
+                buffer[..count].copy_from_slice(chunk);
+                self.remaining = remaining;
+                Ok(count)
+            }
+        }
+
+        let mut reader = InterruptedChunkedReader {
+            remaining: b"chunked secret\r\n",
+            interrupted_once: false,
+            read_calls: 0,
+            requested: Vec::new(),
+        };
+        let password = read_password_record(&mut reader).unwrap();
+
+        assert_eq!(password.as_str(), "chunked secret");
+        assert!(reader.interrupted_once);
+        assert!(reader.read_calls > 2);
+        assert_eq!(
+            reader.requested.first(),
+            Some(&(MAX_PASSWORD_FRAME_BYTES + 1))
+        );
+        assert!(reader
+            .requested
+            .windows(2)
+            .all(|requests| requests[1] <= requests[0]));
     }
 
     #[test]

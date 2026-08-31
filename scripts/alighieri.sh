@@ -27,7 +27,7 @@ set -euo pipefail
 
 SERVICE_NAME="alighieri"
 INSTALLER_FS_HELPER_NAME="alighieri-installer-fs"
-INSTALLER_FS_HELPER_PROTOCOL="alighieri-installer-fs-v1"
+INSTALLER_FS_HELPER_PROTOCOL="alighieri-installer-fs-v2"
 SERVICE_USER="alighieri"
 CONFIG_DIR="/etc/alighieri"
 LOG_DIR="/var/log/alighieri"
@@ -71,6 +71,10 @@ UNIT_REJECTED=""
 UNIT_ROLLBACK_CONFLICT_COPY=""
 UNIT_ROLLBACK_RELOAD_FAILED=0
 BINARY_COMMIT_IN_PROGRESS=0
+BINARY_COMMIT_FD_OPEN=0
+BINARY_COMMIT_SOURCE=""
+BINARY_COMMIT_DESTINATION=""
+BINARY_COMMIT_WITNESS=""
 UPGRADE_LEGACY_UNIT_KIND=""
 LIFECYCLE_LOCK_FILE="/run/alighieri-management.lock"
 
@@ -214,7 +218,9 @@ Commands:
   otherwise run install.
 
 Options:
-  --binary PATH      Use this prebuilt alighieri binary instead of building.
+  --binary PATH      Use this prebuilt service binary. Checkout install/reconfigure
+                     and legacy-unit upgrades still build the companion; release
+                     archives need no toolchain.
   --prefix DIR       Install prefix for the binary (default: ${PREFIX}).
   --config PATH      (install) Use this config in the systemd unit. Without it,
                      reconfiguration preserves the unit's current config path.
@@ -1036,6 +1042,19 @@ link_file_command() {
     [ -n "$STAGED_FS_HELPER" ] || return 127
     "$STAGED_FS_HELPER" hard-link "$1" "$2"
 }
+binary_witness_link_command() {
+    local source="$1" witness="$2" source_parent witness_parent \
+          physical_parent source_leaf witness_leaf
+    [ -n "$STAGED_FS_HELPER" ] || return 127
+    source_parent="$(dirname -- "$source")" || return 1
+    witness_parent="$(dirname -- "$witness")" || return 1
+    [ "$source_parent" = "$witness_parent" ] || return 1
+    physical_parent="$(physical_directory_path "$source_parent")" || return 1
+    source_leaf="$(basename -- "$source")" || return 1
+    witness_leaf="$(basename -- "$witness")" || return 1
+    "$STAGED_FS_HELPER" binary-hard-link \
+        "$physical_parent" "$source_leaf" "$witness_leaf"
+}
 exchange_file_command() {
     [ -n "$STAGED_FS_HELPER" ] || return 127
     "$STAGED_FS_HELPER" exchange "$1" "$2"
@@ -1454,6 +1473,68 @@ replace_file_atomically() {
         [ -f "$destination" ] && [ ! -L "$destination" ]
 }
 
+# `mv SOURCE DESTINATION` is portable, but unlike rename(2) it treats a raced
+# directory destination as a container. Keep the staged inode open on a fixed
+# descriptor across `mv`: caught-signal cleanup can then prove that exact inode
+# reached the requested pathname without leaving a named artifact after SIGKILL.
+open_binary_commit_descriptor() {
+    local source="$1"
+    [ "$BINARY_COMMIT_FD_OPEN" -eq 0 ] || return 1
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [ -d /proc/self/fd ] || return 1
+    if ! { exec 8<"$source"; }; then
+        return 1
+    fi
+    BINARY_COMMIT_FD_OPEN=1
+    if [[ -f /proc/self/fd/8 && -f "$source" && ! -L "$source" &&
+        "$source" -ef /proc/self/fd/8 ]]; then
+        return 0
+    fi
+    exec 8<&- 2>/dev/null || true
+    BINARY_COMMIT_FD_OPEN=0
+    return 1
+}
+
+close_binary_commit_descriptor() {
+    [ "$BINARY_COMMIT_FD_OPEN" -eq 1 ] || return 0
+    exec 8<&- || return 1
+    BINARY_COMMIT_FD_OPEN=0
+}
+
+binary_commit_reached_open_descriptor() {
+    local source="$1" destination="$2"
+    [ "$BINARY_COMMIT_FD_OPEN" -eq 1 ] || return 1
+    # A different entry may legitimately recreate the staged pathname after the
+    # rename. Reject only when SOURCE still names the candidate inode, which
+    # proves the rename did not consume that link.
+    if [ -f "$source" ] && [ ! -L "$source" ] &&
+        [[ "$source" -ef /proc/self/fd/8 ]]; then
+        return 1
+    fi
+    [[ -f /proc/self/fd/8 && -f "$destination" &&
+        ! -L "$destination" && "$destination" -ef /proc/self/fd/8 ]]
+}
+
+binary_commit_reached_persistent_witness() {
+    local source="$1" destination="$2" witness="$3"
+    [ -f "$witness" ] && [ ! -L "$witness" ] || return 1
+    if [ -f "$source" ] && [ ! -L "$source" ] &&
+        [ "$source" -ef "$witness" ]; then
+        return 1
+    fi
+    [ -f "$destination" ] && [ ! -L "$destination" ] &&
+        [ "$destination" -ef "$witness" ]
+}
+
+commit_staged_binary_atomically() {
+    local source="$1" destination="$2"
+    # The command status alone is insufficient: portable mv can consume SOURCE
+    # inside a directory that won the destination race. The open descriptor is
+    # the commit result and also covers an interruption after rename(2) returned.
+    replace_file_atomically "$source" "$destination" || true
+    binary_commit_reached_open_descriptor "$source" "$destination"
+}
+
 # "Installed" means this script's systemd unit is present. A bare binary at the
 # default path (e.g. from `cargo install`) is not treated as an install, so the
 # menu and uninstall never act on something we did not deploy.
@@ -1792,7 +1873,7 @@ rollback_linked_unit_transaction() {
 }
 
 remove_exchange_v1_journal_after_rollback() {
-    local artifact cleanup_ok=1 \
+    local artifact binary_cleanup_source="$BINARY_COMMIT_SOURCE" cleanup_ok=1 \
         rollback_marker="${UNIT_TRANSACTION_DIR}/exchange-v1-rolled-back"
     # Persist the completed rollback before deleting anything required to
     # interpret exchange-v1. If cleanup is interrupted, startup recovery can
@@ -1802,6 +1883,21 @@ remove_exchange_v1_journal_after_rollback() {
         return 1
     }
     remove_retained_backup_if_expected "$UNIT_FILE"
+    # Keep the rollback decision until both external hard links are gone. A
+    # SIGKILL after this function returns must not strand an executable staged
+    # binary beside its destination with no journal that names it.
+    if [ -n "$binary_cleanup_source" ] &&
+        { [ -L "$binary_cleanup_source" ] ||
+            { [ -e "$binary_cleanup_source" ] &&
+                [ ! -f "$binary_cleanup_source" ]; }; }; then
+        # Recovery already classified this pathname as an operator entry. Keep
+        # its spelling available for nested-witness proof, but never unlink it.
+        binary_cleanup_source=""
+    fi
+    if ! remove_recovered_binary_rollback_artifacts "$binary_cleanup_source"; then
+        warn "could not remove binary rollback artifacts"
+        return 1
+    fi
     for artifact in "$STAGED_UNIT" "$UNIT_CANDIDATE_WITNESS" \
         "$UNIT_CANDIDATE_SNAPSHOT" "$UNIT_BACKUP" \
         "${UNIT_TRANSACTION_DIR}/previous.staged" \
@@ -2183,21 +2279,39 @@ create_unit_commit_marker() {
 }
 
 journal_binary_commit_intent() {
-    local staged_binary="$1" intent staged_intent
+    local staged_binary="$1" destination="$2" witness managed_destination \
+          intent staged_intent
+    BINARY_COMMIT_SOURCE=""
+    BINARY_COMMIT_DESTINATION=""
+    BINARY_COMMIT_WITNESS=""
+    managed_destination="$(staged_binary_recovery_destination "$staged_binary")" ||
+        return 1
+    [ "$managed_destination" = "$destination" ] || return 1
+    open_binary_commit_descriptor "$staged_binary" || return 1
+    BINARY_COMMIT_SOURCE="$staged_binary"
+    BINARY_COMMIT_DESTINATION="$destination"
     [ "$UNIT_TRANSACTION_USES_STAGED_LINK" -eq 1 ] || return 0
+
+    witness="$(binary_commit_witness_path "$staged_binary")" || return 1
+    BINARY_COMMIT_WITNESS="$witness"
     intent="${UNIT_TRANSACTION_DIR}/binary-commit-intent"
     staged_intent="${intent}.staged"
     if [ -e "$intent" ] || [ -L "$intent" ] ||
         [ -e "$staged_intent" ] || [ -L "$staged_intent" ]; then
         return 1
     fi
-    (umask 077; printf '%s\n%s\n' "$staged_binary" complete >"$staged_intent") ||
-        return 1
+    # Publish a complete rollback-readable record before creating the external
+    # hard link. SIGKILL at every later prefix can therefore find and remove
+    # both names without guessing whether binary commit was armed.
+    (umask 077; printf '%s\n%s\n%s\n%s\n' \
+        "$staged_binary" "$destination" "$witness" complete \
+        >"$staged_intent") || return 1
     chmod 600 -- "$staged_intent" || return 1
+    create_binary_commit_witness "$staged_binary" "$witness" || return 1
     replace_file_atomically "$staged_intent" "$intent"
 }
 
-staged_binary_recovery_path_has_managed_shape() {
+staged_binary_recovery_destination() {
     local path="$1" suffix base
     case "$path" in /*.new.*) ;; *) return 1 ;; esac
     suffix="${path##*.new.}"
@@ -2205,7 +2319,112 @@ staged_binary_recovery_path_has_managed_shape() {
     base="${path%".new.$suffix"}"
     [ -n "$base" ] && [ "$base" != "$path" ] &&
         [ "$(normalize_path "$path")" = "$path" ] &&
-        [ "$(normalize_path "$base")" = "$base" ]
+        [ "$(normalize_path "$base")" = "$base" ] || return 1
+    printf '%s' "$base"
+}
+
+staged_binary_recovery_path_has_managed_shape() {
+    staged_binary_recovery_destination "$1" >/dev/null
+}
+
+binary_commit_witness_path() {
+    local staged_binary="$1"
+    staged_binary_recovery_path_has_managed_shape "$staged_binary" || return 1
+    printf '%s.commit-witness' "$staged_binary"
+}
+
+binary_commit_witness_has_managed_shape() {
+    local staged_binary="$1" witness="$2" expected
+    expected="$(binary_commit_witness_path "$staged_binary")" || return 1
+    [ "$witness" = "$expected" ] &&
+        [ "$(normalize_path "$witness")" = "$witness" ]
+}
+
+binary_commit_witness_path_has_managed_shape() {
+    local witness="$1" staged_binary
+    case "$witness" in *.commit-witness) ;; *) return 1 ;; esac
+    staged_binary="${witness%.commit-witness}"
+    binary_commit_witness_has_managed_shape "$staged_binary" "$witness"
+}
+
+create_binary_commit_witness() {
+    local staged_binary="$1" witness="$2" expected
+    [ -f "$staged_binary" ] && [ ! -L "$staged_binary" ] || return 1
+    expected="$(binary_commit_witness_path "$staged_binary")" || return 1
+    [ "$witness" = "$expected" ] || return 1
+    [ ! -e "$witness" ] && [ ! -L "$witness" ] || return 1
+    binary_witness_link_command "$staged_binary" "$witness" || return 1
+    if [ -f "$staged_binary" ] && [ ! -L "$staged_binary" ] &&
+        [ -f "$witness" ] && [ ! -L "$witness" ] &&
+        [ "$staged_binary" -ef "$witness" ] &&
+        [[ "$witness" -ef /proc/self/fd/8 ]]; then
+        return 0
+    fi
+    if [ "$BINARY_COMMIT_FD_OPEN" -eq 1 ] &&
+        [ -f "$witness" ] && [ ! -L "$witness" ] &&
+        [[ "$witness" -ef /proc/self/fd/8 ]]; then
+        command rm -f -- "$witness" 2>/dev/null || true
+    fi
+    return 1
+}
+
+binary_commit_witness_is_candidate() {
+    local nested
+    [ -n "$BINARY_COMMIT_WITNESS" ] || return 1
+    [ -f "$BINARY_COMMIT_WITNESS" ] &&
+        [ ! -L "$BINARY_COMMIT_WITNESS" ] || return 1
+    if [ "$BINARY_COMMIT_FD_OPEN" -eq 1 ] &&
+        [[ -f /proc/self/fd/8 &&
+            "$BINARY_COMMIT_WITNESS" -ef /proc/self/fd/8 ]]; then
+        return 0
+    fi
+    if [ -n "$BINARY_COMMIT_SOURCE" ] &&
+        [ -f "$BINARY_COMMIT_SOURCE" ] &&
+        [ ! -L "$BINARY_COMMIT_SOURCE" ] &&
+        [ "$BINARY_COMMIT_SOURCE" -ef "$BINARY_COMMIT_WITNESS" ]; then
+        return 0
+    fi
+    if [ -n "$BINARY_COMMIT_DESTINATION" ] &&
+        [ -f "$BINARY_COMMIT_DESTINATION" ] &&
+        [ ! -L "$BINARY_COMMIT_DESTINATION" ] &&
+        [ "$BINARY_COMMIT_DESTINATION" -ef "$BINARY_COMMIT_WITNESS" ]; then
+        return 0
+    fi
+    if [ -n "$BINARY_COMMIT_SOURCE" ] &&
+        [ -n "$BINARY_COMMIT_DESTINATION" ] &&
+        [ -d "$BINARY_COMMIT_DESTINATION" ]; then
+        nested="${BINARY_COMMIT_DESTINATION}/$(basename -- \
+            "$BINARY_COMMIT_SOURCE")"
+        [ -f "$nested" ] && [ ! -L "$nested" ] &&
+            [ "$nested" -ef "$BINARY_COMMIT_WITNESS" ] && return 0
+    fi
+    return 1
+}
+
+remove_binary_commit_witness() {
+    [ -n "$BINARY_COMMIT_WITNESS" ] || return 0
+    binary_commit_witness_path_has_managed_shape \
+        "$BINARY_COMMIT_WITNESS" || return 1
+    if [ -e "$BINARY_COMMIT_WITNESS" ] || [ -L "$BINARY_COMMIT_WITNESS" ]; then
+        binary_commit_witness_is_candidate || return 1
+        command rm -f -- "$BINARY_COMMIT_WITNESS" || return 1
+    fi
+    [ ! -e "$BINARY_COMMIT_WITNESS" ] &&
+        [ ! -L "$BINARY_COMMIT_WITNESS" ] || return 1
+    BINARY_COMMIT_WITNESS=""
+}
+
+remove_recovered_binary_rollback_artifacts() {
+    local staged_binary="$1"
+    # The source is one of the identities that proves the external witness is
+    # still ours. Remove the witness first so cleanup never destroys its last
+    # proof and then strands an executable hard link beside the install path.
+    remove_binary_commit_witness || return 1
+    if [ -n "$staged_binary" ] &&
+        { [ -e "$staged_binary" ] || [ -L "$staged_binary" ]; }; then
+        [ -f "$staged_binary" ] && [ ! -L "$staged_binary" ] || return 1
+        command rm -f -- "$staged_binary" || return 1
+    fi
 }
 
 mark_binary_transaction_for_rollback() {
@@ -2239,6 +2458,10 @@ mark_binary_transaction_for_rollback() {
 
 finalize_committed_legacy_unit_transaction() {
     local marker="${UNIT_TRANSACTION_DIR}/committed" artifact cleanup_ok=1
+    if ! remove_binary_commit_witness; then
+        warn "could not remove binary commit witness $BINARY_COMMIT_WITNESS"
+        return 1
+    fi
     for artifact in "$UNIT_BACKUP" "$UNIT_CANDIDATE_SNAPSHOT" "$STAGED_UNIT" \
         "$UNIT_CANDIDATE_WITNESS" \
         "${UNIT_TRANSACTION_DIR}/previous.staged" \
@@ -2343,6 +2566,9 @@ commit_unit_transaction() {
 # Remove any staged install/upgrade artifacts and roll back an uncommitted unit.
 cleanup() {
     local preserve_journal=0
+    # Do not let a second termination signal interrupt or recursively enter the
+    # single EXIT cleanup while it is deciding the unit/binary transaction.
+    trap '' HUP INT QUIT TERM
     # `exchange-v1` is the durable hand-off between journal construction and
     # the in-memory transaction guard. If a signal lands after the marker's
     # O_EXCL create but before begin_legacy_unit_transaction sets ACTIVE, infer
@@ -2362,13 +2588,20 @@ cleanup() {
     fi
     # Best-effort: a failing rm must not abort the EXIT trap (under errexit) or
     # change the script's original exit status, so swallow any error.
-    # The staged binary lives beside its destination, so mv uses one atomic
-    # rename. If a signal lands after that rename but before the following shell
-    # instruction, its source is gone: retain the already-validated unit rather
-    # than rolling it back around the newly installed binary.
-    if [ "$UNIT_TRANSACTION_ACTIVE" -eq 1 ] &&
-        [ "$BINARY_COMMIT_IN_PROGRESS" -eq 1 ] && [ -n "$STAGED_BIN" ] &&
-        [ ! -e "$STAGED_BIN" ] && [ ! -L "$STAGED_BIN" ]; then
+    # The staged binary lives beside its destination, so a successful mv uses one
+    # atomic rename. If a signal lands before the following shell instruction,
+    # retain the validated unit only when the exact destination still has the
+    # candidate inode recorded before mv. Source disappearance alone is not
+    # proof: portable mv can consume it inside a raced directory destination.
+    if [ "$BINARY_COMMIT_IN_PROGRESS" -eq 1 ] &&
+        [ -n "$BINARY_COMMIT_SOURCE" ] &&
+        [ -n "$BINARY_COMMIT_DESTINATION" ] &&
+        binary_commit_reached_open_descriptor \
+            "$BINARY_COMMIT_SOURCE" "$BINARY_COMMIT_DESTINATION"; then
+        # Destination identity is authoritative. A concurrent writer may have
+        # recreated STAGED_BIN with a different entry after the rename; clear
+        # our cleanup handle before finalizing so EXIT never removes that entry.
+        STAGED_BIN=""
         if ! commit_unit_transaction; then
             warn "could not finalize the committed legacy-unit transaction"
             preserve_journal=1
@@ -2397,6 +2630,10 @@ cleanup() {
             warn "could not remove the rolled-back staged binary; preserving its rollback journal"
             preserve_journal=1
         fi
+    fi
+    if [ "$preserve_journal" -eq 0 ] && ! remove_binary_commit_witness; then
+        warn "could not remove the binary commit witness; preserving its transaction journal"
+        preserve_journal=1
     fi
     if [ "$preserve_journal" -eq 0 ] && [ -n "$UNIT_TRANSACTION_DIR" ]; then
         # The persistent rollback decision is removed only after its staged
@@ -2434,8 +2671,32 @@ cleanup() {
         command rm -f -- "$STAGED_FS_HELPER" 2>/dev/null || true
         STAGED_FS_HELPER=""
     fi
+    if ! close_binary_commit_descriptor; then
+        warn "could not close the binary commit descriptor"
+    fi
+    BINARY_COMMIT_IN_PROGRESS=0
+    if [ "$preserve_journal" -eq 0 ]; then
+        BINARY_COMMIT_SOURCE=""
+        BINARY_COMMIT_DESTINATION=""
+        BINARY_COMMIT_WITNESS=""
+    fi
     return 0
 }
+
+exit_for_signal() {
+    case "$1" in
+        HUP) exit 129 ;;
+        INT) exit 130 ;;
+        QUIT) exit 131 ;;
+        TERM) exit 143 ;;
+        *) exit 1 ;;
+    esac
+}
+
+trap 'exit_for_signal HUP' HUP
+trap 'exit_for_signal INT' INT
+trap 'exit_for_signal QUIT' QUIT
+trap 'exit_for_signal TERM' TERM
 trap cleanup EXIT
 
 legacy_transaction_directory_is_safe() {
@@ -2453,7 +2714,9 @@ recover_interrupted_legacy_unit_transaction() {
     local transaction_dir="${UNIT_FILE}.migration" candidate snapshot backup \
           witness exchange_marker rollback_finalized displaced marker intent staged_intent binary_rollback artifact \
           untrusted_rollback decision_file="" decision_kind="" \
-          decision_record_trusted=0 recovery_staged_bin="" recovery_result=0
+          decision_record_trusted=0 recovery_staged_bin="" \
+          recovery_destination="" recovery_witness="" \
+          legacy_intent_without_witness=0 recovery_result=0
     local -a intent_lines=()
     [ ! -e "$transaction_dir" ] && [ ! -L "$transaction_dir" ] && return 0
     legacy_transaction_directory_is_safe "$transaction_dir" ||
@@ -2486,6 +2749,41 @@ recover_interrupted_legacy_unit_transaction() {
     if [ -e "$marker" ] || [ -L "$marker" ]; then
         if [ ! -f "$marker" ] || [ -L "$marker" ]; then
             die "legacy-unit transaction commit marker is unsafe: $marker"
+        fi
+        BINARY_COMMIT_SOURCE=""
+        BINARY_COMMIT_DESTINATION=""
+        BINARY_COMMIT_WITNESS=""
+        if [ -e "$staged_intent" ] || [ -L "$staged_intent" ]; then
+            die "committed legacy-unit journal contains an unpublished binary intent: $staged_intent"
+        fi
+        if [ -e "$intent" ] || [ -L "$intent" ]; then
+            if [ ! -f "$intent" ] || [ -L "$intent" ]; then
+                die "committed legacy-unit binary intent is unsafe: $intent"
+            fi
+            mapfile -t intent_lines <"$intent" || intent_lines=()
+            if [ "${#intent_lines[@]}" -eq 4 ] &&
+                [ "${intent_lines[3]}" = complete ] &&
+                staged_binary_recovery_path_has_managed_shape "${intent_lines[0]}" &&
+                [ "$(staged_binary_recovery_destination "${intent_lines[0]}")" = \
+                    "${intent_lines[1]}" ] &&
+                binary_commit_witness_has_managed_shape \
+                    "${intent_lines[0]}" "${intent_lines[2]}"; then
+                BINARY_COMMIT_SOURCE="${intent_lines[0]}"
+                BINARY_COMMIT_DESTINATION="${intent_lines[1]}"
+                BINARY_COMMIT_WITNESS="${intent_lines[2]}"
+            elif [ "${#intent_lines[@]}" -eq 2 ] &&
+                [ "${intent_lines[1]}" = complete ] &&
+                staged_binary_recovery_path_has_managed_shape \
+                    "${intent_lines[0]}"; then
+                # The previous journal format had no external inode witness.
+                # The commit marker is authoritative, so finalize that internal
+                # journal without inventing or deleting a witness.
+                BINARY_COMMIT_SOURCE="${intent_lines[0]}"
+                BINARY_COMMIT_DESTINATION="$(staged_binary_recovery_destination \
+                    "${intent_lines[0]}")"
+            else
+                die "committed legacy-unit binary intent is invalid: $intent"
+            fi
         fi
         STAGED_UNIT=""
         UNIT_CANDIDATE_SNAPSHOT=""
@@ -2549,30 +2847,47 @@ recover_interrupted_legacy_unit_transaction() {
         if [ ! -f "$decision_file" ] || [ -L "$decision_file" ]; then
             die "legacy-unit binary decision is unsafe: $decision_file"
         fi
-        if [ "$decision_file" != "$staged_intent" ] &&
-            [ "$decision_file" != "$untrusted_rollback" ]; then
-            mapfile -t intent_lines <"$decision_file" || intent_lines=()
-            if [ "${#intent_lines[@]}" -eq 2 ] &&
-                [ "${intent_lines[1]}" = complete ] &&
-                staged_binary_recovery_path_has_managed_shape "${intent_lines[0]}"; then
-                recovery_staged_bin="${intent_lines[0]}"
-                decision_record_trusted=1
-            else
-                warn "binary decision record is incomplete; rolling the unit back without deleting an external staged path"
-            fi
+        mapfile -t intent_lines <"$decision_file" || intent_lines=()
+        if [ "${#intent_lines[@]}" -eq 4 ] &&
+            [ "${intent_lines[3]}" = complete ] &&
+            staged_binary_recovery_path_has_managed_shape "${intent_lines[0]}" &&
+            [ "$(staged_binary_recovery_destination "${intent_lines[0]}")" = \
+                "${intent_lines[1]}" ] &&
+            binary_commit_witness_has_managed_shape \
+                "${intent_lines[0]}" "${intent_lines[2]}"; then
+            # Even the untrusted rollback name can contain a complete record if
+            # cleanup moved it after a caught signal. It remains a rollback
+            # decision, but its identities are safe to use for artifact cleanup.
+            recovery_staged_bin="${intent_lines[0]}"
+            recovery_destination="${intent_lines[1]}"
+            recovery_witness="${intent_lines[2]}"
+            BINARY_COMMIT_SOURCE="$recovery_staged_bin"
+            BINARY_COMMIT_DESTINATION="$recovery_destination"
+            BINARY_COMMIT_WITNESS="$recovery_witness"
+            decision_record_trusted=1
+        elif [ "$decision_file" != "$untrusted_rollback" ] &&
+            [ "${#intent_lines[@]}" -eq 2 ] &&
+            [ "${intent_lines[1]}" = complete ] &&
+            staged_binary_recovery_path_has_managed_shape "${intent_lines[0]}"; then
+            # Older journals contain no exact-inode witness. A still-present
+            # staged source is safe to roll back; an absent one is ambiguous
+            # and is preserved for manual recovery below.
+            recovery_staged_bin="${intent_lines[0]}"
+            recovery_destination="$(staged_binary_recovery_destination \
+                "$recovery_staged_bin")"
+            legacy_intent_without_witness=1
+            decision_record_trusted=1
+        else
+            warn "binary decision record is incomplete; rolling the unit back without deleting an external staged path"
         fi
         if [ "$decision_record_trusted" -eq 1 ] &&
-            { [ -L "$recovery_staged_bin" ] ||
-                { [ -e "$recovery_staged_bin" ] && [ ! -f "$recovery_staged_bin" ]; }; }; then
-            warn "binary decision source is unsafe; rolling the unit back without deleting $recovery_staged_bin"
-            recovery_staged_bin=""
-            decision_record_trusted=0
-        fi
-        if [ "$decision_record_trusted" -eq 1 ] &&
-            [ "$decision_kind" = intent ] && [ ! -e "$recovery_staged_bin" ]; then
-            # The intent is published immediately before one atomic binary
-            # rename. An absent source therefore means the validated binary is
-            # committed even if SIGKILL prevented the post-rename marker.
+            [ "$decision_kind" = intent ] && [ -n "$recovery_witness" ] &&
+            binary_commit_reached_persistent_witness \
+                "$recovery_staged_bin" "$recovery_destination" \
+                "$recovery_witness"; then
+            # The intent records a hard-link witness immediately before the
+            # binary rename. Exact destination identity therefore proves the
+            # validated binary committed even if SIGKILL prevented the marker.
             STAGED_UNIT=""
             UNIT_CANDIDATE_SNAPSHOT=""
             if [ -f "$candidate" ] && [ ! -L "$candidate" ]; then STAGED_UNIT="$candidate"; fi
@@ -2586,6 +2901,9 @@ recover_interrupted_legacy_unit_transaction() {
             UNIT_TRANSACTION_DIR="$transaction_dir"
             UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
             UNIT_TRANSACTION_USES_STAGED_LINK=1
+            BINARY_COMMIT_SOURCE="$recovery_staged_bin"
+            BINARY_COMMIT_DESTINATION="$recovery_destination"
+            BINARY_COMMIT_WITNESS="$recovery_witness"
             UNIT_TRANSACTION_EXCHANGE_V1=0
             if [ -f "$exchange_marker" ] && [ ! -L "$exchange_marker" ]; then
                 UNIT_TRANSACTION_EXCHANGE_V1=1
@@ -2605,6 +2923,35 @@ recover_interrupted_legacy_unit_transaction() {
             ok "Recovered the committed binary and finalized its systemd unit migration."
             warn "service activation may have been interrupted; if the upgrade was meant to restart Alighieri, run: systemctl restart $SERVICE_NAME"
             return 0
+        fi
+        # Exact destination identity is authoritative even if a different file,
+        # symlink, or directory recreated the old staged pathname. Only reject
+        # that source shape after the committed orientation has been ruled out.
+        if [ "$decision_record_trusted" -eq 1 ] &&
+            { [ -L "$recovery_staged_bin" ] ||
+                { [ -e "$recovery_staged_bin" ] && [ ! -f "$recovery_staged_bin" ]; }; }; then
+            warn "binary decision source is unsafe; rolling the unit back without deleting $recovery_staged_bin"
+            recovery_staged_bin=""
+            decision_record_trusted=0
+        fi
+        if [ "$decision_record_trusted" -eq 1 ] &&
+            [ "$decision_kind" = intent ] &&
+            [ "$legacy_intent_without_witness" -eq 1 ] &&
+            [ ! -e "$recovery_staged_bin" ] &&
+            [ ! -L "$recovery_staged_bin" ]; then
+            die "legacy-unit binary intent predates exact-destination witnesses; the commit state is ambiguous, so the journal and current unit were preserved for manual recovery: $transaction_dir"
+        fi
+        if [ "$decision_record_trusted" -eq 1 ] &&
+            [ -n "$recovery_witness" ]; then
+            BINARY_COMMIT_SOURCE="$recovery_staged_bin"
+            BINARY_COMMIT_DESTINATION="$recovery_destination"
+            BINARY_COMMIT_WITNESS="$recovery_witness"
+        fi
+        if [ "$decision_record_trusted" -eq 1 ] &&
+            [ "$decision_kind" = intent ] &&
+            [ ! -e "$recovery_staged_bin" ] &&
+            [ ! -L "$recovery_staged_bin" ]; then
+            warn "binary intent did not prove an exact-destination commit; rolling the systemd unit back"
         fi
         if [ "$decision_record_trusted" -eq 0 ]; then
             if [ "$decision_file" != "$untrusted_rollback" ]; then
@@ -2637,14 +2984,8 @@ recover_interrupted_legacy_unit_transaction() {
             UNIT_ROLLBACK_RELOAD_FAILED=1
             die "could not reload systemd while finalizing the completed exchange rollback"
         fi
-        if [ -n "$recovery_staged_bin" ] &&
-            { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
-            if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
-                die "completed exchange rollback preserved unsafe staged binary $recovery_staged_bin"
-            fi
-            command rm -f -- "$recovery_staged_bin" ||
-                die "could not remove the rolled-back staged binary $recovery_staged_bin"
-        fi
+        remove_recovered_binary_rollback_artifacts "$recovery_staged_bin" ||
+            die "could not safely remove the completed exchange rollback's binary artifacts"
         STAGED_UNIT="$candidate"
         UNIT_CANDIDATE_SNAPSHOT="$snapshot"
         UNIT_CANDIDATE_WITNESS="$witness"
@@ -2695,14 +3036,8 @@ recover_interrupted_legacy_unit_transaction() {
             UNIT_TRANSACTION_ACTIVE=0
             die "a concurrent systemd unit was preserved while recovering $transaction_dir; review $UNIT_FILE and the journal before retrying"
         fi
-        if [ -n "$recovery_staged_bin" ] &&
-            { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
-            if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
-                die "restored $UNIT_FILE but preserved unsafe staged binary $recovery_staged_bin"
-            fi
-            command rm -f -- "$recovery_staged_bin" ||
-                die "restored $UNIT_FILE but could not remove staged binary $recovery_staged_bin"
-        fi
+        remove_recovered_binary_rollback_artifacts "$recovery_staged_bin" ||
+            die "restored $UNIT_FILE but could not safely remove the binary rollback artifacts"
         remove_exchange_v1_journal_after_rollback ||
             die "restored $UNIT_FILE but could not finalize $transaction_dir"
         UNIT_TRANSACTION_ACTIVE=0
@@ -2733,14 +3068,8 @@ recover_interrupted_legacy_unit_transaction() {
         fi
         UNIT_RETAINED_BACKUP="${UNIT_FILE}.pre-migration"
         remove_retained_backup_if_expected "$UNIT_FILE"
-        if [ -n "$recovery_staged_bin" ] &&
-            { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
-            if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
-                die "incomplete transaction staged binary is unsafe: $recovery_staged_bin"
-            fi
-            command rm -f -- "$recovery_staged_bin" ||
-                die "could not remove incomplete staged binary $recovery_staged_bin"
-        fi
+        remove_recovered_binary_rollback_artifacts "$recovery_staged_bin" ||
+            die "could not safely remove incomplete binary transaction artifacts"
         for artifact in "$candidate" "$snapshot" "$witness" \
             "${transaction_dir}/previous.staged" \
             "${transaction_dir}/link.probe" \
@@ -2800,14 +3129,8 @@ recover_interrupted_legacy_unit_transaction() {
     fi
 
     remove_retained_backup_if_expected "$UNIT_FILE"
-    if [ -n "$recovery_staged_bin" ] &&
-        { [ -e "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; }; then
-        if [ ! -f "$recovery_staged_bin" ] || [ -L "$recovery_staged_bin" ]; then
-            die "restored $UNIT_FILE but preserved unsafe staged binary $recovery_staged_bin"
-        fi
-        command rm -f -- "$recovery_staged_bin" ||
-            die "restored $UNIT_FILE but could not remove staged binary $recovery_staged_bin"
-    fi
+    remove_recovered_binary_rollback_artifacts "$recovery_staged_bin" ||
+        die "restored $UNIT_FILE but could not safely remove the binary rollback artifacts"
     for artifact in "$binary_rollback" "$untrusted_rollback" "$intent" "$staged_intent" \
         "${transaction_dir}/previous.staged" "${transaction_dir}/link.probe"; do
         if [ -e "$artifact" ] || [ -L "$artifact" ]; then
@@ -2930,7 +3253,7 @@ build_from_source() {
         [ -n "$user_home" ] || user_home="/home/$build_user"
         # shellcheck disable=SC2016  # $1 is expanded by the inner login shell, not here
         runuser -u "$build_user" -- env "HOME=$user_home" \
-            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs' alighieri-build "$REPO_ROOT" ||
+            bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs' alighieri-build "$REPO_ROOT" 9>&- ||
             die "cargo build failed as $build_user; ensure they have a Rust toolchain, or pass --binary"
         return
     fi
@@ -2941,7 +3264,10 @@ build_from_source() {
         warn "building from source as root; cargo runs third-party build scripts — prefer a prebuilt binary via --binary"
     fi
     info "building release binary and installer companion with cargo..."
-    ( cd -- "$REPO_ROOT" && cargo build --release --locked --features installer-fs )
+    (
+        cd -- "$REPO_ROOT" &&
+            cargo build --release --locked --features installer-fs
+    ) 9>&-
 }
 
 build_installer_fs_helper_from_source() {
@@ -2957,7 +3283,7 @@ build_installer_fs_helper_from_source() {
         # shellcheck disable=SC2016  # $1 is expanded by the inner login shell.
         runuser -u "$build_user" -- env "HOME=$user_home" \
             bash -lc 'cd -- "$1" && cargo build --release --locked --features installer-fs --bin alighieri-installer-fs' \
-            alighieri-helper-build "$REPO_ROOT" ||
+            alighieri-helper-build "$REPO_ROOT" 9>&- ||
             die "installer companion build failed as $build_user"
         return
     fi
@@ -2967,9 +3293,11 @@ build_installer_fs_helper_from_source() {
         warn "building the installer companion as root; prefer the version-matched prebuilt Linux release archive"
     fi
     info "building the current installer filesystem companion with cargo..."
-    ( cd -- "$REPO_ROOT" &&
-        cargo build --release --locked --features installer-fs \
-            --bin "$INSTALLER_FS_HELPER_NAME" )
+    (
+        cd -- "$REPO_ROOT" &&
+            cargo build --release --locked --features installer-fs \
+                --bin "$INSTALLER_FS_HELPER_NAME"
+    ) 9>&-
 }
 
 ensure_user() {
@@ -3650,8 +3978,13 @@ run_selftest() {
                 "$helper_live" "$helper_displaced" >/dev/null 2>&1 &&
             "$helper_test_bin" validate-request rename-noreplace \
                 "$helper_previous_staged" "$helper_previous" >/dev/null 2>&1 &&
+            "$helper_test_bin" validate-request binary-hard-link \
+                /usr/local/bin alighieri.new.42 \
+                alighieri.new.42.commit-witness >/dev/null 2>&1 &&
             ! "$helper_test_bin" validate-request hard-link \
                 "$helper_live" "$helper_candidate" >/dev/null 2>&1 &&
+            ! "$helper_test_bin" validate-request binary-hard-link \
+                /usr/local/bin alighieri.new.42 witness >/dev/null 2>&1 &&
             ! "$helper_test_bin" validate-request exchange \
                 "$helper_candidate" >/dev/null 2>&1 &&
             ! "$helper_test_bin" unknown-operation >/dev/null 2>&1; then
@@ -4116,6 +4449,66 @@ run_selftest() {
     }
     _check_lifecycle_lock
     unset -f _check_lifecycle_lock
+
+    _check_build_children_close_lifecycle_lock() {
+        local build_tmp lock SUDO_USER="builder"
+        build_tmp="$(mktemp -d)"
+        lock="$build_tmp/management.lock"
+
+        if (
+            local competing_fd
+            LIFECYCLE_LOCK_FILE="$lock"
+            acquire_lifecycle_lock
+
+            # Exercise both direct Cargo call sites. The mocks fail if the
+            # lifecycle descriptor is visible either in the wrapper subshell
+            # (before Cargo starts) or in the build child itself.
+            (
+                id() { printf '%s\n' 1000; }
+                cd() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                    builtin cd "$@"
+                }
+                cargo() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                }
+                local REPO_ROOT="$build_tmp"
+                build_from_source || exit 1
+                build_installer_fs_helper_from_source || exit 1
+            ) >/dev/null 2>&1 || exit 1
+
+            # Exercise both privilege-dropped call sites at the runuser
+            # boundary, before an untrusted login shell or Cargo can run.
+            (
+                id() { printf '%s\n' 0; }
+                getent() { printf '%s\n' 'builder:x:1000:1000::/home/builder:/bin/bash'; }
+                runuser() {
+                    if { : >&9; } 2>/dev/null; then return 1; fi
+                }
+                local REPO_ROOT="$build_tmp"
+                build_from_source || exit 1
+                build_installer_fs_helper_from_source || exit 1
+            ) >/dev/null 2>&1 || exit 1
+
+            # Redirection on each child must leave the parent descriptor and
+            # its lock intact until the lifecycle operation releases them.
+            { : >&9; } 2>/dev/null
+            exec {competing_fd}>"$lock"
+            if flock_command -n "$competing_fd"; then exit 1; fi
+            release_lifecycle_lock
+            flock_command -n "$competing_fd"
+        ) >/dev/null 2>&1; then
+            printf 'ok   source-build children cannot inherit or release the lifecycle lock\n'
+        else
+            printf 'FAIL source-build lifecycle lock descriptor isolation\n'
+            failures=$((failures + 1))
+        fi
+
+        command rm -f -- "$lock"
+        command rmdir -- "$build_tmp"
+    }
+    _check_build_children_close_lifecycle_lock
+    unset -f _check_build_children_close_lifecycle_lock
 
     _check_hidden() { # path want(hidden|visible)
         local got
@@ -5104,16 +5497,24 @@ run_selftest() {
 
     _check_install_preflight_transaction() {
         local tx_tmp unit config source bin_dir installed calls output userlist \
-              expected_staged expected_staged_unit expected_backup expected_calls \
+              expected_staged expected_staged_unit expected_backup \
+              expected_witness expected_calls \
               expected_error failure_mode \
               succeeded got_binary got_unit got_calls before_inode after_inode \
               fresh_unit fresh_staged fresh_calls \
               signal_unit signal_staged_unit signal_staged_bin signal_installed \
-              signal_calls \
+              signal_witness signal_calls signal_status raced_unit raced_staged_unit \
+              plain_staged_bin plain_installed plain_status \
+              raced_staged_bin raced_installed raced_witness raced_calls \
+              raced_nested fresh_raced_unit fresh_raced_staged_unit \
+              fresh_raced_staged_bin fresh_raced_witness \
+              fresh_raced_installed fresh_raced_calls fresh_raced_nested \
               result test_failures=0 UNIT_FILE CONFIG_DIR CONFIG_FILE LOG_DIR \
               BIN_DIR BINARY PREFIX_EXPLICIT CONFIG_EXPLICIT START_ON_INSTALL \
               STAGED_BIN STAGED_UNIT UNIT_BACKUP UNIT_TRANSACTION_ACTIVE \
-              UNIT_HAD_ORIGINAL BINARY_COMMIT_IN_PROGRESS
+              UNIT_HAD_ORIGINAL BINARY_COMMIT_IN_PROGRESS \
+              BINARY_COMMIT_FD_OPEN BINARY_COMMIT_SOURCE \
+              BINARY_COMMIT_DESTINATION BINARY_COMMIT_WITNESS
         tx_tmp="$(mktemp -d)"
         unit="$tx_tmp/alighieri.service"
         config="$tx_tmp/alighieri.conf"
@@ -5126,6 +5527,7 @@ run_selftest() {
         expected_staged="${installed}.new.$$"
         expected_staged_unit="${unit}.new.$$"
         expected_backup="${unit}.previous.$$"
+        expected_witness="${expected_staged}.commit-witness"
         command mkdir -p -- "$bin_dir"
         printf '%s\n' 'old-unit' >"$unit"
         printf '%s\n' 'internal: 127.0.0.1:1080' >"$config"
@@ -5146,6 +5548,10 @@ run_selftest() {
         UNIT_TRANSACTION_ACTIVE=0
         UNIT_HAD_ORIGINAL=0
         BINARY_COMMIT_IN_PROGRESS=0
+        BINARY_COMMIT_FD_OPEN=0
+        BINARY_COMMIT_SOURCE=""
+        BINARY_COMMIT_DESTINATION=""
+        BINARY_COMMIT_WITNESS=""
 
         _check_install_failure_case() { # failure-mode description
             local description="$2" guard_prefix='config-dir|config-file|'
@@ -5156,7 +5562,7 @@ run_selftest() {
             : >"$calls"
             : >"$output"
             command rm -f -- "$expected_staged" "$expected_staged_unit" \
-                "$expected_backup"
+                "$expected_backup" "$expected_witness"
             before_inode="$(stat -c %i -- "$installed")"
             if (
                 # All command/helper mocks live only in this case process. The
@@ -5325,7 +5731,9 @@ run_selftest() {
                 grep -Fq -- "$expected_error" "$output" &&
                 [ ! -e "$expected_staged" ] &&
                 [ ! -e "$expected_staged_unit" ] &&
-                [ ! -e "$expected_backup" ]; then
+                [ ! -e "$expected_backup" ] &&
+                [ ! -e "$expected_witness" ] &&
+                [ ! -L "$expected_witness" ]; then
                 printf 'ok   install %s preserves binary, unit, and service\n' \
                     "$description"
             else
@@ -5395,19 +5803,22 @@ run_selftest() {
             test_failures=$((test_failures + 1))
         fi
 
-        # Simulate EXIT landing in the instruction window immediately after the
-        # same-filesystem binary rename. The vanished staged source is proof the
-        # atomic commit completed, so cleanup must retain the validated unit.
+        # Simulate EXIT landing immediately after the same-filesystem binary
+        # rename and after another writer recreated the staged pathname. The
+        # exact destination inode proves commit, so cleanup must retain the
+        # validated unit without deleting the unrelated recreated entry.
         signal_unit="$tx_tmp/signal.service"
         signal_staged_unit="${signal_unit}.new.$$"
         signal_staged_bin="$tx_tmp/signal-bin.new.$$"
         signal_installed="$tx_tmp/signal-bin"
+        signal_witness="${signal_staged_bin}.commit-witness"
         signal_calls="$tx_tmp/signal-calls"
         printf '%s\n' 'old-unit' >"$signal_unit"
         printf '%s\n' 'new-unit' >"$signal_staged_unit"
         printf '%s\n' 'new-binary' >"$signal_staged_bin"
         : >"$signal_calls"
-        if (
+        signal_status=0
+        (
             UNIT_FILE="$signal_unit"
             STAGED_UNIT="$signal_staged_unit"
             STAGED_BIN="$signal_staged_bin"
@@ -5424,6 +5835,10 @@ run_selftest() {
             UNIT_TRANSACTION_EXCHANGE_V1=0
             UNIT_CANDIDATE_PUBLISHED=0
             BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
             systemctl() { printf 'daemon-reload|' >>"$signal_calls"; }
             hardlink_utility_available() { :; }
             link_file_command() { command ln -- "$1" "$2"; }
@@ -5437,27 +5852,225 @@ run_selftest() {
                 [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
                 command mv -- "$1" "$2"
             }
+            trap 'exit_for_signal TERM' TERM
+            trap cleanup EXIT
             begin_unit_transaction
+            journal_binary_commit_intent "$STAGED_BIN" "$signal_installed"
             BINARY_COMMIT_IN_PROGRESS=1
             replace_file_atomically "$STAGED_BIN" "$signal_installed"
-            cleanup
-            [ "$(<"$UNIT_FILE")" = "new-unit" ] &&
-                [ "$(<"$signal_installed")" = "new-binary" ] &&
-                [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ]
-        ) && [ ! -s "$signal_calls" ] &&
-            [ ! -e "${signal_unit}.previous.$$" ]; then
-            printf 'ok   cleanup commits the validated unit after an interrupted binary rename\n'
+            printf '%s\n' 'concurrent-binary' >"$STAGED_BIN"
+            STAGED_BIN=""
+            kill -TERM "$BASHPID"
+            exit 99
+        ) || signal_status=$?
+        if [ "$signal_status" -eq 143 ] &&
+            [ "$(<"$signal_unit")" = "new-unit" ] &&
+            [ "$(<"$signal_installed")" = "new-binary" ] &&
+            [ "$(<"$signal_staged_bin")" = "concurrent-binary" ] &&
+            [ ! -s "$signal_calls" ] &&
+            [ ! -e "$signal_staged_unit" ] &&
+            [ ! -e "${signal_unit}.previous.$$" ] &&
+            [ ! -e "$signal_witness" ] && [ ! -L "$signal_witness" ]; then
+            printf 'ok   TERM cleanup commits the validated unit after an interrupted binary rename\n'
         else
-            printf 'FAIL cleanup rolled back after the binary rename had completed\n'
+            printf 'FAIL TERM cleanup rolled back after the binary rename had completed\n'
             test_failures=$((test_failures + 1))
         fi
 
-        command rm -f -- "$unit" "$config" "$source" "$installed" "$calls" \
-            "$output" "$userlist" "$expected_staged" "$expected_staged_unit" \
-            "$expected_backup" "$fresh_unit" "$fresh_staged" "$fresh_calls" \
-            "$signal_unit" "$signal_staged_unit" "$signal_staged_bin" \
-            "$signal_installed" "$signal_calls" "${signal_unit}.previous.$$"
-        command rmdir -- "$LOG_DIR" "$bin_dir" "$tx_tmp"
+        # An ordinary upgrade has no unit transaction. Its signal cleanup must
+        # still recognize the exact binary commit and leave a concurrently
+        # recreated staged pathname alone.
+        plain_installed="$tx_tmp/plain-bin"
+        plain_staged_bin="${plain_installed}.new.$$"
+        printf '%s\n' 'new-binary' >"$plain_staged_bin"
+        plain_status=0
+        (
+            STAGED_BIN="$plain_staged_bin"
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
+            trap 'exit_for_signal TERM' TERM
+            trap cleanup EXIT
+            journal_binary_commit_intent "$STAGED_BIN" "$plain_installed"
+            BINARY_COMMIT_IN_PROGRESS=1
+            replace_file_atomically "$STAGED_BIN" "$plain_installed"
+            printf '%s\n' 'concurrent-binary' >"$STAGED_BIN"
+            kill -TERM "$BASHPID"
+            exit 99
+        ) || plain_status=$?
+        if [ "$plain_status" -eq 143 ] &&
+            [ "$(<"$plain_installed")" = "new-binary" ] &&
+            [ "$(<"$plain_staged_bin")" = "concurrent-binary" ]; then
+            printf 'ok   TERM cleanup preserves a recreated source after an ordinary upgrade commit\n'
+        else
+            printf 'FAIL TERM cleanup removed a recreated ordinary-upgrade source\n'
+            test_failures=$((test_failures + 1))
+        fi
+        command rm -f -- "$plain_staged_bin" "$plain_installed"
+
+        # Portable mv treats a directory that appears after the helper's shape
+        # check as a container. Even though this consumes the staged source,
+        # cleanup must reject the inode mismatch and roll the unit back.
+        raced_unit="$tx_tmp/raced.service"
+        raced_staged_unit="${raced_unit}.new.$$"
+        raced_staged_bin="$tx_tmp/raced-bin.new.$$"
+        raced_installed="$tx_tmp/raced-bin"
+        raced_witness="${raced_staged_bin}.commit-witness"
+        raced_nested="${raced_installed}/$(basename -- "$raced_staged_bin")"
+        raced_calls="$tx_tmp/raced-calls"
+        printf '%s\n' 'old-unit' >"$raced_unit"
+        printf '%s\n' 'new-unit' >"$raced_staged_unit"
+        printf '%s\n' 'new-binary' >"$raced_staged_bin"
+        : >"$raced_calls"
+        if (
+            UNIT_FILE="$raced_unit"
+            STAGED_UNIT="$raced_staged_unit"
+            STAGED_BIN="$raced_staged_bin"
+            UNIT_BACKUP=""
+            UNIT_CANDIDATE_GUARD=""
+            UNIT_CANDIDATE_WITNESS=""
+            UNIT_REJECTED=""
+            UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_TRANSACTION_DIR=""
+            UNIT_RETAINED_BACKUP=""
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_HAD_ORIGINAL=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            UNIT_CANDIDATE_PUBLISHED=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
+            systemctl() { printf 'daemon-reload|' >>"$raced_calls"; }
+            hardlink_utility_available() { :; }
+            link_file_command() { command ln -- "$1" "$2"; }
+            exchange_file_command() {
+                local temporary="${1}.exchange.$$"
+                command mv -- "$1" "$temporary" &&
+                    command mv -- "$2" "$1" &&
+                    command mv -- "$temporary" "$2"
+            }
+            rename_noreplace_file_command() {
+                [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                command mv -- "$1" "$2"
+            }
+            move_file_command() {
+                command mkdir -- "$raced_installed" || return 1
+                command mv "$@"
+            }
+            begin_unit_transaction
+            journal_binary_commit_intent "$STAGED_BIN" "$raced_installed"
+            BINARY_COMMIT_IN_PROGRESS=1
+            replace_file_atomically "$STAGED_BIN" "$raced_installed" || true
+            [ ! -e "$STAGED_BIN" ] && [ -f "$raced_nested" ]
+            cleanup
+            [ "$(<"$UNIT_FILE")" = "old-unit" ] &&
+                [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                [ "$BINARY_COMMIT_FD_OPEN" -eq 0 ]
+        ) && [ "$(<"$raced_calls")" = "daemon-reload|" ] &&
+            [ "$(<"$raced_nested")" = "new-binary" ] &&
+            [ ! -e "${raced_unit}.previous.$$" ] &&
+            [ ! -e "$raced_witness" ] && [ ! -L "$raced_witness" ]; then
+            printf 'ok   cleanup rejects a binary consumed by a raced destination directory\n'
+        else
+            printf 'FAIL cleanup committed a unit without an exact binary destination match\n'
+            test_failures=$((test_failures + 1))
+        fi
+
+        # Exercise the distinct first-install rollback: there is no previous unit
+        # to restore, so the published candidate must be removed and reloaded.
+        fresh_raced_unit="$tx_tmp/fresh-raced.service"
+        fresh_raced_staged_unit="${fresh_raced_unit}.new.$$"
+        fresh_raced_staged_bin="$tx_tmp/fresh-raced-bin.new.$$"
+        fresh_raced_installed="$tx_tmp/fresh-raced-bin"
+        fresh_raced_witness="${fresh_raced_staged_bin}.commit-witness"
+        fresh_raced_nested="${fresh_raced_installed}/$(basename -- \
+            "$fresh_raced_staged_bin")"
+        fresh_raced_calls="$tx_tmp/fresh-raced-calls"
+        printf '%s\n' 'new-unit' >"$fresh_raced_staged_unit"
+        printf '%s\n' 'new-binary' >"$fresh_raced_staged_bin"
+        : >"$fresh_raced_calls"
+        if (
+            UNIT_FILE="$fresh_raced_unit"
+            STAGED_UNIT="$fresh_raced_staged_unit"
+            STAGED_BIN="$fresh_raced_staged_bin"
+            UNIT_BACKUP=""
+            UNIT_CANDIDATE_GUARD=""
+            UNIT_CANDIDATE_WITNESS=""
+            UNIT_REJECTED=""
+            UNIT_CANDIDATE_SNAPSHOT=""
+            UNIT_TRANSACTION_DIR=""
+            UNIT_RETAINED_BACKUP=""
+            UNIT_TRANSACTION_ACTIVE=0
+            UNIT_HAD_ORIGINAL=0
+            UNIT_TRANSACTION_USES_STAGED_LINK=0
+            UNIT_TRANSACTION_EXCHANGE_V1=0
+            UNIT_CANDIDATE_PUBLISHED=0
+            BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
+            systemctl() { printf 'daemon-reload|' >>"$fresh_raced_calls"; }
+            hardlink_utility_available() { :; }
+            link_file_command() { command ln -- "$1" "$2"; }
+            exchange_file_command() { return 1; }
+            rename_noreplace_file_command() {
+                [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+                command mv -- "$1" "$2"
+            }
+            move_file_command() {
+                command mkdir -- "$fresh_raced_installed" || return 1
+                command mv "$@"
+            }
+            begin_unit_transaction
+            journal_binary_commit_intent \
+                "$STAGED_BIN" "$fresh_raced_installed"
+            BINARY_COMMIT_IN_PROGRESS=1
+            replace_file_atomically "$STAGED_BIN" "$fresh_raced_installed" || true
+            [ ! -e "$STAGED_BIN" ] && [ -f "$fresh_raced_nested" ]
+            cleanup
+            [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] &&
+                [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                [ "$BINARY_COMMIT_FD_OPEN" -eq 0 ]
+        ) && [ "$(<"$fresh_raced_calls")" = "daemon-reload|" ] &&
+            [ ! -f "$fresh_raced_installed" ] &&
+            [ ! -L "$fresh_raced_installed" ] &&
+            [ "$(<"$fresh_raced_nested")" = "new-binary" ] &&
+            [ ! -e "$fresh_raced_witness" ] &&
+            [ ! -L "$fresh_raced_witness" ]; then
+            printf 'ok   fresh-install cleanup rejects a binary moved below the exact destination\n'
+        else
+            printf 'FAIL fresh-install cleanup retained a unit without an exact binary match\n'
+            test_failures=$((test_failures + 1))
+        fi
+
+        if ! command rm -f -- "$unit" "$config" "$source" "$installed" \
+            "$calls" "$output" "$userlist" "$expected_staged" \
+            "$expected_staged_unit" "$expected_backup" "$expected_witness" \
+            "$fresh_unit" "$fresh_staged" "$fresh_calls" "$signal_unit" \
+            "$signal_staged_unit" "$signal_staged_bin" "$signal_installed" \
+            "$signal_witness" "$signal_calls" "${signal_unit}.previous.$$" \
+            "$raced_unit" "$raced_staged_unit" "$raced_staged_bin" \
+            "$raced_witness" "$raced_nested" "$raced_calls" \
+            "${raced_unit}.previous.$$" "$fresh_raced_unit" \
+            "$fresh_raced_staged_unit" "$fresh_raced_staged_bin" \
+            "$fresh_raced_witness" "$fresh_raced_nested" \
+            "$fresh_raced_calls"; then
+            test_failures=$((test_failures + 1))
+        fi
+        command rmdir -- "$raced_installed" ||
+            test_failures=$((test_failures + 1))
+        command rmdir -- "$fresh_raced_installed" ||
+            test_failures=$((test_failures + 1))
+        command rmdir -- "$LOG_DIR" "$bin_dir" "$tx_tmp" ||
+            test_failures=$((test_failures + 1))
         result="$test_failures"
         unset -f _check_install_failure_case
         [ "$result" -eq 0 ]
@@ -5475,7 +6088,9 @@ run_selftest() {
               BINARY_EXPLICIT PREFIX_EXPLICIT CONFIG_EXPLICIT INSTALL_CONFIG \
               START_ON_INSTALL STAGED_BIN STAGED_UNIT UNIT_BACKUP \
               UNIT_TRANSACTION_ACTIVE UNIT_HAD_ORIGINAL \
-              BINARY_COMMIT_IN_PROGRESS
+              BINARY_COMMIT_IN_PROGRESS BINARY_COMMIT_FD_OPEN \
+              BINARY_COMMIT_SOURCE BINARY_COMMIT_DESTINATION \
+              BINARY_COMMIT_WITNESS
 
         for mode in success reject; do
             fresh_tmp="$(mktemp -d)"
@@ -5507,6 +6122,10 @@ run_selftest() {
             UNIT_TRANSACTION_ACTIVE=0
             UNIT_HAD_ORIGINAL=0
             BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            BINARY_COMMIT_WITNESS=""
             succeeded=0
 
             if (
@@ -5977,13 +6596,18 @@ run_selftest() {
 
     _check_exchange_v1_transactions() (
         local tx_tmp unit staged transaction candidate snapshot witness backup previous_staged retained \
-              marker rollback_finalized intent staged_binary output UNIT_FILE STAGED_UNIT \
+              marker committed_marker rollback_finalized intent staged_intent \
+              binary_rollback untrusted_rollback \
+              staged_binary installed_binary \
+              commit_witness raced_nested output ambiguity_output UNIT_FILE STAGED_UNIT \
               UNIT_CANDIDATE_GUARD UNIT_CANDIDATE_SNAPSHOT UNIT_CANDIDATE_WITNESS \
               UNIT_BACKUP UNIT_TRANSACTION_DIR UNIT_RETAINED_BACKUP \
               UNIT_TRANSACTION_ACTIVE UNIT_HAD_ORIGINAL \
               UNIT_TRANSACTION_USES_STAGED_LINK UNIT_TRANSACTION_EXCHANGE_V1 \
               UNIT_CANDIDATE_PUBLISHED UNIT_ROLLBACK_RELOAD_FAILED STAGED_FS_HELPER \
-              STAGED_BIN BINARY_COMMIT_IN_PROGRESS \
+              STAGED_BIN BINARY_COMMIT_IN_PROGRESS BINARY_COMMIT_FD_OPEN=0 \
+              BINARY_COMMIT_SOURCE BINARY_COMMIT_DESTINATION \
+              BINARY_COMMIT_WITNESS \
               test_result=0
         tx_tmp="$(mktemp -d)"
         unit="$tx_tmp/alighieri.service"
@@ -5996,16 +6620,26 @@ run_selftest() {
         previous_staged="${backup}.staged"
         retained="${unit}.pre-migration"
         marker="${transaction}/exchange-v1"
+        committed_marker="${transaction}/committed"
         rollback_finalized="${transaction}/exchange-v1-rolled-back"
         intent="${transaction}/binary-commit-intent"
+        staged_intent="${intent}.staged"
+        binary_rollback="${transaction}/binary-rollback"
+        untrusted_rollback="${transaction}/binary-rollback-untrusted"
         staged_binary="$tx_tmp/alighieri.new.123"
+        installed_binary="$tx_tmp/alighieri"
+        commit_witness="${staged_binary}.commit-witness"
         output="$tx_tmp/output"
+        ambiguity_output="$tx_tmp/ambiguity-output"
         UNIT_FILE="$unit"
         STAGED_FS_HELPER="$tx_tmp/mock-helper"
         : >"$STAGED_FS_HELPER"
 
         hardlink_utility_available() { :; }
         link_file_command() { command ln -- "$1" "$2"; }
+        # Invoked indirectly by journal_binary_commit_intent.
+        # shellcheck disable=SC2317
+        binary_witness_link_command() { command ln -- "$1" "$2"; }
         rename_noreplace_file_command() {
             [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
             command mv -- "$1" "$2"
@@ -6021,7 +6655,35 @@ run_selftest() {
         unit_file_is_safe_for_legacy_migration() { [ "$1" = "$candidate" ]; }
         legacy_unit_file_matches_kind() { [ "$(<"$1")" = old-unit ]; }
 
+        # A destination that is already a hard link to the staged inode is not
+        # proof that rename consumed SOURCE. Both predicates stay false while
+        # SOURCE still names that inode, but an unrelated entry recreated at the
+        # same pathname must not mask the exact destination commit.
+        printf '%s\n' new-binary >"$staged_binary" || exit 1
+        command ln -- "$staged_binary" "$installed_binary" || exit 1
+        command ln -- "$staged_binary" "$commit_witness" || exit 1
+        open_binary_commit_descriptor "$staged_binary" || exit 1
+        if binary_commit_reached_open_descriptor \
+            "$staged_binary" "$installed_binary"; then
+            exit 1
+        fi
+        if binary_commit_reached_persistent_witness \
+            "$staged_binary" "$installed_binary" "$commit_witness"; then
+            exit 1
+        fi
+        command rm -f -- "$staged_binary" || exit 1
+        printf '%s\n' concurrent-binary >"$staged_binary" || exit 1
+        binary_commit_reached_open_descriptor \
+            "$staged_binary" "$installed_binary" || exit 1
+        binary_commit_reached_persistent_witness \
+            "$staged_binary" "$installed_binary" "$commit_witness" || exit 1
+        [ "$(<"$staged_binary")" = concurrent-binary ] || exit 1
+        close_binary_commit_descriptor || exit 1
+        command rm -f -- "$staged_binary" "$installed_binary" \
+            "$commit_witness" || exit 1
+
         _reset_exchange_globals() {
+            close_binary_commit_descriptor || true
             STAGED_UNIT=""
             UNIT_CANDIDATE_GUARD=""
             UNIT_CANDIDATE_SNAPSHOT=""
@@ -6037,6 +6699,12 @@ run_selftest() {
             UNIT_ROLLBACK_RELOAD_FAILED=0
             STAGED_BIN=""
             BINARY_COMMIT_IN_PROGRESS=0
+            BINARY_COMMIT_FD_OPEN=0
+            BINARY_COMMIT_SOURCE=""
+            BINARY_COMMIT_DESTINATION=""
+            # This global is intentionally modified only in the self-test subshell.
+            # shellcheck disable=SC2030
+            BINARY_COMMIT_WITNESS=""
         }
 
         if (
@@ -6059,6 +6727,31 @@ run_selftest() {
                     [ ! -e "$transaction" ] &&
                     [ ! -e "$retained" ]
             } || exit 1
+
+            # Once binary rollback is durable, exchange rollback must remove
+            # the external staged inode and witness before it returns after
+            # deleting the journal. This makes every later SIGKILL prefix clean.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' old-unit >"$unit" || exit 1
+            printf '%s\n' new-unit >"$staged" || exit 1
+            STAGED_UNIT="$staged"
+            begin_legacy_unit_transaction legacy ignored ignored || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            STAGED_BIN="$staged_binary"
+            journal_binary_commit_intent \
+                "$STAGED_BIN" "$installed_binary" || exit 1
+            mark_binary_transaction_for_rollback || exit 1
+            [ -f "$binary_rollback" ] || exit 1
+            rollback_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$staged_binary" ] &&
+                    [ ! -L "$staged_binary" ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -L "$commit_witness" ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+            close_binary_commit_descriptor || exit 1
 
             # The durable exchange marker is created before the in-memory ACTIVE
             # flag. Exercise cleanup in that signal window with both possible
@@ -6259,8 +6952,174 @@ run_selftest() {
                     [ ! -e "$transaction" ]
             } || exit 1
 
-            # Binary intent plus an absent staged source records a committed
-            # exchange: keep candidate live and retain the exact displaced inode.
+            # A complete but unpublished intent means binary replacement was not
+            # armed. Recovery rolls back the unit and removes both hard links.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            command ln -- "$staged_binary" "$commit_witness" || exit 1
+            printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
+                "$commit_witness" complete >"$staged_intent" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$staged_binary" ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
+            command rm -f -- "$unit" || exit 1
+
+            # Caught cleanup can rename a complete staged intent to the
+            # untrusted rollback name. If SIGKILL then interrupts that cleanup,
+            # recovery must use the valid identities only to remove both
+            # external links while preserving the rollback decision.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            command ln -- "$staged_binary" "$commit_witness" || exit 1
+            printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
+                "$commit_witness" complete >"$untrusted_rollback" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = old-unit ] &&
+                    [ ! -e "$staged_binary" ] &&
+                    [ ! -L "$staged_binary" ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -L "$commit_witness" ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
+            command rm -f -- "$unit" || exit 1
+
+            # A current binary intent records the exact staged inode. Recovery
+            # commits when that inode reached the requested destination even if
+            # another entry recreated the old staged pathname meanwhile.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            command ln -- "$staged_binary" "$commit_witness" || exit 1
+            printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
+                "$commit_witness" complete >"$intent" || exit 1
+            command mv -- "$staged_binary" "$installed_binary" || exit 1
+            command ln -s -- "$installed_binary" "$staged_binary" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = new-unit ] &&
+                    [ "$(<"$installed_binary")" = new-binary ] &&
+                    [ -L "$staged_binary" ] &&
+                    [ "$(readlink -- "$staged_binary")" = "$installed_binary" ] &&
+                    [ "$(<"$retained")" = old-unit ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+            command rm -f -- "$unit" "$retained" "$staged_binary" \
+                "$installed_binary" || exit 1
+
+            # A crash after the durable unit-commit marker but before journal
+            # cleanup must recover the external binary witness from the intent
+            # and remove it without reconsidering the committed orientation.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            : >"$committed_marker" || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            command ln -- "$staged_binary" "$commit_witness" || exit 1
+            printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
+                "$commit_witness" complete >"$intent" || exit 1
+            command mv -- "$staged_binary" "$installed_binary" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = new-unit ] &&
+                    [ "$(<"$installed_binary")" = new-binary ] &&
+                    [ "$(<"$retained")" = old-unit ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+            command rm -f -- "$unit" "$retained" "$installed_binary" || exit 1
+
+            # A committed journal written by the previous installer version has
+            # only SOURCE and `complete`. The authoritative commit marker must
+            # still permit cleanup instead of blocking every lifecycle command.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            : >"$committed_marker" || exit 1
+            printf '%s\n%s\n' "$staged_binary" complete >"$intent" || exit 1
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                [ "$(<"$unit")" = new-unit ] &&
+                    [ "$(<"$retained")" = old-unit ] &&
+                    [ ! -e "$transaction" ]
+            } || exit 1
+            command rm -f -- "$unit" "$retained" || exit 1
+
+            # A directory that wins the destination race consumes the source but
+            # cannot satisfy the intent's exact-path inode witness. Crash recovery
+            # must restore the old unit instead of falsely committing migration.
+            _reset_exchange_globals || exit 1
+            printf '%s\n' new-unit >"$unit" || exit 1
+            command mkdir -m 700 -- "$transaction" || exit 1
+            printf '%s\n' old-unit >"$candidate" || exit 1
+            printf '%s\n' new-unit >"$snapshot" || exit 1
+            command ln -- "$unit" "$witness" || exit 1
+            command cp -p -- "$candidate" "$backup" || exit 1
+            command ln -- "$candidate" "$retained" || exit 1
+            : >"$marker" || exit 1
+            printf '%s\n' new-binary >"$staged_binary" || exit 1
+            command ln -- "$staged_binary" "$commit_witness" || exit 1
+            printf '%s\n%s\n%s\n%s\n' "$staged_binary" "$installed_binary" \
+                "$commit_witness" complete >"$intent" || exit 1
+            command mkdir -- "$installed_binary" || exit 1
+            command mv -- "$staged_binary" "$installed_binary" || exit 1
+            raced_nested="${installed_binary}/$(basename -- "$staged_binary")"
+            recover_interrupted_legacy_unit_transaction || exit 1
+            {
+                    [ "$(<"$unit")" = old-unit ] &&
+                    [ "$(<"$raced_nested")" = new-binary ] &&
+                    [ ! -e "$commit_witness" ] &&
+                    [ ! -e "$transaction" ] &&
+                    [ ! -e "$retained" ]
+            } || exit 1
+            command rm -f -- "$unit" "$raced_nested" || exit 1
+            command rmdir -- "$installed_binary" || exit 1
+
+            # Older two-line intents have no inode witness. An absent source is
+            # ambiguous, so recovery must preserve the current unit and journal
+            # instead of guessing either commit or rollback.
             _reset_exchange_globals || exit 1
             printf '%s\n' new-unit >"$unit" || exit 1
             command mkdir -m 700 -- "$transaction" || exit 1
@@ -6271,14 +7130,21 @@ run_selftest() {
             command ln -- "$candidate" "$retained" || exit 1
             : >"$marker" || exit 1
             printf '%s\n%s\n' "$staged_binary" complete >"$intent" || exit 1
-            command rm -f -- "$staged_binary" || exit 1
-            recover_interrupted_legacy_unit_transaction || exit 1
+            if (trap - EXIT; recover_interrupted_legacy_unit_transaction) \
+                >"$ambiguity_output" 2>&1; then
+                exit 1
+            fi
             {
                 [ "$(<"$unit")" = new-unit ] &&
+                    [ -d "$transaction" ] &&
+                    [ -f "$intent" ] &&
                     [ "$(<"$retained")" = old-unit ] &&
-                    [ ! -e "$transaction" ]
+                    grep -Fq -- 'commit state is ambiguous' "$ambiguity_output"
             } || exit 1
-            command rm -f -- "$unit" "$retained" || exit 1
+            command rm -f -- "$unit" "$candidate" "$snapshot" "$witness" \
+                "$backup" "$retained" "$marker" "$intent" \
+                "$ambiguity_output" || exit 1
+            command rmdir -- "$transaction" || exit 1
 
             # Backward compatibility: an old #155 detach/publish journal has no
             # exchange marker and is recovered with exact helper operations.
@@ -6333,8 +7199,9 @@ run_selftest() {
 
         command rm -f -- "$unit" "${unit}.operator" "$staged" "$candidate" \
             "$snapshot" "$witness" "$backup" "$previous_staged" "$retained" "$marker" \
-            "$rollback_finalized" "$intent" \
-            "$staged_binary" "$output" "$STAGED_FS_HELPER"
+            "$committed_marker" "$rollback_finalized" "$intent" "$staged_intent" \
+            "$staged_binary" "$installed_binary" "$commit_witness" \
+            "$output" "$ambiguity_output" "$STAGED_FS_HELPER"
         command rmdir -- "$transaction" 2>/dev/null || true
         command rmdir -- "$tx_tmp"
         unset -f _reset_exchange_globals
@@ -6548,10 +7415,215 @@ run_selftest() {
         rmdir -- "$upgrade_tmp"
     }
 
+    _check_legacy_upgrade_commit() {
+        local test_tmp output case_tmp unit config source installed calls helper \
+              retained legacy_witness test_migration_dir staged_binary staged_unit \
+              commit_witness restart_mode expected got test_result=0
+        trap - EXIT
+        test_tmp="$(mktemp -d)" || return 1
+        output="$test_tmp/output"
+
+        require_service_sandbox() { :; }
+        existing_install_directory_for_binary() { dirname -- "$1"; }
+        require_safe_binary_directory() { :; }
+        require_safe_service_config_directory() { :; }
+        require_secure_service_config_file() { :; }
+        reject_hidden_service_path() { :; }
+        installed_binary_path() { printf '%s' "$installed"; }
+        installed_config_path() { printf '%s' "$config"; }
+        loaded_exec_start_payload() { printf '%s %s' "$installed" "$config"; }
+        prepare_upgrade_unit_migration() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = "$installed $config" ] || return 1
+            UPGRADE_LEGACY_UNIT_KIND="v0.1.x"
+        }
+        resolve_source_binary() { :; }
+        resolve_installer_fs_helper_source() {
+            INSTALLER_FS_HELPER_SOURCE="$helper"
+        }
+        stage_installer_fs_helper() {
+            [ "$1" = "$installed" ] || return 1
+            STAGED_FS_HELPER="$helper"
+            printf 'helper|' >>"$calls"
+        }
+        run_in_service_sandbox() {
+            printf '%s\n' '{"ok":true,"userlist":""}'
+        }
+        validate_service_config_sources() { :; }
+        validate_service_userlist() { :; }
+        service_capability_mask() { printf '%s' 0; }
+        legacy_generated_unit_kind() { printf '%s' v0.1.x; }
+        write_unit() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = 0 ] || return 1
+            printf '%s\n' new-unit >"$4"
+        }
+        hardlink_utility_available() { :; }
+        link_file_command() { command ln -- "$1" "$2"; }
+        # Invoked indirectly by journal_binary_commit_intent.
+        # shellcheck disable=SC2317
+        binary_witness_link_command() {
+            printf 'binary-witness|' >>"$calls"
+            command ln -- "$1" "$2"
+        }
+        rename_noreplace_file_command() {
+            [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+            command mv -- "$1" "$2"
+        }
+        exchange_file_command() {
+            local temporary="${1}.exchange"
+            [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+            printf 'exchange|' >>"$calls"
+            command mv -- "$1" "$temporary" &&
+                command mv -- "$2" "$1" &&
+                command mv -- "$temporary" "$2"
+        }
+        unit_file_is_safe_for_legacy_migration() {
+            [ "$1" = "$test_migration_dir/candidate" ]
+        }
+        legacy_unit_file_matches_kind() {
+            [ "$1" = "$test_migration_dir/candidate" ] &&
+                [ "$2" = v0.1.x ] && [ "$3" = "$installed" ] &&
+                [ "$4" = "$config" ] && [ "$(<"$1")" = old-unit ]
+        }
+        reload_and_validate_installed_service() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = 0 ] && [ "$(<"$UNIT_FILE")" = new-unit ] ||
+                return 1
+            printf 'validate|' >>"$calls"
+        }
+        loaded_unit_source_is_unoverridden() { :; }
+        systemctl() {
+            case "${1:-}" in
+                daemon-reload) printf 'reload|' >>"$calls" ;;
+                restart) printf 'restart|' >>"$calls" ;;
+                *) return 1 ;;
+            esac
+        }
+
+        _run_legacy_upgrade_commit_cases() {
+            for restart_mode in 1 0; do
+                case_tmp="$test_tmp/case-$restart_mode"
+                command mkdir -- "$case_tmp" || return 1
+                unit="$case_tmp/alighieri.service"
+                config="$case_tmp/alighieri.conf"
+                source="$case_tmp/source-alighieri"
+                installed="$case_tmp/installed-alighieri"
+                calls="$case_tmp/calls"
+                helper="$case_tmp/alighieri-installer-fs"
+                retained="${unit}.pre-migration"
+                legacy_witness="$case_tmp/legacy.witness"
+                test_migration_dir="${unit}.migration"
+                staged_binary="${installed}.new.$$"
+                staged_unit="${unit}.new.$$"
+                commit_witness="${staged_binary}.commit-witness"
+
+                printf '%s\n' old-unit >"$unit" || return 1
+                command ln -- "$unit" "$legacy_witness" || return 1
+                printf '%s\n' 'internal: 127.0.0.1:1080' >"$config" || return 1
+                printf '%s\n' new-binary >"$source" || return 1
+                printf '%s\n' old-binary >"$installed" || return 1
+                : >"$helper" || return 1
+                : >"$calls" || return 1
+
+                close_binary_commit_descriptor || return 1
+                UNIT_FILE="$unit"
+                BINARY="$source"
+                RESTART_ON_UPGRADE="$restart_mode"
+                UPGRADE_LEGACY_UNIT_KIND=""
+                STAGED_BIN=""
+                STAGED_UNIT=""
+                STAGED_FS_HELPER=""
+                INSTALLER_FS_HELPER_SOURCE=""
+                UNIT_TRANSACTION_ACTIVE=0
+                UNIT_HAD_ORIGINAL=0
+                UNIT_TRANSACTION_USES_STAGED_LINK=0
+                UNIT_TRANSACTION_EXCHANGE_V1=0
+                UNIT_CANDIDATE_PUBLISHED=0
+                UNIT_ROLLBACK_RELOAD_FAILED=0
+                UNIT_BACKUP=""
+                UNIT_CANDIDATE_GUARD=""
+                UNIT_CANDIDATE_SNAPSHOT=""
+                UNIT_CANDIDATE_WITNESS=""
+                UNIT_REJECTED=""
+                UNIT_TRANSACTION_DIR=""
+                UNIT_RETAINED_BACKUP=""
+                BINARY_COMMIT_IN_PROGRESS=0
+                BINARY_COMMIT_SOURCE=""
+                BINARY_COMMIT_DESTINATION=""
+                BINARY_COMMIT_WITNESS=""
+
+                do_upgrade || return 1
+                got="$(<"$calls")"
+                expected='reload|helper|reload|exchange|validate|binary-witness|'
+                [ "$restart_mode" -eq 0 ] || expected="${expected}restart|"
+                {
+                    [ "$got" = "$expected" ] &&
+                        [ "$(<"$unit")" = new-unit ] &&
+                        [ "$(<"$installed")" = new-binary ] &&
+                        [ "$(<"$retained")" = old-unit ] &&
+                        [ "$retained" -ef "$legacy_witness" ] &&
+                        [ ! -e "$test_migration_dir" ] &&
+                        [ ! -L "$test_migration_dir" ] &&
+                        [ ! -e "$staged_binary" ] && [ ! -L "$staged_binary" ] &&
+                        [ ! -e "$staged_unit" ] && [ ! -L "$staged_unit" ] &&
+                        [ ! -e "$commit_witness" ] && [ ! -L "$commit_witness" ] &&
+                        [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                        [ -z "$STAGED_BIN" ] && [ -z "$STAGED_UNIT" ]
+                } || return 1
+
+                command rm -f -- "$unit" "$config" "$source" "$installed" \
+                    "$calls" "$helper" "$retained" "$legacy_witness" || return 1
+                command rmdir -- "$case_tmp" || return 1
+            done
+        }
+
+        if _run_legacy_upgrade_commit_cases >"$output" 2>&1; then
+            printf 'ok   legacy upgrade commits unit and binary transaction with restart control\n'
+        else
+            printf 'FAIL legacy upgrade commit transaction: %s\n' "$(<"$output")"
+            test_result=1
+        fi
+
+        for restart_mode in 1 0; do
+            case_tmp="$test_tmp/case-$restart_mode"
+            unit="$case_tmp/alighieri.service"
+            installed="$case_tmp/installed-alighieri"
+            test_migration_dir="${unit}.migration"
+            command rm -f -- "$unit" "${unit}.pre-migration" \
+                "${unit}.new.$$" "$case_tmp/alighieri.conf" \
+                "$case_tmp/source-alighieri" "$installed" \
+                "${installed}.new.$$" "${installed}.new.$$.commit-witness" \
+                "$case_tmp/calls" "$case_tmp/alighieri-installer-fs" \
+                "$case_tmp/legacy.witness" "$test_migration_dir/candidate" \
+                "$test_migration_dir/candidate.exchange" \
+                "$test_migration_dir/candidate.snapshot" \
+                "$test_migration_dir/candidate.witness" \
+                "$test_migration_dir/previous" \
+                "$test_migration_dir/previous.staged" \
+                "$test_migration_dir/exchange-v1" \
+                "$test_migration_dir/committed" \
+                "$test_migration_dir/binary-commit-intent" \
+                "$test_migration_dir/binary-commit-intent.staged" \
+                "$test_migration_dir/binary-rollback" \
+                "$test_migration_dir/binary-rollback-untrusted" 2>/dev/null || true
+            command rmdir -- "$test_migration_dir" 2>/dev/null || true
+            command rmdir -- "$case_tmp" 2>/dev/null || true
+        done
+        command rm -f -- "$output"
+        command rmdir -- "$test_tmp"
+        unset -f _run_legacy_upgrade_commit_cases
+        return "$test_result"
+    }
+
     # Upgrade must not compare loaded scalar state with newer on-disk list
     # directives, and it must close the potentially long build/preflight window
     # before restart.
     _check_upgrade_reload_order
+    if ! _check_legacy_upgrade_commit; then
+        failures=$((failures + 1))
+    fi
+    unset -f _check_legacy_upgrade_commit
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
@@ -6856,23 +7928,32 @@ do_install() {
 
     info "installing validated binary to $install_bin"
     require_unit_transaction_candidate_current
-    # The checked replacement refuses an unexpected directory destination
-    # instead of moving the staged executable inside it under another basename.
-    # Arm cleanup to distinguish a signal before the atomic rename (source still
-    # present: roll back) from one after it (source gone: commit the validated
-    # unit so it remains consistent with the newly installed binary).
-    journal_binary_commit_intent "$STAGED_BIN" ||
+    # Record the staged inode before replacement. Cleanup may commit the unit
+    # after an interrupt only when that inode reached the exact install path;
+    # source disappearance alone can also mean portable mv consumed it inside a
+    # directory that won a destination race.
+    journal_binary_commit_intent "$STAGED_BIN" "$install_bin" ||
         die "could not journal the pending binary install; the previous unit will be restored"
     BINARY_COMMIT_IN_PROGRESS=1
-    if ! replace_file_atomically "$STAGED_BIN" "$install_bin"; then
-        if [ -e "$STAGED_BIN" ] || [ -L "$STAGED_BIN" ]; then
-            BINARY_COMMIT_IN_PROGRESS=0
-        fi
+    if ! commit_staged_binary_atomically "$STAGED_BIN" "$install_bin"; then
+        BINARY_COMMIT_IN_PROGRESS=0
         die "could not install the validated binary at $install_bin; the previous unit will be restored"
     fi
+    # The exact destination inode proves commit even if another entry recreated
+    # the staged pathname. Stop cleanup from treating that entry as ours.
+    STAGED_BIN=""
     commit_unit_transaction ||
         die "the binary was installed, but the unit transaction could not be finalized"
-    STAGED_BIN=""
+    if ! remove_binary_commit_witness; then
+        # ShellCheck associates the same global with an isolated self-test subshell.
+        # shellcheck disable=SC2031
+        warn "could not remove binary commit witness $BINARY_COMMIT_WITNESS"
+    else
+        BINARY_COMMIT_SOURCE=""
+        BINARY_COMMIT_DESTINATION=""
+    fi
+    close_binary_commit_descriptor ||
+        warn "could not close the binary commit descriptor"
     BINARY_COMMIT_IN_PROGRESS=0
 
     activate_prevalidated_service
@@ -6992,18 +8073,28 @@ do_upgrade() {
 
     info "upgrading binary at $install_bin"
     require_unit_transaction_candidate_current
-    journal_binary_commit_intent "$STAGED_BIN" ||
+    journal_binary_commit_intent "$STAGED_BIN" "$install_bin" ||
         die "could not journal the pending binary replacement; the previous unit will be restored"
     BINARY_COMMIT_IN_PROGRESS=1
-    if ! replace_file_atomically "$STAGED_BIN" "$install_bin"; then
-        if [ -e "$STAGED_BIN" ] || [ -L "$STAGED_BIN" ]; then
-            BINARY_COMMIT_IN_PROGRESS=0
-        fi
+    if ! commit_staged_binary_atomically "$STAGED_BIN" "$install_bin"; then
+        BINARY_COMMIT_IN_PROGRESS=0
         die "could not replace the installed binary at $install_bin; the previous unit will be restored"
     fi
+    # The exact destination inode proves commit even if another entry recreated
+    # the staged pathname. Stop cleanup from treating that entry as ours.
+    STAGED_BIN=""
     commit_unit_transaction ||
         die "the binary was replaced, but the unit transaction could not be finalized"
-    STAGED_BIN=""
+    if ! remove_binary_commit_witness; then
+        # ShellCheck associates the same global with an isolated self-test subshell.
+        # shellcheck disable=SC2031
+        warn "could not remove binary commit witness $BINARY_COMMIT_WITNESS"
+    else
+        BINARY_COMMIT_SOURCE=""
+        BINARY_COMMIT_DESTINATION=""
+    fi
+    close_binary_commit_descriptor ||
+        warn "could not close the binary commit descriptor"
     BINARY_COMMIT_IN_PROGRESS=0
 
     if [ "$RESTART_ON_UPGRADE" -eq 1 ]; then

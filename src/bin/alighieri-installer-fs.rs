@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const PROTOCOL_VERSION: &str = "alighieri-installer-fs-v1";
+const PROTOCOL_VERSION: &str = "alighieri-installer-fs-v2";
 const UNIT_DIRECTORY_PREFIX: &str = "/etc/systemd/system/";
 const MIGRATION_DIRECTORY_PREFIX: &str = "/etc/systemd/system/alighieri.service.migration/";
 const UNIT_NAME: &str = "alighieri.service";
@@ -19,6 +19,7 @@ enum Operation {
     HardLink,
     Exchange,
     RenameNoReplace,
+    BinaryHardLink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ enum ManagedPath {
 #[derive(Debug, PartialEq, Eq)]
 struct Request {
     operation: Operation,
+    parent: Option<PathBuf>,
     source: PathBuf,
     destination: PathBuf,
 }
@@ -76,12 +78,22 @@ fn main() -> ExitCode {
     match execute(&request) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!(
-                "alighieri-installer-fs: {:?} failed for '{}' and '{}': {error}",
-                request.operation,
-                request.source.display(),
-                request.destination.display()
-            );
+            if let Some(parent) = &request.parent {
+                eprintln!(
+                    "alighieri-installer-fs: {:?} failed under '{}' for '{}' and '{}': {error}",
+                    request.operation,
+                    parent.display(),
+                    request.source.display(),
+                    request.destination.display()
+                );
+            } else {
+                eprintln!(
+                    "alighieri-installer-fs: {:?} failed for '{}' and '{}': {error}",
+                    request.operation,
+                    request.source.display(),
+                    request.destination.display()
+                );
+            }
             ExitCode::FAILURE
         }
     }
@@ -92,23 +104,29 @@ fn parse_args_from(args: Vec<OsString>) -> Result<Command, String> {
         return Ok(Command::ProtocolVersion);
     }
 
-    if args.len() == 4 && args[0] == "validate-request" {
+    if args.first().is_some_and(|arg| arg == "validate-request") {
         return parse_request(&args[1..]).map(|_| Command::Validate);
     }
-    if args.len() == 3 {
-        return parse_request(&args).map(Command::Mutate);
-    }
-
-    Err("usage: alighieri-installer-fs protocol-version | validate-request OPERATION SOURCE DESTINATION | OPERATION SOURCE DESTINATION".into())
+    parse_request(&args).map(Command::Mutate)
 }
 
 fn parse_request(args: &[OsString]) -> Result<Request, String> {
-    let operation = match args[0].to_str() {
+    let operation = match args.first().and_then(|arg| arg.to_str()) {
         Some("hard-link") => Operation::HardLink,
         Some("exchange") => Operation::Exchange,
         Some("rename-noreplace") => Operation::RenameNoReplace,
-        _ => return Err("unknown installer filesystem operation".into()),
+        Some("binary-hard-link") => Operation::BinaryHardLink,
+        Some(_) => return Err("unknown installer filesystem operation".into()),
+        None => return Err(request_usage()),
     };
+
+    if operation == Operation::BinaryHardLink {
+        return parse_binary_hard_link_request(args);
+    }
+    if args.len() != 3 {
+        return Err(request_usage());
+    }
+
     let source = PathBuf::from(&args[1]);
     let destination = PathBuf::from(&args[2]);
     let source_kind = classify_unit_file_path(&source)?;
@@ -120,9 +138,73 @@ fn parse_request(args: &[OsString]) -> Result<Request, String> {
 
     Ok(Request {
         operation,
+        parent: None,
         source,
         destination,
     })
+}
+
+fn request_usage() -> String {
+    "usage: alighieri-installer-fs protocol-version | [validate-request] OPERATION SOURCE DESTINATION | [validate-request] binary-hard-link PHYSICAL_PARENT SOURCE_LEAF WITNESS_LEAF".into()
+}
+
+fn parse_binary_hard_link_request(args: &[OsString]) -> Result<Request, String> {
+    if args.len() != 4 {
+        return Err(request_usage());
+    }
+
+    let parent = PathBuf::from(&args[1]);
+    validate_physical_binary_parent(&parent)?;
+
+    let source = PathBuf::from(&args[2]);
+    let destination = PathBuf::from(&args[3]);
+    let source_name = source
+        .to_str()
+        .ok_or("binary staged leaf is not valid UTF-8")?;
+    let destination_name = destination
+        .to_str()
+        .ok_or("binary witness leaf is not valid UTF-8")?;
+    if source.components().count() != 1 || destination.components().count() != 1 {
+        return Err("binary witness source and destination must be exact leaf names".into());
+    }
+
+    let Some((binary_name, pid)) = source_name.rsplit_once(".new.") else {
+        return Err("binary witness source must end in .new.<pid>".into());
+    };
+    if binary_name.is_empty() || parse_pid(pid).is_none() {
+        return Err("binary witness source must end in .new.<positive-pid>".into());
+    }
+    if destination_name != format!("{source_name}.commit-witness") {
+        return Err("binary witness destination must be SOURCE.commit-witness".into());
+    }
+
+    Ok(Request {
+        operation: Operation::BinaryHardLink,
+        parent: Some(parent),
+        source,
+        destination,
+    })
+}
+
+fn validate_physical_binary_parent(parent: &Path) -> Result<(), String> {
+    let parent = parent
+        .to_str()
+        .ok_or("binary witness parent is not valid UTF-8")?;
+    if !parent.starts_with('/') {
+        return Err("binary witness parent must be absolute".into());
+    }
+    if parent.len() > 1 && parent.ends_with('/') {
+        return Err("binary witness parent must not have a trailing slash".into());
+    }
+    if parent != "/"
+        && parent
+            .split('/')
+            .skip(1)
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err("binary witness parent must be a canonical physical path".into());
+    }
+    Ok(())
 }
 
 fn classify_unit_file_path(path: &Path) -> Result<ManagedPath, String> {
@@ -223,6 +305,20 @@ fn validate_operation_paths(
 fn execute(request: &Request) -> io::Result<()> {
     use alighieri::platform::linux::{self, Entry, MigrationEntry};
 
+    if request.operation == Operation::BinaryHardLink {
+        let parent = request.parent.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary hard-link request has no physical parent",
+            )
+        })?;
+        return linux::hard_link_binary_witness(
+            parent,
+            request.source.as_os_str(),
+            request.destination.as_os_str(),
+        );
+    }
+
     fn entry(path: &Path) -> io::Result<Entry> {
         let classified = classify_unit_file_path(path)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -247,6 +343,7 @@ fn execute(request: &Request) -> io::Result<()> {
         Operation::HardLink => linux::Operation::HardLink,
         Operation::Exchange => linux::Operation::Exchange,
         Operation::RenameNoReplace => linux::Operation::RenameNoReplace,
+        Operation::BinaryHardLink => unreachable!("handled above"),
     };
     linux::perform(
         operation,
@@ -284,7 +381,7 @@ mod tests {
             parse_args_from(args(&["protocol-version"])),
             Ok(Command::ProtocolVersion)
         );
-        assert_eq!(PROTOCOL_VERSION, "alighieri-installer-fs-v1");
+        assert_eq!(PROTOCOL_VERSION, "alighieri-installer-fs-v2");
         assert!(parse_args_from(args(&[
             "protocol-version",
             "/etc/systemd/system/alighieri.service"
@@ -300,6 +397,16 @@ mod tests {
             parse_args_from(args(&["validate-request", "exchange", staged, live])),
             Ok(Command::Validate)
         );
+        assert_eq!(
+            parse_args_from(args(&[
+                "validate-request",
+                "binary-hard-link",
+                "/usr/local/bin",
+                "alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ])),
+            Ok(Command::Validate)
+        );
 
         assert!(parse_args_from(args(&["validate-request", "hard-link", staged, live])).is_err());
         assert!(parse_args_from(args(&["validate-request", "exchange", staged])).is_err());
@@ -311,6 +418,77 @@ mod tests {
             "extra"
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn parses_exact_binary_witness_siblings_under_a_physical_parent() {
+        assert_eq!(
+            request(&[
+                "binary-hard-link",
+                "/usr/local/bin",
+                "alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ]),
+            Request {
+                operation: Operation::BinaryHardLink,
+                parent: Some(PathBuf::from("/usr/local/bin")),
+                source: PathBuf::from("alighieri.new.42"),
+                destination: PathBuf::from("alighieri.new.42.commit-witness"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_aliased_parents_and_non_exact_binary_witness_names() {
+        for arguments in [
+            [
+                "binary-hard-link",
+                "usr/local/bin",
+                "alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr//local/bin",
+                "alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr/local/../bin",
+                "alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr/local/bin",
+                "subdir/alighieri.new.42",
+                "alighieri.new.42.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr/local/bin",
+                "alighieri.new.0",
+                "alighieri.new.0.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr/local/bin",
+                "alighieri.new.042",
+                "alighieri.new.042.commit-witness",
+            ],
+            [
+                "binary-hard-link",
+                "/usr/local/bin",
+                "alighieri.new.42",
+                "other.new.42.commit-witness",
+            ],
+        ] {
+            assert!(
+                parse_args_from(args(&arguments)).is_err(),
+                "expected {arguments:?} to be rejected"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "alighieri"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 default-run = "alighieri"
 # Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009

@@ -951,12 +951,16 @@ installed version so the result is easy to verify. When status is invoked with
 reports output only when `--version` succeeds.
 
 **From a checkout:** run it directly — it uses an existing `target/release`
-build if present, otherwise builds one, or takes a binary extracted from a
-[release](https://github.com/wiresock/alighieri/releases):
+service build if present, otherwise builds one, or takes a service binary
+extracted from a [release](https://github.com/wiresock/alighieri/releases).
+Install and reconfigure operations, plus upgrades that migrate a legacy systemd
+unit, still build the version-matched `alighieri-installer-fs` companion from
+that checkout, so they require a Rust toolchain even with `--binary`. Use a
+complete extracted Linux release archive for a toolchain-free installation:
 
 ```sh
 sudo ./scripts/alighieri.sh                        # install, or manage if already installed
-sudo ./scripts/alighieri.sh install --binary ./alighieri  # install a prebuilt binary
+sudo ./scripts/alighieri.sh install --binary ./alighieri  # prebuilt service binary
 sudo ./scripts/alighieri.sh install --no-start     # prepare unit/files without first start
 sudo ./scripts/alighieri.sh upgrade                # use bundled binary or rebuild, then restart
 sudo ./scripts/alighieri.sh status                 # show version, binary, service, and config state
@@ -1315,7 +1319,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | developing (current release v0.5.2) | decades in production |
+| Maturity | developing (current release v0.5.3) | decades in production |
 
 **Which to choose**
 
