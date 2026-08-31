@@ -1319,7 +1319,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | developing (current release v0.5.2) | decades in production |
+| Maturity | developing (current release v0.5.3) | decades in production |
 
 **Which to choose**
 
