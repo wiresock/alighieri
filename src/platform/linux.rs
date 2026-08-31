@@ -1,9 +1,11 @@
 //! Linux-only filesystem primitives used by the systemd installer.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 const SYSTEMD_DIRECTORY: &CStr = c"/etc/systemd/system";
 const MIGRATION_DIRECTORY: &CStr = c"alighieri.service.migration";
@@ -71,6 +73,87 @@ pub fn perform(operation: Operation, source: Entry, destination: Entry) -> io::R
     let directories =
         DirectorySet::open_system(source.is_migration() || destination.is_migration())?;
     directories.perform(operation, source, destination)
+}
+
+/// Create an exact, no-replace hard-link witness for a staged service binary.
+///
+/// The installer validates and resolves the complete directory chain before
+/// passing its physical parent here. Pinning that final directory prevents the
+/// leaf operation from following a raced destination directory or symlink.
+pub fn hard_link_binary_witness(
+    physical_parent: &Path,
+    source_leaf: &OsStr,
+    witness_leaf: &OsStr,
+) -> io::Result<()> {
+    hard_link_binary_witness_for_owner(physical_parent, source_leaf, witness_leaf, 0)
+}
+
+fn hard_link_binary_witness_for_owner(
+    physical_parent: &Path,
+    source_leaf: &OsStr,
+    witness_leaf: &OsStr,
+    expected_owner: libc::uid_t,
+) -> io::Result<()> {
+    validate_binary_witness_leaves(source_leaf, witness_leaf)?;
+    let parent = path_cstring(physical_parent, "binary witness parent")?;
+    let source = leaf_cstring(source_leaf, "binary witness source")?;
+    let witness = leaf_cstring(witness_leaf, "binary witness destination")?;
+    let directory = open_directory(&parent, expected_owner)?;
+    let directory_fd = directory.as_raw_fd();
+
+    let source_before = entry_metadata(directory_fd, &source)?;
+    require_regular_entry(&source_before, "binary witness source")?;
+    linkat(directory_fd, &source, directory_fd, &witness)?;
+
+    let source_after = entry_metadata(directory_fd, &source)?;
+    let witness_after = entry_metadata(directory_fd, &witness)?;
+    require_regular_entry(&source_after, "binary witness source")?;
+    require_regular_entry(&witness_after, "binary witness destination")?;
+    if !same_inode(&source_before, &source_after) || !same_inode(&source_after, &witness_after) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "binary witness source changed or the destination does not identify its exact inode",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_binary_witness_leaves(source: &OsStr, witness: &OsStr) -> io::Result<()> {
+    const STAGED_MARKER: &[u8] = b".new.";
+    const WITNESS_SUFFIX: &[u8] = b".commit-witness";
+
+    let source = source.as_bytes();
+    let marker = source
+        .windows(STAGED_MARKER.len())
+        .rposition(|window| window == STAGED_MARKER)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "binary witness source must end in .new.<pid>",
+            )
+        })?;
+    let binary = &source[..marker];
+    let pid = &source[marker + STAGED_MARKER.len()..];
+    let pid_is_valid = !pid.is_empty()
+        && pid[0] != b'0'
+        && pid.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(pid)
+            .ok()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .is_some_and(|pid| pid > 0);
+    if binary.is_empty() || !pid_is_valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "binary witness source must end in .new.<positive-pid>",
+        ));
+    }
+    if witness.as_bytes().strip_prefix(source) != Some(WITNESS_SUFFIX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "binary witness destination must be SOURCE.commit-witness",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -245,6 +328,65 @@ fn directory_metadata(fd: RawFd) -> io::Result<libc::stat> {
     Ok(unsafe { metadata.assume_init() })
 }
 
+fn entry_metadata(directory_fd: RawFd, leaf: &CStr) -> io::Result<libc::stat> {
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `leaf` is NUL-terminated, `directory_fd` remains open, and
+    // `metadata` points to enough writable storage for `fstatat`.
+    if unsafe {
+        libc::fstatat(
+            directory_fd,
+            leaf.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful `fstatat` initialized the complete structure.
+    Ok(unsafe { metadata.assume_init() })
+}
+
+fn require_regular_entry(metadata: &libc::stat, description: &str) -> io::Result<()> {
+    if metadata.st_mode & libc::S_IFMT == libc::S_IFREG {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} must be a physical regular file"),
+        ))
+    }
+}
+
+fn same_inode(left: &libc::stat, right: &libc::stat) -> bool {
+    left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn path_cstring(path: &Path, description: &str) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} contains a NUL byte"),
+        )
+    })
+}
+
+fn leaf_cstring(leaf: &OsStr, description: &str) -> io::Result<CString> {
+    let bytes = leaf.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} must be one non-empty leaf name"),
+        ));
+    }
+    CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} contains a NUL byte"),
+        )
+    })
+}
+
 fn owned_fd(fd: RawFd) -> io::Result<OwnedFd> {
     if fd < 0 {
         Err(io::Error::last_os_error())
@@ -325,6 +467,93 @@ mod tests {
         let path = root.join("alighieri.service.migration");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn effective_uid() -> libc::uid_t {
+        // SAFETY: reading the effective uid has no preconditions.
+        unsafe { libc::geteuid() }
+    }
+
+    #[test]
+    fn binary_witness_hard_link_pins_parent_and_matches_the_staged_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let source_leaf = OsStr::new("alighieri.new.42");
+        let witness_leaf = OsStr::new("alighieri.new.42.commit-witness");
+        let source = root.path().join(source_leaf);
+        let witness = root.path().join(witness_leaf);
+        std::fs::write(&source, b"candidate").unwrap();
+
+        hard_link_binary_witness_for_owner(root.path(), source_leaf, witness_leaf, effective_uid())
+            .unwrap();
+
+        let source_metadata = std::fs::metadata(&source).unwrap();
+        let witness_metadata = std::fs::metadata(&witness).unwrap();
+        assert_eq!(source_metadata.dev(), witness_metadata.dev());
+        assert_eq!(source_metadata.ino(), witness_metadata.ino());
+        assert!(hard_link_binary_witness_for_owner(
+            root.path(),
+            source_leaf,
+            witness_leaf,
+            effective_uid(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn binary_witness_hard_link_rejects_directory_destination_without_nesting() {
+        let root = tempfile::tempdir().unwrap();
+        let source_leaf = OsStr::new("alighieri.new.42");
+        let witness_leaf = OsStr::new("alighieri.new.42.commit-witness");
+        std::fs::write(root.path().join(source_leaf), b"candidate").unwrap();
+        std::fs::create_dir(root.path().join(witness_leaf)).unwrap();
+
+        assert!(hard_link_binary_witness_for_owner(
+            root.path(),
+            source_leaf,
+            witness_leaf,
+            effective_uid(),
+        )
+        .is_err());
+        assert!(!root.path().join(witness_leaf).join(source_leaf).exists());
+    }
+
+    #[test]
+    fn binary_witness_hard_link_rejects_symlink_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source_leaf = OsStr::new("alighieri.new.42");
+        let witness_leaf = OsStr::new("alighieri.new.42.commit-witness");
+        let target = root.path().join("candidate");
+        std::fs::write(&target, b"candidate").unwrap();
+        symlink(&target, root.path().join(source_leaf)).unwrap();
+
+        assert!(hard_link_binary_witness_for_owner(
+            root.path(),
+            source_leaf,
+            witness_leaf,
+            effective_uid(),
+        )
+        .is_err());
+        assert!(!root.path().join(witness_leaf).exists());
+    }
+
+    #[test]
+    fn binary_witness_platform_layer_rejects_unapproved_leaf_pairs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("alighieri.new.42"), b"candidate").unwrap();
+
+        for (source, witness) in [
+            ("alighieri", "alighieri.commit-witness"),
+            ("alighieri.new.0", "alighieri.new.0.commit-witness"),
+            ("alighieri.new.42", "other.new.42.commit-witness"),
+        ] {
+            assert!(hard_link_binary_witness_for_owner(
+                root.path(),
+                OsStr::new(source),
+                OsStr::new(witness),
+                effective_uid(),
+            )
+            .is_err());
+        }
     }
 
     #[test]

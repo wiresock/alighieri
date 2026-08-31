@@ -36,6 +36,10 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   release rollback.
 - Privilege-dropped and direct source builds no longer inherit the privileged
   lifecycle-lock descriptor into Cargo, build scripts, or proc macros.
+- Binary installation now pins the staged inode on an open descriptor and
+  verifies the exact destination before committing its systemd-unit transaction;
+  crash-recoverable legacy migrations also journal an exact hard-link witness.
+  A raced directory can no longer turn a failed move into a false commit.
 - Management password input now bypasses Rust's process-global stdin buffer and
   reads directly into bounded zeroizing storage on supported platforms.
 
