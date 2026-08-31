@@ -218,7 +218,9 @@ Commands:
   otherwise run install.
 
 Options:
-  --binary PATH      Use this prebuilt alighieri binary instead of building.
+  --binary PATH      Use this prebuilt service binary. Checkout install/reconfigure
+                     and legacy-unit upgrades still build the companion; release
+                     archives need no toolchain.
   --prefix DIR       Install prefix for the binary (default: ${PREFIX}).
   --config PATH      (install) Use this config in the systemd unit. Without it,
                      reconfiguration preserves the unit's current config path.
@@ -7413,10 +7415,215 @@ run_selftest() {
         rmdir -- "$upgrade_tmp"
     }
 
+    _check_legacy_upgrade_commit() {
+        local test_tmp output case_tmp unit config source installed calls helper \
+              retained legacy_witness test_migration_dir staged_binary staged_unit \
+              commit_witness restart_mode expected got test_result=0
+        trap - EXIT
+        test_tmp="$(mktemp -d)" || return 1
+        output="$test_tmp/output"
+
+        require_service_sandbox() { :; }
+        existing_install_directory_for_binary() { dirname -- "$1"; }
+        require_safe_binary_directory() { :; }
+        require_safe_service_config_directory() { :; }
+        require_secure_service_config_file() { :; }
+        reject_hidden_service_path() { :; }
+        installed_binary_path() { printf '%s' "$installed"; }
+        installed_config_path() { printf '%s' "$config"; }
+        loaded_exec_start_payload() { printf '%s %s' "$installed" "$config"; }
+        prepare_upgrade_unit_migration() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = "$installed $config" ] || return 1
+            UPGRADE_LEGACY_UNIT_KIND="v0.1.x"
+        }
+        resolve_source_binary() { :; }
+        resolve_installer_fs_helper_source() {
+            INSTALLER_FS_HELPER_SOURCE="$helper"
+        }
+        stage_installer_fs_helper() {
+            [ "$1" = "$installed" ] || return 1
+            STAGED_FS_HELPER="$helper"
+            printf 'helper|' >>"$calls"
+        }
+        run_in_service_sandbox() {
+            printf '%s\n' '{"ok":true,"userlist":""}'
+        }
+        validate_service_config_sources() { :; }
+        validate_service_userlist() { :; }
+        service_capability_mask() { printf '%s' 0; }
+        legacy_generated_unit_kind() { printf '%s' v0.1.x; }
+        write_unit() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = 0 ] || return 1
+            printf '%s\n' new-unit >"$4"
+        }
+        hardlink_utility_available() { :; }
+        link_file_command() { command ln -- "$1" "$2"; }
+        # Invoked indirectly by journal_binary_commit_intent.
+        # shellcheck disable=SC2317
+        binary_witness_link_command() {
+            printf 'binary-witness|' >>"$calls"
+            command ln -- "$1" "$2"
+        }
+        rename_noreplace_file_command() {
+            [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+            command mv -- "$1" "$2"
+        }
+        exchange_file_command() {
+            local temporary="${1}.exchange"
+            [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+            printf 'exchange|' >>"$calls"
+            command mv -- "$1" "$temporary" &&
+                command mv -- "$2" "$1" &&
+                command mv -- "$temporary" "$2"
+        }
+        unit_file_is_safe_for_legacy_migration() {
+            [ "$1" = "$test_migration_dir/candidate" ]
+        }
+        legacy_unit_file_matches_kind() {
+            [ "$1" = "$test_migration_dir/candidate" ] &&
+                [ "$2" = v0.1.x ] && [ "$3" = "$installed" ] &&
+                [ "$4" = "$config" ] && [ "$(<"$1")" = old-unit ]
+        }
+        reload_and_validate_installed_service() {
+            [ "$1" = "$installed" ] && [ "$2" = "$config" ] &&
+                [ "$3" = 0 ] && [ "$(<"$UNIT_FILE")" = new-unit ] ||
+                return 1
+            printf 'validate|' >>"$calls"
+        }
+        loaded_unit_source_is_unoverridden() { :; }
+        systemctl() {
+            case "${1:-}" in
+                daemon-reload) printf 'reload|' >>"$calls" ;;
+                restart) printf 'restart|' >>"$calls" ;;
+                *) return 1 ;;
+            esac
+        }
+
+        _run_legacy_upgrade_commit_cases() {
+            for restart_mode in 1 0; do
+                case_tmp="$test_tmp/case-$restart_mode"
+                command mkdir -- "$case_tmp" || return 1
+                unit="$case_tmp/alighieri.service"
+                config="$case_tmp/alighieri.conf"
+                source="$case_tmp/source-alighieri"
+                installed="$case_tmp/installed-alighieri"
+                calls="$case_tmp/calls"
+                helper="$case_tmp/alighieri-installer-fs"
+                retained="${unit}.pre-migration"
+                legacy_witness="$case_tmp/legacy.witness"
+                test_migration_dir="${unit}.migration"
+                staged_binary="${installed}.new.$$"
+                staged_unit="${unit}.new.$$"
+                commit_witness="${staged_binary}.commit-witness"
+
+                printf '%s\n' old-unit >"$unit" || return 1
+                command ln -- "$unit" "$legacy_witness" || return 1
+                printf '%s\n' 'internal: 127.0.0.1:1080' >"$config" || return 1
+                printf '%s\n' new-binary >"$source" || return 1
+                printf '%s\n' old-binary >"$installed" || return 1
+                : >"$helper" || return 1
+                : >"$calls" || return 1
+
+                close_binary_commit_descriptor || return 1
+                UNIT_FILE="$unit"
+                BINARY="$source"
+                RESTART_ON_UPGRADE="$restart_mode"
+                UPGRADE_LEGACY_UNIT_KIND=""
+                STAGED_BIN=""
+                STAGED_UNIT=""
+                STAGED_FS_HELPER=""
+                INSTALLER_FS_HELPER_SOURCE=""
+                UNIT_TRANSACTION_ACTIVE=0
+                UNIT_HAD_ORIGINAL=0
+                UNIT_TRANSACTION_USES_STAGED_LINK=0
+                UNIT_TRANSACTION_EXCHANGE_V1=0
+                UNIT_CANDIDATE_PUBLISHED=0
+                UNIT_ROLLBACK_RELOAD_FAILED=0
+                UNIT_BACKUP=""
+                UNIT_CANDIDATE_GUARD=""
+                UNIT_CANDIDATE_SNAPSHOT=""
+                UNIT_CANDIDATE_WITNESS=""
+                UNIT_REJECTED=""
+                UNIT_TRANSACTION_DIR=""
+                UNIT_RETAINED_BACKUP=""
+                BINARY_COMMIT_IN_PROGRESS=0
+                BINARY_COMMIT_SOURCE=""
+                BINARY_COMMIT_DESTINATION=""
+                BINARY_COMMIT_WITNESS=""
+
+                do_upgrade || return 1
+                got="$(<"$calls")"
+                expected='reload|helper|reload|exchange|validate|binary-witness|'
+                [ "$restart_mode" -eq 0 ] || expected="${expected}restart|"
+                {
+                    [ "$got" = "$expected" ] &&
+                        [ "$(<"$unit")" = new-unit ] &&
+                        [ "$(<"$installed")" = new-binary ] &&
+                        [ "$(<"$retained")" = old-unit ] &&
+                        [ "$retained" -ef "$legacy_witness" ] &&
+                        [ ! -e "$test_migration_dir" ] &&
+                        [ ! -L "$test_migration_dir" ] &&
+                        [ ! -e "$staged_binary" ] && [ ! -L "$staged_binary" ] &&
+                        [ ! -e "$staged_unit" ] && [ ! -L "$staged_unit" ] &&
+                        [ ! -e "$commit_witness" ] && [ ! -L "$commit_witness" ] &&
+                        [ "$UNIT_TRANSACTION_ACTIVE" -eq 0 ] &&
+                        [ -z "$STAGED_BIN" ] && [ -z "$STAGED_UNIT" ]
+                } || return 1
+
+                command rm -f -- "$unit" "$config" "$source" "$installed" \
+                    "$calls" "$helper" "$retained" "$legacy_witness" || return 1
+                command rmdir -- "$case_tmp" || return 1
+            done
+        }
+
+        if _run_legacy_upgrade_commit_cases >"$output" 2>&1; then
+            printf 'ok   legacy upgrade commits unit and binary transaction with restart control\n'
+        else
+            printf 'FAIL legacy upgrade commit transaction: %s\n' "$(<"$output")"
+            test_result=1
+        fi
+
+        for restart_mode in 1 0; do
+            case_tmp="$test_tmp/case-$restart_mode"
+            unit="$case_tmp/alighieri.service"
+            installed="$case_tmp/installed-alighieri"
+            test_migration_dir="${unit}.migration"
+            command rm -f -- "$unit" "${unit}.pre-migration" \
+                "${unit}.new.$$" "$case_tmp/alighieri.conf" \
+                "$case_tmp/source-alighieri" "$installed" \
+                "${installed}.new.$$" "${installed}.new.$$.commit-witness" \
+                "$case_tmp/calls" "$case_tmp/alighieri-installer-fs" \
+                "$case_tmp/legacy.witness" "$test_migration_dir/candidate" \
+                "$test_migration_dir/candidate.exchange" \
+                "$test_migration_dir/candidate.snapshot" \
+                "$test_migration_dir/candidate.witness" \
+                "$test_migration_dir/previous" \
+                "$test_migration_dir/previous.staged" \
+                "$test_migration_dir/exchange-v1" \
+                "$test_migration_dir/committed" \
+                "$test_migration_dir/binary-commit-intent" \
+                "$test_migration_dir/binary-commit-intent.staged" \
+                "$test_migration_dir/binary-rollback" \
+                "$test_migration_dir/binary-rollback-untrusted" 2>/dev/null || true
+            command rmdir -- "$test_migration_dir" 2>/dev/null || true
+            command rmdir -- "$case_tmp" 2>/dev/null || true
+        done
+        command rm -f -- "$output"
+        command rmdir -- "$test_tmp"
+        unset -f _run_legacy_upgrade_commit_cases
+        return "$test_result"
+    }
+
     # Upgrade must not compare loaded scalar state with newer on-disk list
     # directives, and it must close the potentially long build/preflight window
     # before restart.
     _check_upgrade_reload_order
+    if ! _check_legacy_upgrade_commit; then
+        failures=$((failures + 1))
+    fi
+    unset -f _check_legacy_upgrade_commit
 
     if [ "$failures" -ne 0 ]; then
         printf '\n%d self-test(s) failed\n' "$failures" >&2
