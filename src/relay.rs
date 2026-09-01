@@ -230,7 +230,7 @@ pub async fn relay_tcp(
 /// and for the decrypted inspect path (`plugin::relay`). Uses `tokio::io::split`
 /// on both sides (no owned-split fast path), which is fine off the default relay
 /// hot path.
-#[cfg(feature = "plugins")]
+#[cfg(any(feature = "plugins", feature = "rdp"))]
 pub async fn relay_generic<C, R>(
     client: C,
     remote: R,

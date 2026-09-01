@@ -10,7 +10,9 @@
 //! ```text
 //! # Listen for clients on all interfaces, port 1080.
 //! internal: 0.0.0.0 port = 1080
-//! # Make outbound connections from this address (0.0.0.0 = OS default).
+//! # Direct egress is the default; `rdp` is available in supported Windows builds.
+//! egress: direct
+//! # Make direct outbound connections from this address (0.0.0.0 = OS default).
 //! external: 0.0.0.0
 //!
 //! # Offer "no auth" and username/password; require a userlist for the latter.
@@ -95,6 +97,18 @@ impl AuthKind {
 pub enum Protocol {
     Tcp,
     Udp,
+}
+
+/// Network egress transport used for outbound connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Egress {
+    /// Connect directly from the machine running Alighieri.
+    #[default]
+    Direct,
+    /// Carry TCP streams over an existing Microsoft RDP session and connect
+    /// from the remote Windows machine.
+    Rdp,
 }
 
 /// Where log lines are emitted.
@@ -211,8 +225,11 @@ pub struct RateLimits {
 pub struct Config {
     /// Address the proxy listens on for clients (Dante `internal`).
     pub internal: SocketAddr,
+    /// Transport used for outbound connections. Defaults to [`Egress::Direct`].
+    pub egress: Egress,
     /// Local address used as the source for outbound connections
-    /// (Dante `external`). `0.0.0.0` lets the OS choose.
+    /// (Dante `external`). This applies only to direct egress; `0.0.0.0` or
+    /// `[::]` lets the OS choose and is required when RDP egress is selected.
     pub external: IpAddr,
     /// Trusted upstream CIDRs permitted to send a PROXY protocol header. Empty
     /// disables PROXY protocol. When non-empty, a connection from a listed
@@ -416,15 +433,40 @@ impl Config {
             && !self.internal.ip().to_canonical().is_loopback()
     }
 
-    /// Validates settings that only take effect when the process starts (so this
-    /// is run at startup and by `config check`, but not on reload, where these
-    /// settings are not applied anyway).
+    /// Validates process-level constraints before a configuration becomes
+    /// effective. This is run at startup and by `config check`. On reload, the
+    /// server first restores restart-only settings to their active values, then
+    /// validates the resulting effective configuration.
+    ///
+    /// RDP egress must be supported by the current build and requires an
+    /// unspecified `external` address because the remote agent controls the
+    /// outbound socket.
     ///
     /// The metrics endpoint is unauthenticated and exposes operational counters
     /// and rule labels, so a non-loopback (or unspecified) `metrics.listen` is
     /// refused unless the operator explicitly opts in with `metrics.allowpublic`.
     /// An IPv4-mapped loopback address is canonicalised first.
     pub fn validate_startup(&self) -> Result<()> {
+        if self.egress == Egress::Rdp {
+            if !self.external.is_unspecified() {
+                return Err(Error::Config(format!(
+                    "external {} cannot be used with egress 'rdp'; use an unspecified address \
+                     (0.0.0.0 or ::) because the remote agent controls the outbound socket",
+                    self.external
+                )));
+            }
+
+            #[cfg(not(windows))]
+            return Err(Error::Config(
+                "egress 'rdp' is only available on Windows".into(),
+            ));
+
+            #[cfg(all(windows, not(feature = "rdp")))]
+            return Err(Error::Config(
+                "egress 'rdp' requires a build with the Cargo feature 'rdp' enabled".into(),
+            ));
+        }
+
         if let Some(addr) = self.metrics_listen {
             let ip = addr.ip().to_canonical();
             if (ip.is_unspecified() || !ip.is_loopback()) && !self.metrics_allow_public {
@@ -433,6 +475,25 @@ impl Config {
                      so set 'metrics.allowpublic: true' to expose it or bind it to 127.0.0.1/[::1]"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Rejects settings that cannot operate from the Windows Service host.
+    ///
+    /// RDP dynamic virtual channels belong to an interactive user's desktop
+    /// session, while the managed service runs as LocalService in session 0.
+    /// Until a deliberately authenticated service-to-user broker exists, fail
+    /// before service installation/startup instead of accepting an unusable
+    /// transport configuration.
+    #[cfg(windows)]
+    pub(crate) fn validate_windows_service_startup(&self) -> Result<()> {
+        if self.egress == Egress::Rdp {
+            return Err(Error::Config(
+                "egress 'rdp' is unavailable in Windows Service mode; run Alighieri as an \
+                 interactive console process"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -649,6 +710,7 @@ const MAX_LOG_ROTATE_KEEP: usize = 10_000;
 #[derive(Default)]
 struct Builder {
     internal: Option<SocketAddr>,
+    egress: Option<Egress>,
     external: Option<IpAddr>,
     proxy_protocol: Option<Vec<Cidr>>,
     socks_methods: Option<Vec<AuthKind>>,
@@ -784,6 +846,7 @@ impl Builder {
 
         Ok(Config {
             internal,
+            egress: self.egress.unwrap_or(Egress::Direct),
             external: self.external.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             proxy_protocol: self.proxy_protocol.unwrap_or_default(),
             socks_methods,
@@ -849,6 +912,7 @@ impl Builder {
 fn parse_setting(b: &mut Builder, key: &str, vals: &[String], lineno: usize) -> Result<()> {
     match key {
         "internal" => b.internal = Some(parse_endpoint(vals, lineno)?),
+        "egress" => b.egress = Some(parse_egress(vals, lineno)?),
         "external" => b.external = Some(parse_ip(vals, lineno)?),
         "proxyprotocol" | "proxy.protocol" => {
             if vals.is_empty() {
@@ -1349,6 +1413,20 @@ fn parse_log_format(vals: &[String], lineno: usize) -> Result<LogFormat> {
         other => Err(cfg_err(
             lineno,
             &format!("unsupported logformat '{other}' (expected 'text' or 'json')"),
+        )),
+    }
+}
+
+fn parse_egress(vals: &[String], lineno: usize) -> Result<Egress> {
+    match expect_single(vals, lineno, "egress transport")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "direct" => Ok(Egress::Direct),
+        "rdp" => Ok(Egress::Rdp),
+        other => Err(cfg_err(
+            lineno,
+            &format!("unsupported egress '{other}' (expected 'direct' or 'rdp')"),
         )),
     }
 }
@@ -1971,6 +2049,7 @@ mod tests {
         r#"
 # Alighieri sample
 internal: 0.0.0.0 port = 1080
+egress: direct
 external: 0.0.0.0
 socksmethod: none
 connecttimeout: 15
@@ -2014,6 +2093,7 @@ socks pass {
     fn parse_full_sample() {
         let cfg = Config::parse(sample()).unwrap();
         assert_eq!(cfg.internal, "0.0.0.0:1080".parse().unwrap());
+        assert_eq!(cfg.egress, Egress::Direct);
         assert_eq!(cfg.external, "0.0.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(cfg.socks_methods, vec![AuthKind::None]);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(15));
@@ -2072,6 +2152,7 @@ socks pass {
     #[test]
     fn defaults_applied() {
         let cfg = Config::parse("internal: 127.0.0.1 port = 1080").unwrap();
+        assert_eq!(cfg.egress, Egress::Direct);
         assert_eq!(cfg.external, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(cfg.socks_methods, vec![AuthKind::None]);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
@@ -2340,6 +2421,7 @@ ratelimit.bytes: 64KiB/30
         // Scalar value parsers (IP, enum keywords, the cache-ttl keyword, usize)
         // reject extra tokens instead of silently using only the first.
         assert!(Config::parse("internal: 127.0.0.1:1080\nexternal: 0.0.0.0 oops").is_err());
+        assert!(Config::parse("internal: 127.0.0.1:1080\negress: direct oops").is_err());
         assert!(Config::parse("internal: 127.0.0.1:1080\nlogformat: json text").is_err());
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.prefer: ipv4 oops").is_err());
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: off oops").is_err());
@@ -2347,6 +2429,7 @@ ratelimit.bytes: 64KiB/30
         assert!(Config::parse("internal: 127.0.0.1:1080\nlogrotate.keep: 5 oops").is_err());
         // The valid single-value forms still parse.
         assert!(Config::parse("internal: 127.0.0.1:1080\nexternal: 0.0.0.0").is_ok());
+        assert!(Config::parse("internal: 127.0.0.1:1080\negress: direct").is_ok());
         assert!(Config::parse("internal: 127.0.0.1:1080\nlogformat: json").is_ok());
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.prefer: ipv4").is_ok());
         assert!(Config::parse("internal: 127.0.0.1:1080\ndns.cachettl: off").is_ok());
@@ -2394,6 +2477,65 @@ ratelimit.bytes: 64KiB/30
     fn rejects_unknown_dns_preference() {
         let err = Config::parse("internal: 127.0.0.1:1080\ndns.prefer: ipv10").unwrap_err();
         assert!(err.to_string().contains("unsupported dns.prefer"));
+    }
+
+    #[test]
+    fn parses_rdp_egress_and_rejects_unknown_transport() {
+        let cfg = Config::parse("internal: 127.0.0.1:1080\negress: RDP").unwrap();
+        assert_eq!(cfg.egress, Egress::Rdp);
+
+        let err = Config::parse("internal: 127.0.0.1:1080\negress: teleport").unwrap_err();
+        assert!(err.to_string().contains("expected 'direct' or 'rdp'"));
+    }
+
+    #[test]
+    fn rdp_egress_rejects_a_concrete_external_address() {
+        let cfg =
+            Config::parse("internal: 127.0.0.1:1080\negress: rdp\nexternal: 192.0.2.10").unwrap();
+        let err = cfg.validate_startup().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("external 192.0.2.10"), "{err}");
+        assert!(message.contains("egress 'rdp'"), "{err}");
+
+        // The direct transport retains the existing source-bind behavior.
+        let cfg = Config::parse("internal: 127.0.0.1:1080\negress: direct\nexternal: 192.0.2.10")
+            .unwrap();
+        cfg.validate_startup().unwrap();
+    }
+
+    #[test]
+    fn rdp_egress_requires_a_supported_build() {
+        let cfg = Config::parse("internal: 127.0.0.1:1080\negress: rdp").unwrap();
+
+        #[cfg(not(windows))]
+        {
+            let err = cfg.validate_startup().unwrap_err();
+            assert!(
+                err.to_string().contains("only available on Windows"),
+                "{err}"
+            );
+        }
+
+        #[cfg(all(windows, not(feature = "rdp")))]
+        {
+            let err = cfg.validate_startup().unwrap_err();
+            assert!(err.to_string().contains("feature 'rdp' enabled"), "{err}");
+        }
+
+        #[cfg(all(windows, feature = "rdp"))]
+        cfg.validate_startup().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rdp_egress_is_rejected_for_the_windows_service_host() {
+        let cfg = Config::parse("internal: 127.0.0.1:1080\negress: rdp").unwrap();
+        let err = cfg.validate_windows_service_startup().unwrap_err();
+        assert!(err.to_string().contains("Windows Service mode"), "{err}");
+        assert!(err.to_string().contains("interactive console"), "{err}");
+
+        let cfg = Config::parse("internal: 127.0.0.1:1080\negress: direct").unwrap();
+        cfg.validate_windows_service_startup().unwrap();
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub mod platform;
 #[cfg(feature = "plugins")]
 pub mod plugin;
 mod proxy_protocol;
+#[cfg(feature = "rdp")]
+#[doc(hidden)]
+pub mod rdp;
 mod relay;
 pub mod runtime;
 pub mod server;
