@@ -8,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use windows::core::{Error as WindowsError, PCSTR};
 use windows::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, ERROR_TIMEOUT, HANDLE, WIN32_ERROR,
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_PIPE_NOT_CONNECTED, ERROR_TIMEOUT, HANDLE,
+    WIN32_ERROR,
 };
 use windows::Win32::System::RemoteDesktop::{
     WTSVirtualChannelClose, WTSVirtualChannelOpenEx, WTSVirtualChannelRead, WTSVirtualChannelWrite,
@@ -177,10 +178,12 @@ fn wts_actor(
             WTSVirtualChannelRead(channel, READ_TIMEOUT_MS, &mut read_buffer, &mut count)
         };
         if let Err(error) = read {
-            // A timeout is the actor's scheduling tick, not a session failure.
+            // A no-data result is the actor's scheduling tick, not a session
+            // failure. WTS can report a finite read timeout as either
+            // ERROR_TIMEOUT or ERROR_IO_INCOMPLETE.
             // Inspect the error already captured by windows-rs rather than
             // consulting the thread-local last-error value a second time.
-            if is_win32_error(&error, ERROR_TIMEOUT) {
+            if is_wts_read_poll_tick(&error) {
                 continue;
             }
             let win32 = win32_error_code(&error);
@@ -288,6 +291,10 @@ fn is_win32_error(error: &WindowsError, expected: WIN32_ERROR) -> bool {
     win32_error_code(error) == Some(expected.0)
 }
 
+fn is_wts_read_poll_tick(error: &WindowsError) -> bool {
+    is_win32_error(error, ERROR_TIMEOUT) || is_win32_error(error, ERROR_IO_INCOMPLETE)
+}
+
 fn win32_error_code(error: &WindowsError) -> Option<u32> {
     let hresult = error.code().0 as u32;
     (hresult & 0xffff_0000 == 0x8007_0000).then_some(hresult & 0x0000_ffff)
@@ -358,5 +365,18 @@ mod tests {
         let generic = WindowsError::from_hresult(HRESULT(0x8000_4005_u32 as i32));
         assert_eq!(win32_error_code(&generic), None);
         assert_eq!(windows_error(generic).raw_os_error(), None);
+    }
+
+    #[test]
+    fn wts_read_poll_tick_accepts_only_no_data_errors() {
+        let timeout = WindowsError::from_hresult(HRESULT::from_win32(ERROR_TIMEOUT.0));
+        let incomplete = WindowsError::from_hresult(HRESULT::from_win32(ERROR_IO_INCOMPLETE.0));
+        let broken_pipe = WindowsError::from_hresult(HRESULT::from_win32(ERROR_BROKEN_PIPE.0));
+        let generic = WindowsError::from_hresult(HRESULT(0x8000_4005_u32 as i32));
+
+        assert!(is_wts_read_poll_tick(&timeout));
+        assert!(is_wts_read_poll_tick(&incomplete));
+        assert!(!is_wts_read_poll_tick(&broken_pipe));
+        assert!(!is_wts_read_poll_tick(&generic));
     }
 }
