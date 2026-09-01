@@ -2310,6 +2310,7 @@ mod tests {
             .resolve("localhost", port, Duration::from_secs(3))
             .await
             .unwrap();
+        assert!(resolved.can_retry());
         assert!(!resolved.candidates().is_empty());
         let invalid = SocketAddr::from(([192, 0, 2, 1], port));
         assert_eq!(
@@ -2319,6 +2320,7 @@ mod tests {
                 .unwrap_err(),
             MuxError::InvalidCandidate(invalid)
         );
+        assert!(resolved.can_retry());
         let selected = resolved
             .candidates()
             .iter()
@@ -2330,6 +2332,7 @@ mod tests {
             .open(selected, Duration::from_secs(3))
             .await
             .unwrap();
+        assert!(!resolved.can_retry());
         accept.await.unwrap().unwrap();
         drop(stream);
         driver.abort();
