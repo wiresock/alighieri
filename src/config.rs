@@ -433,9 +433,14 @@ impl Config {
             && !self.internal.ip().to_canonical().is_loopback()
     }
 
-    /// Validates settings that only take effect when the process starts (so this
-    /// is run at startup and by `config check`, but not on reload, where these
-    /// settings are not applied anyway).
+    /// Validates process-level constraints before a configuration becomes
+    /// effective. This is run at startup and by `config check`. On reload, the
+    /// server first restores restart-only settings to their active values, then
+    /// validates the resulting effective configuration.
+    ///
+    /// RDP egress must be supported by the current build and requires an
+    /// unspecified `external` address because the remote agent controls the
+    /// outbound socket.
     ///
     /// The metrics endpoint is unauthenticated and exposes operational counters
     /// and rule labels, so a non-loopback (or unspecified) `metrics.listen` is

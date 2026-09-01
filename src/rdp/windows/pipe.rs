@@ -58,6 +58,10 @@ impl Drop for SecurityDescriptor {
 /// first-instance flag detects a pre-existing name and fails closed rather than
 /// connecting the bridge to an untrusted server.
 pub fn create_server() -> io::Result<NamedPipeServer> {
+    create_server_at(PIPE_NAME)
+}
+
+fn create_server_at(pipe_name: &str) -> io::Result<NamedPipeServer> {
     let descriptor = SecurityDescriptor::owner_only()?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -74,7 +78,7 @@ pub fn create_server() -> io::Result<NamedPipeServer> {
     // Windows copies the security descriptor into the new kernel object.
     unsafe {
         options.create_with_security_attributes_raw(
-            PIPE_NAME,
+            pipe_name,
             (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
         )
     }
@@ -119,11 +123,120 @@ fn windows_error(error: windows::core::Error) -> io::Error {
 mod tests {
     use super::*;
 
+    /// Reads a live pipe's DACL back as SDDL through its kernel handle. Keeping
+    /// this independent of [`PIPE_SDDL`] makes the test verify what Windows
+    /// actually installed, rather than merely re-checking the input string.
+    ///
+    /// Returns `None` when the current account cannot read the descriptor. CI
+    /// sets `ALIGHIERI_REQUIRE_DACL_TESTS`, so that path is enforced there while
+    /// still allowing an unusually restricted developer account to skip it.
+    fn read_dacl_sddl(server: &NamedPipeServer) -> Option<String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_ACCESS_DENIED, HANDLE};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_KERNEL_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        // SAFETY: the server owns a valid live kernel handle. `GetSecurityInfo`
+        // allocates `psd` with LocalAlloc, and pointers returned inside it stay
+        // valid until that descriptor is freed below.
+        unsafe {
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let rc = GetSecurityInfo(
+                server.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut psd,
+            );
+            if rc == ERROR_ACCESS_DENIED {
+                LocalFree(psd);
+                return None;
+            }
+            assert_eq!(rc, 0, "GetSecurityInfo failed (code {rc})");
+
+            let mut sddl_ptr: *mut u16 = std::ptr::null_mut();
+            let mut len = 0u32;
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_ptr,
+                &mut len,
+            );
+            assert_ne!(ok, 0, "converting the pipe descriptor to SDDL failed");
+            let chars = (len as usize).saturating_sub(1);
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(sddl_ptr, chars));
+            LocalFree(sddl_ptr.cast());
+            LocalFree(psd);
+            Some(sddl)
+        }
+    }
+
+    fn skip_dacl_test_or_panic(reason: &str) {
+        if std::env::var_os("ALIGHIERI_REQUIRE_DACL_TESTS").is_some_and(|v| !v.is_empty()) {
+            panic!("a DACL test would skip but ALIGHIERI_REQUIRE_DACL_TESTS is set: {reason}");
+        }
+        eprintln!("skipping DACL test: {reason}");
+    }
+
     #[test]
     fn pipe_name_is_local_and_sddl_is_protected() {
         assert!(PIPE_NAME.starts_with(r"\\.\pipe\"));
         assert!(PIPE_SDDL.starts_with("D:P"));
         assert!(PIPE_SDDL.contains(";;;OW"));
         assert!(!PIPE_SDDL.contains(";;;WD"));
+    }
+
+    #[tokio::test]
+    async fn created_pipe_is_owner_system_only_and_single_instance() {
+        let pipe_name = format!(r"\\.\pipe\alighieri-rdp-v1-test-{}", std::process::id());
+        let server = create_server_at(&pipe_name).expect("the secured test pipe must be created");
+
+        let error = match create_server_at(&pipe_name) {
+            Ok(_) => panic!("a second first-instance pipe creation must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32),
+            "the duplicate first-instance creation must fail closed"
+        );
+
+        let Some(sddl) = read_dacl_sddl(&server) else {
+            skip_dacl_test_or_panic("the secured pipe DACL is not readable by this account");
+            return;
+        };
+        assert!(
+            sddl.starts_with("D:P"),
+            "the pipe DACL must be protected: {sddl}"
+        );
+        let aces: Vec<&str> = sddl
+            .split(['(', ')'])
+            .filter(|chunk| chunk.contains(';'))
+            .collect();
+        assert_eq!(
+            aces.len(),
+            2,
+            "the pipe DACL must have exactly two ACEs: {sddl}"
+        );
+        assert!(
+            aces.iter().all(|ace| ace.starts_with("A;")),
+            "every pipe ACE must be an allow ACE: {sddl}"
+        );
+        let trustees: std::collections::BTreeSet<&str> = aces
+            .iter()
+            .filter_map(|ace| ace.rsplit(';').next())
+            .collect();
+        assert_eq!(
+            trustees,
+            std::collections::BTreeSet::from(["OW", "SY"]),
+            "pipe DACL trustees must be exactly Owner Rights and SYSTEM: {sddl}"
+        );
     }
 }
