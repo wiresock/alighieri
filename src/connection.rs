@@ -1131,7 +1131,7 @@ fn rdp_io_reply(error: &io::Error) -> Reply {
     match error.kind() {
         io::ErrorKind::ConnectionRefused => Reply::ConnectionRefused,
         io::ErrorKind::TimedOut => Reply::TtlExpired,
-        io::ErrorKind::AddrNotAvailable => Reply::HostUnreachable,
+        io::ErrorKind::HostUnreachable | io::ErrorKind::AddrNotAvailable => Reply::HostUnreachable,
         io::ErrorKind::PermissionDenied => Reply::ConnectionNotAllowed,
         io::ErrorKind::Unsupported => Reply::AddressTypeNotSupported,
         io::ErrorKind::OutOfMemory | io::ErrorKind::InvalidData | io::ErrorKind::Other => {
@@ -1333,26 +1333,34 @@ mod tests {
         use crate::rdp::protocol::OpenErrorCode;
 
         let cases = [
+            (OpenErrorCode::General, Reply::GeneralFailure),
+            (OpenErrorCode::PolicyDenied, Reply::ConnectionNotAllowed),
+            (OpenErrorCode::NetworkUnreachable, Reply::NetworkUnreachable),
+            (OpenErrorCode::HostUnreachable, Reply::HostUnreachable),
+            (OpenErrorCode::ConnectionRefused, Reply::ConnectionRefused),
+            (OpenErrorCode::Timeout, Reply::TtlExpired),
+            (OpenErrorCode::ResourceLimit, Reply::GeneralFailure),
             (
-                MuxError::Remote {
-                    code: OpenErrorCode::AddressTypeUnsupported,
-                    diagnostic: "unsupported".into(),
-                },
+                OpenErrorCode::AddressTypeUnsupported,
                 Reply::AddressTypeNotSupported,
             ),
-            (
-                MuxError::Remote {
-                    code: OpenErrorCode::General,
-                    diagnostic: "failed".into(),
-                },
-                Reply::GeneralFailure,
-            ),
-            (MuxError::ResourceLimit, Reply::GeneralFailure),
         ];
 
-        for (error, expected) in cases {
+        for (code, expected) in cases {
+            let error = MuxError::Remote {
+                code,
+                diagnostic: "remote failure".into(),
+            };
             assert_eq!(rdp_io_reply(&error.into_io()), expected);
         }
+        assert_eq!(
+            rdp_io_reply(&io::Error::from(io::ErrorKind::HostUnreachable)),
+            Reply::HostUnreachable
+        );
+        assert_eq!(
+            rdp_io_reply(&MuxError::ResourceLimit.into_io()),
+            Reply::GeneralFailure
+        );
     }
 
     #[test]

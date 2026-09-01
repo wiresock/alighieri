@@ -79,7 +79,7 @@ impl MuxError {
             Self::Remote {
                 code: OpenErrorCode::HostUnreachable,
                 ..
-            } => io::ErrorKind::AddrNotAvailable,
+            } => io::ErrorKind::HostUnreachable,
             Self::Remote {
                 code: OpenErrorCode::NetworkUnreachable,
                 ..
@@ -2187,7 +2187,9 @@ fn open_error_code(error: &io::Error) -> OpenErrorCode {
         io::ErrorKind::ConnectionRefused => OpenErrorCode::ConnectionRefused,
         io::ErrorKind::TimedOut => OpenErrorCode::Timeout,
         io::ErrorKind::NetworkUnreachable => OpenErrorCode::NetworkUnreachable,
-        io::ErrorKind::NotFound | io::ErrorKind::AddrNotAvailable => OpenErrorCode::HostUnreachable,
+        io::ErrorKind::NotFound
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::HostUnreachable => OpenErrorCode::HostUnreachable,
         io::ErrorKind::Unsupported => OpenErrorCode::AddressTypeUnsupported,
         io::ErrorKind::OutOfMemory => OpenErrorCode::ResourceLimit,
         io::ErrorKind::PermissionDenied => OpenErrorCode::PolicyDenied,
@@ -2694,6 +2696,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_connect_host_unreachable_is_returned_as_open_error() {
+        let candidates = vec!["192.0.2.10:443".parse().unwrap()];
+        let mut streams = BTreeMap::from([(
+            1,
+            AgentStreamState::Opening {
+                candidates: Some(candidates.clone()),
+            },
+        )]);
+        let (ordered, mut ordered_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+        let mut relays = JoinSet::new();
+        finish_agent_operation(
+            AgentOperation::Opened {
+                stream_id: 1,
+                result: Err(io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    "no route to host",
+                )),
+            },
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: 8,
+                max_streams: 1,
+            },
+            &mut streams,
+            &ordered,
+            &events,
+            &mut relays,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            ordered_rx.recv().await,
+            Some(Frame::OpenError {
+                stream_id: 1,
+                code: OpenErrorCode::HostUnreachable,
+                diagnostic: "no route to host".into(),
+            })
+        );
+        assert!(matches!(
+            streams.get(&1),
+            Some(AgentStreamState::Resolved(saved)) if saved == &candidates
+        ));
+    }
+
+    #[tokio::test]
     async fn local_io_failure_queues_an_io_close() {
         let shared = StreamShared::new(8);
         shared.set_close_reason(CloseReason::Io);
@@ -2848,6 +2897,41 @@ mod tests {
     }
 
     #[test]
+    fn io_error_kinds_map_to_open_error_codes() {
+        let cases = [
+            (
+                io::ErrorKind::ConnectionRefused,
+                OpenErrorCode::ConnectionRefused,
+            ),
+            (io::ErrorKind::TimedOut, OpenErrorCode::Timeout),
+            (
+                io::ErrorKind::NetworkUnreachable,
+                OpenErrorCode::NetworkUnreachable,
+            ),
+            (
+                io::ErrorKind::HostUnreachable,
+                OpenErrorCode::HostUnreachable,
+            ),
+            (io::ErrorKind::NotFound, OpenErrorCode::HostUnreachable),
+            (
+                io::ErrorKind::AddrNotAvailable,
+                OpenErrorCode::HostUnreachable,
+            ),
+            (
+                io::ErrorKind::Unsupported,
+                OpenErrorCode::AddressTypeUnsupported,
+            ),
+            (io::ErrorKind::OutOfMemory, OpenErrorCode::ResourceLimit),
+            (io::ErrorKind::PermissionDenied, OpenErrorCode::PolicyDenied),
+            (io::ErrorKind::Other, OpenErrorCode::General),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(open_error_code(&io::Error::from(kind)), expected);
+        }
+    }
+
+    #[test]
     fn stream_ids_and_agent_policy_are_strict() {
         assert!(validate_local_stream_id(1).is_ok());
         assert!(validate_local_stream_id(0).is_err());
@@ -2880,7 +2964,7 @@ mod tests {
             }
             .into_io()
             .kind(),
-            io::ErrorKind::AddrNotAvailable
+            io::ErrorKind::HostUnreachable
         );
     }
 }
