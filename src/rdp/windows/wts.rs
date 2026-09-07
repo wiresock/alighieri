@@ -106,6 +106,8 @@ async fn open_bridge() -> io::Result<DuplexStream> {
     ready_rx
         .await
         .map_err(|_| io::Error::other("WTS actor stopped before initialization"))??;
+    // Intentionally detached: actor stop cancels this generation's pump
+    // independently of I/O progress; process/runtime teardown aborts it too.
     tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx));
     Ok(mux_side)
 }
@@ -147,16 +149,57 @@ async fn pump_bridge(
 }
 
 fn wts_actor(
-    mut outbound: mpsc::Receiver<Vec<u8>>,
+    outbound: mpsc::Receiver<Vec<u8>>,
     inbound: mpsc::Sender<Vec<u8>>,
     ready: oneshot::Sender<io::Result<()>>,
     stopped: oneshot::Sender<()>,
 ) {
-    let channel = match open_channel() {
+    wts_actor_with_channel(outbound, inbound, ready, stopped, || {
+        open_channel().map(NativeWtsChannel)
+    });
+}
+
+// Keep the actor's real control flow testable without a live RDP session. Only
+// the native API boundary is substituted; queueing, reassembly and exit paths
+// (including stop-before-close ordering) are shared with production.
+trait WtsChannel {
+    fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize>;
+    fn write(&mut self, data: &[u8]) -> io::Result<()>;
+    fn close(self);
+}
+
+struct NativeWtsChannel(HANDLE);
+
+impl WtsChannel for NativeWtsChannel {
+    fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize> {
+        let mut count = 0u32;
+        // SAFETY: the channel handle is owned exclusively by this actor thread;
+        // the mutable buffer and count out pointer remain live for the call.
+        unsafe { WTSVirtualChannelRead(self.0, READ_TIMEOUT_MS, buffer, &mut count) }?;
+        Ok(count as usize)
+    }
+
+    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        write_channel(self.0, data)
+    }
+
+    fn close(self) {
+        close_channel(self.0);
+    }
+}
+
+fn wts_actor_with_channel<C: WtsChannel>(
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    inbound: mpsc::Sender<Vec<u8>>,
+    ready: oneshot::Sender<io::Result<()>>,
+    stopped: oneshot::Sender<()>,
+    open: impl FnOnce() -> io::Result<C>,
+) {
+    let mut channel = match open() {
         Ok(channel) => {
             if ready.send(Ok(())).is_err() {
                 let _ = stopped.send(());
-                close_channel(channel);
+                channel.close();
                 return;
             }
             channel
@@ -170,7 +213,7 @@ fn wts_actor(
     let mut reassembler = DvcReassembler::new();
     let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
     loop {
-        match drain_outbound_batch(&mut outbound, |data| write_channel(channel, data)) {
+        match drain_outbound_batch(&mut outbound, |data| channel.write(data)) {
             Ok(OutboundQueueState::Open) => {}
             Ok(OutboundQueueState::Closed) => break,
             Err(error) => {
@@ -179,29 +222,25 @@ fn wts_actor(
             }
         }
 
-        let mut count = 0u32;
-        // SAFETY: the channel handle is owned exclusively by this actor thread;
-        // the mutable buffer and count out pointer remain live for the call.
-        let read = unsafe {
-            WTSVirtualChannelRead(channel, READ_TIMEOUT_MS, &mut read_buffer, &mut count)
-        };
-        if let Err(error) = read {
-            // A no-data result is the actor's scheduling tick, not a session
-            // failure. WTS can report a finite read timeout as either
-            // ERROR_TIMEOUT or ERROR_IO_INCOMPLETE.
-            // Inspect the error already captured by windows-rs rather than
-            // consulting the thread-local last-error value a second time.
-            if is_wts_read_poll_tick(&error) {
-                continue;
+        let count = match channel.read(&mut read_buffer) {
+            Ok(count) => count,
+            Err(error) => {
+                // A no-data result is the actor's scheduling tick, not a session
+                // failure. WTS can report a finite read timeout as either
+                // ERROR_TIMEOUT or ERROR_IO_INCOMPLETE.
+                // Inspect the error already captured by windows-rs rather than
+                // consulting the thread-local last-error value a second time.
+                if is_wts_read_poll_tick(&error) {
+                    continue;
+                }
+                let win32 = win32_error_code(&error);
+                debug!(%error, ?win32, "WTS channel read failed");
+                break;
             }
-            let win32 = win32_error_code(&error);
-            debug!(%error, ?win32, "WTS channel read failed");
-            break;
-        }
+        };
         if count == 0 {
             break;
         }
-        let count = count as usize;
         if count > read_buffer.len() {
             warn!(count, "WTS returned an impossible read length");
             break;
@@ -223,7 +262,7 @@ fn wts_actor(
     // Publish termination before entering another blocking Windows API, not
     // merely when the actor's queue endpoints are eventually dropped.
     let _ = stopped.send(());
-    close_channel(channel);
+    channel.close();
 }
 
 fn forward_inbound(inbound: &mpsc::Sender<Vec<u8>>, message: Vec<u8>) -> io::Result<()> {
@@ -339,6 +378,134 @@ mod tests {
     use crate::rdp::protocol::{Frame, FrameDecoder, Hello, Role};
     use tokio::net::TcpListener;
     use windows::core::HRESULT;
+
+    enum ActorRead {
+        Bytes(Vec<u8>),
+        Count(usize),
+        Error(WIN32_ERROR),
+    }
+
+    struct TestWtsChannel<'a> {
+        scenario: &'static str,
+        read: Option<ActorRead>,
+        fail_write: bool,
+        stopped: &'a mut oneshot::Receiver<()>,
+        closes: &'a mut usize,
+    }
+
+    impl WtsChannel for TestWtsChannel<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize> {
+            match self.read.take().expect("unexpected actor read") {
+                ActorRead::Bytes(data) => {
+                    buffer[..data.len()].copy_from_slice(&data);
+                    Ok(data.len())
+                }
+                ActorRead::Count(count) => Ok(count),
+                ActorRead::Error(error) => {
+                    Err(WindowsError::from_hresult(HRESULT::from_win32(error.0)))
+                }
+            }
+        }
+
+        fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+            assert!(self.fail_write, "unexpected actor write");
+            self.fail_write = false;
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn close(self) {
+            // This runs at entry to the close API, not after the actor returns.
+            // Removing either production send must fail even though dropping
+            // the sender would eventually wake the pump after close returns.
+            assert_eq!(self.stopped.try_recv(), Ok(()), "{}", self.scenario);
+            assert!(self.read.is_none(), "{} exited before read", self.scenario);
+            assert!(!self.fail_write, "{} exited before write", self.scenario);
+            *self.closes += 1;
+        }
+    }
+
+    #[test]
+    fn actor_exit_paths_signal_stop_before_close() {
+        for scenario in [
+            "initialization cancelled",
+            "outbound closed",
+            "write failure",
+            "read failure",
+            "read EOF",
+            "oversized read",
+            "malformed PDU",
+            "inbound full",
+            "inbound closed",
+        ] {
+            let (outbound_tx, outbound_rx) = mpsc::channel(1);
+            let (inbound_tx, inbound_rx) = mpsc::channel(1);
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (stopped_tx, mut stopped_rx) = oneshot::channel();
+            let mut outbound_tx = Some(outbound_tx);
+            let mut inbound_rx = Some(inbound_rx);
+            let mut ready_rx = Some(ready_rx);
+            let mut closes = 0;
+            let mut channel = TestWtsChannel {
+                scenario,
+                read: None,
+                fail_write: false,
+                stopped: &mut stopped_rx,
+                closes: &mut closes,
+            };
+            match scenario {
+                "initialization cancelled" => drop(ready_rx.take()),
+                "outbound closed" => drop(outbound_tx.take()),
+                "write failure" => {
+                    outbound_tx.as_ref().unwrap().try_send(vec![1]).unwrap();
+                    channel.fail_write = true;
+                }
+                "read failure" => channel.read = Some(ActorRead::Error(ERROR_BROKEN_PIPE)),
+                "read EOF" => channel.read = Some(ActorRead::Count(0)),
+                "oversized read" => channel.read = Some(ActorRead::Count(READ_BUFFER_SIZE + 1)),
+                "malformed PDU" => channel.read = Some(ActorRead::Bytes(vec![0])),
+                "inbound full" | "inbound closed" => {
+                    if scenario == "inbound full" {
+                        inbound_tx.try_send(vec![0]).unwrap();
+                    } else {
+                        drop(inbound_rx.take());
+                    }
+                    // One complete WTS CHANNEL_PDU_HEADER + payload (FIRST|LAST).
+                    channel.read = Some(ActorRead::Bytes(vec![1, 0, 0, 0, 3, 0, 0, 0, 42]));
+                }
+                _ => unreachable!(),
+            }
+            wts_actor_with_channel(outbound_rx, inbound_tx, ready_tx, stopped_tx, || {
+                Ok(channel)
+            });
+            assert_eq!(closes, 1, "{scenario}");
+            if let Some(mut ready_rx) = ready_rx {
+                ready_rx.try_recv().unwrap().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn actor_open_failure_reports_error_and_drops_stop_sender() {
+        let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let (stopped_tx, mut stopped_rx) = oneshot::channel();
+        wts_actor_with_channel::<TestWtsChannel<'_>>(
+            outbound_rx,
+            inbound_tx,
+            ready_tx,
+            stopped_tx,
+            || Err(io::Error::from(io::ErrorKind::NotConnected)),
+        );
+        assert_eq!(
+            ready_rx.try_recv().unwrap().unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert_eq!(
+            stopped_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        );
+    }
 
     #[tokio::test]
     async fn actor_death_cancels_pumps_parked_on_duplex_io() {

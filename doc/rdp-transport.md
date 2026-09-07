@@ -447,6 +447,13 @@ first-instance collision and client-side owner validation. Set
 `ALIGHIERI_REQUIRE_DACL_TESTS=1` for required Windows security test runs, as CI
 does. Tests that require a real RDP stack remain manual.
 
+Actor exit-path tests use the production loop with only the WTS API boundary
+substituted. They verify explicit stop notification before close for cancelled
+initialization, disconnected queues, read/write failure, EOF, invalid lengths,
+malformed PDUs, and inbound saturation; open failure is covered separately.
+These complement the pump/mux/TCP saturation test, which injects actor death,
+but neither exercises the actual `WTSVirtualChannel*` calls.
+
 ### Recorded live evidence and remaining acceptance gates
 
 The operator-provided September 1, 2026 two-machine x86-64 Windows transcript,
