@@ -372,6 +372,7 @@ impl ResolvedTarget {
         if !self.candidates.contains(&address) {
             return Err(MuxError::InvalidCandidate(address));
         }
+        let deadline = operation_deadline(timeout)?;
         // A cancelled OPEN cannot be retried: its outcome is unknown. Only an
         // explicit remote OPEN_ERROR restores the resolved candidate set.
         self.finished = true;
@@ -390,7 +391,7 @@ impl ResolvedTarget {
                 .map_err(|_| MuxError::Unavailable)?;
             response.await.map_err(|_| MuxError::Unavailable)?
         };
-        match tokio::time::timeout(timeout, operation).await {
+        match tokio::time::timeout_at(deadline, operation).await {
             Ok(Ok(mut stream)) => {
                 cancellation.disarm();
                 stream.slot = self.permit.take();
@@ -2945,6 +2946,44 @@ mod tests {
             Err(error) if error == expected
         ));
         assert_eq!(client.inner.next_stream_id.load(Ordering::Relaxed), 1);
+        driver.abort();
+        agent.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_resolved_open_timeout_preserves_target_for_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, driver, agent) = sessions().await;
+        let mut resolved = client
+            .resolve("127.0.0.1", address.port(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        let candidates = resolved.candidates().to_vec();
+        let available_slots = client.inner.slots.available_permits();
+
+        assert_eq!(
+            resolved
+                .open(address, Duration::from_secs(u64::MAX))
+                .await
+                .unwrap_err(),
+            MuxError::InvalidState("operation timeout exceeds clock range")
+        );
+        assert!(resolved.can_retry());
+        assert_eq!(resolved.candidates(), candidates);
+        assert!(resolved.permit.is_some());
+        assert_eq!(client.inner.slots.available_permits(), available_slots);
+
+        // Invalid input must neither send OPEN nor cancel the resolved stream:
+        // a later valid call still uses the original remote candidate state.
+        let stream = resolved
+            .open(address, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(stream.stream_id(), 1);
+        assert!(!resolved.can_retry());
+        listener.accept().await.unwrap();
+        drop(stream);
         driver.abort();
         agent.abort();
     }

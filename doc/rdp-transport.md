@@ -129,7 +129,10 @@ FIRST/LAST sequence, caps reassembly, ignores documented benign PDU metadata
 Compression and unknown flags remain errors. Consecutive outbound writes are
 batch-limited so reads and their flow-control updates continue to make progress.
 The WTS actor never waits for an inbound queue consumer: saturation cancels the
-generation. Independent local pipe pumps keep reverse traffic and disconnect
+generation. A separate actor-stop notification cancels both duplex pumps even
+when they are blocked on I/O; it is sent before closing the WTS handle so mux
+teardown does not wait for queue polling or a Windows close call to return.
+Independent local pipe pumps keep reverse traffic and disconnect
 cancellation pollable while either direction is backpressured.
 
 On `Disconnected`, `Terminated`, `OnClose`, WTS I/O failure, malformed DVC PDU,
@@ -519,6 +522,17 @@ Windows x86-64 and is additionally cross-built for Windows ARM64.
 - The current 0.5 plugin data-plane interceptor cannot wrap an RDP upstream.
 - Remote DNS is not cached in the MVP; each hostname request uses the remote
   machine's current resolver result.
+- WTS and COM calls run on dedicated OS workers. Shutdown signals cancel async
+  bridges and logical sessions, but cannot interrupt a worker already inside
+  a WTS open/read/write/close or COM proxy/channel call. A stuck Windows API
+  call can retain its worker thread and channel/proxy until the call returns or
+  the helper/agent process exits. The MVP does not promise bounded OS-worker
+  termination; retaining or joining a thread handle would not make those calls
+  cancellable. Repeated reconnects while earlier calls remain stuck can retain
+  multiple workers, so per-generation queue bounds are not a global thread/RSS
+  bound in this failure mode. Validate this distinction during live
+  disconnect/socket-cleanup testing; it requires a different Windows
+  I/O/process-isolation design to remove.
 - Installer integration, Authenticode signing, service brokering, explicit
   metadata CIDRs, richer transport metrics, and automated two-VM RDP testing are
   follow-up work.

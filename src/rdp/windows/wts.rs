@@ -98,14 +98,15 @@ async fn open_bridge() -> io::Result<DuplexStream> {
     let (outbound_tx, outbound_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (stopped_tx, stopped_rx) = oneshot::channel();
     std::thread::Builder::new()
         .name("alighieri-rdp-wts".into())
-        .spawn(move || wts_actor(outbound_rx, inbound_tx, ready_tx))?;
+        .spawn(move || wts_actor(outbound_rx, inbound_tx, ready_tx, stopped_tx))?;
 
     ready_rx
         .await
         .map_err(|_| io::Error::other("WTS actor stopped before initialization"))??;
-    tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx));
+    tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx));
     Ok(mux_side)
 }
 
@@ -113,6 +114,7 @@ async fn pump_bridge(
     bridge: DuplexStream,
     outbound: mpsc::Sender<Vec<u8>>,
     mut inbound: mpsc::Receiver<Vec<u8>>,
+    stopped: oneshot::Receiver<()>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(bridge);
     let to_channel = async {
@@ -135,6 +137,10 @@ async fn pump_bridge(
         writer.shutdown().await
     };
     tokio::select! {
+        // Queue closure cannot wake a pump blocked on duplex I/O. Observe
+        // actor death independently and drop both duplex halves immediately,
+        // including when the stop notification predates this task's first poll.
+        _ = stopped => debug!("WTS actor stopped; cancelling both bridge pumps"),
         result = to_channel => if let Err(error) = result { debug!(%error, "WTS outbound bridge stopped"); },
         result = from_channel => if let Err(error) = result { debug!(%error, "WTS inbound bridge stopped"); },
     }
@@ -144,10 +150,12 @@ fn wts_actor(
     mut outbound: mpsc::Receiver<Vec<u8>>,
     inbound: mpsc::Sender<Vec<u8>>,
     ready: oneshot::Sender<io::Result<()>>,
+    stopped: oneshot::Sender<()>,
 ) {
     let channel = match open_channel() {
         Ok(channel) => {
             if ready.send(Ok(())).is_err() {
+                let _ = stopped.send(());
                 close_channel(channel);
                 return;
             }
@@ -212,6 +220,9 @@ fn wts_actor(
             }
         }
     }
+    // Publish termination before entering another blocking Windows API, not
+    // merely when the actor's queue endpoints are eventually dropped.
+    let _ = stopped.send(());
     close_channel(channel);
 }
 
@@ -325,7 +336,163 @@ fn windows_error(error: WindowsError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdp::protocol::{Frame, FrameDecoder, Hello, Role};
+    use tokio::net::TcpListener;
     use windows::core::HRESULT;
+
+    #[tokio::test]
+    async fn actor_death_cancels_pumps_parked_on_duplex_io() {
+        let (mut mux_side, actor_side) = tokio::io::duplex(1);
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let pump = tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx));
+
+        forward_inbound(&inbound_tx, vec![1; 64]).unwrap();
+        // Reading one byte proves from_channel started its write. Its remaining
+        // bytes cannot fit; to_channel has no duplex input and awaits a read.
+        let mut byte = [0];
+        tokio::time::timeout(Duration::from_secs(3), mux_side.read_exact(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        forward_inbound(&inbound_tx, vec![2; 64]).unwrap();
+        assert_eq!(
+            forward_inbound(&inbound_tx, vec![3]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        stopped_tx.send(()).unwrap();
+        drop(inbound_tx);
+        drop(outbound_rx);
+        tokio::time::timeout(Duration::from_secs(3), pump)
+            .await
+            .expect("actor death must cancel duplex I/O, not wait for queue polling")
+            .unwrap();
+        let mut tail = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), mux_side.read_to_end(&mut tail))
+            .await
+            .expect("dropping the bridge must expose EOF to the mux")
+            .unwrap();
+        assert!(tail.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn actor_stop_before_pump_start_is_not_lost() {
+        let (mut mux_side, actor_side) = tokio::io::duplex(1);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        // Dropping the sender also covers unexpected actor exit/unwinding.
+        drop(stopped_tx);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx),
+        )
+        .await
+        .expect("a stop preceding the first pump poll must remain observable");
+        assert_eq!(mux_side.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    async fn receive_actor_frame(outbound: &mut mpsc::Receiver<Vec<u8>>) -> Frame {
+        let mut decoder = FrameDecoder::new();
+        loop {
+            let bytes = tokio::time::timeout(Duration::from_secs(3), outbound.recv())
+                .await
+                .unwrap()
+                .expect("agent must respond before actor shutdown");
+            let mut frames = decoder.push(&bytes).unwrap();
+            if !frames.is_empty() {
+                // Setup sends one request at a time, before keepalive begins.
+                assert_eq!(frames.len(), 1);
+                assert_eq!(decoder.buffered_len(), 0);
+                return frames.remove(0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_saturation_stops_agent_and_tcp_without_waiting_for_mux_timeout() {
+        // Use the real bridge/mux composition with smaller queues to make
+        // both-direction backpressure deterministic without megabytes of data.
+        let (mux_side, actor_side) = tokio::io::duplex(64);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let pump = tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx));
+        let agent = tokio::spawn(mux::run_agent_session(mux_side, AgentPolicy::default()));
+        forward_inbound(
+            &inbound_tx,
+            Frame::Hello(Hello::new(Role::Local, 1)).encode().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_actor_frame(&mut outbound_rx).await,
+            Frame::Hello(_)
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        forward_inbound(
+            &inbound_tx,
+            Frame::Open {
+                stream_id: 1,
+                address: listener.local_addr().unwrap(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut destination, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            receive_actor_frame(&mut outbound_rx).await,
+            Frame::OpenOk { stream_id: 1, .. }
+        ));
+
+        // Stop consuming actor output. Enough PINGs fill the writer's control
+        // queue and decoded-frame queue, leaving from_channel in write_all and
+        // the reverse pump waiting for the actor to consume its bounded queue.
+        let flood = Frame::Ping { nonce: 7 }.encode().unwrap().repeat(1024);
+        forward_inbound(&inbound_tx, flood.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), inbound_tx.send(flood))
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while outbound_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            forward_inbound(&inbound_tx, vec![0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!agent.is_finished());
+
+        // Signal before closing WTS. Keep the fake actor's queue endpoints
+        // alive: cleanup must not depend on the Windows close API returning.
+        stopped_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), pump)
+            .await
+            .expect("actor death must promptly stop the duplex bridge")
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), agent)
+            .await
+            .expect("agent teardown must not wait for the 45-second mux timeout")
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), destination.read(&mut [0]))
+                .await
+                .expect("agent teardown must close the destination TCP socket")
+                .unwrap(),
+            0
+        );
+        drop((inbound_tx, outbound_rx));
+    }
 
     #[test]
     fn policy_arguments_are_explicit_and_help_exits() {
