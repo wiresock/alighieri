@@ -1,6 +1,6 @@
 //! COM LocalServer and mstsc DVC AddIn registration.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -51,8 +51,12 @@ fn register_path(machine_wide: bool, executable: &Path) -> io::Result<()> {
     let local_server = create_key(root, LOCAL_SERVER_KEY)?;
     // Quote paths containing spaces and additionally set ServerExecutable so
     // COM activation cannot ambiguously parse the image path.
-    let command = format!("\"{}\"", executable.display());
-    set_string(&local_server, None, OsStr::new(&command))?;
+    // Preserve Windows paths containing unpaired UTF-16 code units as well as
+    // ordinary Unicode: Path::display would replace them with U+FFFD.
+    let mut command = OsString::from("\"");
+    command.push(executable.as_os_str());
+    command.push("\"");
+    set_string(&local_server, None, &command)?;
     set_string(
         &local_server,
         Some("ServerExecutable"),

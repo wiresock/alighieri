@@ -549,7 +549,7 @@ pub fn address_allowed(ip: IpAddr, policy: &DnsPolicy) -> bool {
 /// must not be re-routed as IPv4 — are returned unchanged; those prefixes are
 /// instead covered by the `reserved` category. (Operates on `IpAddr`, which has
 /// no scope; the caller's `set_ip` is what preserves a `SocketAddr`'s scope.)
-fn canonical_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
     let ip = ip.to_canonical();
     let IpAddr::V6(v6) = ip else { return ip };
     // `to_ipv4` recognises both IPv4-in-IPv6 wrappers (`::a.b.c.d` and

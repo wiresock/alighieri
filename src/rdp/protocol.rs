@@ -812,11 +812,12 @@ pub fn decode_address(input: &[u8]) -> Result<(SocketAddr, usize), ProtocolError
     Ok((canonicalize_address(address), needed))
 }
 
-/// Canonicalises an IPv4-mapped IPv6 socket address and clears IPv6 flow info.
+/// Canonicalises IPv4-in-IPv6 wrappers consistently with DNS/ACL policy and
+/// clears IPv6 flow info while preserving genuine IPv6 scope IDs.
 pub fn canonicalize_address(address: SocketAddr) -> SocketAddr {
     match address {
         SocketAddr::V4(address) => SocketAddr::V4(address),
-        SocketAddr::V6(address) => match IpAddr::V6(*address.ip()).to_canonical() {
+        SocketAddr::V6(address) => match crate::dns::canonical_ip(IpAddr::V6(*address.ip())) {
             IpAddr::V4(ip) => SocketAddr::new(IpAddr::V4(ip), address.port()),
             IpAddr::V6(ip) => {
                 SocketAddr::V6(SocketAddrV6::new(ip, address.port(), 0, address.scope_id()))
@@ -1583,6 +1584,63 @@ mod tests {
             decode_address(&encoded).unwrap().0,
             "192.0.2.9:8080".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn compatible_ipv6_candidates_match_policy_and_deduplicate() {
+        let compatible: SocketAddr = "[::127.0.0.1]:443".parse().unwrap();
+        let canonical: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(canonicalize_address(compatible), canonical);
+
+        for frame in [
+            Frame::ResolveOk {
+                stream_id: 1,
+                addresses: vec![compatible],
+            },
+            Frame::Open {
+                stream_id: 1,
+                address: compatible,
+            },
+        ] {
+            let expected = match frame {
+                Frame::ResolveOk { .. } => Frame::ResolveOk {
+                    stream_id: 1,
+                    addresses: vec![canonical],
+                },
+                _ => Frame::Open {
+                    stream_id: 1,
+                    address: canonical,
+                },
+            };
+            assert_eq!(
+                Frame::decode_exact(&frame.encode().unwrap()).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            Frame::ResolveOk {
+                stream_id: 1,
+                addresses: vec![compatible, canonical],
+            }
+            .encode()
+            .unwrap_err(),
+            ProtocolError::DuplicateAddress(canonical)
+        );
+        // Also exercise peer-supplied noncanonical IPv6 bytes, rather than
+        // relying only on our encoder (which already collapses wrappers).
+        let mut payload = vec![2];
+        put_u16(&mut payload, compatible.port());
+        let IpAddr::V6(ip) = compatible.ip() else {
+            unreachable!()
+        };
+        payload.extend_from_slice(&ip.octets());
+        put_u32(&mut payload, 0);
+        assert_eq!(decode_address(&payload).unwrap().0, canonical);
+
+        for address in ["[::]:443", "[::1]:443", "[64:ff9b::7f00:1]:443"] {
+            let address: SocketAddr = address.parse().unwrap();
+            assert_eq!(canonicalize_address(address), address);
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! Bounded ALRD session multiplexing shared by the local connector and agent.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,9 @@ const WORKER_QUEUE_CAPACITY: usize = 256;
 const SESSION_CONTROL_BURST: usize = 8;
 
 static NEXT_GENERATION_NONCE: AtomicU64 = AtomicU64::new(1);
+// OS resolver calls cannot be cancelled. Keep their permits inside the actual
+// blocking jobs, so timeouts and reconnects cannot accumulate unbounded jobs.
+static DNS_WORKER_SLOTS: Semaphore = Semaphore::const_new(protocol::MAX_STREAMS as usize);
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub(crate) enum MuxError {
@@ -111,6 +115,24 @@ fn protocol_error(message: impl Into<String>) -> MuxError {
     MuxError::Protocol(message.into())
 }
 
+fn operation_deadline(timeout: Duration) -> Result<Instant, MuxError> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(MuxError::InvalidState(
+            "operation timeout exceeds clock range",
+        ))
+}
+
+async fn session_operation<T>(
+    operation: impl Future<Output = Result<T, MuxError>>,
+) -> Result<T, MuxError> {
+    // A healthy but very slowly draining writer must not let a queue send or
+    // stream gate suspend the driver's keepalive/cancellation checks forever.
+    tokio::time::timeout(FRAME_WRITE_TIMEOUT, operation)
+        .await
+        .map_err(|_| MuxError::Timeout)?
+}
+
 fn generation_nonce() -> u64 {
     let clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -158,6 +180,7 @@ struct ClientInner {
     slots: Arc<Semaphore>,
     admission: AsyncMutex<()>,
     next_stream_id: AtomicU32,
+    shutdown: Arc<Notify>,
 }
 
 impl ClientHandle {
@@ -175,7 +198,7 @@ impl ClientHandle {
         validation
             .validate()
             .map_err(|error| MuxError::Protocol(error.to_string()))?;
-        let deadline = Instant::now() + timeout;
+        let deadline = operation_deadline(timeout)?;
         let permit = tokio::time::timeout_at(deadline, self.inner.slots.clone().acquire_owned())
             .await
             .map_err(|_| MuxError::Timeout)?
@@ -198,21 +221,22 @@ impl ClientHandle {
         .await
         .map_err(|_| MuxError::Timeout)?
         .map_err(|_| MuxError::Unavailable)?;
+        let mut cancellation = PendingClose::new(self, stream_id);
         drop(admission);
         match tokio::time::timeout_at(deadline, response).await {
-            Ok(Ok(Ok(candidates))) => Ok(ResolvedTarget {
-                handle: self.clone(),
-                stream_id,
-                candidates,
-                permit: Some(permit),
-                finished: false,
-            }),
+            Ok(Ok(Ok(candidates))) => {
+                cancellation.disarm();
+                Ok(ResolvedTarget {
+                    handle: self.clone(),
+                    stream_id,
+                    candidates,
+                    permit: Some(permit),
+                    finished: false,
+                })
+            }
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(MuxError::Unavailable),
-            Err(_) => {
-                self.close_best_effort(stream_id);
-                Err(MuxError::Timeout)
-            }
+            Err(_) => Err(MuxError::Timeout),
         }
     }
 
@@ -228,7 +252,7 @@ impl ClientHandle {
         }
         .validate()
         .map_err(|error| MuxError::Protocol(error.to_string()))?;
-        let deadline = Instant::now() + timeout;
+        let deadline = operation_deadline(timeout)?;
         let permit = tokio::time::timeout_at(deadline, self.inner.slots.clone().acquire_owned())
             .await
             .map_err(|_| MuxError::Timeout)?
@@ -249,18 +273,17 @@ impl ClientHandle {
         .await
         .map_err(|_| MuxError::Timeout)?
         .map_err(|_| MuxError::Unavailable)?;
+        let mut cancellation = PendingClose::new(self, stream_id);
         drop(admission);
         match tokio::time::timeout_at(deadline, response).await {
             Ok(Ok(Ok(mut stream))) => {
+                cancellation.disarm();
                 stream.slot = Some(permit);
                 Ok(stream)
             }
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(_)) => Err(MuxError::Unavailable),
-            Err(_) => {
-                self.close_best_effort(stream_id);
-                Err(MuxError::Timeout)
-            }
+            Err(_) => Err(MuxError::Timeout),
         }
     }
 
@@ -270,7 +293,10 @@ impl ClientHandle {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(2)
             })
-            .map_err(|_| MuxError::StreamIdExhausted)
+            .map_err(|_| {
+                self.inner.shutdown.notify_one();
+                MuxError::StreamIdExhausted
+            })
     }
 
     fn close_best_effort(&self, stream_id: u32) {
@@ -280,9 +306,43 @@ impl ClientHandle {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 debug!(
                     stream_id,
-                    "RDP cancellation queue is full; session cleanup will reclaim it"
+                    "RDP cancellation queue is full; terminating the generation"
                 );
+                // This notification cannot be lost, even before the driver is
+                // first polled. Failing the generation keeps cancellation both
+                // bounded and non-lossy without spawning an unbounded sender.
+                self.inner.shutdown.notify_one();
             }
+        }
+    }
+}
+
+/// Owns cancellation once an operation has entered the mux, including when its
+/// caller drops the future instead of waiting for the explicit timeout.
+struct PendingClose {
+    handle: ClientHandle,
+    stream_id: u32,
+    armed: bool,
+}
+
+impl PendingClose {
+    fn new(handle: &ClientHandle, stream_id: u32) -> Self {
+        Self {
+            handle: handle.clone(),
+            stream_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingClose {
+    fn drop(&mut self) {
+        if self.armed {
+            self.handle.close_best_effort(self.stream_id);
         }
     }
 }
@@ -312,6 +372,10 @@ impl ResolvedTarget {
         if !self.candidates.contains(&address) {
             return Err(MuxError::InvalidCandidate(address));
         }
+        // A cancelled OPEN cannot be retried: its outcome is unknown. Only an
+        // explicit remote OPEN_ERROR restores the resolved candidate set.
+        self.finished = true;
+        let mut cancellation = PendingClose::new(&self.handle, self.stream_id);
         let (reply, response) = oneshot::channel();
         let operation = async {
             self.handle
@@ -328,21 +392,18 @@ impl ResolvedTarget {
         };
         match tokio::time::timeout(timeout, operation).await {
             Ok(Ok(mut stream)) => {
+                cancellation.disarm();
                 stream.slot = self.permit.take();
-                self.finished = true;
                 Ok(stream)
             }
             Ok(Err(error)) => {
-                if !matches!(error, MuxError::Remote { .. }) {
-                    self.finished = true;
+                if matches!(error, MuxError::Remote { .. }) {
+                    cancellation.disarm();
+                    self.finished = false;
                 }
                 Err(error)
             }
-            Err(_) => {
-                self.handle.close_best_effort(self.stream_id);
-                self.finished = true;
-                Err(MuxError::Timeout)
-            }
+            Err(_) => Err(MuxError::Timeout),
         }
     }
 
@@ -405,6 +466,7 @@ struct StreamShared {
     capacity: usize,
     event: Notify,
     credit_event: Notify,
+    remote_close_event: Notify,
     peer_credit: CreditWindow,
     send_gate: AsyncMutex<()>,
     receive_credit_gate: AsyncMutex<()>,
@@ -434,6 +496,7 @@ impl StreamShared {
             capacity: window as usize,
             event: Notify::new(),
             credit_event: Notify::new(),
+            remote_close_event: Notify::new(),
             peer_credit: CreditWindow::new(window),
             send_gate: AsyncMutex::new(()),
             receive_credit_gate: AsyncMutex::new(()),
@@ -496,6 +559,7 @@ impl StreamShared {
         self.peer_credit.close();
         self.event.notify_waiters();
         self.credit_event.notify_waiters();
+        self.remote_close_event.notify_waiters();
     }
 
     fn session_failure(&self, error: &MuxError) {
@@ -510,6 +574,26 @@ impl StreamShared {
         self.peer_credit.close();
         self.event.notify_waiters();
         self.credit_event.notify_waiters();
+        self.remote_close_event.notify_waiters();
+    }
+
+    async fn wait_remote_close(&self) -> io::Result<()> {
+        loop {
+            let notified = self.remote_close_event.notified();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| io::Error::other("RDP stream lock poisoned"))?;
+                if state.remote_closed {
+                    return match &state.failure {
+                        Some((kind, message)) => Err(io::Error::new(*kind, message.clone())),
+                        None => Ok(()),
+                    };
+                }
+            }
+            notified.await;
+        }
     }
 
     fn drop_local(&self) {
@@ -669,6 +753,14 @@ impl RdpStream {
     pub(crate) fn set_close_reason(&self, reason: CloseReason) {
         self.shared.set_close_reason(reason);
     }
+
+    /// Owned notification of full peer closure. A normal CLOSE permits the
+    /// relay to drain inbound data; an error cancels both directions immediately.
+    /// SHUTDOWN_WRITE alone never completes this future.
+    pub(crate) fn closed(&self) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        let shared = self.shared.clone();
+        async move { shared.wait_remote_close().await }
+    }
 }
 
 impl AsyncRead for RdpStream {
@@ -775,6 +867,11 @@ impl AsyncWrite for RdpStream {
             return Poll::Ready(Err(io::Error::new(kind, message)));
         }
         if state.remote_closed {
+            if state.shutdown_sent {
+                // A later normal CLOSE cannot revoke an already completed
+                // SHUTDOWN_WRITE (for example while the relay polls it again).
+                return Poll::Ready(Ok(()));
+            }
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "RDP stream is closed",
@@ -799,6 +896,28 @@ impl Drop for RdpStream {
 
 struct StreamRecord {
     shared: Arc<StreamShared>,
+    workers: Option<[JoinHandle<()>; 2]>,
+}
+
+impl Drop for StreamRecord {
+    fn drop(&mut self) {
+        if let Some(workers) = &self.workers {
+            for worker in workers {
+                worker.abort();
+            }
+        }
+        // Dropping a session future (connector shutdown, agent cancellation,
+        // or an early error) must wake callers holding the stream too.
+        let unfinished = self
+            .shared
+            .state
+            .lock()
+            .is_ok_and(|state| !state.remote_closed && !state.dropped);
+        if unfinished {
+            self.shared
+                .session_failure(&MuxError::SessionClosed("session driver stopped".into()));
+        }
+    }
 }
 
 enum WorkerEvent {
@@ -814,14 +933,14 @@ fn spawn_stream(
     events: mpsc::Sender<WorkerEvent>,
 ) -> (RdpStream, StreamRecord) {
     let shared = StreamShared::new(limits.receive_window);
-    tokio::spawn(outbound_worker(
+    let outbound = tokio::spawn(outbound_worker(
         stream_id,
         limits.max_data as usize,
         shared.clone(),
         ordered.clone(),
         events,
     ));
-    tokio::spawn(credit_worker(stream_id, shared.clone(), ordered));
+    let credit = tokio::spawn(credit_worker(stream_id, shared.clone(), ordered));
     (
         RdpStream {
             shared: shared.clone(),
@@ -829,7 +948,10 @@ fn spawn_stream(
             bound_address,
             slot: None,
         },
-        StreamRecord { shared },
+        StreamRecord {
+            shared,
+            workers: Some([outbound, credit]),
+        },
     )
 }
 
@@ -905,7 +1027,9 @@ async fn outbound_worker(
             }
             OutboundAction::Data(wanted) => {
                 let Some(credit) = shared.peer_credit.take_up_to(wanted).await else {
-                    break;
+                    // drop_local closes the credit window to wake this wait;
+                    // the next iteration still needs to emit CLOSE.
+                    continue;
                 };
                 let _gate = shared.send_gate.lock().await;
                 let payload = {
@@ -914,7 +1038,7 @@ async fn outbound_worker(
                         Err(_) => break,
                     };
                     if state.dropped || state.remote_closed {
-                        break;
+                        continue;
                     }
                     let count = credit.min(state.outbound.len());
                     let payload: Vec<u8> = state.outbound.drain(..count).collect();
@@ -1106,6 +1230,24 @@ where
     Ok(())
 }
 
+/// JoinHandle drops detach tasks; generation cancellation must instead release
+/// both transport halves and wake callers waiting for stream admission.
+struct SessionTasks {
+    reader: JoinHandle<Result<(), MuxError>>,
+    writer: JoinHandle<Result<(), MuxError>>,
+    slots: Option<Arc<Semaphore>>,
+}
+
+impl Drop for SessionTasks {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+        if let Some(slots) = &self.slots {
+            slots.close();
+        }
+    }
+}
+
 pub(crate) async fn start_client_session<T>(
     mut io: T,
 ) -> Result<(ClientHandle, JoinHandle<Result<(), MuxError>>), MuxError>
@@ -1119,25 +1261,37 @@ where
     let (ordered_tx, ordered_rx) = mpsc::channel(DATA_QUEUE_CAPACITY);
     let (frames_tx, frames_rx) = mpsc::channel(READER_QUEUE_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(WORKER_QUEUE_CAPACITY);
-    let reader_task = tokio::spawn(frame_reader(reader, frames_tx));
-    let writer_task = tokio::spawn(frame_writer(writer, control_rx, ordered_rx));
-    let task = tokio::spawn(drive_client(
-        limits,
-        commands_rx,
-        control_tx,
-        ordered_tx,
-        frames_rx,
-        events_tx,
-        events_rx,
-        reader_task,
-        writer_task,
-    ));
+    let slots = Arc::new(Semaphore::new(limits.max_streams as usize));
+    let shutdown = Arc::new(Notify::new());
+    let driver_shutdown = shutdown.clone();
+    let tasks = SessionTasks {
+        reader: tokio::spawn(frame_reader(reader, frames_tx)),
+        writer: tokio::spawn(frame_writer(writer, control_rx, ordered_rx)),
+        slots: Some(slots.clone()),
+    };
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = driver_shutdown.notified() => Err(MuxError::ResourceLimit),
+            result = drive_client(
+                limits,
+                commands_rx,
+                control_tx,
+                ordered_tx,
+                frames_rx,
+                events_tx,
+                events_rx,
+                tasks,
+            ) => result,
+        }
+    });
     let handle = ClientHandle {
         inner: Arc::new(ClientInner {
             commands: commands_tx,
-            slots: Arc::new(Semaphore::new(limits.max_streams as usize)),
+            slots,
             admission: AsyncMutex::new(()),
             next_stream_id: AtomicU32::new(1),
+            shutdown,
         }),
     };
     Ok((handle, task))
@@ -1166,8 +1320,7 @@ async fn drive_client(
     mut frames: mpsc::Receiver<Frame>,
     events_tx: mpsc::Sender<WorkerEvent>,
     mut events: mpsc::Receiver<WorkerEvent>,
-    mut reader_task: JoinHandle<Result<(), MuxError>>,
-    mut writer_task: JoinHandle<Result<(), MuxError>>,
+    mut tasks: SessionTasks,
 ) -> Result<(), MuxError> {
     let mut streams = BTreeMap::<u32, ClientStreamState>::new();
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
@@ -1176,9 +1329,8 @@ async fn drive_client(
     let mut ping = None::<(u64, Instant)>;
     let result = loop {
         tokio::select! {
-            biased;
-            result = &mut reader_task => break join_result("reader", result),
-            result = &mut writer_task => break join_result("writer", result),
+            result = &mut tasks.reader => break join_result("reader", result),
+            result = &mut tasks.writer => break join_result("writer", result),
             _ = keepalive.tick() => {
                 if let Some((_, sent)) = ping {
                     if sent.elapsed() >= KEEPALIVE_TIMEOUT {
@@ -1186,24 +1338,28 @@ async fn drive_client(
                     }
                 } else {
                     let nonce = generation_nonce();
-                    control.send(Frame::Ping { nonce }).await
-                        .map_err(|_| MuxError::Unavailable)?;
+                    if let Err(error) = session_operation(async {
+                        control.send(Frame::Ping { nonce }).await
+                            .map_err(|_| MuxError::Unavailable)
+                    }).await {
+                        break Err(error);
+                    }
                     ping = Some((nonce, Instant::now()));
                 }
             }
             Some(event) = events.recv() => handle_client_worker_event(event, &mut streams),
             Some(command) = commands.recv() => {
-                if let Err(error) = handle_client_command(
+                if let Err(error) = session_operation(handle_client_command(
                     command,
                     limits,
                     &mut streams,
                     &ordered,
-                ).await {
+                )).await {
                     break Err(error);
                 }
             }
             Some(frame) = frames.recv() => {
-                if let Err(error) = handle_client_frame(
+                if let Err(error) = session_operation(handle_client_frame(
                     frame,
                     limits,
                     &mut streams,
@@ -1211,7 +1367,7 @@ async fn drive_client(
                     &ordered,
                     &events_tx,
                     &mut ping,
-                ).await {
+                )).await {
                     break Err(error);
                 }
             }
@@ -1219,8 +1375,8 @@ async fn drive_client(
         }
     };
 
-    reader_task.abort();
-    writer_task.abort();
+    tasks.reader.abort();
+    tasks.writer.abort();
     let failure = result
         .as_ref()
         .err()
@@ -1334,6 +1490,21 @@ async fn handle_client_command(
         }
         ClientCommand::Close { stream_id } => {
             if let Some(state) = streams.remove(&stream_id) {
+                if matches!(state, ClientStreamState::Closing) {
+                    streams.insert(stream_id, ClientStreamState::Closing);
+                    return Ok(());
+                }
+                if let ClientStreamState::Open(record) = state {
+                    record
+                        .shared
+                        .session_failure(&MuxError::SessionClosed("operation cancelled".into()));
+                    streams.insert(stream_id, ClientStreamState::Closing);
+                    record
+                        .shared
+                        .queue_close_once(stream_id, CloseReason::Cancelled, ordered)
+                        .await?;
+                    return Ok(());
+                }
                 fail_client_state(state, MuxError::SessionClosed("operation cancelled".into()));
                 streams.insert(stream_id, ClientStreamState::Closing);
                 ordered
@@ -1540,7 +1711,11 @@ fn handle_client_worker_event(event: WorkerEvent, streams: &mut BTreeMap<u32, Cl
             }
         }
         WorkerEvent::Stopped(stream_id) => {
-            streams.remove(&stream_id);
+            // Cancellation may already have replaced the live record with a
+            // tombstone. Keep it until the peer acknowledges our CLOSE.
+            if matches!(streams.get(&stream_id), Some(ClientStreamState::Open(_))) {
+                streams.remove(&stream_id);
+            }
         }
     }
 }
@@ -1625,18 +1800,13 @@ where
     let (ordered_tx, ordered_rx) = mpsc::channel(DATA_QUEUE_CAPACITY);
     let (frames_tx, frames_rx) = mpsc::channel(READER_QUEUE_CAPACITY);
     let (events_tx, events_rx) = mpsc::channel(WORKER_QUEUE_CAPACITY);
-    let reader_task = tokio::spawn(frame_reader(reader, frames_tx));
-    let writer_task = tokio::spawn(frame_writer(writer, control_rx, ordered_rx));
+    let tasks = SessionTasks {
+        reader: tokio::spawn(frame_reader(reader, frames_tx)),
+        writer: tokio::spawn(frame_writer(writer, control_rx, ordered_rx)),
+        slots: None,
+    };
     drive_agent(
-        limits,
-        policy,
-        control_tx,
-        ordered_tx,
-        frames_rx,
-        events_tx,
-        events_rx,
-        reader_task,
-        writer_task,
+        limits, policy, control_tx, ordered_tx, frames_rx, events_tx, events_rx, tasks,
     )
     .await
 }
@@ -1650,8 +1820,7 @@ async fn drive_agent(
     mut frames: mpsc::Receiver<Frame>,
     events_tx: mpsc::Sender<WorkerEvent>,
     mut events: mpsc::Receiver<WorkerEvent>,
-    mut reader_task: JoinHandle<Result<(), MuxError>>,
-    mut writer_task: JoinHandle<Result<(), MuxError>>,
+    mut tasks: SessionTasks,
 ) -> Result<(), MuxError> {
     let mut streams = BTreeMap::<u32, AgentStreamState>::new();
     let mut operations = JoinSet::<AgentOperation>::new();
@@ -1664,9 +1833,8 @@ async fn drive_agent(
 
     let result = loop {
         tokio::select! {
-            biased;
-            result = &mut reader_task => break join_result("reader", result),
-            result = &mut writer_task => break join_result("writer", result),
+            result = &mut tasks.reader => break join_result("reader", result),
+            result = &mut tasks.writer => break join_result("writer", result),
             _ = keepalive.tick() => {
                 if let Some((_, sent)) = ping {
                     if sent.elapsed() >= KEEPALIVE_TIMEOUT {
@@ -1674,8 +1842,12 @@ async fn drive_agent(
                     }
                 } else {
                     let nonce = generation_nonce();
-                    control.send(Frame::Ping { nonce }).await
-                        .map_err(|_| MuxError::Unavailable)?;
+                    if let Err(error) = session_operation(async {
+                        control.send(Frame::Ping { nonce }).await
+                            .map_err(|_| MuxError::Unavailable)
+                    }).await {
+                        break Err(error);
+                    }
                     ping = Some((nonce, Instant::now()));
                 }
             }
@@ -1683,14 +1855,14 @@ async fn drive_agent(
             operation = operations.join_next(), if !operations.is_empty() => {
                 match operation {
                     Some(Ok(operation)) => {
-                        if let Err(error) = finish_agent_operation(
+                        if let Err(error) = session_operation(finish_agent_operation(
                             operation,
                             limits,
                             &mut streams,
                             &ordered,
                             &events_tx,
                             &mut relays,
-                        ).await {
+                        )).await {
                             break Err(error);
                         }
                     }
@@ -1708,7 +1880,7 @@ async fn drive_agent(
                 }
             }
             Some(frame) = frames.recv() => {
-                if let Err(error) = handle_agent_frame(
+                if let Err(error) = session_operation(handle_agent_frame(
                     frame,
                     limits,
                     &policy,
@@ -1718,7 +1890,8 @@ async fn drive_agent(
                     &mut operations,
                     &mut ping,
                     &mut highest_stream_id,
-                ).await {
+                    relays.len(),
+                )).await {
                     break Err(error);
                 }
             }
@@ -1726,8 +1899,8 @@ async fn drive_agent(
         }
     };
 
-    reader_task.abort();
-    writer_task.abort();
+    tasks.reader.abort();
+    tasks.writer.abort();
     operations.abort_all();
     relays.abort_all();
     let failure = result
@@ -1754,6 +1927,7 @@ async fn handle_agent_frame(
     operations: &mut JoinSet<AgentOperation>,
     ping: &mut Option<(u64, Instant)>,
     highest_stream_id: &mut u32,
+    active_relays: usize,
 ) -> Result<(), MuxError> {
     match frame {
         Frame::Resolve {
@@ -1767,7 +1941,7 @@ async fn handle_agent_frame(
             }
             register_peer_stream_id(stream_id, highest_stream_id)?;
             if streams.len() >= limits.max_streams as usize
-                || operations.len() >= limits.max_streams as usize
+                || active_relays + operations.len() >= limits.max_streams as usize
             {
                 send_open_error(
                     ordered,
@@ -1823,6 +1997,22 @@ async fn handle_agent_frame(
                     return Err(protocol_error("OPEN in the wrong stream state"));
                 }
             };
+            // Normal CLOSE can retire its stream record while a relay drains
+            // buffered bytes to TCP. Count those relays too, including pending
+            // connects that will create a relay once they complete.
+            if active_relays + operations.len() >= limits.max_streams as usize {
+                if let Some(candidates) = candidates {
+                    streams.insert(stream_id, AgentStreamState::Resolved(candidates));
+                }
+                send_open_error(
+                    ordered,
+                    stream_id,
+                    OpenErrorCode::ResourceLimit,
+                    "agent worker limit reached",
+                )
+                .await?;
+                return Ok(());
+            }
             if !agent_address_allowed(address.ip(), policy) {
                 if let Some(candidates) = candidates {
                     streams.insert(stream_id, AgentStreamState::Resolved(candidates));
@@ -1920,7 +2110,11 @@ async fn handle_agent_frame(
                         .await
                         .map_err(|_| MuxError::Unavailable)?;
                 }
-                AgentStreamState::Cancelled => {}
+                AgentStreamState::Cancelled => {
+                    // The operation still owns a bounded worker slot until
+                    // completion; duplicate CLOSE must not release it early.
+                    streams.insert(stream_id, AgentStreamState::Cancelled);
+                }
             }
         }
         Frame::Ping { nonce } => {
@@ -1987,7 +2181,7 @@ async fn finish_agent_operation(
                     send_open_error(
                         ordered,
                         stream_id,
-                        open_error_code(&error),
+                        resolve_error_code(&error),
                         &error.to_string(),
                     )
                     .await?;
@@ -2016,6 +2210,9 @@ async fn finish_agent_operation(
                                 &format!("query remote bound address: {error}"),
                             )
                             .await?;
+                            if let Some(candidates) = candidates {
+                                streams.insert(stream_id, AgentStreamState::Resolved(candidates));
+                            }
                             return Ok(());
                         }
                     };
@@ -2038,13 +2235,18 @@ async fn finish_agent_operation(
                     );
                     streams.insert(stream_id, AgentStreamState::Open(record));
                     relays.spawn(async move {
+                        let closed = stream.closed();
                         let mut stream = stream;
                         let mut socket = socket;
-                        if let Err(error) = crate::relay::relay_generic(
-                            &mut stream,
+                        // CLOSE terminates both directions. Treating a normal
+                        // CLOSE as just read EOF leaves an idle TCP peer and
+                        // its relay alive forever after the stream slot retires.
+                        if let Err(error) = crate::relay::relay_generic_until(
                             &mut socket,
+                            &mut stream,
                             Duration::ZERO,
                             None,
+                            closed,
                         )
                         .await
                         {
@@ -2077,21 +2279,40 @@ async fn resolve_remote(
     timeout: Duration,
     policy: &AgentPolicy,
 ) -> io::Result<Vec<SocketAddr>> {
-    let lookup = tokio::net::lookup_host((hostname.as_str(), port));
-    let addresses = tokio::time::timeout(timeout, lookup)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "remote DNS timed out"))??;
-    let mut result = Vec::new();
-    for address in addresses {
-        let address = canonicalize_address(address);
-        if agent_address_allowed(address.ip(), policy) && !result.contains(&address) {
-            result.push(address);
-            if result.len() == MAX_RESOLVE_ADDRESSES {
-                break;
+    let policy = policy.clone();
+    let lookup = run_dns_lookup(&DNS_WORKER_SLOTS, move || {
+        let addresses = (hostname.as_str(), port).to_socket_addrs()?;
+        let mut result = Vec::new();
+        for address in addresses {
+            let address = canonicalize_address(address);
+            if agent_address_allowed(address.ip(), &policy) && !result.contains(&address) {
+                result.push(address);
+                if result.len() == MAX_RESOLVE_ADDRESSES {
+                    break;
+                }
             }
         }
-    }
-    Ok(result)
+        Ok(result)
+    });
+    tokio::time::timeout(timeout, lookup)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "remote DNS timed out"))?
+}
+
+async fn run_dns_lookup(
+    slots: &'static Semaphore,
+    lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> io::Result<Vec<SocketAddr>> {
+    let permit = slots
+        .acquire()
+        .await
+        .map_err(|_| io::Error::other("DNS worker admission stopped"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        lookup()
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("DNS worker failed: {error}")))?
 }
 
 fn agent_address_allowed(ip: IpAddr, policy: &AgentPolicy) -> bool {
@@ -2127,7 +2348,9 @@ fn handle_agent_worker_event(event: WorkerEvent, streams: &mut BTreeMap<u32, Age
             }
         }
         WorkerEvent::Stopped(stream_id) => {
-            streams.remove(&stream_id);
+            if matches!(streams.get(&stream_id), Some(AgentStreamState::Open(_))) {
+                streams.remove(&stream_id);
+            }
         }
     }
 }
@@ -2194,6 +2417,16 @@ fn open_error_code(error: &io::Error) -> OpenErrorCode {
         io::ErrorKind::OutOfMemory => OpenErrorCode::ResourceLimit,
         io::ErrorKind::PermissionDenied => OpenErrorCode::PolicyDenied,
         _ => OpenErrorCode::General,
+    }
+}
+
+fn resolve_error_code(error: &io::Error) -> OpenErrorCode {
+    match open_error_code(error) {
+        // getaddrinfo errors, including Windows WSANO_DATA/WSAHOST_NOT_FOUND,
+        // are not consistently exposed as io::ErrorKind::NotFound. The DNS
+        // operation context still establishes that the host cannot be resolved.
+        OpenErrorCode::General => OpenErrorCode::HostUnreachable,
+        code => code,
     }
 }
 
@@ -2433,6 +2666,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_pending_requests_sends_a_cancelled_close() {
+        for resolve in [false, true] {
+            let (local, mut remote) = tokio::io::duplex(128 * 1024);
+            let (started, ready) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                handshake(&mut remote, Role::Agent).await.unwrap();
+                let request = protocol::read_frame(&mut remote).await.unwrap();
+                assert!(matches!(request, Frame::Resolve { stream_id: 1, .. }) == resolve);
+                if !resolve {
+                    assert!(matches!(request, Frame::Open { stream_id: 1, .. }));
+                }
+                started.send(()).unwrap();
+                assert_eq!(
+                    protocol::read_frame(&mut remote).await.unwrap(),
+                    Frame::Close {
+                        stream_id: 1,
+                        reason: CloseReason::Cancelled,
+                    }
+                );
+            });
+            let (client, driver) = start_client_session(local).await.unwrap();
+            let caller = client.clone();
+            let operation = tokio::spawn(async move {
+                if resolve {
+                    caller
+                        .resolve("example.test", 443, Duration::from_secs(60))
+                        .await
+                        .map(|_| ())
+                } else {
+                    caller
+                        .open_ip("192.0.2.1:443".parse().unwrap(), Duration::from_secs(60))
+                        .await
+                        .map(|_| ())
+                }
+            });
+            ready.await.unwrap();
+            operation.abort();
+            assert!(operation.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .expect("dropping a pending caller must immediately close its remote operation")
+                .unwrap();
+            driver.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_resolved_open_closes_it_and_disables_retry() {
+        let address: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let (local, mut remote) = tokio::io::duplex(128 * 1024);
+        let (started, ready) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            handshake(&mut remote, Role::Agent).await.unwrap();
+            assert!(matches!(
+                protocol::read_frame(&mut remote).await.unwrap(),
+                Frame::Resolve { stream_id: 1, .. }
+            ));
+            protocol::write_frame(
+                &mut remote,
+                &Frame::ResolveOk {
+                    stream_id: 1,
+                    addresses: vec![address],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                protocol::read_frame(&mut remote).await.unwrap(),
+                Frame::Open { stream_id: 1, .. }
+            ));
+            started.send(()).unwrap();
+            assert_eq!(
+                protocol::read_frame(&mut remote).await.unwrap(),
+                Frame::Close {
+                    stream_id: 1,
+                    reason: CloseReason::Cancelled,
+                }
+            );
+        });
+        let (client, driver) = start_client_session(local).await.unwrap();
+        let mut resolved = client
+            .resolve("example.test", 443, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut opening = Box::pin(resolved.open(address, Duration::from_secs(60)));
+        tokio::select! {
+            result = &mut opening => panic!("OPEN must remain pending: {result:?}"),
+            _ = ready => {}
+        }
+        drop(opening);
+        assert!(!resolved.can_retry());
+        drop(resolved);
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn full_cancellation_queue_terminates_generation_and_live_streams() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, driver, agent) = sessions().await;
+        let mut stream = client
+            .open_ip(listener.local_addr().unwrap(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            client
+                .inner
+                .commands
+                .try_send(ClientCommand::Close { stream_id: 3 })
+                .unwrap();
+        }
+        client.close_best_effort(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), driver)
+                .await
+                .expect("overflow must terminate the generation without waiting for keepalive")
+                .unwrap()
+                .unwrap_err(),
+            MuxError::ResourceLimit
+        );
+        assert!(client.inner.slots.is_closed());
+        assert!(client.inner.commands.is_closed());
+        let mut byte = [0; 1];
+        assert!(stream.read(&mut byte).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .expect("the peer must observe the closed transport")
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_credit_blocked_stream_still_sends_close() {
+        let limits = NegotiatedLimits {
+            max_data: 4,
+            receive_window: 8,
+            max_streams: 1,
+        };
+        let (ordered, mut frames) = mpsc::channel(4);
+        let (events, mut events_rx) = mpsc::channel(1);
+        let (mut stream, _record) =
+            spawn_stream(1, "127.0.0.1:1".parse().unwrap(), limits, ordered, events);
+        stream.write_all(b"123456789").await.unwrap();
+        for payload in [b"1234", b"5678"] {
+            assert_eq!(
+                frames.recv().await.unwrap(),
+                Frame::Data {
+                    stream_id: 1,
+                    payload: payload.to_vec(),
+                }
+            );
+        }
+        // The ninth byte now waits for WINDOW_UPDATE from an idle peer.
+        drop(stream);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), frames.recv())
+                .await
+                .expect("dropping a credit-blocked stream must notify the peer")
+                .unwrap(),
+            Frame::Close {
+                stream_id: 1,
+                reason: CloseReason::Normal,
+            }
+        );
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(WorkerEvent::LocalCloseQueued(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_cancellation_and_worker_stop_preserve_close_tombstone() {
+        let shared = StreamShared::new(8);
+        let mut streams = BTreeMap::from([(
+            1,
+            ClientStreamState::Open(StreamRecord {
+                shared,
+                workers: None,
+            }),
+        )]);
+        let limits = NegotiatedLimits {
+            max_data: 4,
+            receive_window: 8,
+            max_streams: 1,
+        };
+        let (ordered, mut frames) = mpsc::channel(4);
+        for _ in 0..2 {
+            handle_client_command(
+                ClientCommand::Close { stream_id: 1 },
+                limits,
+                &mut streams,
+                &ordered,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            frames.recv().await.unwrap(),
+            Frame::Close {
+                stream_id: 1,
+                reason: CloseReason::Cancelled,
+            }
+        );
+        assert!(frames.try_recv().is_err(), "CLOSE must be queued only once");
+        handle_client_worker_event(WorkerEvent::Stopped(1), &mut streams);
+        assert!(matches!(streams.get(&1), Some(ClientStreamState::Closing)));
+        let (control, _control_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+        handle_client_frame(
+            Frame::Close {
+                stream_id: 1,
+                reason: CloseReason::Normal,
+            },
+            limits,
+            &mut streams,
+            &control,
+            &ordered,
+            &events,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        assert!(streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_client_driver_closes_transport_and_releases_workers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, driver, agent) = sessions().await;
+        let mut stream = client
+            .open_ip(listener.local_addr().unwrap(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        let shared = Arc::downgrade(&stream.shared);
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        let mut byte = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                .await
+                .expect("driver cancellation must wake a live read")
+                .is_err()
+        );
+        assert!(client.inner.slots.is_closed());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while shared.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both per-stream workers must release their shared buffers");
+        assert!(tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .expect("both transport halves must be dropped on driver abort")
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_operation_timeouts_fail_without_panicking() {
+        let (client, driver, agent) = sessions().await;
+        let timeout = Duration::from_secs(u64::MAX);
+        let expected = MuxError::InvalidState("operation timeout exceeds clock range");
+        assert_eq!(
+            client
+                .open_ip("192.0.2.1:443".parse().unwrap(), timeout)
+                .await
+                .unwrap_err(),
+            expected
+        );
+        assert!(matches!(
+            client.resolve("example.test", 443, timeout).await,
+            Err(error) if error == expected
+        ));
+        assert_eq!(client.inner.next_stream_id.load(Ordering::Relaxed), 1);
+        driver.abort();
+        agent.abort();
+    }
+
+    #[tokio::test]
+    async fn exhausted_stream_ids_end_the_generation_for_reconnect() {
+        let (client, driver, agent) = sessions().await;
+        client
+            .inner
+            .next_stream_id
+            .store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .open_ip("192.0.2.1:443".parse().unwrap(), Duration::from_secs(1))
+                .await
+                .unwrap_err(),
+            MuxError::StreamIdExhausted
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("ID exhaustion must allow the connector to establish a fresh generation")
+            .unwrap()
+            .is_err());
+        assert!(client.inner.slots.is_closed());
+        assert!(tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn abrupt_generation_loss_fails_live_streams() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2543,7 +3087,13 @@ mod tests {
     #[tokio::test]
     async fn negotiated_max_data_is_enforced_by_the_mux() {
         let shared = StreamShared::new(8);
-        let mut streams = BTreeMap::from([(1, ClientStreamState::Open(StreamRecord { shared }))]);
+        let mut streams = BTreeMap::from([(
+            1,
+            ClientStreamState::Open(StreamRecord {
+                shared,
+                workers: None,
+            }),
+        )]);
         let (control, _control_rx) = mpsc::channel(1);
         let (ordered, _ordered_rx) = mpsc::channel(1);
         let (events, _events_rx) = mpsc::channel(1);
@@ -2696,6 +3246,235 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolver_specific_errors_map_to_host_unreachable() {
+        let mut errors = vec![io::Error::other("getaddrinfo returned an unknown name")];
+        errors.extend((11001..=11004).map(io::Error::from_raw_os_error));
+        for error in errors {
+            let mut streams = BTreeMap::from([(1, AgentStreamState::Resolving)]);
+            let (ordered, mut frames) = mpsc::channel(1);
+            let (events, _events_rx) = mpsc::channel(1);
+            finish_agent_operation(
+                AgentOperation::Resolved {
+                    stream_id: 1,
+                    result: Err(error),
+                },
+                NegotiatedLimits {
+                    max_data: 4,
+                    receive_window: 8,
+                    max_streams: 1,
+                },
+                &mut streams,
+                &ordered,
+                &events,
+                &mut JoinSet::new(),
+            )
+            .await
+            .unwrap();
+            assert!(streams.is_empty());
+            assert!(matches!(
+                frames.recv().await.unwrap(),
+                Frame::OpenError {
+                    code: OpenErrorCode::HostUnreachable,
+                    ..
+                }
+            ));
+        }
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::OutOfMemory,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NetworkUnreachable,
+        ] {
+            assert_eq!(
+                resolve_error_code(&io::Error::from(kind)),
+                open_error_code(&io::Error::from(kind))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dns_job_keeps_its_slot_until_blocking_work_finishes() {
+        static TEST_SLOTS: Semaphore = Semaphore::const_new(1);
+        let (started, ready) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let first = tokio::spawn(run_dns_lookup(&TEST_SLOTS, move || {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Ok(Vec::new())
+        }));
+        ready.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(TEST_SLOTS.available_permits(), 0);
+        let (second_started, mut second_ready) = oneshot::channel();
+        let second = tokio::spawn(run_dns_lookup(&TEST_SLOTS, move || {
+            second_started.send(()).unwrap();
+            Ok(Vec::new())
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_ready)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second_ready)
+            .await
+            .expect("the next generation may resolve once the real job releases its slot")
+            .unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(TEST_SLOTS.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn normal_remote_close_terminates_agent_relay_with_idle_tcp_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let expected = vec![0x5a; 64 * 1024];
+        let mut streams = BTreeMap::from([(1, AgentStreamState::Opening { candidates: None })]);
+        let (ordered, mut frames) = mpsc::channel(4);
+        let (events, _events_rx) = mpsc::channel(4);
+        let mut relays = JoinSet::new();
+        finish_agent_operation(
+            AgentOperation::Opened {
+                stream_id: 1,
+                result: Ok(socket),
+            },
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: protocol::INITIAL_WINDOW,
+                max_streams: 1,
+            },
+            &mut streams,
+            &ordered,
+            &events,
+            &mut relays,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(frames.recv().await, Some(Frame::OpenOk { .. })));
+        let Some(AgentStreamState::Open(record)) = streams.remove(&1) else {
+            panic!("agent stream was not opened");
+        };
+        record.shared.push_inbound(&expected).unwrap();
+        record.shared.finish_inbound().unwrap();
+        record.shared.remote_close(CloseReason::Normal);
+        drop(record);
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::new();
+            peer.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        tokio::time::timeout(Duration::from_secs(1), relays.join_next())
+            .await
+            .expect("full CLOSE must cancel both relay directions even when TCP peer is idle")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn repeated_agent_cancel_keeps_pending_operations_bounded() {
+        let limits = NegotiatedLimits {
+            max_data: 4,
+            receive_window: 8,
+            max_streams: 1,
+        };
+        let mut streams = BTreeMap::from([(1, AgentStreamState::Opening { candidates: None })]);
+        let mut operations = JoinSet::new();
+        operations.spawn(std::future::pending::<AgentOperation>());
+        let (ordered, mut frames) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(1);
+        let mut ping = None;
+        let mut highest = 1;
+        let policy = AgentPolicy::default();
+        for _ in 0..2 {
+            handle_agent_frame(
+                Frame::Close {
+                    stream_id: 1,
+                    reason: CloseReason::Cancelled,
+                },
+                limits,
+                &policy,
+                &mut streams,
+                &control,
+                &ordered,
+                &mut operations,
+                &mut ping,
+                &mut highest,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(streams.get(&1), Some(AgentStreamState::Cancelled)));
+        assert!(matches!(frames.recv().await, Some(Frame::Close { .. })));
+        assert!(frames.try_recv().is_err());
+        // Even when the map is empty, an outstanding worker must count against
+        // admission. This also covers completions not yet reaped by the driver.
+        streams.clear();
+        handle_agent_frame(
+            Frame::Open {
+                stream_id: 3,
+                address: "192.0.2.1:443".parse().unwrap(),
+            },
+            limits,
+            &policy,
+            &mut streams,
+            &control,
+            &ordered,
+            &mut operations,
+            &mut ping,
+            &mut highest,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            frames.recv().await,
+            Some(Frame::OpenError {
+                stream_id: 3,
+                code: OpenErrorCode::ResourceLimit,
+                ..
+            })
+        ));
+        assert_eq!(operations.len(), 1);
+        assert!(streams.is_empty());
+        operations = JoinSet::new();
+        handle_agent_frame(
+            Frame::Open {
+                stream_id: 5,
+                address: "192.0.2.1:443".parse().unwrap(),
+            },
+            limits,
+            &policy,
+            &mut streams,
+            &control,
+            &ordered,
+            &mut operations,
+            &mut ping,
+            &mut highest,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            frames.recv().await,
+            Some(Frame::OpenError {
+                stream_id: 5,
+                code: OpenErrorCode::ResourceLimit,
+                ..
+            })
+        ));
+        assert!(
+            operations.is_empty(),
+            "a draining relay must still count against admission"
+        );
+    }
+
+    #[tokio::test]
     async fn remote_connect_host_unreachable_is_returned_as_open_error() {
         let candidates = vec!["192.0.2.10:443".parse().unwrap()];
         let mut streams = BTreeMap::from([(
@@ -2780,6 +3559,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_close_does_not_revoke_completed_write_shutdown() {
+        for reason in [CloseReason::Normal, CloseReason::Io] {
+            let shared = StreamShared::new(8);
+            {
+                let mut state = shared.state.lock().unwrap();
+                state.write_shutdown = true;
+                state.shutdown_sent = true;
+            }
+            let mut stream = RdpStream {
+                shared: shared.clone(),
+                stream_id: 1,
+                bound_address: "127.0.0.1:1".parse().unwrap(),
+                slot: None,
+            };
+            shared.remote_close(reason);
+            assert_eq!(
+                stream.shutdown().await.is_ok(),
+                reason == CloseReason::Normal
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn credit_window_rejects_overflow_and_replenishes() {
         let credit = Arc::new(CreditWindow::new(8));
         assert_eq!(credit.take_up_to(6).await, Some(6));
@@ -2802,6 +3604,96 @@ mod tests {
 
         tokio::time::advance(FRAME_WRITE_TIMEOUT + Duration::from_secs(1)).await;
         assert_eq!(task.await.unwrap().unwrap_err(), MuxError::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_driver_handler_times_out_independently_of_writer() {
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (control, _control_rx) = mpsc::channel(1);
+        control.send(Frame::Ping { nonce: 1 }).await.unwrap();
+        let (ordered, _ordered_rx) = mpsc::channel(1);
+        let (frames_tx, frames) = mpsc::channel(1);
+        frames_tx.send(Frame::Ping { nonce: 2 }).await.unwrap();
+        let (events_tx, events) = mpsc::channel(1);
+        let tasks = SessionTasks {
+            reader: tokio::spawn(std::future::pending()),
+            writer: tokio::spawn(std::future::pending()),
+            slots: None,
+        };
+        let reader = tasks.reader.abort_handle();
+        let writer = tasks.writer.abort_handle();
+        let driver = tokio::spawn(drive_client(
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: 8,
+                max_streams: 1,
+            },
+            commands,
+            control,
+            ordered,
+            frames,
+            events_tx,
+            events,
+            tasks,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(FRAME_WRITE_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(driver.await.unwrap().unwrap_err(), MuxError::Timeout);
+        tokio::task::yield_now().await;
+        assert!(reader.is_finished());
+        assert!(writer.is_finished());
+    }
+
+    #[tokio::test]
+    async fn incoming_frames_progress_during_continuous_command_load() {
+        let (commands_tx, commands) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            commands_tx
+                .try_send(ClientCommand::Close { stream_id: 1 })
+                .unwrap();
+        }
+        let producer = tokio::spawn(async move {
+            while commands_tx
+                .send(ClientCommand::Close { stream_id: 1 })
+                .await
+                .is_ok()
+            {}
+        });
+        let (control, _control_rx) = mpsc::channel(1);
+        let (ordered, _ordered_rx) = mpsc::channel(1);
+        let (frames_tx, frames) = mpsc::channel(1);
+        frames_tx
+            .send(Frame::Hello(Hello::new(Role::Agent, 1)))
+            .await
+            .unwrap();
+        let (events_tx, events) = mpsc::channel(1);
+        let driver = tokio::spawn(drive_client(
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: 8,
+                max_streams: 1,
+            },
+            commands,
+            control,
+            ordered,
+            frames,
+            events_tx,
+            events,
+            SessionTasks {
+                reader: tokio::spawn(std::future::pending()),
+                writer: tokio::spawn(std::future::pending()),
+                slots: None,
+            },
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), driver)
+                .await
+                .expect("local commands must not starve peer frame handling")
+                .unwrap()
+                .unwrap_err(),
+            MuxError::Protocol("unexpected peer message for local role".into())
+        );
+        producer.await.unwrap();
     }
 
     #[tokio::test]
@@ -2830,6 +3722,7 @@ mod tests {
             &mut operations,
             &mut agent_ping,
             &mut highest_stream_id,
+            0,
         )
         .await
         .unwrap();
@@ -2886,6 +3779,7 @@ mod tests {
             &mut operations,
             &mut ping,
             &mut highest_stream_id,
+            0,
         )
         .await
         .unwrap_err();

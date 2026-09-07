@@ -200,7 +200,8 @@ fn wts_actor(
         }
         match reassembler.push(&read_buffer[..count]) {
             Ok(Some(message)) => {
-                if inbound.blocking_send(message).is_err() {
+                if let Err(error) = forward_inbound(&inbound, message) {
+                    warn!(%error, "WTS inbound bridge stopped");
                     break;
                 }
             }
@@ -212,6 +213,20 @@ fn wts_actor(
         }
     }
     close_channel(channel);
+}
+
+fn forward_inbound(inbound: &mpsc::Sender<Vec<u8>>, message: Vec<u8>) -> io::Result<()> {
+    // This actor also writes WINDOW_UPDATE and CLOSE traffic. Waiting for the
+    // mux to drain inbound data can therefore deadlock both directions. Losing
+    // any bytes would corrupt framing, so overload ends the entire generation.
+    inbound.try_send(message).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => {
+            io::Error::new(io::ErrorKind::WouldBlock, "WTS receive queue is full")
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "WTS receive bridge closed")
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,6 +366,32 @@ mod tests {
         .unwrap();
         assert_eq!(state, OutboundQueueState::Closed);
         assert_eq!(written.len(), OUTBOUND_WRITE_BATCH + 1);
+    }
+
+    #[test]
+    fn full_inbound_queue_fails_without_waiting_for_the_consumer() {
+        let (inbound, mut receiver) = mpsc::channel(1);
+        forward_inbound(&inbound, b"first".to_vec()).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_inbound = inbound.clone();
+        let worker = std::thread::spawn(move || {
+            let result = forward_inbound(&worker_inbound, b"overflow".to_vec());
+            let _ = result_tx.send(result.map_err(|error| error.kind()));
+        });
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the WTS actor must not block on a full inbound queue"),
+            Err(io::ErrorKind::WouldBlock)
+        );
+        worker.join().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"first");
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        assert_eq!(
+            forward_inbound(&inbound, Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

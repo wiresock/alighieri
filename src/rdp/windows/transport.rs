@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 use windows::core::{implement, Error, IUnknown, Interface, BSTR, GUID, PCSTR};
@@ -186,6 +186,9 @@ fn spawn_channel_writer(
                 let writes = (|| -> windows::core::Result<()> {
                     while let Some(data) = outbound.blocking_recv() {
                         for chunk in data.chunks(DVC_WRITE_CHUNK) {
+                            if session.is_closed() {
+                                return Ok(());
+                            }
                             // SAFETY: the resolved proxy is used only in this initialized
                             // apartment and `Write` copies the live slice before returning.
                             unsafe {
@@ -248,7 +251,7 @@ async fn run_pipe_bridge(
     outbound: &mpsc::Sender<Vec<u8>>,
     stop: &mut watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let mut pipe = pipe::create_server()?;
+    let pipe = pipe::create_server()?;
     tokio::select! {
         result = pipe.connect() => result?,
         _ = stop.wait_for(|value| *value) => return Ok(()),
@@ -258,28 +261,46 @@ async fn run_pipe_bridge(
         "Alighieri connected to the RDP channel bridge"
     );
 
-    let mut read_buffer = [0u8; 16 * 1024];
-    loop {
-        tokio::select! {
-            _ = stop.wait_for(|value| *value) => return Ok(()),
-            data = inbound.recv() => match data {
-                Some(data) => pipe.write_all(&data).await?,
-                None => return Ok(()),
-            },
-            read = pipe.read(&mut read_buffer) => {
-                let count = read?;
-                if count == 0 {
-                    return Ok(());
-                }
-                // The COM writer owns the channel and performs the final DVC-sized
-                // chunking. Awaiting this bounded queue propagates backpressure to
-                // the pipe without ever blocking a COM callback.
-                outbound
-                    .send(read_buffer[..count].to_vec())
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DVC writer closed"))?;
-            }
+    pump_pipe_bridge(pipe, inbound, outbound, stop).await
+}
+
+async fn pump_pipe_bridge<T>(
+    pipe: T,
+    inbound: &mut mpsc::Receiver<Vec<u8>>,
+    outbound: &mpsc::Sender<Vec<u8>>,
+    stop: &mut watch::Receiver<bool>,
+) -> io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(pipe);
+    let to_pipe = async {
+        while let Some(data) = inbound.recv().await {
+            writer.write_all(&data).await?;
         }
+        Ok(())
+    };
+    let to_channel = async {
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).await?;
+            if count == 0 {
+                return Ok(());
+            }
+            outbound
+                .send(buffer[..count].to_vec())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DVC writer closed"))?;
+        }
+    };
+    // Each direction must remain independently pollable under backpressure.
+    // Keep shutdown outside both complete forwarding loops so it can cancel
+    // pending pipe writes and queue sends, releasing the pipe and COM writer.
+    tokio::select! {
+        biased;
+        _ = stop.wait_for(|value| *value) => Ok(()),
+        result = to_pipe => result,
+        result = to_channel => result,
     }
 }
 
@@ -599,5 +620,67 @@ mod tests {
 
         assert!(session.is_closed());
         assert!(*stop.borrow());
+    }
+
+    #[tokio::test]
+    async fn stalled_pipe_write_does_not_block_reverse_traffic_or_shutdown() {
+        let (pipe, mut client) = tokio::io::duplex(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        inbound_tx.send(vec![1; 64]).await.unwrap();
+        let bridge = tokio::spawn(async move {
+            pump_pipe_bridge(pipe, &mut inbound_rx, &outbound_tx, &mut stop_rx).await
+        });
+
+        // Reading one byte proves the bridge is writing a message much larger
+        // than the pipe capacity; leave the rest unread while sending back.
+        let mut byte = [0];
+        client.read_exact(&mut byte).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), outbound_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"x"
+        );
+        stop_tx.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .expect("shutdown must cancel the pending write")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_outbound_queue_does_not_block_inbound_traffic_or_shutdown() {
+        let (pipe, mut client) = tokio::io::duplex(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        outbound_tx.send(b"full".to_vec()).await.unwrap();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let bridge = tokio::spawn(async move {
+            pump_pipe_bridge(pipe, &mut inbound_rx, &outbound_tx, &mut stop_rx).await
+        });
+        // Two bytes in a one-byte pipe prove the bridge has begun consuming
+        // outbound traffic even though its next queue send cannot complete.
+        client.write_all(b"ab").await.unwrap();
+        inbound_tx.send(b"x".to_vec()).await.unwrap();
+        let mut byte = [0];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.read_exact(&mut byte),
+        )
+        .await
+        .expect("reverse traffic must remain live")
+        .unwrap();
+        assert_eq!(&byte, b"x");
+        stop_tx.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .expect("shutdown must cancel the pending send")
+            .unwrap()
+            .unwrap();
     }
 }

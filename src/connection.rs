@@ -543,11 +543,13 @@ impl Connection {
                 .await;
         }
 
-        let result = relay::relay_generic(
+        let closed = remote.closed();
+        let result = relay::relay_generic_until(
             &mut self.stream,
             &mut remote,
             self.config.io_timeout,
             throttle,
+            closed,
         )
         .await;
         if result.is_err() {
@@ -604,11 +606,13 @@ impl Connection {
         // stream cannot satisfy that contract, so do not invoke (and discard)
         // interceptors merely to detect their presence. Control-plane flow hooks
         // remain supported here; data-plane interception is an explicit MVP gap.
-        let result = relay::relay_generic(
+        let closed = remote.closed();
+        let result = relay::relay_generic_until(
             &mut self.stream,
             &mut remote,
             self.config.io_timeout,
             throttle,
+            closed,
         )
         .await;
         if result.is_err() {
@@ -1325,6 +1329,116 @@ async fn connect_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn permissive_rdp_config() -> Config {
+        Config::parse(
+            "internal: 127.0.0.1:0\n\
+             egress: rdp\n\
+             client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n\
+             socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp command: connect udpassociate }",
+        )
+        .unwrap()
+    }
+
+    async fn rdp_test_connection(
+        config: Config,
+    ) -> (TcpStream, tokio::task::JoinHandle<Result<()>>, Arc<Metrics>) {
+        // Construct the request handler directly so the fail-closed guard is
+        // exercised on every platform, including builds that reject RDP at
+        // startup, without connecting to an operator's live named-pipe bridge.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(local).await.unwrap();
+        let (proxy, peer) = listener.accept().await.unwrap();
+        let metrics = Metrics::new();
+        let resources = ConnectionResources {
+            abuse: AbuseControls::new(config.rate_limits.clone()),
+            config: Arc::new(config),
+            users: Arc::new(UserDb::new()),
+            command_auth: None,
+            metrics: metrics.clone(),
+            dns_resolver: Arc::new(DnsResolver::new()),
+            throttle_bucket: None,
+            #[cfg(feature = "plugins")]
+            plugins: Arc::new(crate::plugin::PluginHost::default()),
+            #[cfg(all(windows, feature = "rdp"))]
+            rdp: None,
+        };
+        let handler = tokio::spawn(
+            Connection::new(ClientStream::Tcp(proxy), peer, local, resources).handle(),
+        );
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut selection = [0; 2];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut selection))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection, [5, 0]);
+        (client, handler, metrics)
+    }
+
+    #[tokio::test]
+    async fn rdp_udp_associate_fails_closed_before_udp_resource_allocation() {
+        // An occupied relay range would produce GeneralFailure if UDP binding
+        // were reached; a permissive ACL would otherwise allow direct egress.
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut config = permissive_rdp_config();
+        config.udp_port_range = Some(PortRange {
+            min: port,
+            max: port,
+        });
+        config.udp_advertise = Some(UdpAdvertise::Host("must-not-resolve.invalid".into()));
+        let (mut client, handler, metrics) = rdp_test_connection(config).await;
+
+        client
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .expect("unsupported UDP must fail before DNS or socket allocation")
+            .unwrap();
+        assert_eq!(reply, [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            handler.await.unwrap(),
+            Err(Error::CommandNotSupported)
+        ));
+        assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+        let counters = metrics.render_prometheus();
+        assert!(counters.contains("alighieri_udp_associations_total 0\n"));
+        assert!(counters.contains("alighieri_udp_associations_active 0\n"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_rdp_connect_never_falls_back_to_a_direct_socket() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (mut client, handler, _) = rdp_test_connection(permissive_rdp_config()).await;
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&port.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        #[cfg(all(windows, feature = "rdp"))]
+        let expected_reply = 3;
+        #[cfg(not(all(windows, feature = "rdp")))]
+        let expected_reply = 1;
+        assert_eq!(reply, [5, expected_reply, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(handler.await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err(),
+            "RDP failure must never create a direct destination connection"
+        );
+    }
 
     #[cfg(all(windows, feature = "rdp"))]
     #[test]

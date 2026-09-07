@@ -3,30 +3,42 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
 
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{LocalFree, BOOL, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    LocalFree, BOOL, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE,
+    HLOCAL,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Local-only pipe used by the single-session MVP.
 pub const PIPE_NAME: &str = r"\\.\pipe\alighieri-rdp-v1";
 
-/// The object owner (the interactive user running the COM server) and Local
-/// System have full access. The protected DACL prevents inherited broad grants.
+/// The explicitly assigned creating user and Local System have full access.
+/// The protected DACL prevents inherited broad grants.
 const PIPE_SDDL: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
 
 struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
 impl SecurityDescriptor {
     fn owner_only() -> io::Result<Self> {
-        let sddl: Vec<u16> = PIPE_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        // Elevated tokens can otherwise default the object owner to the
+        // Administrators group. Pin OW to the creating user, regardless of UAC.
+        let sddl = format!("O:{}{PIPE_SDDL}", current_user_sid()?);
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         // SAFETY: `sddl` is NUL-terminated and `descriptor` is an out pointer.
         unsafe {
@@ -55,8 +67,8 @@ impl Drop for SecurityDescriptor {
 }
 
 /// Creates the single local bridge endpoint with a protected DACL. Using the
-/// first-instance flag detects a pre-existing name and fails closed rather than
-/// connecting the bridge to an untrusted server.
+/// first-instance flag detects a pre-existing name and fails closed. The client
+/// separately authenticates the owner of its connected handle.
 pub fn create_server() -> io::Result<NamedPipeServer> {
     create_server_at(PIPE_NAME)
 }
@@ -88,10 +100,20 @@ fn create_server_at(pipe_name: &str) -> io::Result<NamedPipeServer> {
 /// a busy single instance is retried briefly so reconnect races do not fail a
 /// SOCKS request spuriously.
 pub async fn connect_client() -> io::Result<NamedPipeClient> {
+    connect_client_at(PIPE_NAME).await
+}
+
+async fn connect_client_at(pipe_name: &str) -> io::Result<NamedPipeClient> {
+    let expected_owner = current_user_sid()?;
     let mut busy_retries = 0u8;
     loop {
-        match ClientOptions::new().open(PIPE_NAME) {
-            Ok(client) => return Ok(client),
+        // Tokio uses SECURITY_IDENTIFICATION by default: opening a squatted
+        // pipe must not let its server impersonate this process.
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => {
+                validate_server_owner(&client, &expected_owner)?;
+                return Ok(client);
+            }
             Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
                 if busy_retries == 10 {
                     return Err(error);
@@ -108,6 +130,93 @@ pub async fn connect_client() -> io::Result<NamedPipeClient> {
             Err(error) => return Err(error),
         }
     }
+}
+
+fn validate_server_owner(client: &NamedPipeClient, expected_owner: &str) -> io::Result<()> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: query the connected kernel object, not its replaceable name.
+    // Windows allocates the descriptor; `owner` points inside that allocation.
+    let result = unsafe {
+        GetSecurityInfo(
+            HANDLE(client.as_raw_handle()),
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    let _descriptor = SecurityDescriptor(descriptor);
+    if result.is_err() {
+        return Err(io::Error::from_raw_os_error(result.0 as i32));
+    }
+    let owner = sid_string(owner)?;
+    if owner == expected_owner || owner == "S-1-5-18" {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "RDP bridge pipe is not owned by the current user or Local System",
+        ))
+    }
+}
+
+fn current_user_sid() -> io::Result<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: the process pseudo-handle is valid and token is writable.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(windows_error)?;
+    // SAFETY: OpenProcessToken returned a new owned handle on success.
+    let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut length = 0;
+    // SAFETY: the live token is queried only for the required buffer size.
+    let query = unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenUser,
+            None,
+            0,
+            &mut length,
+        )
+    };
+    let error = query.err().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows returned an empty TOKEN_USER",
+        )
+    })?;
+    if error.code() != windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+        return Err(windows_error(error));
+    }
+    // usize storage supplies the alignment TOKEN_USER requires. The returned
+    // SID remains valid while this buffer lives.
+    let mut buffer = vec![0usize; (length as usize).div_ceil(size_of::<usize>())];
+    // SAFETY: buffer has the required size/alignment and token remains live.
+    unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            length,
+            &mut length,
+        )
+    }
+    .map_err(windows_error)?;
+    // SAFETY: GetTokenInformation initialized a correctly aligned TOKEN_USER.
+    sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+}
+
+fn sid_string(sid: PSID) -> io::Result<String> {
+    let mut text = PWSTR::null();
+    // SAFETY: callers provide a SID in a live Windows-owned descriptor/token.
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(windows_error)?;
+    // SAFETY: successful conversion yields a NUL-terminated LocalAlloc string.
+    let result = unsafe { text.to_string() }.map_err(io::Error::other);
+    unsafe { LocalFree(HLOCAL(text.0.cast())) };
+    result
 }
 
 fn windows_error(error: windows::core::Error) -> io::Error {
@@ -238,5 +347,140 @@ mod tests {
             std::collections::BTreeSet::from(["OW", "SY"]),
             "pipe DACL trustees must be exactly Owner Rights and SYSTEM: {sddl}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_authenticates_the_connected_pipe_owner_before_sending_data() {
+        use tokio::io::AsyncReadExt;
+
+        let pipe_name = format!(r"\\.\pipe\alighieri-rdp-owner-test-{}", std::process::id());
+        let mut server = create_server_at(&pipe_name).unwrap();
+        let client = connect_client_at(&pipe_name).await.unwrap();
+        server.connect().await.unwrap();
+
+        let owner = current_user_sid().unwrap();
+        validate_server_owner(&client, &owner).unwrap();
+        if owner != "S-1-5-18" {
+            // The actual kernel object belongs to this user, not the unrelated
+            // Guests SID. A permissive DACL alone cannot establish peer identity.
+            assert_eq!(
+                validate_server_owner(&client, "S-1-5-32-546")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), server.read(&mut byte))
+                .await
+                .is_err(),
+            "authentication must not send any application bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_pipe_dacl_grants_owner_system_and_denies_an_unrelated_sid() {
+        use windows::Win32::Foundation::LUID;
+        use windows::Win32::Security::Authorization::{
+            AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
+            AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
+            AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
+            AUTHZ_AUDIT_EVENT_HANDLE, AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE,
+            AUTHZ_RM_FLAG_NO_AUDIT, AUTHZ_SKIP_TOKEN_GROUPS,
+        };
+        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION};
+        use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+
+        let pipe_name = format!(r"\\.\pipe\alighieri-rdp-access-test-{}", std::process::id());
+        let server = create_server_at(&pipe_name).unwrap();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: query the live kernel object's installed security descriptor.
+        let status = unsafe {
+            GetSecurityInfo(
+                HANDLE(server.as_raw_handle()),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        let descriptor = SecurityDescriptor(descriptor);
+        assert!(status.is_ok(), "read live pipe security: {status:?}");
+        let desired = (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0;
+
+        // Evaluate the installed descriptor with Windows' authorization engine.
+        // Supplying explicit SIDs without account/group lookup avoids creating
+        // users, depending on domain connectivity, or requiring elevation.
+        for (sid, expected_access) in [
+            (current_user_sid().unwrap(), true),
+            ("S-1-5-18".to_owned(), true),
+            ("S-1-5-21-1-2-3-1001".to_owned(), false),
+        ] {
+            let wide: Vec<u16> = sid.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut principal = PSID::default();
+            let mut manager = AUTHZ_RESOURCE_MANAGER_HANDLE::default();
+            let mut context = AUTHZ_CLIENT_CONTEXT_HANDLE::default();
+            let mut granted = 0;
+            let mut access_error = 0;
+            let request = AUTHZ_ACCESS_REQUEST {
+                DesiredAccess: desired,
+                ..Default::default()
+            };
+            let mut reply = AUTHZ_ACCESS_REPLY {
+                ResultListLength: 1,
+                GrantedAccessMask: &mut granted,
+                Error: &mut access_error,
+                ..Default::default()
+            };
+            // SAFETY: all input/output storage lives through these calls;
+            // handles and the converted SID are released before assertions.
+            let result = unsafe {
+                (|| -> windows::core::Result<()> {
+                    ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut principal)?;
+                    AuthzInitializeResourceManager(
+                        AUTHZ_RM_FLAG_NO_AUDIT.0,
+                        None,
+                        None,
+                        None,
+                        PCWSTR::null(),
+                        &mut manager,
+                    )?;
+                    AuthzInitializeContextFromSid(
+                        AUTHZ_SKIP_TOKEN_GROUPS,
+                        principal,
+                        manager,
+                        None,
+                        LUID::default(),
+                        None,
+                        &mut context,
+                    )?;
+                    AuthzAccessCheck(
+                        AUTHZ_ACCESS_CHECK_FLAGS(0),
+                        context,
+                        &request,
+                        AUTHZ_AUDIT_EVENT_HANDLE::default(),
+                        descriptor.0,
+                        None,
+                        &mut reply,
+                        None,
+                    )
+                })()
+            };
+            unsafe {
+                let _ = AuthzFreeContext(context);
+                let _ = AuthzFreeResourceManager(manager);
+                let _ = LocalFree(HLOCAL(principal.0));
+            }
+            result.expect("evaluate pipe DACL using AuthzAccessCheck");
+            assert_eq!(
+                access_error == 0 && granted & desired == desired,
+                expected_access,
+                "unexpected pipe access for {sid}: error={access_error}, granted={granted:#x}"
+            );
+        }
     }
 }

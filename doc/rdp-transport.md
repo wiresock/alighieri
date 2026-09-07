@@ -1,8 +1,9 @@
 # RDP Dynamic Virtual Channel transport
 
-Status: implemented Windows MVP, with real two-machine RDP validation remaining
-manual. The implementation is enabled by the optional Cargo feature `rdp`;
-direct egress remains the default.
+Status: implemented Windows MVP. A real two-machine TCP smoke test has passed;
+the remaining production acceptance scenarios below still require manual RDP
+validation, including a rerun after transport changes. The implementation is
+enabled by the optional Cargo feature `rdp`; direct egress remains the default.
 
 ## Purpose and scope
 
@@ -14,8 +15,9 @@ control and data path is a named RDP Dynamic Virtual Channel (DVC).
 The MVP supports Microsoft `mstsc.exe`, TCP CONNECT, IPv4, IPv6, hostnames with
 remote DNS, simultaneous streams, TCP half-close, bounded flow control, and
 recovery after a DVC reconnect. UDP, a Windows service agent, multi-user RDS
-selection, GUI configuration, stream resumption, compression, traffic shaping,
-and an extra encryption layer are out of scope.
+selection, GUI configuration, stream resumption, compression, and an extra
+encryption layer are out of scope. Existing Alighieri TCP bandwidth throttling
+also applies to RDP streams through the generic relay.
 
 The repository uses `doc/` rather than `docs/`, so this document lives beside
 the existing operator and protocol documentation.
@@ -101,8 +103,11 @@ Alighieri's reconnecting client attaches when that bridge becomes available and
 ALRD negotiation starts.
 
 The named pipe is local-only, rejects remote clients, and uses a protected DACL
-for the creating account plus SYSTEM. The first-instance flag detects an existing
-name and fails closed rather than attaching to a pre-created server. The fixed
+for the creating account plus SYSTEM. Its owner is explicitly the helper's user
+SID. The first-instance flag makes helper creation fail closed if the name is
+already occupied. Before sending any protocol bytes, the client checks the
+connected pipe's owner and accepts only its own account or SYSTEM; another local
+user cannot impersonate the helper by pre-creating a permissive pipe. The fixed
 MVP pipe name is not scoped by logon SID or Windows session, so one local helper
 and compatible RDP channel is supported at a time and another process running as
 the same account is inside the IPC trust boundary. Windows Service validation
@@ -119,9 +124,13 @@ ALRD framing does not depend on DVC write boundaries.
 The remote agent gives one actor exclusive ownership of the WTS channel because
 `WTSVirtualChannelRead`/`Write` are not thread-safe. Raw WTS reads contain an
 eight-byte `CHANNEL_PDU_HEADER`; the actor validates its declared length and
-FIRST/LAST sequence, caps reassembly, and only then feeds bytes to the ALRD
-decoder. Consecutive outbound writes are batch-limited so reads and their
-flow-control updates continue to make progress.
+FIRST/LAST sequence, caps reassembly, ignores documented benign PDU metadata
+(including SHOW_PROTOCOL), and only then feeds bytes to the ALRD decoder.
+Compression and unknown flags remain errors. Consecutive outbound writes are
+batch-limited so reads and their flow-control updates continue to make progress.
+The WTS actor never waits for an inbound queue consumer: saturation cancels the
+generation. Independent local pipe pumps keep reverse traffic and disconnect
+cancellation pollable while either direction is backpressured.
 
 On `Disconnected`, `Terminated`, `OnClose`, WTS I/O failure, malformed DVC PDU,
 or pipe loss, the current generation is cancelled. All logical streams fail and
@@ -184,7 +193,8 @@ IPv4: family:u8=1, port:u16, address:[u8;4]
 IPv6: family:u8=2, port:u16, address:[u8;16], scope_id:u32
 ```
 
-IPv4-mapped IPv6 addresses are canonicalised to IPv4 before policy and encoding.
+IPv4-mapped and deprecated IPv4-compatible IPv6 wrappers are canonicalised to
+IPv4 consistently before policy and encoding (`::` and `::1` remain IPv6).
 IPv6 flow information is normalised to zero; the scope ID is preserved so
 link-local candidates remain usable and distinct. Hostnames occur only in
 RESOLVE and are validated as UTF-8 with Alighieri's DNS label/total-length rules.
@@ -243,6 +253,14 @@ rejected. Dropping an established logical stream normally sends CLOSE(Normal);
 timed-out or abandoned resolve/open work sends CLOSE(Cancelled), while relay I/O
 failures send CLOSE(I/O).
 
+A full normal CLOSE stops the reverse upload but still drains accepted inbound
+bytes and the destination writer's shutdown (including buffered TLS output).
+SHUTDOWN_WRITE alone preserves the opposite TCP half. Error CLOSE and generation
+failure abort both directions. Draining agent relays count toward the negotiated
+worker limit even after their stream record retires; they cannot accumulate
+outside admission accounting. Existing idle timeout and throttling rules still
+apply, without a new hard deadline that would truncate deliberately slow tails.
+
 ## Flow control, backpressure, and fairness
 
 Each side advertises the number of DATA bytes it is prepared to buffer per
@@ -264,11 +282,18 @@ or tasks.
 
 At most 128 logical streams and 128 concurrent resolve/connect operations exist;
 each open stream has exactly two bounded workers and at most one relay task.
-Resolution returns at most 16 deduplicated addresses. At maximum negotiated
+The process-wide DNS worker limit also covers OS resolver calls that continue
+after their caller times out or their generation disconnects; capacity is not
+released until the blocking resolver actually returns. Resolution returns at
+most 16 deduplicated addresses. At maximum negotiated
 limits, logical inbound/outbound buffers account for 64 MiB of payload capacity,
 the ordered writer queue for 8 MiB, and the decoded reader queue for 4 MiB per
-mux endpoint, plus small fixed decoder and bookkeeping overhead. The separate
-COM and WTS bridges also use fixed-capacity queues.
+mux endpoint. Generic relay copy buffers add up to 8 MiB (two 32 KiB buffers
+per stream). These are payload-capacity bounds, not a process RSS ceiling:
+allocator/task bookkeeping, TLS buffers, and OS socket/pipe buffers are extra.
+The separate COM and WTS bridges also use fixed-capacity queues (512 entries
+each); inbound entries are capped at one validated DVC message and outbound
+entries at a 16 KiB pipe/duplex read. No queue grows with total stream history.
 
 ## Timeouts and health
 
@@ -284,7 +309,11 @@ cannot occupy the transport indefinitely.
 Each side sends a PING every 15 seconds while no previous ping is outstanding.
 The matching PONG must arrive within 45 seconds; an unexpected nonce is a
 protocol error. A missed health deadline tears down the generation. Keepalive is
-transport health, not TCP stream idle policy.
+transport health, not TCP stream idle policy. Individual frame writes and mux
+handler waits are bounded to 45 seconds so queue backpressure cannot suspend
+generation cleanup indefinitely. A full cancellation-command queue requests
+generation teardown through a separate signal; cancellation is never silently
+dropped and never creates an unbounded background sender.
 
 ## Configuration and commands
 
@@ -385,9 +414,10 @@ possibly metadata services. Alighieri ACLs and DNS deny categories remain the
 primary policy, with optional agent-side defence in depth. The agent never
 listens on a network port.
 
-The local named pipe is not a network boundary. It rejects remote clients, uses
-a protected creating-account/SYSTEM DACL, and fails closed if its fixed name
-already exists. Access is account-scoped rather than logon-session-scoped;
+The local named pipe rejects remote clients, uses a protected
+creating-account/SYSTEM DACL, verifies the server owner before trusting its
+bytes, and fails closed if its fixed name already exists. Access is
+account-scoped rather than logon-session-scoped;
 loosening that boundary for a service or multi-session broker is not permitted
 without explicit authentication and session selection.
 
@@ -406,10 +436,49 @@ Platform-neutral automated tests cover:
   transport loss, and a fresh reconnect generation with no stale state;
 - in-memory duplex integration proving independent multiplexed progress.
 
-Windows-only unit tests cover DVC PDU reassembly, bounded WTS write batching,
-captured HRESULT mapping, connector shutdown signaling, registry path and pipe
-security-string invariants, and argument parsing. Tests that require a real RDP
-stack are manual only.
+Windows-only tests cover DVC PDU reassembly, bounded WTS write batching and
+inbound saturation, captured HRESULT mapping, connector shutdown signaling,
+bidirectional bridge cancellation, registry paths, and argument parsing. Pipe
+tests inspect an actual kernel object's owner/protected DACL and exercise
+first-instance collision and client-side owner validation. Set
+`ALIGHIERI_REQUIRE_DACL_TESTS=1` for required Windows security test runs, as CI
+does. Tests that require a real RDP stack remain manual.
+
+### Recorded live evidence and remaining acceptance gates
+
+The operator-provided September 1, 2026 two-machine x86-64 Windows transcript,
+after the WTS `ERROR_IO_INCOMPLETE` polling fix (commit `8b0f04a`), demonstrated:
+
+- successful hostname HTTPS and IPv4-literal HTTP through the RDP path;
+- different direct and proxied public source addresses;
+- CONNECT failure while the transport was unavailable and ACL-denied port
+  rejection with SOCKS reply 2;
+- named-rule metrics, an 8 MiB transfer in about 8 seconds under the configured
+  throttle, and eight concurrent 32 MiB transfers with curl exit code 0;
+- ten short requests completing in approximately 539–590 ms during those
+  concurrent transfers (their individual curl exit codes were not recorded).
+
+The failed `.invalid` lookup returned generic SOCKS reply 1 in that build, not
+the desired host/DNS-unreachable reply 4. DNS error normalization is covered by
+the follow-up automated regression tests; its live result needs rechecking.
+
+This is evidence of working TCP egress, not complete production certification.
+After the latest transport fixes, rerun the smoke tests and record the binary
+commit/hash, both OS/architecture versions, and results for:
+
+- IPv6 and scoped-address destinations;
+- both TCP half-close directions, stalled readers/writers, idle timeout, and
+  cancellation while all queues or stream slots are busy;
+- disconnect/reconnect with active transfers, remote socket cleanup, and new
+  requests succeeding without restarting either process;
+- DNS/refusal/unreachable reply codes, denied remote IP candidates, UDP
+  ASSOCIATE rejection with no direct traffic, and byte/hash integrity;
+- COM autoactivation/unregistration and real cross-account pipe access denial
+  and pre-created-pipe rejection under the intended deployment accounts.
+
+Windows ARM64 remains cross-build-only validation until exercised on hardware.
+Do not mark these live acceptance gates passed based on in-memory or local pipe
+tests. A second Windows/RDP session is required to complete them.
 
 Manual end-to-end procedure:
 

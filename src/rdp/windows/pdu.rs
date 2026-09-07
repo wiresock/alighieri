@@ -7,7 +7,12 @@ use crate::rdp::protocol::{HEADER_LEN, MAX_FRAME_PAYLOAD};
 const PDU_HEADER_LEN: usize = 8;
 const CHANNEL_FLAG_FIRST: u32 = 0x01;
 const CHANNEL_FLAG_LAST: u32 = 0x02;
-const KNOWN_FLAGS: u32 = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
+// MS-RDPBCGR 2.2.6.1.1: SHOW_PROTOCOL controls header visibility;
+// SUSPEND/RESUME must be ignored in this client-to-server direction, and
+// SHADOW_PERSISTENT is unused. None changes application payload bytes.
+const CHANNEL_FLAG_SHOW_PROTOCOL: u32 = 0x10;
+const IGNORED_METADATA_FLAGS: u32 = CHANNEL_FLAG_SHOW_PROTOCOL | 0x20 | 0x40 | 0x80;
+const KNOWN_FLAGS: u32 = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | IGNORED_METADATA_FLAGS;
 
 /// A DVC `Write` never needs to carry more than one largest ALRD frame.
 const MAX_MESSAGE_LEN: usize = HEADER_LEN + MAX_FRAME_PAYLOAD;
@@ -110,13 +115,14 @@ impl DvcReassembler {
             _ => {}
         }
 
-        self.buffer.extend_from_slice(&input[PDU_HEADER_LEN..]);
-        if self.buffer.len() > declared {
+        let actual = self.buffer.len() + input.len() - PDU_HEADER_LEN;
+        if actual > declared {
             return Err(ReassemblyError::LengthExceeded {
                 expected: declared,
-                actual: self.buffer.len(),
+                actual,
             });
         }
+        self.buffer.extend_from_slice(&input[PDU_HEADER_LEN..]);
         if !last {
             return Ok(None);
         }
@@ -185,8 +191,8 @@ mod tests {
         let mut r = DvcReassembler::new();
         assert_eq!(r.push(&[0; 7]), Err(ReassemblyError::HeaderTooShort(7)));
         assert_eq!(
-            r.push(&pdu(0, 0x80, b"")),
-            Err(ReassemblyError::UnknownFlags(0x80))
+            r.push(&pdu(0, 0x100, b"")),
+            Err(ReassemblyError::UnknownFlags(0x100))
         );
         assert_eq!(
             r.push(&pdu(MAX_MESSAGE_LEN + 1, CHANNEL_FLAG_FIRST, b"")),
@@ -219,5 +225,45 @@ mod tests {
                 actual: 5
             })
         );
+    }
+
+    #[test]
+    fn benign_metadata_preserves_fragment_boundaries_and_lengths() {
+        let mut r = DvcReassembler::new();
+        for metadata in [
+            CHANNEL_FLAG_SHOW_PROTOCOL,
+            0x20,
+            0x40,
+            0x80,
+            IGNORED_METADATA_FLAGS,
+        ] {
+            assert_eq!(
+                r.push(&pdu(2, CHANNEL_FLAG_FIRST | metadata, b"a"))
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                r.push(&pdu(2, CHANNEL_FLAG_LAST | metadata, b"b")).unwrap(),
+                Some(b"ab".to_vec())
+            );
+            assert_eq!(
+                r.push(&pdu(1, CHANNEL_FLAG_LAST | metadata, b"x")),
+                Err(ReassemblyError::MissingFirst)
+            );
+        }
+        // WTS delivers application bytes, not raw compressed channel traffic.
+        for flag in [
+            0x0001_0000,
+            0x0020_0000,
+            0x0040_0000,
+            0x0080_0000,
+            0x8000_0000,
+        ] {
+            let flags = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST | flag;
+            assert_eq!(
+                r.push(&pdu(1, flags, b"x")),
+                Err(ReassemblyError::UnknownFlags(flags))
+            );
+        }
     }
 }
