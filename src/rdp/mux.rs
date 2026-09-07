@@ -3704,6 +3704,50 @@ mod tests {
         assert_eq!(result, (0, 0));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn finish_agent_operation_plumbs_io_timeout_to_relay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+
+        let mut streams = BTreeMap::from([(1, AgentStreamState::Opening { candidates: None })]);
+        let (ordered, mut frames) = mpsc::channel(4);
+        let (events, _events_rx) = mpsc::channel(4);
+        let mut relays = JoinSet::new();
+        let policy = AgentPolicy {
+            io_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        finish_agent_operation(
+            AgentOperation::Opened {
+                stream_id: 1,
+                result: Ok(socket),
+            },
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: protocol::INITIAL_WINDOW,
+                max_streams: 1,
+            },
+            &policy,
+            &mut streams,
+            &ordered,
+            &events,
+            &mut relays,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(frames.recv().await, Some(Frame::OpenOk { .. })));
+
+        tokio::time::timeout(Duration::from_secs(10), relays.join_next())
+            .await
+            .expect("agent relay must terminate on configured io_timeout")
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn repeated_agent_cancel_keeps_pending_operations_bounded() {
         let limits = NegotiatedLimits {
