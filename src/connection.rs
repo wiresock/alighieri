@@ -208,11 +208,24 @@ impl Connection {
         }
 
         // 4. Request.
-        let request = with_timeout(
+        let request = match with_timeout(
             self.config.handshake_timeout,
             socks5::read_request(&mut self.stream),
         )
-        .await?;
+        .await
+        {
+            Ok(request) => request,
+            Err(e) => {
+                // An unknown ATYP is a request-level rejection (RFC 1928 §6),
+                // before any egress is selected. Preserve the existing silent
+                // close for other malformed, incomplete or timed-out input.
+                if matches!(&e, Error::Io(io) if io.kind() == io::ErrorKind::Unsupported) {
+                    socks5::write_reply(&mut self.stream, e.to_reply(), socks5::unspecified_v4())
+                        .await?;
+                }
+                return Err(e);
+            }
+        };
         info!(
             peer = %self.peer,
             command = ?request.command,
@@ -1377,6 +1390,35 @@ mod tests {
             .unwrap();
         assert_eq!(selection, [5, 0]);
         (client, handler, metrics)
+    }
+
+    #[tokio::test]
+    async fn unsupported_address_type_reply_precedes_egress_selection() {
+        for egress in [Egress::Direct, Egress::Rdp] {
+            let mut config = permissive_rdp_config();
+            config.egress = egress;
+            let (mut client, handler, metrics) = rdp_test_connection(config).await;
+
+            // No address length is defined for ATYP 2. The header alone must
+            // reject immediately, without waiting for a guessed address format
+            // or requiring an available RDP connector.
+            client.write_all(&[5, 1, 0, 2]).await.unwrap();
+            let mut reply = [0; 10];
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+                .await
+                .expect("unsupported ATYP must reply without resolving or connecting")
+                .unwrap();
+            assert_eq!(reply, [5, 8, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let result = tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .expect("the rejected request must end the connection")
+                .unwrap();
+            assert!(matches!(result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::Unsupported));
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+            assert!(metrics
+                .render_prometheus()
+                .contains("alighieri_tcp_connects_total 0\n"));
+        }
     }
 
     #[tokio::test]

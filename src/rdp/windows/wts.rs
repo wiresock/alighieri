@@ -57,7 +57,7 @@ pub async fn run_agent() -> io::Result<()> {
         );
         tokio::select! {
             result = tokio::signal::ctrl_c() => return result,
-            result = mux::run_agent_session(bridge, policy.clone()) => {
+            result = bridge.run(policy.clone()) => {
                 match result {
                     Ok(()) => debug!("RDP agent generation ended"),
                     Err(error) => warn!(%error, "RDP agent generation was lost"),
@@ -93,7 +93,41 @@ fn parse_policy(arguments: impl IntoIterator<Item = String>) -> io::Result<Optio
     Ok(Some(policy))
 }
 
-async fn open_bridge() -> io::Result<DuplexStream> {
+// The generation owns the abortable async pump even if the native actor never
+// returns from a WTS call and therefore cannot publish its stop notification.
+struct BridgePump(tokio::task::JoinHandle<()>);
+
+impl BridgePump {
+    async fn stop(&mut self) {
+        self.0.abort();
+        // Reap cancellation before reconnecting, so the old duplex and the
+        // pump's queue endpoints have actually been dropped, not just marked.
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for BridgePump {
+    fn drop(&mut self) {
+        // Also covers Ctrl+C, cancellation of run_agent, and an unpolled run.
+        self.0.abort();
+    }
+}
+
+struct AgentBridge {
+    stream: DuplexStream,
+    pump: BridgePump,
+}
+
+impl AgentBridge {
+    async fn run(self, policy: AgentPolicy) -> Result<(), mux::MuxError> {
+        let Self { stream, mut pump } = self;
+        let result = mux::run_agent_session(stream, policy).await;
+        pump.stop().await;
+        result
+    }
+}
+
+async fn open_bridge() -> io::Result<AgentBridge> {
     let (mux_side, actor_side) = tokio::io::duplex(BRIDGE_CAPACITY);
     let (outbound_tx, outbound_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
@@ -106,10 +140,16 @@ async fn open_bridge() -> io::Result<DuplexStream> {
     ready_rx
         .await
         .map_err(|_| io::Error::other("WTS actor stopped before initialization"))??;
-    // Intentionally detached: actor stop cancels this generation's pump
-    // independently of I/O progress; process/runtime teardown aborts it too.
-    tokio::spawn(pump_bridge(actor_side, outbound_tx, inbound_rx, stopped_rx));
-    Ok(mux_side)
+    let pump = BridgePump(tokio::spawn(pump_bridge(
+        actor_side,
+        outbound_tx,
+        inbound_rx,
+        stopped_rx,
+    )));
+    Ok(AgentBridge {
+        stream: mux_side,
+        pump,
+    })
 }
 
 async fn pump_bridge(
@@ -161,14 +201,36 @@ fn wts_actor(
 
 // Keep the actor's real control flow testable without a live RDP session. Only
 // the native API boundary is substituted; queueing, reassembly and exit paths
-// (including stop-before-close ordering) are shared with production.
+// (including stop-before-close ordering) are shared with production. Channel
+// implementations release their owned resource in Drop.
 trait WtsChannel {
     fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize>;
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
-    fn close(self);
 }
 
 struct NativeWtsChannel(HANDLE);
+
+impl Drop for NativeWtsChannel {
+    fn drop(&mut self) {
+        close_channel(self.0);
+    }
+}
+
+struct ActorChannel<C> {
+    channel: C,
+    stopped: Option<oneshot::Sender<()>>,
+}
+
+impl<C> Drop for ActorChannel<C> {
+    fn drop(&mut self) {
+        // Drop runs before the channel field's destructor, including during
+        // unwinding. Publish termination before a potentially blocking close;
+        // queue-endpoint destruction alone would publish it too late.
+        if let Some(stopped) = self.stopped.take() {
+            let _ = stopped.send(());
+        }
+    }
+}
 
 impl WtsChannel for NativeWtsChannel {
     fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize> {
@@ -182,10 +244,6 @@ impl WtsChannel for NativeWtsChannel {
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         write_channel(self.0, data)
     }
-
-    fn close(self) {
-        close_channel(self.0);
-    }
 }
 
 fn wts_actor_with_channel<C: WtsChannel>(
@@ -195,25 +253,25 @@ fn wts_actor_with_channel<C: WtsChannel>(
     stopped: oneshot::Sender<()>,
     open: impl FnOnce() -> io::Result<C>,
 ) {
-    let mut channel = match open() {
-        Ok(channel) => {
-            if ready.send(Ok(())).is_err() {
-                let _ = stopped.send(());
-                channel.close();
-                return;
-            }
-            channel
-        }
+    let channel = match open() {
+        Ok(channel) => channel,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    let mut owner = ActorChannel {
+        channel,
+        stopped: Some(stopped),
+    };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
 
     let mut reassembler = DvcReassembler::new();
     let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
     loop {
-        match drain_outbound_batch(&mut outbound, |data| channel.write(data)) {
+        match drain_outbound_batch(&mut outbound, |data| owner.channel.write(data)) {
             Ok(OutboundQueueState::Open) => {}
             Ok(OutboundQueueState::Closed) => break,
             Err(error) => {
@@ -222,7 +280,7 @@ fn wts_actor_with_channel<C: WtsChannel>(
             }
         }
 
-        let count = match channel.read(&mut read_buffer) {
+        let count = match owner.channel.read(&mut read_buffer) {
             Ok(count) => count,
             Err(error) => {
                 // A no-data result is the actor's scheduling tick, not a session
@@ -259,10 +317,6 @@ fn wts_actor_with_channel<C: WtsChannel>(
             }
         }
     }
-    // Publish termination before entering another blocking Windows API, not
-    // merely when the actor's queue endpoints are eventually dropped.
-    let _ = stopped.send(());
-    channel.close();
 }
 
 fn forward_inbound(inbound: &mpsc::Sender<Vec<u8>>, message: Vec<u8>) -> io::Result<()> {
@@ -376,8 +430,158 @@ fn windows_error(error: WindowsError) -> io::Error {
 mod tests {
     use super::*;
     use crate::rdp::protocol::{Frame, FrameDecoder, Hello, Role};
+    use std::future::Future;
+    use std::sync::{Arc, Condvar, Mutex};
     use tokio::net::TcpListener;
     use windows::core::HRESULT;
+
+    struct BlockedWriteChannel {
+        entered: Option<oneshot::Sender<()>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl WtsChannel for BlockedWriteChannel {
+        fn read(&mut self, _buffer: &mut [u8]) -> windows::core::Result<usize> {
+            panic!("the primed write must run before any read");
+        }
+
+        fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+            self.entered.take().unwrap().send(()).unwrap();
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    // Always release and join the fake native worker, even if a test fails.
+    // Production native calls are not claimed to support this test-only escape.
+    struct BlockedActor {
+        release: Arc<(Mutex<bool>, Condvar)>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for BlockedActor {
+        fn drop(&mut self) {
+            let (released, wake) = &*self.release;
+            *released.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_one();
+            let _ = self.thread.take().unwrap().join();
+        }
+    }
+
+    async fn bridge_with_blocked_native_write() -> (AgentBridge, BlockedActor) {
+        let (mut stream, actor_side) = tokio::io::duplex(1);
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let channel = BlockedWriteChannel {
+            entered: Some(entered_tx),
+            release: release.clone(),
+        };
+        outbound_tx.try_send(vec![0]).unwrap();
+        let thread = std::thread::spawn(move || {
+            wts_actor_with_channel(outbound_rx, inbound_tx, ready_tx, stopped_tx, || {
+                Ok(channel)
+            });
+        });
+        let actor = BlockedActor {
+            release,
+            thread: Some(thread),
+        };
+        tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The real actor is now parked in write(), retaining both queue ends
+        // and the stop sender. Fill its queue before starting the pump.
+        outbound_tx.try_send(vec![1]).unwrap();
+        let pump = BridgePump(tokio::spawn(pump_bridge(
+            actor_side,
+            outbound_tx,
+            inbound_rx,
+            stopped_rx,
+        )));
+        // Capacity is one: completing this write proves the pump read its first
+        // byte, then parked on the full outbound queue. Its reverse direction
+        // has no inbound data and waits on recv, not duplex I/O.
+        tokio::time::timeout(Duration::from_secs(3), stream.write_all(&[2, 3]))
+            .await
+            .unwrap()
+            .unwrap();
+        (AgentBridge { stream, pump }, actor)
+    }
+
+    #[tokio::test]
+    async fn dead_mux_requires_pump_abort_while_native_write_is_blocked() {
+        let (AgentBridge { stream, mut pump }, actor) = bridge_with_blocked_native_write().await;
+        drop(stream);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut pump.0)
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(3), pump.stop())
+            .await
+            .expect("abort must reap the pump without waiting for native Write");
+        assert!(pump.0.is_finished());
+        assert!(!actor.thread.as_ref().unwrap().is_finished());
+    }
+
+    #[tokio::test]
+    async fn mux_timeout_reaps_pump_before_returning_while_native_write_is_blocked() {
+        let (bridge, actor) = bridge_with_blocked_native_write().await;
+        let pump = bridge.pump.0.abort_handle();
+        tokio::time::pause();
+        let mut session = Box::pin(bridge.run(AgentPolicy::default()));
+        // Poll the real session to install its handshake timeout before moving
+        // virtual time. It cannot write HELLO through the saturated bridge.
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(session.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let result = tokio::time::timeout(Duration::from_secs(3), session)
+            .await
+            .expect("session return must not await native Write");
+        assert!(matches!(result, Err(mux::MuxError::Timeout)));
+        assert!(pump.is_finished(), "reconnect must not retain the old pump");
+        assert!(!actor.thread.as_ref().unwrap().is_finished());
+    }
+
+    #[tokio::test]
+    async fn dropping_generation_aborts_pump_even_if_session_was_never_polled() {
+        for poll_session in [false, true] {
+            let (bridge, actor) = bridge_with_blocked_native_write().await;
+            let pump = bridge.pump.0.abort_handle();
+            let mut session = Box::pin(bridge.run(AgentPolicy::default()));
+            if poll_session {
+                assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    session.as_mut().poll(cx)
+                ))
+                .await
+                .is_pending());
+            }
+            drop(session);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !pump.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelling a generation must abort its pump");
+            assert!(!actor.thread.as_ref().unwrap().is_finished());
+        }
+    }
 
     enum ActorRead {
         Bytes(Vec<u8>),
@@ -412,11 +616,13 @@ mod tests {
             self.fail_write = false;
             Err(io::Error::from(io::ErrorKind::BrokenPipe))
         }
+    }
 
-        fn close(self) {
+    impl Drop for TestWtsChannel<'_> {
+        fn drop(&mut self) {
             // This runs at entry to the close API, not after the actor returns.
-            // Removing either production send must fail even though dropping
-            // the sender would eventually wake the pump after close returns.
+            // Removing the owner's stop notification must fail even though
+            // dropping the sender would eventually wake the pump after close.
             assert_eq!(self.stopped.try_recv(), Ok(()), "{}", self.scenario);
             assert!(self.read.is_none(), "{} exited before read", self.scenario);
             assert!(!self.fail_write, "{} exited before write", self.scenario);
@@ -505,6 +711,71 @@ mod tests {
             stopped_rx.try_recv(),
             Err(oneshot::error::TryRecvError::Closed)
         );
+    }
+
+    struct PanickingWtsChannel<'a> {
+        operation: &'static str,
+        stopped: &'a mut oneshot::Receiver<()>,
+        stop_at_close: &'a mut Option<Result<(), oneshot::error::TryRecvError>>,
+        closes: &'a mut usize,
+    }
+
+    impl WtsChannel for PanickingWtsChannel<'_> {
+        fn read(&mut self, _buffer: &mut [u8]) -> windows::core::Result<usize> {
+            assert_eq!(self.operation, "read");
+            panic!("injected actor read panic");
+        }
+
+        fn write(&mut self, _data: &[u8]) -> io::Result<()> {
+            assert_eq!(self.operation, "write");
+            panic!("injected actor write panic");
+        }
+    }
+
+    impl Drop for PanickingWtsChannel<'_> {
+        fn drop(&mut self) {
+            // Record, do not assert while unwinding: a failed regression must
+            // report normally instead of aborting on a second panic in Drop.
+            *self.stop_at_close = Some(self.stopped.try_recv());
+            *self.closes += 1;
+        }
+    }
+
+    #[test]
+    fn actor_panic_signals_stop_before_closing_channel_once() {
+        for operation in ["read", "write"] {
+            let (outbound_tx, outbound_rx) = mpsc::channel(1);
+            let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+            let (ready_tx, mut ready_rx) = oneshot::channel();
+            let (stopped_tx, mut stopped_rx) = oneshot::channel();
+            if operation == "write" {
+                outbound_tx.try_send(vec![1]).unwrap();
+            }
+            let mut stop_at_close = None;
+            let mut closes = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wts_actor_with_channel(outbound_rx, inbound_tx, ready_tx, stopped_tx, || {
+                    Ok(PanickingWtsChannel {
+                        operation,
+                        stopped: &mut stopped_rx,
+                        stop_at_close: &mut stop_at_close,
+                        closes: &mut closes,
+                    })
+                });
+            }));
+            let panic = result.expect_err("the actor must reach the injected panic");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&match operation {
+                    "read" => "injected actor read panic",
+                    "write" => "injected actor write panic",
+                    _ => unreachable!(),
+                })
+            );
+            ready_rx.try_recv().unwrap().unwrap();
+            assert_eq!(stop_at_close, Some(Ok(())), "{operation}");
+            assert_eq!(closes, 1, "{operation}");
+        }
     }
 
     #[tokio::test]

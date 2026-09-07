@@ -132,6 +132,11 @@ The WTS actor never waits for an inbound queue consumer: saturation cancels the
 generation. A separate actor-stop notification cancels both duplex pumps even
 when they are blocked on I/O; it is sent before closing the WTS handle so mux
 teardown does not wait for queue polling or a Windows close call to return.
+The mux generation also owns its async bridge task: session completion aborts
+and reaps that task before reconnecting, and cancellation aborts it on drop.
+This releases the pump and duplex even if a native WTS write never returns and
+cannot signal actor stop. Native handle cleanup is owned by a destructor;
+unwinding signals stop before attempting the potentially blocking close.
 Independent local pipe pumps keep reverse traffic and disconnect
 cancellation pollable while either direction is backpressured.
 
@@ -453,6 +458,10 @@ initialization, disconnected queues, read/write failure, EOF, invalid lengths,
 malformed PDUs, and inbound saturation; open failure is covered separately.
 These complement the pump/mux/TCP saturation test, which injects actor death,
 but neither exercises the actual `WTSVirtualChannel*` calls.
+Additional regressions park the fake actor's write on a condition variable and
+leave it blocked while verifying pump cleanup on mux timeout, cancellation,
+and an unpolled generation. Read/write panic tests verify stop-before-close
+and exactly-once channel destruction during unwinding.
 
 ### Recorded live evidence and remaining acceptance gates
 
@@ -536,8 +545,10 @@ Windows x86-64 and is additionally cross-built for Windows ARM64.
   the helper/agent process exits. The MVP does not promise bounded OS-worker
   termination; retaining or joining a thread handle would not make those calls
   cancellable. Repeated reconnects while earlier calls remain stuck can retain
-  multiple workers, so per-generation queue bounds are not a global thread/RSS
-  bound in this failure mode. Validate this distinction during live
+  multiple workers and their actor-owned outbound queues. Generation teardown
+  frees the abortable pump and duplex, but not those native-worker resources,
+  so per-generation queue bounds are not a global thread/RSS bound in this
+  failure mode. Validate this distinction during live
   disconnect/socket-cleanup testing; it requires a different Windows
   I/O/process-isolation design to remove.
 - Installer integration, Authenticode signing, service brokering, explicit
