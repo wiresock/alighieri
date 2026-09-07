@@ -1784,9 +1784,14 @@ async fn handle_client_frame(
 fn handle_client_worker_event(event: WorkerEvent, streams: &mut BTreeMap<u32, ClientStreamState>) {
     match event {
         WorkerEvent::LocalCloseQueued(stream_id) => {
-            if let Some(ClientStreamState::Open(mut record)) = streams.remove(&stream_id) {
-                let permit = record.permit.take();
-                streams.insert(stream_id, ClientStreamState::Closing(permit));
+            if let Some(state) = streams.remove(&stream_id) {
+                let next = match state {
+                    ClientStreamState::Open(mut record) => {
+                        ClientStreamState::Closing(record.permit.take())
+                    }
+                    other => other,
+                };
+                streams.insert(stream_id, next);
             }
         }
         WorkerEvent::Stopped(stream_id) => {
@@ -2701,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn full_duplex_concurrency_soak_no_deadlock() {
         const STREAMS: usize = 64;
-        const BYTES_PER_STREAM: usize = 64 * 1024;
+        const BYTES_PER_STREAM: usize = 1024 * 1024;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2725,7 +2730,7 @@ mod tests {
             let client = client.clone();
             tasks.spawn(async move {
                 let stream = client
-                    .open_ip(address, Duration::from_secs(10))
+                    .open_ip(address, Duration::from_secs(30))
                     .await
                     .unwrap();
 
@@ -2753,9 +2758,13 @@ mod tests {
             });
         }
 
-        while let Some(result) = tasks.join_next().await {
-            result.unwrap();
-        }
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("soak test timed out; potential deadlock under queue saturation");
 
         server.await.unwrap();
         assert!(
@@ -3052,6 +3061,60 @@ mod tests {
         .await
         .unwrap();
         assert!(streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_cancellation_and_local_close_queued_preserve_close_tombstone() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(semaphore.available_permits(), 0);
+
+        let mut streams = BTreeMap::from([(1, ClientStreamState::Closing(Some(permit)))]);
+        handle_client_worker_event(WorkerEvent::LocalCloseQueued(1), &mut streams);
+
+        assert!(matches!(
+            streams.get(&1),
+            Some(ClientStreamState::Closing(Some(_)))
+        ));
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "permit must not be released early"
+        );
+
+        let limits = NegotiatedLimits {
+            max_data: 4,
+            receive_window: 8,
+            max_streams: 1,
+        };
+        let (control, _control_rx) = mpsc::channel(1);
+        let (ordered, _ordered_rx) = mpsc::channel(1);
+        let (events, _events_rx) = mpsc::channel(1);
+
+        let result = handle_client_frame(
+            Frame::Close {
+                stream_id: 1,
+                reason: CloseReason::Normal,
+            },
+            limits,
+            &mut streams,
+            &control,
+            &ordered,
+            &events,
+            &mut None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "peer CLOSE ack must succeed instead of killing generation"
+        );
+        assert!(streams.is_empty(), "tombstone must be retired");
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit must be released when tombstone is retired"
+        );
     }
 
     #[tokio::test]
@@ -3576,54 +3639,69 @@ mod tests {
         assert_eq!(reader.await.unwrap(), expected);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn normal_remote_close_terminates_agent_relay_when_tcp_peer_never_reads() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let socket = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (_peer, _) = listener.accept().await.unwrap();
-        let payload = vec![0x42; 256 * 1024];
-        let mut streams = BTreeMap::from([(1, AgentStreamState::Opening { candidates: None })]);
-        let (ordered, mut frames) = mpsc::channel(4);
+        struct PendingStream;
+        impl AsyncRead for PendingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for PendingStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let limits = NegotiatedLimits {
+            max_data: 4,
+            receive_window: protocol::INITIAL_WINDOW,
+            max_streams: 1,
+        };
+        let (ordered, _ordered_rx) = mpsc::channel(4);
         let (events, _events_rx) = mpsc::channel(4);
-        let mut relays = JoinSet::new();
-        let policy = AgentPolicy {
-            io_timeout: Duration::from_millis(200),
-            ..Default::default()
-        };
-        finish_agent_operation(
-            AgentOperation::Opened {
-                stream_id: 1,
-                result: Ok(socket),
-            },
-            NegotiatedLimits {
-                max_data: 4,
-                receive_window: protocol::INITIAL_WINDOW,
-                max_streams: 1,
-            },
-            &policy,
-            &mut streams,
-            &ordered,
-            &events,
-            &mut relays,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(frames.recv().await, Some(Frame::OpenOk { .. })));
-        let Some(AgentStreamState::Open(record)) = streams.remove(&1) else {
-            panic!("agent stream was not opened");
-        };
+        let (mut stream, record) =
+            spawn_stream(1, "127.0.0.1:1".parse().unwrap(), limits, ordered, events);
+
+        let payload = vec![0x42; 64 * 1024];
         record.shared.push_inbound(&payload).unwrap();
         record.shared.finish_inbound().unwrap();
         record.shared.remote_close(CloseReason::Normal);
         drop(record);
 
-        tokio::time::timeout(Duration::from_secs(3), relays.join_next())
-            .await
-            .expect("agent relay must terminate when destination TCP peer never reads")
-            .unwrap()
-            .unwrap();
+        let mut destination = PendingStream;
+        let closed = stream.closed();
+        // AgentPolicy::default() uses io_timeout = Duration::ZERO (idle = None),
+        // which exercises the POST_CLOSE_DRAIN_TIMEOUT watchdog path.
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::relay::relay_generic_until(
+                &mut destination,
+                &mut stream,
+                Duration::ZERO,
+                None,
+                closed,
+            ),
+        )
+        .await
+        .expect("relay must terminate within watchdog timeout under paused time")
+        .unwrap();
+
+        assert_eq!(result, (0, 0));
     }
 
     #[tokio::test]

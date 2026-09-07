@@ -266,8 +266,10 @@ bytes and the destination writer's shutdown (including buffered TLS output).
 SHUTDOWN_WRITE alone preserves the opposite TCP half. Error CLOSE and generation
 failure abort both directions. Draining agent relays count toward the negotiated
 worker limit even after their stream record retires; they cannot accumulate
-outside admission accounting. Existing idle timeout and throttling rules still
-apply, without a new hard deadline that would truncate deliberately slow tails.
+outside admission accounting. After a normal CLOSE the drain is bounded by
+the destination relay's idle timeout when configured and by a 10-second
+no-progress watchdog deadline otherwise. Because the bound is activity-based,
+genuinely slow-but-progressing tails are not truncated.
 
 ## Flow control, backpressure, and fairness
 
@@ -308,7 +310,9 @@ entries at a 16 KiB pipe/duplex read. No queue grows with total stream history.
 Alighieri's configured `dns.timeout` and `connecttimeout` bound how long the
 local caller waits, while the agent independently caps each remote resolve and
 connect operation at 30 seconds. The effective setup deadline is therefore the
-shorter bound. `iotimeout` remains the established logical-relay idle policy.
+shorter bound. `iotimeout` remains the established logical-relay idle policy,
+while the agent's destination-side TCP relay supports an independent `--io-timeout`
+bound (disabled by default).
 
 Each newly attached channel must exchange valid ALRD HELLO messages within 10
 seconds. A timeout discards that generation so a silent or incompatible peer
@@ -365,7 +369,7 @@ The remote agent runs in the connected user's RDP desktop:
 
 ```powershell
 .\alighieri-rdp-agent.exe
-.\alighieri-rdp-agent.exe --deny-loopback --deny-private --deny-link-local
+.\alighieri-rdp-agent.exe --deny-loopback --deny-private --deny-link-local --io-timeout 60
 ```
 
 Agent deny switches are additive and default off so legitimate access to remote
