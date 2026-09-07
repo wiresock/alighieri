@@ -15,6 +15,14 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   the bounded multiplexed protocol supports IPv4, IPv6, concurrent streams,
   half-close, flow control, and clean generation reset after RDP reconnects.
 
+### Changed
+
+- SOCKS5 request handling now returns RFC 1928 reply `0x08` (`AddressTypeNotSupported`)
+  when encountering an unsupported address type (ATYP) instead of closing the
+  connection abruptly.
+- Host-unreachable connect errors now report RFC 1928 reply `0x04` (`HostUnreachable`)
+  instead of generic `0x03` (`NetworkUnreachable`).
+
 ## [0.5.3] - 2026-08-31
 
 ### Added

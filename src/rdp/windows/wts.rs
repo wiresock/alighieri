@@ -70,16 +70,33 @@ pub async fn run_agent() -> io::Result<()> {
 
 fn parse_policy(arguments: impl IntoIterator<Item = String>) -> io::Result<Option<AgentPolicy>> {
     let mut policy = AgentPolicy::default();
-    for argument in arguments {
+    let mut iter = arguments.into_iter();
+    while let Some(argument) = iter.next() {
         match argument.to_ascii_lowercase().as_str() {
             "--deny-loopback" | "/deny-loopback" => policy.deny_loopback = true,
             "--deny-private" | "/deny-private" => policy.deny_private = true,
             "--deny-link-local" | "/deny-link-local" => policy.deny_link_local = true,
+            "--io-timeout" | "/io-timeout" => {
+                let value = iter.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--io-timeout requires a duration in seconds",
+                    )
+                })?;
+                let secs: u64 = value.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --io-timeout value '{value}'"),
+                    )
+                })?;
+                policy.io_timeout = Duration::from_secs(secs);
+            }
             "--help" | "-h" | "/?" => {
                 println!("Usage: alighieri-rdp-agent.exe [options]");
                 println!("  --deny-loopback    Reject remote loopback destinations");
                 println!("  --deny-private     Reject RFC1918/unique-local destinations");
                 println!("  --deny-link-local  Reject IPv4/IPv6 link-local destinations");
+                println!("  --io-timeout SECS  Idle timeout for destination TCP relays (default 0; disabled)");
                 return Ok(None);
             }
             unknown => {
@@ -938,12 +955,17 @@ mod tests {
             "--deny-loopback".to_owned(),
             "--deny-private".to_owned(),
             "--deny-link-local".to_owned(),
+            "--io-timeout".to_owned(),
+            "45".to_owned(),
         ])
         .unwrap()
         .unwrap();
         assert!(policy.deny_loopback && policy.deny_private && policy.deny_link_local);
+        assert_eq!(policy.io_timeout, Duration::from_secs(45));
         assert!(parse_policy(["--help".to_owned()]).unwrap().is_none());
         assert!(parse_policy(["--unknown".to_owned()]).is_err());
+        assert!(parse_policy(["--io-timeout".to_owned()]).is_err());
+        assert!(parse_policy(["--io-timeout".to_owned(), "abc".to_owned()]).is_err());
     }
 
     #[test]

@@ -268,6 +268,7 @@ impl ClientHandle {
                 stream_id,
                 address,
                 reply,
+                permit,
             }),
         )
         .await
@@ -276,9 +277,8 @@ impl ClientHandle {
         let mut cancellation = PendingClose::new(self, stream_id);
         drop(admission);
         match tokio::time::timeout_at(deadline, response).await {
-            Ok(Ok(Ok(mut stream))) => {
+            Ok(Ok(Ok(stream))) => {
                 cancellation.disarm();
-                stream.slot = Some(permit);
                 Ok(stream)
             }
             Ok(Ok(Err(error))) => Err(error),
@@ -379,6 +379,7 @@ impl ResolvedTarget {
         let mut cancellation = PendingClose::new(&self.handle, self.stream_id);
         let (reply, response) = oneshot::channel();
         let operation = async {
+            let permit = self.permit.take();
             self.handle
                 .inner
                 .commands
@@ -386,18 +387,19 @@ impl ResolvedTarget {
                     stream_id: self.stream_id,
                     address,
                     reply,
+                    permit,
                 })
                 .await
-                .map_err(|_| MuxError::Unavailable)?;
-            response.await.map_err(|_| MuxError::Unavailable)?
+                .map_err(|_| (MuxError::Unavailable, None))?;
+            response.await.map_err(|_| (MuxError::Unavailable, None))?
         };
         match tokio::time::timeout_at(deadline, operation).await {
-            Ok(Ok(mut stream)) => {
+            Ok(Ok(stream)) => {
                 cancellation.disarm();
-                stream.slot = self.permit.take();
                 Ok(stream)
             }
-            Ok(Err(error)) => {
+            Ok(Err((error, returned_permit))) => {
+                self.permit = returned_permit;
                 if matches!(error, MuxError::Remote { .. }) {
                     cancellation.disarm();
                     self.finished = false;
@@ -431,12 +433,14 @@ enum ClientCommand {
     Open {
         stream_id: u32,
         address: SocketAddr,
-        reply: oneshot::Sender<Result<RdpStream, MuxError>>,
+        reply: oneshot::Sender<Result<RdpStream, (MuxError, Option<OwnedSemaphorePermit>)>>,
+        permit: Option<OwnedSemaphorePermit>,
     },
     OpenIp {
         stream_id: u32,
         address: SocketAddr,
         reply: oneshot::Sender<Result<RdpStream, MuxError>>,
+        permit: OwnedSemaphorePermit,
     },
     Close {
         stream_id: u32,
@@ -728,7 +732,6 @@ pub(crate) struct RdpStream {
     shared: Arc<StreamShared>,
     stream_id: u32,
     bound_address: SocketAddr,
-    slot: Option<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for RdpStream {
@@ -898,6 +901,7 @@ impl Drop for RdpStream {
 struct StreamRecord {
     shared: Arc<StreamShared>,
     workers: Option<[JoinHandle<()>; 2]>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for StreamRecord {
@@ -947,11 +951,11 @@ fn spawn_stream(
             shared: shared.clone(),
             stream_id,
             bound_address,
-            slot: None,
         },
         StreamRecord {
             shared,
             workers: Some([outbound, credit]),
+            permit: None,
         },
     )
 }
@@ -1090,6 +1094,22 @@ enum OutboundAction {
 async fn credit_worker(stream_id: u32, shared: Arc<StreamShared>, ordered: mpsc::Sender<Frame>) {
     loop {
         let notified = shared.credit_event.notified();
+        let has_credit = match shared.state.lock() {
+            Ok(state) => {
+                if state.dropped || state.remote_closed {
+                    return;
+                }
+                state.returned_credit != 0
+            }
+            Err(_) => return,
+        };
+        if !has_credit {
+            notified.await;
+            continue;
+        }
+        let Ok(permit) = ordered.reserve().await else {
+            return;
+        };
         let _gate = shared.send_gate.lock().await;
         // Keep inbound DATA handling behind this gate until the corresponding
         // WINDOW_UPDATE is committed to the ordered writer queue and the local
@@ -1107,13 +1127,7 @@ async fn credit_worker(stream_id: u32, shared: Arc<StreamShared>, ordered: mpsc:
             Err(_) => return,
         };
         if credit != 0 {
-            if ordered
-                .send(Frame::WindowUpdate { stream_id, credit })
-                .await
-                .is_err()
-            {
-                return;
-            }
+            permit.send(Frame::WindowUpdate { stream_id, credit });
             let mut state = match shared.state.lock() {
                 Ok(state) => state,
                 Err(_) => return,
@@ -1125,12 +1139,11 @@ async fn credit_worker(stream_id: u32, shared: Arc<StreamShared>, ordered: mpsc:
                 return;
             }
             state.receive_credit = updated;
+        } else {
+            drop(permit);
         }
         drop(_receive_credit_gate);
         drop(_gate);
-        if credit == 0 {
-            notified.await;
-        }
     }
 }
 
@@ -1298,6 +1311,39 @@ where
     Ok((handle, task))
 }
 
+enum OpenReply {
+    Candidate(oneshot::Sender<Result<RdpStream, (MuxError, Option<OwnedSemaphorePermit>)>>),
+    Ip(oneshot::Sender<Result<RdpStream, MuxError>>),
+}
+
+impl OpenReply {
+    fn send_ok(self, stream: RdpStream) {
+        match self {
+            Self::Candidate(reply) => {
+                if let Err(Ok(stream)) = reply.send(Ok(stream)) {
+                    drop(stream);
+                }
+            }
+            Self::Ip(reply) => {
+                if let Err(Ok(stream)) = reply.send(Ok(stream)) {
+                    drop(stream);
+                }
+            }
+        }
+    }
+
+    fn send_err(self, error: MuxError, permit: Option<OwnedSemaphorePermit>) {
+        match self {
+            Self::Candidate(reply) => {
+                let _ = reply.send(Err((error, permit)));
+            }
+            Self::Ip(reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
 enum ClientStreamState {
     Resolving {
         port: u16,
@@ -1306,10 +1352,11 @@ enum ClientStreamState {
     Resolved(Vec<SocketAddr>),
     Opening {
         candidates: Option<Vec<SocketAddr>>,
-        reply: oneshot::Sender<Result<RdpStream, MuxError>>,
+        reply: OpenReply,
+        permit: Option<OwnedSemaphorePermit>,
     },
     Open(StreamRecord),
-    Closing,
+    Closing(Option<OwnedSemaphorePermit>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1437,26 +1484,34 @@ async fn handle_client_command(
             stream_id,
             address,
             reply,
+            permit,
         } => {
             let Some(state) = streams.remove(&stream_id) else {
-                let _ = reply.send(Err(MuxError::InvalidState("OPEN without RESOLVE")));
+                let _ = reply.send(Err((
+                    MuxError::InvalidState("OPEN without RESOLVE"),
+                    permit,
+                )));
                 return Ok(());
             };
             let ClientStreamState::Resolved(candidates) = state else {
                 streams.insert(stream_id, state);
-                let _ = reply.send(Err(MuxError::InvalidState("stream is not resolved")));
+                let _ = reply.send(Err((
+                    MuxError::InvalidState("stream is not resolved"),
+                    permit,
+                )));
                 return Ok(());
             };
             if !candidates.contains(&address) {
                 streams.insert(stream_id, ClientStreamState::Resolved(candidates));
-                let _ = reply.send(Err(MuxError::InvalidCandidate(address)));
+                let _ = reply.send(Err((MuxError::InvalidCandidate(address), permit)));
                 return Ok(());
             }
             streams.insert(
                 stream_id,
                 ClientStreamState::Opening {
                     candidates: Some(candidates),
-                    reply,
+                    reply: OpenReply::Candidate(reply),
+                    permit,
                 },
             );
             ordered
@@ -1468,9 +1523,11 @@ async fn handle_client_command(
             stream_id,
             address,
             reply,
+            permit,
         } => {
             validate_local_stream_id(stream_id)?;
             if streams.len() >= limits.max_streams as usize {
+                drop(permit);
                 let _ = reply.send(Err(MuxError::ResourceLimit));
                 return Ok(());
             }
@@ -1481,7 +1538,8 @@ async fn handle_client_command(
                 stream_id,
                 ClientStreamState::Opening {
                     candidates: None,
-                    reply,
+                    reply: OpenReply::Ip(reply),
+                    permit: Some(permit),
                 },
             );
             ordered
@@ -1491,23 +1549,37 @@ async fn handle_client_command(
         }
         ClientCommand::Close { stream_id } => {
             if let Some(state) = streams.remove(&stream_id) {
-                if matches!(state, ClientStreamState::Closing) {
-                    streams.insert(stream_id, ClientStreamState::Closing);
+                if let ClientStreamState::Closing(permit) = state {
+                    streams.insert(stream_id, ClientStreamState::Closing(permit));
                     return Ok(());
                 }
-                if let ClientStreamState::Open(record) = state {
+                if let ClientStreamState::Open(mut record) = state {
                     record
                         .shared
                         .session_failure(&MuxError::SessionClosed("operation cancelled".into()));
-                    streams.insert(stream_id, ClientStreamState::Closing);
+                    let permit = record.permit.take();
+                    streams.insert(stream_id, ClientStreamState::Closing(permit));
                     record
                         .shared
                         .queue_close_once(stream_id, CloseReason::Cancelled, ordered)
                         .await?;
                     return Ok(());
                 }
-                fail_client_state(state, MuxError::SessionClosed("operation cancelled".into()));
-                streams.insert(stream_id, ClientStreamState::Closing);
+                let permit = match state {
+                    ClientStreamState::Opening { reply, permit, .. } => {
+                        reply.send_err(MuxError::SessionClosed("operation cancelled".into()), None);
+                        permit
+                    }
+                    ClientStreamState::Resolving { reply, .. } => {
+                        let _ =
+                            reply.send(Err(MuxError::SessionClosed("operation cancelled".into())));
+                        None
+                    }
+                    ClientStreamState::Resolved(_) => None,
+                    ClientStreamState::Closing(permit) => permit,
+                    ClientStreamState::Open(_) => unreachable!(),
+                };
+                streams.insert(stream_id, ClientStreamState::Closing(permit));
                 ordered
                     .send(Frame::Close {
                         stream_id,
@@ -1538,8 +1610,8 @@ async fn handle_client_frame(
         } => {
             let (expected_port, reply) = match streams.remove(&stream_id) {
                 Some(ClientStreamState::Resolving { port, reply }) => (port, reply),
-                Some(ClientStreamState::Closing) => {
-                    streams.insert(stream_id, ClientStreamState::Closing);
+                Some(ClientStreamState::Closing(permit)) => {
+                    streams.insert(stream_id, ClientStreamState::Closing(permit));
                     return Ok(());
                 }
                 Some(state) => {
@@ -1566,7 +1638,7 @@ async fn handle_client_frame(
                 streams.insert(stream_id, ClientStreamState::Resolved(addresses.clone()));
                 if reply.send(Ok(addresses)).is_err() {
                     streams.remove(&stream_id);
-                    streams.insert(stream_id, ClientStreamState::Closing);
+                    streams.insert(stream_id, ClientStreamState::Closing(None));
                     ordered
                         .send(Frame::Close {
                             stream_id,
@@ -1581,10 +1653,10 @@ async fn handle_client_frame(
             stream_id,
             bound_address,
         } => {
-            let reply = match streams.remove(&stream_id) {
-                Some(ClientStreamState::Opening { reply, .. }) => reply,
-                Some(ClientStreamState::Closing) => {
-                    streams.insert(stream_id, ClientStreamState::Closing);
+            let (reply, permit) = match streams.remove(&stream_id) {
+                Some(ClientStreamState::Opening { reply, permit, .. }) => (reply, permit),
+                Some(ClientStreamState::Closing(permit)) => {
+                    streams.insert(stream_id, ClientStreamState::Closing(permit));
                     return Ok(());
                 }
                 Some(state) => {
@@ -1593,17 +1665,16 @@ async fn handle_client_frame(
                 }
                 None => return Err(protocol_error("OPEN_OK for an unknown stream")),
             };
-            let (stream, record) = spawn_stream(
+            let (stream, mut record) = spawn_stream(
                 stream_id,
                 bound_address,
                 limits,
                 ordered.clone(),
                 events.clone(),
             );
+            record.permit = permit;
             streams.insert(stream_id, ClientStreamState::Open(record));
-            if let Err(stream) = reply.send(Ok(stream)) {
-                drop(stream);
-            }
+            reply.send_ok(stream);
         }
         Frame::OpenError {
             stream_id,
@@ -1618,14 +1689,20 @@ async fn handle_client_frame(
                 ClientStreamState::Resolving { reply, .. } => {
                     let _ = reply.send(Err(error));
                 }
-                ClientStreamState::Opening { candidates, reply } => {
-                    let _ = reply.send(Err(error));
+                ClientStreamState::Opening {
+                    candidates,
+                    reply,
+                    permit,
+                } => {
                     if let Some(candidates) = candidates {
+                        reply.send_err(error, permit);
                         streams.insert(stream_id, ClientStreamState::Resolved(candidates));
+                    } else {
+                        reply.send_err(error, permit);
                     }
                 }
-                ClientStreamState::Closing => {
-                    streams.insert(stream_id, ClientStreamState::Closing);
+                ClientStreamState::Closing(permit) => {
+                    streams.insert(stream_id, ClientStreamState::Closing(permit));
                 }
                 other => {
                     streams.insert(stream_id, other);
@@ -1642,20 +1719,20 @@ async fn handle_client_frame(
                     let _gate = record.shared.receive_credit_gate.lock().await;
                     record.shared.push_inbound(&payload)?;
                 }
-                Some(ClientStreamState::Closing) => {}
+                Some(ClientStreamState::Closing(_)) => {}
                 Some(_) => return Err(protocol_error("DATA arrived before OPEN_OK")),
                 None => return Err(protocol_error("DATA used an unknown stream ID")),
             }
         }
         Frame::ShutdownWrite { stream_id } => match streams.get(&stream_id) {
             Some(ClientStreamState::Open(record)) => record.shared.finish_inbound()?,
-            Some(ClientStreamState::Closing) => {}
+            Some(ClientStreamState::Closing(_)) => {}
             Some(_) => return Err(protocol_error("SHUTDOWN_WRITE arrived before OPEN_OK")),
             None => return Err(protocol_error("SHUTDOWN_WRITE used an unknown stream ID")),
         },
         Frame::WindowUpdate { stream_id, credit } => match streams.get(&stream_id) {
             Some(ClientStreamState::Open(record)) => record.shared.peer_credit.add(credit)?,
-            Some(ClientStreamState::Closing) => {}
+            Some(ClientStreamState::Closing(_)) => {}
             Some(_) => return Err(protocol_error("WINDOW_UPDATE arrived before OPEN_OK")),
             None => return Err(protocol_error("WINDOW_UPDATE used an unknown stream ID")),
         },
@@ -1664,7 +1741,7 @@ async fn handle_client_frame(
                 return Err(protocol_error("CLOSE for an unknown stream"));
             };
             match state {
-                ClientStreamState::Closing => {}
+                ClientStreamState::Closing(_) => {}
                 ClientStreamState::Open(record) => {
                     record.shared.remote_close(reason);
                     record
@@ -1707,8 +1784,9 @@ async fn handle_client_frame(
 fn handle_client_worker_event(event: WorkerEvent, streams: &mut BTreeMap<u32, ClientStreamState>) {
     match event {
         WorkerEvent::LocalCloseQueued(stream_id) => {
-            if matches!(streams.get(&stream_id), Some(ClientStreamState::Open(_))) {
-                streams.insert(stream_id, ClientStreamState::Closing);
+            if let Some(ClientStreamState::Open(mut record)) = streams.remove(&stream_id) {
+                let permit = record.permit.take();
+                streams.insert(stream_id, ClientStreamState::Closing(permit));
             }
         }
         WorkerEvent::Stopped(stream_id) => {
@@ -1740,11 +1818,11 @@ fn fail_client_state(state: ClientStreamState, error: MuxError) {
         ClientStreamState::Resolving { reply, .. } => {
             let _ = reply.send(Err(error));
         }
-        ClientStreamState::Opening { reply, .. } => {
-            let _ = reply.send(Err(error));
+        ClientStreamState::Opening { reply, permit, .. } => {
+            reply.send_err(error, permit);
         }
         ClientStreamState::Open(record) => record.shared.session_failure(&error),
-        ClientStreamState::Resolved(_) | ClientStreamState::Closing => {}
+        ClientStreamState::Resolved(_) | ClientStreamState::Closing(_) => {}
     }
 }
 
@@ -1757,6 +1835,7 @@ pub(crate) struct AgentPolicy {
     pub(crate) deny_link_local: bool,
     pub(crate) resolve_timeout: Duration,
     pub(crate) connect_timeout: Duration,
+    pub(crate) io_timeout: Duration,
 }
 
 impl Default for AgentPolicy {
@@ -1767,6 +1846,7 @@ impl Default for AgentPolicy {
             deny_link_local: false,
             resolve_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(30),
+            io_timeout: Duration::ZERO,
         }
     }
 }
@@ -1859,6 +1939,7 @@ async fn drive_agent(
                         if let Err(error) = session_operation(finish_agent_operation(
                             operation,
                             limits,
+                            &policy,
                             &mut streams,
                             &ordered,
                             &events_tx,
@@ -2142,6 +2223,7 @@ async fn handle_agent_frame(
 async fn finish_agent_operation(
     operation: AgentOperation,
     limits: NegotiatedLimits,
+    policy: &AgentPolicy,
     streams: &mut BTreeMap<u32, AgentStreamState>,
     ordered: &mpsc::Sender<Frame>,
     events: &mpsc::Sender<WorkerEvent>,
@@ -2235,6 +2317,7 @@ async fn finish_agent_operation(
                         events.clone(),
                     );
                     streams.insert(stream_id, AgentStreamState::Open(record));
+                    let io_timeout = policy.io_timeout;
                     relays.spawn(async move {
                         let closed = stream.closed();
                         let mut stream = stream;
@@ -2245,7 +2328,7 @@ async fn finish_agent_operation(
                         if let Err(error) = crate::relay::relay_generic_until(
                             &mut socket,
                             &mut stream,
-                            Duration::ZERO,
+                            io_timeout,
                             None,
                             closed,
                         )
@@ -2616,6 +2699,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_duplex_concurrency_soak_no_deadlock() {
+        const STREAMS: usize = 64;
+        const BYTES_PER_STREAM: usize = 64 * 1024;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut tasks = JoinSet::new();
+            for _ in 0..STREAMS {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tasks.spawn(async move {
+                    let (mut reader, mut writer) = socket.split();
+                    tokio::io::copy(&mut reader, &mut writer).await.unwrap();
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+        });
+
+        let (client, driver, agent) = sessions().await;
+        let mut tasks = JoinSet::new();
+
+        for i in 0..STREAMS {
+            let client = client.clone();
+            tasks.spawn(async move {
+                let stream = client
+                    .open_ip(address, Duration::from_secs(10))
+                    .await
+                    .unwrap();
+
+                let mut payload = vec![0u8; BYTES_PER_STREAM];
+                for (chunk_idx, chunk) in payload.chunks_mut(4).enumerate() {
+                    let val = ((i as u32) ^ (chunk_idx as u32)).to_le_bytes();
+                    chunk.copy_from_slice(&val[..chunk.len()]);
+                }
+
+                let payload_clone = payload.clone();
+                let (mut reader, mut writer) = tokio::io::split(stream);
+
+                let writer_task = tokio::spawn(async move {
+                    writer.write_all(&payload_clone).await.unwrap();
+                    writer.shutdown().await.unwrap();
+                });
+
+                let mut received = Vec::with_capacity(BYTES_PER_STREAM);
+                reader.read_to_end(&mut received).await.unwrap();
+
+                writer_task.await.unwrap();
+
+                assert_eq!(received.len(), BYTES_PER_STREAM);
+                assert_eq!(received, payload);
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+
+        server.await.unwrap();
+        assert!(
+            !driver.is_finished(),
+            "client driver crashed or exited prematurely"
+        );
+        assert!(
+            !agent.is_finished(),
+            "agent driver crashed or exited prematurely"
+        );
+        driver.abort();
+        agent.abort();
+    }
+
+    #[tokio::test]
     async fn connection_failure_propagates_without_killing_session() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2848,6 +3003,7 @@ mod tests {
             ClientStreamState::Open(StreamRecord {
                 shared,
                 workers: None,
+                permit: None,
             }),
         )]);
         let limits = NegotiatedLimits {
@@ -2875,7 +3031,10 @@ mod tests {
         );
         assert!(frames.try_recv().is_err(), "CLOSE must be queued only once");
         handle_client_worker_event(WorkerEvent::Stopped(1), &mut streams);
-        assert!(matches!(streams.get(&1), Some(ClientStreamState::Closing)));
+        assert!(matches!(
+            streams.get(&1),
+            Some(ClientStreamState::Closing(_))
+        ));
         let (control, _control_rx) = mpsc::channel(1);
         let (events, _events_rx) = mpsc::channel(1);
         handle_client_frame(
@@ -3112,7 +3271,6 @@ mod tests {
             shared: shared.clone(),
             stream_id: 1,
             bound_address: "127.0.0.1:1".parse().unwrap(),
-            slot: None,
         };
         let mut consumed = [0u8; 2];
         stream.read_exact(&mut consumed).await.unwrap();
@@ -3131,6 +3289,7 @@ mod tests {
             ClientStreamState::Open(StreamRecord {
                 shared,
                 workers: None,
+                permit: None,
             }),
         )]);
         let (control, _control_rx) = mpsc::channel(1);
@@ -3266,6 +3425,7 @@ mod tests {
                 receive_window: 8,
                 max_streams: 1,
             },
+            &AgentPolicy::default(),
             &mut streams,
             &ordered,
             &events,
@@ -3302,6 +3462,7 @@ mod tests {
                     receive_window: 8,
                     max_streams: 1,
                 },
+                &AgentPolicy::default(),
                 &mut streams,
                 &ordered,
                 &events,
@@ -3386,6 +3547,7 @@ mod tests {
                 receive_window: protocol::INITIAL_WINDOW,
                 max_streams: 1,
             },
+            &AgentPolicy::default(),
             &mut streams,
             &ordered,
             &events,
@@ -3412,6 +3574,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reader.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn normal_remote_close_terminates_agent_relay_when_tcp_peer_never_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let payload = vec![0x42; 256 * 1024];
+        let mut streams = BTreeMap::from([(1, AgentStreamState::Opening { candidates: None })]);
+        let (ordered, mut frames) = mpsc::channel(4);
+        let (events, _events_rx) = mpsc::channel(4);
+        let mut relays = JoinSet::new();
+        let policy = AgentPolicy {
+            io_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        finish_agent_operation(
+            AgentOperation::Opened {
+                stream_id: 1,
+                result: Ok(socket),
+            },
+            NegotiatedLimits {
+                max_data: 4,
+                receive_window: protocol::INITIAL_WINDOW,
+                max_streams: 1,
+            },
+            &policy,
+            &mut streams,
+            &ordered,
+            &events,
+            &mut relays,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(frames.recv().await, Some(Frame::OpenOk { .. })));
+        let Some(AgentStreamState::Open(record)) = streams.remove(&1) else {
+            panic!("agent stream was not opened");
+        };
+        record.shared.push_inbound(&payload).unwrap();
+        record.shared.finish_inbound().unwrap();
+        record.shared.remote_close(CloseReason::Normal);
+        drop(record);
+
+        tokio::time::timeout(Duration::from_secs(3), relays.join_next())
+            .await
+            .expect("agent relay must terminate when destination TCP peer never reads")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3538,6 +3750,7 @@ mod tests {
                 receive_window: 8,
                 max_streams: 1,
             },
+            &AgentPolicy::default(),
             &mut streams,
             &ordered,
             &events,
@@ -3587,7 +3800,6 @@ mod tests {
             shared: StreamShared::new(8),
             stream_id: 1,
             bound_address: "127.0.0.1:1".parse().unwrap(),
-            slot: None,
         };
         let mut empty = [];
         let read = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut empty))
@@ -3610,7 +3822,6 @@ mod tests {
                 shared: shared.clone(),
                 stream_id: 1,
                 bound_address: "127.0.0.1:1".parse().unwrap(),
-                slot: None,
             };
             shared.remote_close(reason);
             assert_eq!(
@@ -3774,7 +3985,7 @@ mod tests {
             }
         );
 
-        let mut client_streams = BTreeMap::from([(1, ClientStreamState::Closing)]);
+        let mut client_streams = BTreeMap::from([(1, ClientStreamState::Closing(None))]);
         let (client_control, _client_control_rx) = mpsc::channel(1);
         let (client_ordered, _client_ordered_rx) = mpsc::channel(1);
         let (events, _events_rx) = mpsc::channel(1);
