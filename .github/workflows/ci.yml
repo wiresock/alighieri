@@ -108,6 +108,15 @@ jobs:
             )" || exit 1
             test -f "$ASSET"
             tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/scripts/alighieri.sh"
+            if tar tzf "$ASSET" | grep -Fq "macos-daemon.sh"; then
+              echo "Linux archive must not contain macos-daemon.sh" >&2
+              exit 1
+            fi
+            if tar tzf "$ASSET" | grep -Fq "macos-launch"; then
+              echo "Linux archive must not contain macOS launchd plists" >&2
+              exit 1
+            fi
           else
             ASSET="$(
               scripts/package-unix.sh \
@@ -120,6 +129,10 @@ jobs:
             test -f "$ASSET"
             tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/LICENSING.md"
             tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+            if tar tzf "$ASSET" | grep -Fq "scripts/alighieri.sh"; then
+              echo "macOS archive must not contain the Linux installer" >&2
+              exit 1
+            fi
             extract="$RUNNER_TEMP/alighieri-macos-archive"
             mkdir -p "$extract"
             tar -xzf "$ASSET" -C "$extract"

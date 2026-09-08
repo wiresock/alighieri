@@ -23,6 +23,19 @@ expect_plist_string() {
   [[ "$actual" == "$expected" ]] || fail "$plist $key: expected $expected, got ${actual:-<missing>}"
 }
 
+expect_plist_integer() {
+  local plist="$1" key="$2" expected="$3"
+  local actual=""
+  if command -v plutil >/dev/null 2>&1; then
+    actual="$(plutil -extract "$key" raw -o - "$plist")"
+  else
+    actual="$(awk -v key="$key" '
+      $0 ~ "<key>" key "</key>" { getline; gsub(/.*<integer>|<\/integer>.*/, ""); print; exit }
+    ' "$plist")"
+  fi
+  [[ "$actual" == "$expected" ]] || fail "$plist $key: expected integer $expected, got ${actual:-<missing>}"
+}
+
 expect_plist_missing() {
   local plist="$1" key="$2"
   if grep -Fq "<key>$key</key>" "$plist"; then
@@ -50,7 +63,7 @@ expect_plist_missing doc/macos-launchagent.plist StandardOutPath
 expect_plist_string doc/macos-launchdaemon.plist Label com.wiresock.alighieri
 expect_plist_string doc/macos-launchdaemon.plist UserName _alighieri
 expect_plist_string doc/macos-launchdaemon.plist GroupName _alighieri
-expect_plist_string doc/macos-launchdaemon.plist Umask 077
+expect_plist_integer doc/macos-launchdaemon.plist Umask 63
 expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.0 /opt/alighieri/bin/alighieri
 expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.1 /opt/alighieri/alighieri.conf
 expect_plist_missing doc/macos-launchdaemon.plist StandardOutPath
@@ -65,7 +78,18 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   trap 'rm -rf "$root"' EXIT
 
   binary=""
-  for candidate in target/debug/alighieri target/release/alighieri; do
+  shopt -s nullglob
+  candidates=()
+  if [[ -n "${ALIGHIERI_SMOKE_BIN:-}" ]]; then
+    candidates+=("${ALIGHIERI_SMOKE_BIN}")
+  fi
+  candidates+=(
+    target/debug/alighieri
+    target/release/alighieri
+    target/*/release/alighieri
+    target/*/debug/alighieri
+  )
+  for candidate in "${candidates[@]}"; do
     if [[ -x "$candidate" ]]; then
       binary="$candidate"
       break
@@ -84,6 +108,16 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
         exit 1
       }
     }' || fail "Darwin binary minos $minos is older than 10.14"
+    if command -v lipo >/dev/null 2>&1 && lipo -archs "$binary" 2>/dev/null | grep -Fq x86_64; then
+      awk -v minos="$minos" 'BEGIN {
+        n = split(minos, p, ".")
+        major = p[1] + 0
+        minor = (n >= 2 ? p[2] : 0) + 0
+        if (major > 10 || (major == 10 && minor > 14)) {
+          exit 1
+        }
+      }' || fail "x86_64 Darwin minos $minos is newer than the documented 10.14 floor"
+    fi
   fi
 
   conf="$root/generated.conf"
@@ -115,7 +149,7 @@ EOF
     plutil -lint "$staged_plist" >/dev/null
   fi
   expect_plist_string "$staged_plist" UserName _alighieri
-  expect_plist_string "$staged_plist" Umask 077
+  expect_plist_integer "$staged_plist" Umask 63
   expect_plist_string "$staged_plist" ProgramArguments.0 "$staged_root/bin/alighieri"
   expect_plist_string "$staged_plist" ProgramArguments.1 "$staged_root/alighieri.conf"
 

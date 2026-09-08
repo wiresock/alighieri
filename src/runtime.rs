@@ -1801,6 +1801,7 @@ fn open_rotating_log_file(path: &Path, _pin_path: bool) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     #[cfg(windows)]
     {
@@ -2920,6 +2921,22 @@ mod tests {
                 candidate.display()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_file_refuses_a_symlink_logfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.log");
+        let path = dir.path().join("alighieri.log");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let error = RotatingFile::open(path, 10, 1).unwrap_err();
+        assert_ne!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "O_NOFOLLOW must refuse the symlink rather than creating a new file: {error}"
+        );
     }
 
     #[cfg(windows)]

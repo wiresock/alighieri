@@ -9,7 +9,7 @@
 	<key>GroupName</key>
 	<string>_alighieri</string>
 	<key>Umask</key>
-	<string>077</string>
+	<integer>63</integer>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/alighieri/bin/alighieri</string>

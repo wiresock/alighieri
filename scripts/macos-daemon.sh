@@ -239,7 +239,7 @@ write_plist() {
 	<key>GroupName</key>
 	<string>${ACCOUNT}</string>
 	<key>Umask</key>
-	<string>077</string>
+	<integer>63</integer>
 	<key>ProgramArguments</key>
 	<array>
 		<string>${binary_xml}</string>
@@ -587,8 +587,8 @@ EOF
   install_tree "$root" "$tmp/fake-bin" "$tmp/fake.conf" 0
   [[ -x "$root/bin/alighieri" ]] || fail "installed binary missing"
   [[ -f "$root/alighieri.conf" ]] || fail "installed config missing"
-  grep -Fq "<string>077</string>" "$root/${PLIST_LABEL}.plist" \
-    || fail "generated plist missing Umask 077"
+  grep -Fq "<integer>63</integer>" "$root/${PLIST_LABEL}.plist" \
+    || fail "generated plist missing Umask 63 (077 octal)"
   grep -Fq "${root}/bin/alighieri" "$root/${PLIST_LABEL}.plist" \
     || fail "generated plist missing staged binary path"
   if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then

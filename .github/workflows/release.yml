@@ -167,7 +167,8 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "10.14"
         run: |
           chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh scripts/macos-daemon.sh
-          scripts/macos-install-smoke.sh
+          ALIGHIERI_SMOKE_BIN="target/${{ matrix.target }}/release/alighieri" \
+            scripts/macos-install-smoke.sh
           ASSET="$(
             scripts/package-unix.sh \
               --os macos \
