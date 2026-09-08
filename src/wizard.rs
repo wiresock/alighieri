@@ -4258,6 +4258,17 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_tls_macos_rejects_colliding_managed_file_roles() {
+        let mut fields = public_tls_fields();
+        fields.insert("output".into(), "/opt/alighieri/users".into());
+        fields.insert("userlist".into(), "/opt/alighieri/users".into());
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("configuration output path"), "{err}");
+        assert!(err.contains("userlist path"), "{err}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn public_tls_linux_userlist_must_be_a_direct_managed_file() {
@@ -4297,6 +4308,7 @@ mod tests {
         assert!(public_userlist_path_supported_by_deployment(&custom));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_acme_cache_file_path_collisions() {
         let dir = tempfile::tempdir().unwrap();
@@ -4321,6 +4333,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_collisions_between_file_roles() {
         let dir = tempfile::tempdir().unwrap();
@@ -4348,6 +4361,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_file_ancestor_conflicts() {
         let dir = tempfile::tempdir().unwrap();
@@ -4643,6 +4657,7 @@ mod tests {
         assert!(err.contains("not a regular file"), "{err}");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_hard_linked_file_roles() {
         let dir = tempfile::tempdir().unwrap();
@@ -4661,6 +4676,7 @@ mod tests {
         assert!(err.contains("log file"), "{err}");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_reserves_rotated_log_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -5922,6 +5938,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         // profile even when this test runs on Windows CI.
         wizard_form.userlist_path = Some(PathBuf::from("/etc/alighieri/users"));
         wizard_form.acme_cache_path = Some(PathBuf::from("/var/lib/alighieri/acme"));
+        wizard_form.log_file = None;
         let wizard_config = Config::parse(&render_config(&wizard_form)).unwrap();
 
         let static_to_wizard = config_loss_warnings(&static_config, &wizard_config);
@@ -6311,7 +6328,10 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("Alighieri supports IPv6 in other configurations"));
         assert!(html.contains("incorrect or unreachable AAAA record"));
         assert!(html.contains("inbound UDP <code>40000-40099</code>"));
+        #[cfg(not(target_os = "macos"))]
         assert!(html.contains("--check --config"));
+        #[cfg(target_os = "macos")]
+        assert!(html.contains("macos-daemon.sh install --binary"));
         #[cfg(target_os = "linux")]
         {
             assert!(html.contains("scripts/alighieri.sh install --no-start"));
@@ -6545,7 +6565,10 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let html = render_success(&report, &form, &completion_context());
         let absolute_output = std::path::absolute(&report.output_path).unwrap();
 
+        #[cfg(not(target_os = "macos"))]
         assert!(html.contains("--check --config"));
+        #[cfg(target_os = "macos")]
+        assert!(html.contains("--config"));
         assert!(html.contains(&html_escape(&absolute_output.display().to_string())));
         #[cfg(target_os = "linux")]
         {
