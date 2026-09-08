@@ -247,14 +247,36 @@ where
     relay_streams(cr, cw, rr, rw, idle_opt, throttle).await
 }
 
+/// Like `relay_generic`, with a separate signal for a full remote close.
+/// A normal close stops upload and drains download, including writer shutdown;
+/// a failed close aborts immediately. TCP write-half EOF alone is not a signal.
+#[cfg(all(feature = "rdp", any(windows, test)))]
+pub(crate) async fn relay_generic_until<C, R, F>(
+    client: C,
+    remote: R,
+    idle: Duration,
+    throttle: Option<Throttle>,
+    closed: F,
+) -> io::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+    F: Future<Output = io::Result<()>>,
+{
+    let (cr, cw) = tokio::io::split(client);
+    let (rr, rw) = tokio::io::split(remote);
+    let idle = if idle.is_zero() { None } else { Some(idle) };
+    relay_streams_until(cr, cw, rr, rw, idle, throttle, closed, true).await
+}
+
 /// The idle timeout applies to the connection as a whole: traffic in either
 /// direction keeps it alive, matching Dante's `iotimeout`. A coarse watchdog
 /// enforces it so the hot copy loops never re-arm timers per read.
 async fn relay_streams<CR, CW, RR, RW>(
-    mut client_read: CR,
-    mut client_write: CW,
-    mut remote_read: RR,
-    mut remote_write: RW,
+    client_read: CR,
+    client_write: CW,
+    remote_read: RR,
+    remote_write: RW,
     idle: Option<Duration>,
     throttle: Option<Throttle>,
 ) -> io::Result<(u64, u64)>
@@ -263,6 +285,37 @@ where
     CW: AsyncWrite + Unpin,
     RR: AsyncRead + Unpin,
     RW: AsyncWrite + Unpin,
+{
+    relay_streams_until(
+        client_read,
+        client_write,
+        remote_read,
+        remote_write,
+        idle,
+        throttle,
+        std::future::pending(),
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn relay_streams_until<CR, CW, RR, RW, F>(
+    mut client_read: CR,
+    mut client_write: CW,
+    mut remote_read: RR,
+    mut remote_write: RW,
+    idle: Option<Duration>,
+    throttle: Option<Throttle>,
+    closed: F,
+    strict_shutdown: bool,
+) -> io::Result<(u64, u64)>
+where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    RW: AsyncWrite + Unpin,
+    F: Future<Output = io::Result<()>>,
 {
     let up_total = AtomicU64::new(0);
     let down_total = AtomicU64::new(0);
@@ -275,6 +328,7 @@ where
             &activity,
             &up_total,
             idle,
+            strict_shutdown,
         );
         let down = copy_direction(
             &mut remote_read,
@@ -283,13 +337,15 @@ where
             &activity,
             &down_total,
             idle,
+            strict_shutdown,
         );
-        relay_both(up, down, idle, &activity).await
+        relay_both_until(up, down, idle, &activity, closed).await
     };
-    // Directions cut off by the idle watchdog have not shut their writers
-    // down; doing it here is a no-op for the ones that finished normally.
-    let _ = remote_write.shutdown().await;
-    let _ = client_write.shutdown().await;
+    // Normal EOF shuts each writer down inside `copy_direction`, while the
+    // watchdog still bounds that operation. After an idle timeout or an error,
+    // return immediately so the caller drops the streams. A graceful shutdown
+    // here could wait forever for RDP receive credit (or a stalled TLS flush)
+    // after the watchdog has already stopped polling.
     result?;
     Ok((
         up_total.load(Ordering::Relaxed),
@@ -306,6 +362,7 @@ where
 /// pinned the connection permit; the idle path merely delayed teardown by up to
 /// `idle`. When `idle` is set, a coarse watchdog ends the relay after the shared
 /// activity clock has been quiet that long.
+#[cfg(test)]
 async fn relay_both<U, D>(
     up: U,
     down: D,
@@ -316,9 +373,27 @@ where
     U: Future<Output = io::Result<()>>,
     D: Future<Output = io::Result<()>>,
 {
-    tokio::pin!(up, down);
+    relay_both_until(up, down, idle, activity, std::future::pending()).await
+}
+
+const POST_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn relay_both_until<U, D, F>(
+    up: U,
+    down: D,
+    idle: Option<Duration>,
+    activity: &ActivityClock,
+    closed: F,
+) -> io::Result<()>
+where
+    U: Future<Output = io::Result<()>>,
+    D: Future<Output = io::Result<()>>,
+    F: Future<Output = io::Result<()>>,
+{
+    tokio::pin!(up, down, closed);
     let mut up_done = false;
     let mut down_done = false;
+    let mut close_seen = false;
     let mut ticker = idle.map(|idle| {
         let mut tick = tokio::time::interval(idle_tick_period(idle));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -331,8 +406,33 @@ where
             // propagates (via `res?`) instead of being masked by the watchdog
             // returning `Ok`.
             biased;
+            result = &mut closed, if !close_seen => {
+                result?;
+                // Prioritize a normal full-close over an upload error caused
+                // by that same close. Already accepted download bytes and a
+                // buffered TLS writer must still reach shutdown normally.
+                up_done = true;
+                close_seen = true;
+                if ticker.is_none() {
+                    let mut tick = tokio::time::interval(idle_tick_period(POST_CLOSE_DRAIN_TIMEOUT));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ticker = Some(tick);
+                }
+            }
             res = &mut up, if !up_done => {
-                res?; // propagate a copy error at once, dropping `down`
+                if let Err(error) = res {
+                    // A concurrent remote CLOSE can become visible after the
+                    // close branch polled Pending, then make upload fail in
+                    // this same poll. Recheck once before discarding download.
+                    let close = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(closed.as_mut().poll(cx))
+                    }).await;
+                    match close {
+                        std::task::Poll::Ready(Ok(())) => close_seen = true,
+                        std::task::Poll::Ready(Err(error)) => return Err(error),
+                        std::task::Poll::Pending => return Err(error),
+                    }
+                }
                 up_done = true;
             }
             res = &mut down, if !down_done => {
@@ -344,7 +444,15 @@ where
             // async expression is still evaluated — so a guarded
             // `ticker.as_mut().unwrap().tick()` would panic when the ticker is None.
             _ = maybe_tick(ticker.as_mut()) => {
-                if idle.is_some_and(|idle| activity.idle_for() >= idle) {
+                let limit = if close_seen {
+                    idle.unwrap_or(POST_CLOSE_DRAIN_TIMEOUT)
+                } else {
+                    match idle {
+                        Some(idle) => idle,
+                        None => continue,
+                    }
+                };
+                if activity.idle_for() >= limit {
                     break; // no traffic in either direction for too long
                 }
                 continue;
@@ -378,6 +486,7 @@ async fn copy_direction<R, W>(
     activity: &ActivityClock,
     total: &AtomicU64,
     idle: Option<Duration>,
+    strict_shutdown: bool,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -400,8 +509,14 @@ where
         w.write_all(&buf[..n]).await?;
         total.fetch_add(n as u64, Ordering::Relaxed);
     }
-    let _ = w.shutdown().await;
-    Ok(())
+    if strict_shutdown {
+        w.shutdown().await
+    } else {
+        if let Err(error) = w.shutdown().await {
+            debug!(%error, "ignoring shutdown error after clean EOF");
+        }
+        Ok(())
+    }
 }
 
 /// Sleeps for `wait`, marking `activity` at least every `idle/2` so a long
@@ -1342,8 +1457,289 @@ fn interceptor_dns_policy() -> DnsPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Models a transport whose graceful shutdown waits for peer progress,
+    /// such as an RDP stream with queued bytes and no remaining peer credit.
+    struct PendingShutdown {
+        fail_write: bool,
+    }
+
+    impl AsyncWrite for PendingShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_write {
+                Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+            } else {
+                Poll::Ready(Ok(bytes.len()))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    struct BufferedShutdownWriter {
+        buffer: Vec<u8>,
+        delivered: Arc<Mutex<Vec<u8>>>,
+        shutdown_started: Option<tokio::sync::oneshot::Sender<()>>,
+        shutdown_allowed: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    impl AsyncWrite for BufferedShutdownWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.buffer.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(started) = self.shutdown_started.take() {
+                let _ = started.send(());
+            }
+            match Pin::new(&mut self.shutdown_allowed).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    let buffered = std::mem::take(&mut self.buffer);
+                    self.delivered.lock().unwrap().extend(buffered);
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_close_drains_buffered_download_and_preserves_byte_counts() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (started, shutdown_started) = tokio::sync::oneshot::channel();
+        let (allow_shutdown, shutdown_allowed) = tokio::sync::oneshot::channel();
+        let writer = BufferedShutdownWriter {
+            buffer: Vec::new(),
+            delivered: delivered.clone(),
+            shutdown_started: Some(started),
+            shutdown_allowed,
+        };
+        let relay = tokio::spawn(relay_streams_until(
+            &b"upload must stop"[..],
+            writer,
+            &b"buffered download tail"[..],
+            PendingShutdown { fail_write: true },
+            None,
+            None,
+            async { Ok(()) },
+            true,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !relay.is_finished(),
+            "normal CLOSE must await the final flush"
+        );
+        assert!(delivered.lock().unwrap().is_empty());
+        allow_shutdown.send(()).unwrap();
+        let counters = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*delivered.lock().unwrap(), b"buffered download tail");
+        assert_eq!(counters, (0, b"buffered download tail".len() as u64));
+    }
+
+    #[tokio::test]
+    async fn remote_close_reports_a_failed_final_writer_flush() {
+        let (allow_shutdown, shutdown_allowed) = tokio::sync::oneshot::channel();
+        drop(allow_shutdown);
+        let writer = BufferedShutdownWriter {
+            buffer: Vec::new(),
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            shutdown_started: None,
+            shutdown_allowed,
+        };
+        let error = relay_streams_until(
+            tokio::io::empty(),
+            writer,
+            &b"unflushed tail"[..],
+            tokio::io::sink(),
+            None,
+            None,
+            async { Ok(()) },
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normal_close_racing_upload_error_still_drains_download() {
+        use std::sync::atomic::AtomicBool;
+
+        let close_ready = Arc::new(AtomicBool::new(false));
+        let close_signal = close_ready.clone();
+        let closed = std::future::poll_fn(move |_| {
+            if close_signal.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        });
+        let up = async {
+            // The close future has just polled Pending. Simulate the remote
+            // closing on another worker before this upload observes the socket.
+            close_ready.store(true, Ordering::Release);
+            Err(io::ErrorKind::BrokenPipe.into())
+        };
+        let drained = Arc::new(AtomicBool::new(false));
+        let down_finished = drained.clone();
+        let down = async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            down_finished.store(true, Ordering::Release);
+            Ok(())
+        };
+        relay_both_until(up, down, None, &ActivityClock::new(), closed)
+            .await
+            .unwrap();
+        assert!(drained.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_remote_close_aborts_a_stalled_download() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay_streams_until(
+                tokio::io::empty(),
+                PendingShutdown { fail_write: false },
+                tokio::io::empty(),
+                PendingShutdown { fail_write: false },
+                None,
+                None,
+                async { Err(io::ErrorKind::ConnectionReset.into()) },
+                true,
+            ),
+        )
+        .await
+        .expect("failed full close must abort without waiting for writer shutdown")
+        .unwrap_err();
+        assert_eq!(result.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_close_preserves_slow_shaping_during_the_final_drain() {
+        let throttle = Throttle::new().with_bucket(Arc::new(Mutex::new(
+            crate::throttle::TokenBucket::new(1.0, 1.0, std::time::Instant::now()),
+        )));
+        let start = tokio::time::Instant::now();
+        let counters = relay_streams_until(
+            tokio::io::empty(),
+            tokio::io::sink(),
+            &[0; 128][..],
+            tokio::io::sink(),
+            Some(Duration::from_secs(2)),
+            Some(throttle),
+            async { Ok(()) },
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counters, (0, 128));
+        assert!(start.elapsed() >= Duration::from_secs(126));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_relay_does_not_wait_for_transport_shutdown() {
+        // Both copy directions see EOF, then stall in graceful shutdown. The
+        // idle watchdog must still release the relay and its connection permit.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay_streams(
+                tokio::io::empty(),
+                PendingShutdown { fail_write: false },
+                tokio::io::empty(),
+                PendingShutdown { fail_write: false },
+                Some(Duration::from_secs(1)),
+                None,
+            ),
+        )
+        .await
+        .expect("idle termination must not restart a stalled graceful shutdown")
+        .unwrap();
+        assert_eq!(result, (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_relay_does_not_wait_for_transport_shutdown() {
+        // With idle disabled, an I/O error must return immediately even when
+        // graceful shutdown would never complete on the failed transport.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay_streams(
+                &b"request"[..],
+                tokio::io::sink(),
+                tokio::io::empty(),
+                PendingShutdown { fail_write: true },
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("error termination must not await graceful shutdown")
+        .unwrap_err();
+        assert_eq!(result.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn direct_relay_preserves_byte_counters_when_shutdown_fails() {
+        struct FailShutdownWriter;
+        impl AsyncWrite for FailShutdownWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+            }
+        }
+        let counters = relay_streams(
+            &b"direct upload"[..],
+            FailShutdownWriter,
+            tokio::io::empty(),
+            tokio::io::sink(),
+            None,
+            None,
+        )
+        .await
+        .expect("direct relay must not fail when only post-EOF shutdown fails");
+        assert_eq!(counters, (13, 0));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn idle_relay_stays_alive_while_one_direction_flows() {
@@ -1474,6 +1870,7 @@ mod tests {
             &activity,
             &total,
             None,
+            true,
         )
         .await
         .unwrap();

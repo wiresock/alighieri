@@ -461,6 +461,12 @@ const CONFIG_SETTINGS_METADATA: &[ConfigSettingMetadata] = &[
         note: "listener address is bound when the process starts",
     },
     ConfigSettingMetadata {
+        name: "egress",
+        reload: ReloadBehavior::Restart,
+        applies_to: "process",
+        note: "outbound transport and any RDP session bridge are initialised when the process starts",
+    },
+    ConfigSettingMetadata {
         name: "external",
         reload: ReloadBehavior::Live,
         applies_to: "new_connections",
@@ -2612,6 +2618,7 @@ mod tests {
     fn config_metadata_json_describes_live_and_restart_settings() {
         let metadata = config_metadata_json();
         assert!(metadata.contains("\"name\":\"internal\",\"reload\":\"restart\""));
+        assert!(metadata.contains("\"name\":\"egress\",\"reload\":\"restart\""));
         assert!(metadata.contains("\"name\":\"dns.prefer\",\"reload\":\"live\""));
         assert!(metadata.contains("\"name\":\"include\",\"reload\":\"live\""));
     }
@@ -2660,6 +2667,7 @@ mod tests {
         // `config metadata --json` stays complete.
         let expected: BTreeSet<&str> = [
             "internal",
+            "egress",
             "external",
             "proxyprotocol",
             "socksmethod",

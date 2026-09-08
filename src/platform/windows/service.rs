@@ -68,7 +68,10 @@ fn run_service() -> windows_service::Result<()> {
         .flatten()
         .unwrap_or_else(default_config_path);
 
-    let config = match Config::load(&config_path) {
+    let config = match Config::load(&config_path).and_then(|config| {
+        config.validate_windows_service_startup()?;
+        Ok(config)
+    }) {
         Ok(config) => config,
         Err(e) => {
             // No valid Config exists yet, so no file path can be proven disjoint

@@ -38,6 +38,10 @@ pub struct Server {
     /// [`Server::with_plugins`]; not part of the hot-reloaded [`ServerState`].
     #[cfg(feature = "plugins")]
     plugins: Arc<crate::plugin::PluginHost>,
+    /// Process-wide reconnecting RDP session manager. It is restart-only and is
+    /// shared by every accepted SOCKS connection.
+    #[cfg(all(windows, feature = "rdp"))]
+    rdp: Option<Arc<crate::rdp::windows::client::RdpConnector>>,
     metrics_addr: Option<SocketAddr>,
     metrics_listener: Mutex<Option<TcpListener>>,
     tls_listener: Option<tls::TlsListener>,
@@ -132,6 +136,12 @@ impl Server {
         process_config.internal = listen;
         process_config.metrics_listen = metrics_addr;
         let process_config = Arc::new(process_config);
+        #[cfg(all(windows, feature = "rdp"))]
+        let rdp = if config.egress == crate::config::Egress::Rdp {
+            Some(crate::rdp::windows::client::RdpConnector::start())
+        } else {
+            None
+        };
 
         Ok(Server {
             state: Arc::new(RwLock::new(ServerState {
@@ -147,6 +157,8 @@ impl Server {
             abuse,
             #[cfg(feature = "plugins")]
             plugins: Arc::new(crate::plugin::PluginHost::default()),
+            #[cfg(all(windows, feature = "rdp"))]
+            rdp,
             metrics_addr,
             metrics_listener: Mutex::new(metrics_listener),
             tls_listener,
@@ -190,14 +202,15 @@ impl Server {
     /// sinks, and the max-connection semaphore require a process restart.
     pub async fn reload(&self, mut config: Config) -> Result<()> {
         warn_restart_required_changes(&self.process_config, &config);
+        prepare_effective_reload_config(&mut config, &self.process_config)?;
         let users = load_users(&config).await?;
-        preserve_process_config(&mut config, &self.process_config);
         // Warn on the *effective* config: `preserve_process_config` has just
-        // restored the restart-only fields (`internal`, `tls`) to their live
-        // values, so e.g. a reload requesting a loopback `internal` no longer
-        // suppresses the open-proxy warning while the public listener stays live
-        // until restart. Reloadable fields (rules, socksmethod, proxyprotocol)
-        // already hold their new values here, so those footguns stay accurate.
+        // restored the restart-only fields (`egress`, `internal`, `tls`) to
+        // their live values, so e.g. a reload requesting a loopback `internal`
+        // no longer suppresses the open-proxy warning while the public listener
+        // stays live until restart. Reloadable fields (rules, socksmethod,
+        // proxyprotocol) already hold their new values here, so those footguns
+        // stay accurate.
         warn_config_footguns(&config);
         let command_auth = build_command_auth(&config);
         let rate_limits = config.rate_limits.clone();
@@ -403,6 +416,8 @@ impl Server {
             let abuse = self.abuse.clone();
             #[cfg(feature = "plugins")]
             let plugins = self.plugins.clone();
+            #[cfg(all(windows, feature = "rdp"))]
+            let rdp = self.rdp.clone();
             let handshake_timeout = config.handshake_timeout;
             conns.spawn(async move {
                 // Resolve the real client address from a trusted upstream's
@@ -455,6 +470,8 @@ impl Server {
                     throttle_bucket,
                     #[cfg(feature = "plugins")]
                     plugins,
+                    #[cfg(all(windows, feature = "rdp"))]
+                    rdp,
                 };
                 if let Some(listener) = tls_listener {
                     match tokio::time::timeout(handshake_timeout, listener.accept(stream)).await {
@@ -680,6 +697,13 @@ fn warn_config_footguns(config: &Config) {
 }
 
 fn warn_restart_required_changes(old: &Config, new: &Config) {
+    if old.egress != new.egress {
+        warn!(
+            current = ?old.egress,
+            requested = ?new.egress,
+            "egress transport changes require a restart"
+        );
+    }
     if old.internal != new.internal {
         warn!(
             current = %old.internal,
@@ -729,6 +753,7 @@ fn warn_restart_required_changes(old: &Config, new: &Config) {
 }
 
 fn preserve_process_config(config: &mut Config, process_config: &Config) {
+    config.egress = process_config.egress;
     config.internal = process_config.internal;
     config.metrics_listen = process_config.metrics_listen;
     config.metrics_allow_public = process_config.metrics_allow_public;
@@ -740,6 +765,14 @@ fn preserve_process_config(config: &mut Config, process_config: &Config) {
     config.log_format = process_config.log_format;
     config.log_rotate_size = process_config.log_rotate_size;
     config.log_rotate_keep = process_config.log_rotate_keep;
+}
+
+fn prepare_effective_reload_config(config: &mut Config, process_config: &Config) -> Result<()> {
+    preserve_process_config(config, process_config);
+    // Validate the effective combination after restoring restart-only fields.
+    // In particular, an active RDP transport must never accept a concrete
+    // direct-egress source address from a reload that requested `egress: direct`.
+    config.validate_startup()
 }
 
 struct AbortOnDrop<T>(JoinHandle<T>);
@@ -922,6 +955,20 @@ mod tests {
             state.config.metrics_allow_public,
             "metrics.allowpublic must keep its startup value across reload"
         );
+    }
+
+    #[cfg(all(windows, feature = "rdp"))]
+    #[test]
+    fn effective_rdp_reload_rejects_a_concrete_external_address() {
+        let live = Config::parse("internal: 127.0.0.1:1080\negress: rdp").unwrap();
+        let mut requested =
+            Config::parse("internal: 127.0.0.1:1080\negress: direct\nexternal: 192.0.2.10")
+                .unwrap();
+
+        let error = prepare_effective_reload_config(&mut requested, &live).unwrap_err();
+        assert_eq!(requested.egress, crate::config::Egress::Rdp);
+        assert!(error.to_string().contains("external 192.0.2.10"), "{error}");
+        assert!(error.to_string().contains("egress 'rdp'"), "{error}");
     }
 
     #[test]

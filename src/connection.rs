@@ -21,7 +21,7 @@ use crate::abuse::AbuseControls;
 use crate::acl::{ClientContext, Scope, SocksContext, Verdict};
 use crate::auth::{AuthOutcome, CommandAuth, UserDb};
 use crate::client_stream::ClientStream;
-use crate::config::{Config, Protocol, RateLimit, UdpAdvertise};
+use crate::config::{Config, Egress, Protocol, RateLimit, UdpAdvertise};
 use crate::dns::DnsResolver;
 use crate::errors::{Error, Result};
 use crate::metrics::Metrics;
@@ -44,6 +44,8 @@ pub struct Connection {
     throttle_bucket: Option<Arc<Mutex<TokenBucket>>>,
     #[cfg(feature = "plugins")]
     plugins: Arc<crate::plugin::PluginHost>,
+    #[cfg(all(windows, feature = "rdp"))]
+    rdp: Option<Arc<crate::rdp::windows::client::RdpConnector>>,
 }
 
 pub struct ConnectionResources {
@@ -57,6 +59,8 @@ pub struct ConnectionResources {
     /// The restart-only registry of active plugins (empty by default).
     #[cfg(feature = "plugins")]
     pub plugins: Arc<crate::plugin::PluginHost>,
+    #[cfg(all(windows, feature = "rdp"))]
+    pub rdp: Option<Arc<crate::rdp::windows::client::RdpConnector>>,
 }
 
 impl Connection {
@@ -82,6 +86,8 @@ impl Connection {
             throttle_bucket: resources.throttle_bucket,
             #[cfg(feature = "plugins")]
             plugins: resources.plugins,
+            #[cfg(all(windows, feature = "rdp"))]
+            rdp: resources.rdp,
         }
     }
 
@@ -202,11 +208,24 @@ impl Connection {
         }
 
         // 4. Request.
-        let request = with_timeout(
+        let request = match with_timeout(
             self.config.handshake_timeout,
             socks5::read_request(&mut self.stream),
         )
-        .await?;
+        .await
+        {
+            Ok(request) => request,
+            Err(e) => {
+                // An unknown ATYP is a request-level rejection (RFC 1928 §6),
+                // before any egress is selected. Preserve the existing silent
+                // close for other malformed, incomplete or timed-out input.
+                if matches!(&e, Error::Io(io) if io.kind() == io::ErrorKind::Unsupported) {
+                    socks5::write_reply(&mut self.stream, e.to_reply(), socks5::unspecified_v4())
+                        .await?;
+                }
+                return Err(e);
+            }
+        };
         info!(
             peer = %self.peer,
             command = ?request.command,
@@ -235,6 +254,23 @@ impl Connection {
         request: Request,
         method: crate::config::AuthKind,
     ) -> Result<()> {
+        if self.config.egress == Egress::Rdp {
+            #[cfg(all(windows, feature = "rdp"))]
+            return self.handle_connect_rdp(request, method).await;
+
+            #[cfg(not(all(windows, feature = "rdp")))]
+            {
+                socks5::write_reply(
+                    &mut self.stream,
+                    Reply::GeneralFailure,
+                    socks5::unspecified_v4(),
+                )
+                .await?;
+                return Err(Error::Config(
+                    "RDP egress is unavailable in this build".into(),
+                ));
+            }
+        }
         let targets = match self
             .dns_resolver
             .resolve_all(&request.dest, &self.config.dns)
@@ -350,6 +386,258 @@ impl Connection {
 
         self.finish_connect(target, remote, req_host, decision)
             .await
+    }
+
+    /// CONNECT over the process-wide RDP DVC session. Hostnames are resolved by
+    /// the remote agent, then the returned candidates pass through the same DNS
+    /// deny/order policy and SOCKS ACL as direct egress before OPEN names an IP.
+    #[cfg(all(windows, feature = "rdp"))]
+    async fn handle_connect_rdp(
+        mut self,
+        request: Request,
+        method: crate::config::AuthKind,
+    ) -> Result<()> {
+        let Some(connector) = self.rdp.clone() else {
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::NetworkUnreachable,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "RDP transport is not initialized",
+            )
+            .into());
+        };
+
+        let req_host = match &request.dest {
+            TargetAddr::Domain(host, _) => Some(host.as_str()),
+            TargetAddr::Ip(_) => None,
+        };
+        let mut resolution = None;
+        let targets = match &request.dest {
+            TargetAddr::Ip(address) => crate::dns::apply_policy(vec![*address], &self.config.dns),
+            TargetAddr::Domain(host, port) => {
+                match connector
+                    .resolve(host, *port, self.config.dns.timeout)
+                    .await
+                {
+                    Ok(resolved) => {
+                        let targets = crate::dns::apply_policy(
+                            resolved.candidates().to_vec(),
+                            &self.config.dns,
+                        );
+                        resolution = Some(resolved);
+                        targets
+                    }
+                    Err(error) => {
+                        let reply = rdp_io_reply(&error);
+                        let error = Error::Io(error);
+                        socks5::write_reply(&mut self.stream, reply, socks5::unspecified_v4())
+                            .await?;
+                        warn!(peer = %self.peer, dest = %request.dest, error = %error, "remote destination resolution failed");
+                        return Err(error);
+                    }
+                }
+            }
+        };
+
+        if targets.is_empty() {
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::HostUnreachable,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "remote resolution returned no policy-allowed addresses",
+            )
+            .into());
+        }
+        let candidates: Vec<_> = if self.config.dns.try_all {
+            targets
+        } else {
+            targets.into_iter().take(1).collect()
+        };
+
+        let mut denied = 0usize;
+        let mut last_error = None;
+        let mut connected = None;
+        for target in candidates {
+            let decision = self.authorize_connect_target(req_host, target, method);
+            self.metrics.rule_hit(
+                Scope::Socks,
+                decision.verdict,
+                decision.source_line,
+                decision.rule_name.clone(),
+            );
+            if decision.verdict != Verdict::Pass {
+                denied += 1;
+                info!(peer = %self.peer, dest = %target, "RDP connect candidate denied by socks rule");
+                continue;
+            }
+
+            let opened = match resolution.as_mut() {
+                Some(resolved) => resolved
+                    .open(target, self.config.connect_timeout)
+                    .await
+                    .map_err(crate::rdp::mux::MuxError::into_io),
+                None => connector.open_ip(target, self.config.connect_timeout).await,
+            };
+            match opened {
+                Ok(remote) => {
+                    connected = Some((target, remote, decision));
+                    break;
+                }
+                Err(error) => {
+                    warn!(peer = %self.peer, dest = %target, error = %error, "RDP remote connect failed");
+                    last_error = Some(error);
+                    let can_retry = resolution
+                        .as_ref()
+                        .is_none_or(crate::rdp::mux::ResolvedTarget::can_retry);
+                    if !self.config.dns.try_all || !can_retry {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some((target, remote, decision)) = connected else {
+            if let Some(error) = last_error {
+                let reply = rdp_io_reply(&error);
+                socks5::write_reply(&mut self.stream, reply, socks5::unspecified_v4()).await?;
+                return Err(Error::Io(error));
+            }
+            self.metrics.socks_request_denied();
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::ConnectionNotAllowed,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            info!(peer = %self.peer, denied, "RDP connect denied by socks rules");
+            return Err(Error::AccessDenied);
+        };
+
+        self.metrics.socks_request_allowed();
+        let bound = remote.bound_address();
+        socks5::write_reply(&mut self.stream, Reply::Succeeded, bound).await?;
+        self.metrics.tcp_connect();
+        info!(
+            peer = %self.peer,
+            dest = %target,
+            bound = %bound,
+            rule_line = ?decision.source_line,
+            rule_name = decision.rule_name.as_deref().unwrap_or(""),
+            "RDP connect established"
+        );
+        self.finish_connect_rdp(target, remote, req_host, decision)
+            .await
+    }
+
+    #[cfg(all(windows, feature = "rdp"))]
+    async fn finish_connect_rdp(
+        mut self,
+        target: SocketAddr,
+        mut remote: crate::rdp::mux::RdpStream,
+        req_host: Option<&str>,
+        decision: crate::acl::RuleDecision,
+    ) -> Result<()> {
+        #[cfg(not(feature = "plugins"))]
+        let _ = req_host;
+        let throttle = self.throttle(decision.bandwidth.as_ref());
+
+        #[cfg(feature = "plugins")]
+        if !self.plugins.is_empty() {
+            return self
+                .finish_connect_rdp_with_plugins(target, remote, req_host, decision, throttle)
+                .await;
+        }
+
+        let closed = remote.closed();
+        let result = relay::relay_generic_until(
+            &mut self.stream,
+            &mut remote,
+            self.config.io_timeout,
+            throttle,
+            closed,
+        )
+        .await;
+        if result.is_err() {
+            remote.set_close_reason(crate::rdp::protocol::CloseReason::Io);
+        }
+        let (up, down) = result?;
+        self.metrics.tcp_relay_closed(up, down);
+        debug!(peer = %self.peer, dest = %target, up, down, "RDP connect closed");
+        Ok(())
+    }
+
+    #[cfg(all(windows, feature = "rdp", feature = "plugins"))]
+    async fn finish_connect_rdp_with_plugins(
+        mut self,
+        target: SocketAddr,
+        mut remote: crate::rdp::mux::RdpStream,
+        req_host: Option<&str>,
+        decision: crate::acl::RuleDecision,
+        throttle: Option<Throttle>,
+    ) -> Result<()> {
+        use crate::plugin::{FlowCtx, FlowDecision, FlowStats, RuleInfo, TagSet};
+
+        let mut ctx = FlowCtx {
+            client: self.peer,
+            proxy: self.local,
+            command: Command::Connect,
+            protocol: Protocol::Tcp,
+            dest_host: req_host,
+            dest: target,
+            rule: RuleInfo::from_decision(&decision),
+            tags: TagSet::new(),
+        };
+        let flow_decision = match tokio::time::timeout(
+            self.config.handshake_timeout,
+            self.plugins.on_flow(&mut ctx),
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(_) => {
+                remote.set_close_reason(crate::rdp::protocol::CloseReason::Cancelled);
+                self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
+                return Ok(());
+            }
+        };
+        if let FlowDecision::Deny(reason) = flow_decision {
+            remote.set_close_reason(crate::rdp::protocol::CloseReason::Cancelled);
+            info!(peer = %self.peer, dest = %target, reason, "RDP flow denied by plugin");
+            self.plugins.on_flow_end(&ctx, &FlowStats::new(0, 0)).await;
+            return Ok(());
+        }
+        // The current plugin SDK transfers relay ownership when `intercept`
+        // returns Some, but its StreamArgs require a TcpStream. An RDP logical
+        // stream cannot satisfy that contract, so do not invoke (and discard)
+        // interceptors merely to detect their presence. Control-plane flow hooks
+        // remain supported here; data-plane interception is an explicit MVP gap.
+        let closed = remote.closed();
+        let result = relay::relay_generic_until(
+            &mut self.stream,
+            &mut remote,
+            self.config.io_timeout,
+            throttle,
+            closed,
+        )
+        .await;
+        if result.is_err() {
+            remote.set_close_reason(crate::rdp::protocol::CloseReason::Io);
+        }
+        let (up, down) = result.as_ref().ok().copied().unwrap_or((0, 0));
+        self.plugins
+            .on_flow_end(&ctx, &FlowStats::new(up, down))
+            .await;
+        result?;
+        self.metrics.tcp_relay_closed(up, down);
+        Ok(())
     }
 
     /// Runs the CONNECT relay to completion. Without the `plugins` feature (or with
@@ -548,6 +836,16 @@ impl Connection {
         request: Request,
         method: crate::config::AuthKind,
     ) -> Result<()> {
+        if self.config.egress == Egress::Rdp {
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::CommandNotSupported,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            info!(peer = %self.peer, "UDP ASSOCIATE is unsupported with RDP egress");
+            return Err(Error::CommandNotSupported);
+        }
         // Authorise the command before allocating any resources: if no socks
         // rule could ever permit UDP for this client (e.g. a `command: connect`
         // only policy), reject now rather than binding sockets and replying
@@ -816,6 +1114,50 @@ impl Connection {
     }
 }
 
+#[cfg(all(windows, feature = "rdp"))]
+fn rdp_io_reply(error: &io::Error) -> Reply {
+    use crate::rdp::mux::MuxError;
+    use crate::rdp::protocol::OpenErrorCode;
+
+    if let Some(error) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<MuxError>())
+    {
+        return match error {
+            MuxError::Remote { code, .. } => match code {
+                OpenErrorCode::General | OpenErrorCode::ResourceLimit => Reply::GeneralFailure,
+                OpenErrorCode::PolicyDenied => Reply::ConnectionNotAllowed,
+                OpenErrorCode::NetworkUnreachable => Reply::NetworkUnreachable,
+                OpenErrorCode::HostUnreachable => Reply::HostUnreachable,
+                OpenErrorCode::ConnectionRefused => Reply::ConnectionRefused,
+                OpenErrorCode::Timeout => Reply::TtlExpired,
+                OpenErrorCode::AddressTypeUnsupported => Reply::AddressTypeNotSupported,
+            },
+            MuxError::Timeout => Reply::TtlExpired,
+            MuxError::Unavailable | MuxError::SessionClosed(_) | MuxError::Transport(_) => {
+                Reply::NetworkUnreachable
+            }
+            MuxError::ResourceLimit
+            | MuxError::StreamIdExhausted
+            | MuxError::InvalidState(_)
+            | MuxError::InvalidCandidate(_)
+            | MuxError::Protocol(_) => Reply::GeneralFailure,
+        };
+    }
+
+    match error.kind() {
+        io::ErrorKind::ConnectionRefused => Reply::ConnectionRefused,
+        io::ErrorKind::TimedOut => Reply::TtlExpired,
+        io::ErrorKind::HostUnreachable | io::ErrorKind::AddrNotAvailable => Reply::HostUnreachable,
+        io::ErrorKind::PermissionDenied => Reply::ConnectionNotAllowed,
+        io::ErrorKind::Unsupported => Reply::AddressTypeNotSupported,
+        io::ErrorKind::OutOfMemory | io::ErrorKind::InvalidData | io::ErrorKind::Other => {
+            Reply::GeneralFailure
+        }
+        _ => Reply::NetworkUnreachable,
+    }
+}
+
 async fn with_timeout<T, F>(timeout: Duration, operation: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -1000,6 +1342,182 @@ async fn connect_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn permissive_rdp_config() -> Config {
+        Config::parse(
+            "internal: 127.0.0.1:0\n\
+             egress: rdp\n\
+             client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }\n\
+             socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp udp command: connect udpassociate }",
+        )
+        .unwrap()
+    }
+
+    async fn rdp_test_connection(
+        config: Config,
+    ) -> (TcpStream, tokio::task::JoinHandle<Result<()>>, Arc<Metrics>) {
+        // Construct the request handler directly so the fail-closed guard is
+        // exercised on every platform, including builds that reject RDP at
+        // startup, without connecting to an operator's live named-pipe bridge.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(local).await.unwrap();
+        let (proxy, peer) = listener.accept().await.unwrap();
+        let metrics = Metrics::new();
+        let resources = ConnectionResources {
+            abuse: AbuseControls::new(config.rate_limits.clone()),
+            config: Arc::new(config),
+            users: Arc::new(UserDb::new()),
+            command_auth: None,
+            metrics: metrics.clone(),
+            dns_resolver: Arc::new(DnsResolver::new()),
+            throttle_bucket: None,
+            #[cfg(feature = "plugins")]
+            plugins: Arc::new(crate::plugin::PluginHost::default()),
+            #[cfg(all(windows, feature = "rdp"))]
+            rdp: None,
+        };
+        let handler = tokio::spawn(
+            Connection::new(ClientStream::Tcp(proxy), peer, local, resources).handle(),
+        );
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut selection = [0; 2];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut selection))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection, [5, 0]);
+        (client, handler, metrics)
+    }
+
+    #[tokio::test]
+    async fn unsupported_address_type_reply_precedes_egress_selection() {
+        for egress in [Egress::Direct, Egress::Rdp] {
+            let mut config = permissive_rdp_config();
+            config.egress = egress;
+            let (mut client, handler, metrics) = rdp_test_connection(config).await;
+
+            // No address length is defined for ATYP 2. The header alone must
+            // reject immediately, without waiting for a guessed address format
+            // or requiring an available RDP connector.
+            client.write_all(&[5, 1, 0, 2]).await.unwrap();
+            let mut reply = [0; 10];
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+                .await
+                .expect("unsupported ATYP must reply without resolving or connecting")
+                .unwrap();
+            assert_eq!(reply, [5, 8, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let result = tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .expect("the rejected request must end the connection")
+                .unwrap();
+            assert!(matches!(result, Err(Error::Io(e)) if e.kind() == io::ErrorKind::Unsupported));
+            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+            assert!(metrics
+                .render_prometheus()
+                .contains("alighieri_tcp_connects_total 0\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rdp_udp_associate_fails_closed_before_udp_resource_allocation() {
+        // An occupied relay range would produce GeneralFailure if UDP binding
+        // were reached; a permissive ACL would otherwise allow direct egress.
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut config = permissive_rdp_config();
+        config.udp_port_range = Some(PortRange {
+            min: port,
+            max: port,
+        });
+        config.udp_advertise = Some(UdpAdvertise::Host("must-not-resolve.invalid".into()));
+        let (mut client, handler, metrics) = rdp_test_connection(config).await;
+
+        client
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .expect("unsupported UDP must fail before DNS or socket allocation")
+            .unwrap();
+        assert_eq!(reply, [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            handler.await.unwrap(),
+            Err(Error::CommandNotSupported)
+        ));
+        assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+        let counters = metrics.render_prometheus();
+        assert!(counters.contains("alighieri_udp_associations_total 0\n"));
+        assert!(counters.contains("alighieri_udp_associations_active 0\n"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_rdp_connect_never_falls_back_to_a_direct_socket() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (mut client, handler, _) = rdp_test_connection(permissive_rdp_config()).await;
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&port.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        #[cfg(all(windows, feature = "rdp"))]
+        let expected_reply = 3;
+        #[cfg(not(all(windows, feature = "rdp")))]
+        let expected_reply = 1;
+        assert_eq!(reply, [5, expected_reply, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(handler.await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err(),
+            "RDP failure must never create a direct destination connection"
+        );
+    }
+
+    #[cfg(all(windows, feature = "rdp"))]
+    #[test]
+    fn rdp_mux_errors_preserve_socks_reply_semantics() {
+        use crate::rdp::mux::MuxError;
+        use crate::rdp::protocol::OpenErrorCode;
+
+        let cases = [
+            (OpenErrorCode::General, Reply::GeneralFailure),
+            (OpenErrorCode::PolicyDenied, Reply::ConnectionNotAllowed),
+            (OpenErrorCode::NetworkUnreachable, Reply::NetworkUnreachable),
+            (OpenErrorCode::HostUnreachable, Reply::HostUnreachable),
+            (OpenErrorCode::ConnectionRefused, Reply::ConnectionRefused),
+            (OpenErrorCode::Timeout, Reply::TtlExpired),
+            (OpenErrorCode::ResourceLimit, Reply::GeneralFailure),
+            (
+                OpenErrorCode::AddressTypeUnsupported,
+                Reply::AddressTypeNotSupported,
+            ),
+        ];
+
+        for (code, expected) in cases {
+            let error = MuxError::Remote {
+                code,
+                diagnostic: "remote failure".into(),
+            };
+            assert_eq!(rdp_io_reply(&error.into_io()), expected);
+        }
+        assert_eq!(
+            rdp_io_reply(&io::Error::from(io::ErrorKind::HostUnreachable)),
+            Reply::HostUnreachable
+        );
+        assert_eq!(
+            rdp_io_reply(&MuxError::ResourceLimit.into_io()),
+            Reply::GeneralFailure
+        );
+    }
 
     #[test]
     fn requested_udp_endpoint_uses_concrete_matching_client_addr() {

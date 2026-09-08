@@ -211,9 +211,11 @@ pub async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> Result<TargetA
             let port = r.read_u16().await?;
             Ok(TargetAddr::Domain(domain, port))
         }
-        other => Err(Error::Protocol(format!(
-            "unsupported address type 0x{other:02x}"
-        ))),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("unsupported address type 0x{other:02x}"),
+        )
+        .into()),
     }
 }
 
@@ -609,15 +611,20 @@ mod tests {
 
     #[tokio::test]
     async fn read_target_addr_rejects_unsupported_atyp() {
-        // ATYP 0x02 is unassigned; reject it rather than misread the following
-        // bytes as an address (a parser that fell through could desync the stream).
-        let bytes = [0x02u8, 1, 2, 3, 4, 0x00, 0x50];
-        let mut cur = Cursor::new(bytes.to_vec());
-        let err = read_target_addr(&mut cur).await.unwrap_err();
-        assert!(
-            matches!(err, Error::Protocol(ref m) if m.contains("unsupported address type")),
-            "unexpected error: {err:?}"
-        );
+        // Unassigned ATYP values must neither consume a guessed address format
+        // nor lose the typed error needed for RFC 1928's reply 0x08.
+        for atyp in [0x00, 0x02, 0xff] {
+            let bytes = [atyp, 1, 2, 3, 4, 0x00, 0x50];
+            let mut cur = Cursor::new(bytes.to_vec());
+            let err = read_target_addr(&mut cur).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::Unsupported),
+                "unexpected error: {err:?}"
+            );
+            assert!(err.to_string().contains("unsupported address type"));
+            assert_eq!(err.to_reply(), Reply::AddressTypeNotSupported);
+            assert_eq!(cur.position(), 1);
+        }
     }
 
     #[tokio::test]

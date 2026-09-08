@@ -31,6 +31,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
   - [Hot reload](#hot-reload)
 - [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
+- [RDP egress over an existing Windows session](#rdp-egress-over-an-existing-windows-session)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
 - [Rust API and plugin SDK](#rust-api-and-plugin-sdk)
@@ -54,6 +55,8 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Per-client abuse controls** for connection and auth-failure rates, plus a
   token-bucket **bandwidth throttle** (TCP shaped, UDP policed)
 - **Windows Event Log** service lifecycle and startup failure events
+- **Optional Windows RDP egress** — multiplex TCP CONNECT streams through an
+  existing Microsoft Remote Desktop session without opening a remote listener
 - **Hot reload** for policy, DNS, timeout, auth, and userlist changes
 - **Configuration wizard** — generate or edit a config from a short-lived, loopback-only web UI
 - **Optional plugin SDK** — statically link custom control-plane, TCP, and UDP
@@ -409,7 +412,10 @@ independent, simplified implementation. A minimal permissive example:
 # Interface to listen on.
 internal: 127.0.0.1 port = 1080
 
-# Address used for outbound connections (0.0.0.0 = OS default).
+# Outbound transport. 'direct' is the default; Windows RDP egress is optional.
+egress: direct
+
+# Address used for direct outbound connections (0.0.0.0 = OS default).
 external: 0.0.0.0
 
 # Offer no-auth and username/password. 'username' requires a userlist.
@@ -464,7 +470,8 @@ socks pass "allow-default" {
 |--------------------|-----------------|------------------------------------------------------|
 | `include`          | —               | Include another config file or final-component glob  |
 | `internal`         | — (required)    | Listening address (`IP port = N` or `IP:PORT`)       |
-| `external`         | `0.0.0.0`       | Source address for outbound connections              |
+| `egress`           | `direct`        | Outbound transport: `direct`, or optional Windows `rdp` for TCP CONNECT (restart-only) |
+| `external`         | `0.0.0.0`       | Source address for direct outbound connections; RDP mode requires an unspecified address |
 | `proxyprotocol`    | —               | Trusted upstream CIDR(s) allowed to send a PROXY protocol (v1/v2) header; the real client address then drives rules/limits/logs. Unset disables it |
 | `socksmethod`      | `none`          | Offered auth methods (`none`, `username`)            |
 | `userlist`         | —               | Path to `username:password-or-hash` file             |
@@ -861,9 +868,9 @@ policy. New client connections use the reloaded ACLs, DNS policy,
 authentication settings, userlist, timeout values, and rate-limit settings.
 Existing connections continue with the configuration they accepted under.
 
-Listener addresses, `maxconnections`, metrics listener settings, TLS listener
-settings, and logging sinks are process-level resources; changes to those
-settings are reported in the logs and require a restart.
+The egress transport, listener addresses, `maxconnections`, metrics listener
+settings, TLS listener settings, and logging sinks are process-level resources;
+changes to those settings are reported in the logs and require a restart.
 
 Tools and local setup UIs can inspect the same distinction with
 `alighieri config metadata --json`.
@@ -1064,6 +1071,88 @@ sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
 echo 'net.core.rmem_max=8388608
 net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
 ```
+
+## RDP egress over an existing Windows session
+
+The optional `rdp` feature sends SOCKS5 TCP CONNECT traffic through the network
+stack of the Windows machine at the far end of an existing Microsoft Remote
+Desktop (`mstsc.exe`) session. It uses an RDP Dynamic Virtual Channel: the
+remote agent opens no TCP or UDP listener. SOCKS authentication, ACL decisions,
+DNS candidate filtering/ordering, metrics, and configured caller/relay timeouts
+remain local. Hostnames are resolved by the agent and remote answers are not
+cached in this MVP; the agent also applies a 30-second safety cap to each remote
+DNS and connect operation.
+
+Windows release archives include `alighieri-rdp-transport.exe` (the local COM
+helper) and `alighieri-rdp-agent.exe` (run inside the remote desktop). To build
+them from source:
+
+```powershell
+cargo build --release --locked --features rdp --bins
+```
+
+A source build places the executables in `.\target\release`. Copy
+`alighieri.exe`, `alighieri-rdp-transport.exe`, and
+`alighieri-rdp-agent.exe` from there to a stable directory and enter it before
+using the commands below. An extracted release archive already has the expected
+layout.
+
+On the local Windows machine, keep the helper at a stable absolute path and
+register it for the current user. This needs no elevation:
+
+```powershell
+.\alighieri-rdp-transport.exe --register
+```
+
+Restart any running `mstsc.exe`, connect to the intended remote Windows
+machine, copy `alighieri-rdp-agent.exe` there, and run it in that interactive
+RDP desktop:
+
+```powershell
+.\alighieri-rdp-agent.exe
+```
+
+Then start the local proxy with a TCP-only policy and `egress: rdp`:
+
+```conf
+internal: 127.0.0.1 port = 1080
+egress: rdp
+socksmethod: none
+
+client pass "localhost" {
+    from: 127.0.0.1/32 to: 127.0.0.1/32
+}
+socks pass "rdp-ipv4" {
+    from: 127.0.0.1/32 to: 0.0.0.0/0
+    protocol: tcp
+    command: connect
+}
+socks pass "rdp-ipv6" {
+    from: 127.0.0.1/32 to: ::/0
+    protocol: tcp
+    command: connect
+}
+```
+
+RDP egress is restart-only and currently supports console mode, one compatible
+Microsoft RDP session, and TCP CONNECT only. Windows Service validation rejects
+RDP mode because LocalService cannot use the interactive user's protected
+channel bridge. UDP ASSOCIATE never falls back to direct egress. A concrete
+`external` source address is invalid in this mode; leave it unset or
+unspecified. The remote agent has the logged-in user's
+network reach, potentially including its loopback and private LAN, so retain
+restrictive SOCKS rules and `dns.deny` policy as appropriate.
+
+The configuration wizard does not generate RDP mode in this MVP. If an RDP
+configuration is imported, the wizard reports `egress` as an unsupported setting
+that would be lost; do not save that regenerated configuration unless switching
+back to direct egress is intentional.
+
+Use `--unregister` to remove the per-user registration. The `--machine` form of
+register/unregister writes the machine-wide registration and requires an
+elevated shell. See [`doc/rdp-transport.md`](doc/rdp-transport.md) for the full
+deployment model, agent-side deny switches, security boundaries, limitations,
+and reproducible two-machine reconnect/half-close/concurrency test checklist.
 
 ## Windows Service
 

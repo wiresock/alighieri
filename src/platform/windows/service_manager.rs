@@ -867,12 +867,13 @@ fn finalize_install<C: ServiceController>(
 fn validate_config(config_path: &Path) -> ServiceCliResult<()> {
     let config = Config::load(config_path)
         .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
-    // Mirror the checks `Server::bind` runs at startup (same order as the
-    // `check` command) so `service install`/`start`/`reload` reject a config that
-    // would otherwise fail the moment the service binds — e.g. an
-    // unauthenticated public metrics endpoint.
+    // Apply the service-host restriction first, then mirror the checks
+    // `Server::bind` runs at startup (same order as the `check` command), so
+    // `service install`/`start`/`reload` reject an unusable configuration before
+    // asking SCM to act.
     config
-        .validate_startup()
+        .validate_windows_service_startup()
+        .and_then(|()| config.validate_startup())
         .and_then(|()| tls::validate_config(&config))
         .map_err(|e| ServiceCliError::Config(format!("{} ({})", config_path.display(), e)))?;
     // Service mode always writes a file log. Validate the resolved active path
@@ -1275,6 +1276,21 @@ mod tests {
             panic!("service validation should refuse public metrics without metrics.allowpublic");
         };
         assert!(err.to_string().contains("metrics.allowpublic"), "{err}");
+    }
+
+    #[test]
+    fn validate_config_rejects_rdp_egress_for_the_service_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.conf");
+        std::fs::write(
+            &path,
+            "internal: 127.0.0.1 port = 1080\negress: rdp\nsocks pass { from: 127.0.0.1/32 to: 0.0.0.0/0 command: connect }",
+        )
+        .unwrap();
+
+        let err = validate_config(&path).unwrap_err();
+        assert!(err.to_string().contains("Windows Service mode"), "{err}");
+        assert!(err.to_string().contains("interactive console"), "{err}");
     }
 
     #[test]

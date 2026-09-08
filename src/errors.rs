@@ -52,8 +52,12 @@ impl Error {
             Error::Io(e) => match e.kind() {
                 std::io::ErrorKind::ConnectionRefused => Reply::ConnectionRefused,
                 std::io::ErrorKind::TimedOut => Reply::TtlExpired,
-                std::io::ErrorKind::AddrNotAvailable => Reply::HostUnreachable,
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::HostUnreachable => {
+                    Reply::HostUnreachable
+                }
+                std::io::ErrorKind::NetworkUnreachable => Reply::NetworkUnreachable,
                 std::io::ErrorKind::PermissionDenied => Reply::ConnectionNotAllowed,
+                std::io::ErrorKind::Unsupported => Reply::AddressTypeNotSupported,
                 _ => Reply::NetworkUnreachable,
             },
             _ => Reply::GeneralFailure,
@@ -99,6 +103,30 @@ mod tests {
     fn io_refused_maps_to_refused() {
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nope");
         assert_eq!(Error::Io(io).to_reply(), Reply::ConnectionRefused);
+    }
+
+    #[test]
+    fn unsupported_io_and_command_keep_distinct_replies() {
+        let io = std::io::Error::from(std::io::ErrorKind::Unsupported);
+        assert_eq!(Error::Io(io).to_reply(), Reply::AddressTypeNotSupported);
+        assert_eq!(
+            Error::CommandNotSupported.to_reply(),
+            Reply::CommandNotSupported
+        );
+    }
+
+    #[test]
+    fn io_host_and_network_unreachable_keep_distinct_replies() {
+        for (kind, reply) in [
+            (std::io::ErrorKind::HostUnreachable, Reply::HostUnreachable),
+            (std::io::ErrorKind::AddrNotAvailable, Reply::HostUnreachable),
+            (
+                std::io::ErrorKind::NetworkUnreachable,
+                Reply::NetworkUnreachable,
+            ),
+        ] {
+            assert_eq!(Error::from(std::io::Error::from(kind)).to_reply(), reply);
+        }
     }
 
     #[test]

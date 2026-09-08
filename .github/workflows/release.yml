@@ -113,10 +113,10 @@ jobs:
             features: --features installer-fs
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: ''
+            features: --features rdp
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            features: ''
+            features: --features rdp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -175,16 +175,25 @@ jobs:
           $dir = "alighieri-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "$dir/doc/templates" -Force | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/alighieri.exe" $dir/
+          Copy-Item "target/${{ matrix.target }}/release/alighieri-rdp-transport.exe" $dir/
+          Copy-Item "target/${{ matrix.target }}/release/alighieri-rdp-agent.exe" $dir/
+          Copy-Item doc/alighieri.conf "$dir/doc/alighieri.conf"
           Copy-Item doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
           Copy-Item doc/management-cli.md "$dir/doc/management-cli.md"
+          Copy-Item doc/rdp-transport.md "$dir/doc/rdp-transport.md"
           Copy-Item doc/templates/public-tls-proxifyre.conf "$dir/doc/templates/public-tls-proxifyre.conf"
           Copy-Item README.md, LICENSE, CHANGELOG.md $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $archiveCheckDir = Join-Path $env:RUNNER_TEMP "$dir-archive-check"
           Expand-Archive -LiteralPath "$dir.zip" -DestinationPath $archiveCheckDir
           $expectedArchiveFiles = @(
+            (Join-Path $archiveCheckDir "$dir/alighieri.exe"),
+            (Join-Path $archiveCheckDir "$dir/alighieri-rdp-transport.exe"),
+            (Join-Path $archiveCheckDir "$dir/alighieri-rdp-agent.exe"),
+            (Join-Path $archiveCheckDir "$dir/doc/alighieri.conf"),
             (Join-Path $archiveCheckDir "$dir/doc/acme-tls-test.md"),
             (Join-Path $archiveCheckDir "$dir/doc/management-cli.md"),
+            (Join-Path $archiveCheckDir "$dir/doc/rdp-transport.md"),
             (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf")
           )
           foreach ($path in $expectedArchiveFiles) {
