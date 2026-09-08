@@ -899,8 +899,9 @@ where
         // Accept only datagrams from the legitimate client. `src` is kept in the
         // socket's own family (it is stored as the reply target below and must
         // stay sendable on this socket); `client_source_accepted` canonicalises
-        // both addresses internally. The predeclared lock is stored in the
-        // client's family by `requested_udp_endpoint`.
+        // both addresses internally. The predeclared lock is stored as the
+        // canonical client address by `requested_udp_endpoint`, matching the
+        // AF_INET relay bind used for IPv4-mapped locals.
         if !client_source_accepted(src, client_ip, client_endpoint.get().copied()) {
             continue; // spoofed / unrelated / off-lock source
         }

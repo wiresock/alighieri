@@ -6,6 +6,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Fixed
+
+- UDP ASSOCIATE on a dual-stack `[::]` listener now binds the client-facing
+  relay socket on the canonical IPv4 address rather than `::ffff:a.b.c.d`.
+  Darwin does not deliver IPv4 UDP to an AF_INET6 socket bound to a mapped
+  address, so IPv4 clients previously timed out after a successful associate.
+
 ## [0.6.0] - 2026-09-08
 
 ### Added

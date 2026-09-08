@@ -533,13 +533,12 @@ async fn udp_associate_relays_datagrams() {
 }
 
 /// On a dual-stack `[::]` listener an IPv4 client is accepted as an IPv4-mapped
-/// peer, so the UDP relay socket is bound on a `::ffff:` (AF_INET6) address. This
-/// exercises that path end to end: the client must get a v4 (ATYP=0x01) BND.ADDR
-/// (not an IPv6-form reply it would misparse), and the locked client endpoint
-/// must stay sendable on the v6 relay socket (a plain-IPv4 endpoint cannot be
-/// `send_to` on AF_INET6), so the reply round-trips. Skipped when `[::]:0` cannot
-/// be bound or has no IPv4 path (e.g. Windows' default `IPV6_V6ONLY`, or a host
-/// without IPv6).
+/// peer. The relay socket is bound on the canonical IPv4 address — Darwin does
+/// not deliver IPv4 UDP to an AF_INET6 socket bound to `::ffff:a.b.c.d` — and
+/// this exercises that path end to end: the client must get a v4 (ATYP=0x01)
+/// BND.ADDR (not an IPv6-form reply it would misparse), and datagrams must
+/// round-trip. Skipped when `[::]:0` cannot be bound or has no IPv4 path
+/// (e.g. Windows' default `IPV6_V6ONLY`, or a host without IPv6).
 #[tokio::test]
 async fn udp_associate_relays_for_mapped_client_on_dual_stack_listener() {
     let cfg = Config::parse(
