@@ -245,7 +245,11 @@ start_daemon() {
 
 selftest() {
   local tmp
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/alighieri-macos-daemon.XXXXXX")"
+  # Keep the fixture tree off /tmp and /var: on Darwin those are symlinks
+  # (/tmp -> /private/tmp, /var -> /private/var) and the ancestor walk
+  # must still be able to prove a successful install.
+  mkdir -p target
+  tmp="$(mktemp -d "${PWD}/target/alighieri-macos-daemon.XXXXXX")"
   ALIGHIERI_SELFTEST_TMP="$tmp"
   trap 'rm -rf "${ALIGHIERI_SELFTEST_TMP:-}"' EXIT
   local db="$tmp/dscl"
