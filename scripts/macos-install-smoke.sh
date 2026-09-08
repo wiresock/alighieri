@@ -95,6 +95,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
       break
     fi
   done
+  shopt -u nullglob
   [[ -n "$binary" ]] || fail "no built Alighieri binary to stage"
 
   if command -v vtool >/dev/null 2>&1; then
