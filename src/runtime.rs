@@ -2931,12 +2931,14 @@ mod tests {
         let path = dir.path().join("alighieri.log");
         std::fs::write(&target, b"secret").unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        let error = RotatingFile::open(path, 10, 1).unwrap_err();
-        assert_ne!(
-            error.kind(),
-            io::ErrorKind::NotFound,
-            "O_NOFOLLOW must refuse the symlink rather than creating a new file: {error}"
-        );
+        match RotatingFile::open(path, 10, 1) {
+            Ok(_) => panic!("O_NOFOLLOW must refuse a symlink logfile"),
+            Err(error) => assert_ne!(
+                error.kind(),
+                io::ErrorKind::NotFound,
+                "O_NOFOLLOW must refuse the symlink rather than creating a new file: {error}"
+            ),
+        }
     }
 
     #[cfg(windows)]

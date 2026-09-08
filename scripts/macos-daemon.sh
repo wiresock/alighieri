@@ -63,11 +63,9 @@ validate_daemon_root() {
   [[ -n "$path" ]] || fail "daemon root is required"
   [[ "$path" == /* ]] || fail "daemon root must be an absolute path: $path"
   [[ "$path" != "/" ]] || fail "refusing filesystem root as the daemon tree"
-  case "$path" in
-    *'/./'*|*/.|*'/..'*|*/..)
-      fail "daemon root must not contain . or .. components: $path"
-      ;;
-  esac
+  if [[ "$path" == *'/./'* || "$path" == */. || "$path" == *'/..'* || "$path" == */.. ]]; then
+    fail "daemon root must not contain . or .. components: $path"
+  fi
   if [[ "$(dirname "$path")" == "/" ]]; then
     fail "daemon root must not be a top-level directory: $path"
   fi
