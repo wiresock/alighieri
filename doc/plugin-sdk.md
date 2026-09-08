@@ -221,7 +221,10 @@ contacted-remote checks, shaping, and idle accounting.
 A plugin that needs its own QUIC or HTTP/3 stack can return a
 `DatagramInterceptor` from `intercept_association`. It drives SDK-owned
 `ClientDatagrams` and `UpstreamOriginator` facades rather than raw relay
-sockets. The simplest interceptor transparently splices the association:
+sockets. `AssociateCtx::relay_addr` is the SOCKS BND address already sent to
+the client (including `udp.advertise`). `ClientDatagrams::local_addr()` is
+the physical bind of that relay socket and can differ when advertise is set.
+The simplest interceptor transparently splices the association:
 
 ```rust
 use std::io;

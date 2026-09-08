@@ -14,6 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "10.14"
   # Hosted runners include Node. Make the wizard's executable browser-state
   # test fail rather than silently skip if that runtime ever disappears.
   ALIGHIERI_REQUIRE_NODE_TESTS: "1"
@@ -97,25 +98,28 @@ jobs:
         run: |
           chmod +x scripts/package-unix.sh
           if [[ "${{ runner.os }}" == "Linux" ]]; then
-            eval "$(
+            ASSET="$(
               scripts/package-unix.sh \
                 --os linux \
                 --target x86_64-unknown-linux-gnu \
                 --version test \
                 --bindir target/debug \
                 --archive
-            )"
+            )" || exit 1
+            test -f "$ASSET"
             tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/LICENSING.md"
           else
-            eval "$(
+            ASSET="$(
               scripts/package-unix.sh \
                 --os macos \
                 --target aarch64-apple-darwin \
                 --version test \
                 --bindir target/debug \
                 --archive
-            )"
+            )" || exit 1
+            test -f "$ASSET"
             tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
             extract="$RUNNER_TEMP/alighieri-macos-archive"
             mkdir -p "$extract"
             tar -xzf "$ASSET" -C "$extract"
@@ -173,14 +177,15 @@ jobs:
         run: |
           test -x "target/${{ matrix.target }}/release/alighieri"
           chmod +x scripts/package-unix.sh
-          eval "$(
+          ASSET="$(
             scripts/package-unix.sh \
               --os macos \
               --target x86_64-apple-darwin \
               --version test \
               --bindir "target/${{ matrix.target }}/release" \
               --archive
-          )"
+          )" || exit 1
+          test -f "$ASSET"
           file "target/${{ matrix.target }}/release/alighieri"
           lipo -archs "target/${{ matrix.target }}/release/alighieri" | grep -Fq x86_64
       - name: Assert cross-compiled Windows RDP helpers
@@ -220,13 +225,22 @@ jobs:
         run: |
           test -x scripts/alighieri.sh
           test -x scripts/install-linux.sh
-          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh
+          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh scripts/macos-daemon.sh
           test -x scripts/package-unix.sh
           test -x scripts/macos-install-smoke.sh
+          test -x scripts/macos-daemon.sh
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
       - name: Run installer self-tests
-        run: bash scripts/alighieri.sh __selftest
+        run: |
+          bash scripts/alighieri.sh __selftest
+          bash scripts/macos-daemon.sh __selftest
+          bash scripts/macos-install-smoke.sh
+          if ASSET="$(scripts/package-unix.sh --os macos --target t --version v --bindir /no-such-bindir --archive 2>/dev/null)"; then
+            echo "package-unix.sh must fail when the bindir is missing" >&2
+            exit 1
+          fi
+          test -z "${ASSET:-}"
 
   # Verify the crate still builds on its declared minimum supported Rust
   # version (Cargo.toml `rust-version`). Clippy and rustfmt stay on the stable

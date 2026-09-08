@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Static checks for the macOS LaunchAgent/LaunchDaemon examples.
-# Does not load launchd jobs.
+# Static and staged checks for the macOS LaunchAgent/LaunchDaemon examples.
+# Does not load launchd jobs or create system accounts.
 set -euo pipefail
 
 fail() {
@@ -8,56 +8,121 @@ fail() {
   exit 1
 }
 
+expect_plist_string() {
+  local plist="$1" key="$2" expected="$3"
+  local actual=""
+  if command -v plutil >/dev/null 2>&1; then
+    actual="$(plutil -extract "$key" raw -o - "$plist")"
+  elif [[ "$key" != *.* ]]; then
+    actual="$(awk -v key="$key" '
+      $0 ~ "<key>" key "</key>" { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }
+    ' "$plist")"
+  elif grep -Fq "<string>${expected}</string>" "$plist"; then
+    actual="$expected"
+  fi
+  [[ "$actual" == "$expected" ]] || fail "$plist $key: expected $expected, got ${actual:-<missing>}"
+}
+
+expect_plist_missing() {
+  local plist="$1" key="$2"
+  if grep -Fq "<key>$key</key>" "$plist"; then
+    fail "$plist must not contain $key"
+  fi
+}
+
+bash scripts/macos-daemon.sh __selftest
+
 for plist in doc/macos-launchagent.plist doc/macos-launchdaemon.plist; do
   [[ -f "$plist" ]] || fail "missing $plist"
   if command -v plutil >/dev/null 2>&1; then
     plutil -lint "$plist" >/dev/null
   fi
+  grep -Eq "/opt/homebrew|/usr/local/" "$plist" \
+    && fail "$plist must not point at Homebrew-controlled paths"
 done
 
-agent="$(cat doc/macos-launchagent.plist)"
-daemon="$(cat doc/macos-launchdaemon.plist)"
+expect_plist_string doc/macos-launchagent.plist Label com.wiresock.alighieri
+expect_plist_string doc/macos-launchagent.plist ProgramArguments.0 /opt/alighieri/bin/alighieri
+expect_plist_string doc/macos-launchagent.plist LimitLoadToSessionType Aqua
+expect_plist_missing doc/macos-launchagent.plist UserName
+expect_plist_missing doc/macos-launchagent.plist StandardOutPath
 
-echo "$agent" | grep -Fq "/usr/local/libexec/alighieri" \
-  || fail "LaunchAgent binary is not /usr/local/libexec/alighieri"
-echo "$agent" | grep -Eq "/opt/homebrew|/usr/local/bin/" \
-  && fail "LaunchAgent must not point at Homebrew-replaceable paths"
-echo "$agent" | grep -Fq "<key>UserName</key>" \
-  && fail "LaunchAgent must run as the session user, not a system account"
-echo "$agent" | grep -Fq "LimitLoadToSessionType" \
-  || fail "LaunchAgent must be limited to an Aqua login session"
-echo "$agent" | grep -Fq "StandardOutPath" \
-  && fail "LaunchAgent must not rely on unbounded launchd stdout files"
+expect_plist_string doc/macos-launchdaemon.plist Label com.wiresock.alighieri
+expect_plist_string doc/macos-launchdaemon.plist UserName _alighieri
+expect_plist_string doc/macos-launchdaemon.plist GroupName _alighieri
+expect_plist_string doc/macos-launchdaemon.plist Umask 077
+expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.0 /opt/alighieri/bin/alighieri
+expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.1 /opt/alighieri/alighieri.conf
+expect_plist_missing doc/macos-launchdaemon.plist StandardOutPath
 
-echo "$daemon" | grep -Fq "<string>_alighieri</string>" \
-  || fail "LaunchDaemon must run as the dedicated _alighieri account"
-echo "$daemon" | grep -Fq "/usr/local/libexec/alighieri" \
-  || fail "LaunchDaemon binary is not /usr/local/libexec/alighieri"
-echo "$daemon" | grep -Eq "/opt/homebrew|/usr/local/bin/" \
-  && fail "LaunchDaemon must not point at Homebrew-replaceable paths"
-echo "$daemon" | grep -Fq "StandardOutPath" \
-  && fail "LaunchDaemon must not rely on unbounded launchd stdout files"
+[[ -x scripts/macos-daemon.sh ]] || chmod +x scripts/macos-daemon.sh
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  prefix="$(mktemp -d "${TMPDIR:-/tmp}/alighieri-macos-prefix.XXXXXX")"
-  trap 'rm -rf "$prefix"' EXIT
-  mkdir -p "$prefix/libexec" "$prefix/etc/alighieri" "$prefix/LaunchAgents"
-  # Stage the documented layout without requiring root. `true` is a shell
-  # builtin on Darwin, so `command -v true` is not a file `install` can copy.
-  if [[ -x /usr/bin/true ]]; then
-    install -m 755 /usr/bin/true "$prefix/libexec/alighieri"
-  else
-    printf '%s\n' '#!/bin/sh' 'exit 0' >"$prefix/libexec/alighieri"
-    chmod 755 "$prefix/libexec/alighieri"
+  root="${PWD}/target/alighieri-macos-smoke"
+  rm -rf "$root"
+  mkdir -p "$root"
+  chmod 755 "$root"
+  trap 'rm -rf "$root"' EXIT
+
+  binary=""
+  for candidate in target/debug/alighieri target/release/alighieri; do
+    if [[ -x "$candidate" ]]; then
+      binary="$candidate"
+      break
+    fi
+  done
+  [[ -n "$binary" ]] || fail "no built Alighieri binary to stage"
+
+  if command -v vtool >/dev/null 2>&1; then
+    minos="$(vtool -show-build "$binary" | awk '/minos/ { print $2; exit }')"
+    if [[ -n "$minos" ]]; then
+      awk -v minos="$minos" 'BEGIN {
+        n = split(minos, p, ".")
+        major = p[1] + 0
+        minor = (n >= 2 ? p[2] : 0) + 0
+        if (major < 10 || (major == 10 && minor < 14)) {
+          exit 1
+        }
+      }' || fail "Darwin binary minos $minos is older than 10.14"
+    fi
   fi
-  install -m 644 doc/alighieri.conf "$prefix/etc/alighieri/alighieri.conf"
-  install -m 644 doc/macos-launchagent.plist "$prefix/LaunchAgents/com.wiresock.alighieri.plist"
-  [[ -x "$prefix/libexec/alighieri" ]] || fail "staged binary is not executable"
-  [[ -f "$prefix/etc/alighieri/alighieri.conf" ]] || fail "staged config missing"
-  program="$(sed -n 's/.*<string>\(\/usr\/local\/libexec\/alighieri\)<\/string>.*/\1/p' \
-    "$prefix/LaunchAgents/com.wiresock.alighieri.plist" | head -n 1)"
-  [[ "$program" == "/usr/local/libexec/alighieri" ]] \
-    || fail "staged LaunchAgent ProgramArguments drifted"
+
+  conf="$root/generated.conf"
+  cat >"$conf" <<'EOF'
+internal: 127.0.0.1 port = 1080
+socksmethod: none
+client pass { from: 127.0.0.0/8 to: 0.0.0.0/0 }
+socks pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol: tcp command: connect }
+logoutput: file
+logfile: PLACEHOLDER/logs/alighieri.log
+EOF
+  staged_root="$root/opt/alighieri"
+  mkdir -p "$(dirname "$staged_root")"
+  chmod 755 "$(dirname "$staged_root")"
+  sed "s|PLACEHOLDER|$staged_root|g" "$conf" >"$root/check.conf"
+
+  scripts/macos-daemon.sh install \
+    --root "$staged_root" \
+    --binary "$binary" \
+    --config "$root/check.conf" \
+    --no-start
+
+  [[ -x "$staged_root/bin/alighieri" ]] || fail "staged binary missing"
+  "$staged_root/bin/alighieri" --check --config "$staged_root/alighieri.conf"
+
+  staged_plist="$staged_root/com.wiresock.alighieri.plist"
+  [[ -f "$staged_plist" ]] || fail "helper did not generate a plist"
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$staged_plist" >/dev/null
+  fi
+  expect_plist_string "$staged_plist" UserName _alighieri
+  expect_plist_string "$staged_plist" Umask 077
+  expect_plist_string "$staged_plist" ProgramArguments.0 "$staged_root/bin/alighieri"
+  expect_plist_string "$staged_plist" ProgramArguments.1 "$staged_root/alighieri.conf"
+
+  # Independent assertion failures: each required key/path is checked above.
+  grep -Fq "/usr/local" "$staged_plist" && fail "staged plist still mentions /usr/local"
+  grep -Fq "/opt/homebrew" "$staged_plist" && fail "staged plist mentions Homebrew"
 fi
 
 echo "macos-install-smoke: ok"

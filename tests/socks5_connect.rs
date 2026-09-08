@@ -751,11 +751,15 @@ async fn udp_associate_mapped_unspecified_locks_declared_port() {
 
 #[tokio::test]
 async fn udp_associate_mapped_external_reaches_ipv4() {
+    if UdpSocket::bind("127.0.0.2:0").await.is_err() {
+        eprintln!("skipping udp_associate_mapped_external_reaches_ipv4: 127.0.0.2 unavailable");
+        return;
+    }
     let echo = start_udp_echo_server().await;
     let cfg = Config::parse(
         r#"
 internal: 127.0.0.1:0
-external: ::ffff:127.0.0.1
+external: ::ffff:127.0.0.2
 socksmethod: none
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 socks pass {
@@ -1824,7 +1828,49 @@ socks pass {
     let reply = request_udp_associate_dest(&mut stream, "0.0.0.0:0".parse().unwrap())
         .await
         .expect_err("cross-family PROXY UDP ASSOCIATE must fail closed");
-    assert_ne!(reply, 0x00);
+    assert_eq!(
+        reply, 0x01,
+        "cross-family PROXY UDP must fail closed with GeneralFailure"
+    );
+}
+
+#[tokio::test]
+async fn proxy_protocol_udp_associate_round_trips_same_family() {
+    let echo = start_udp_echo_server().await;
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+proxyprotocol: 127.0.0.0/8
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_proxy, proxy_addr) = start_proxy_with_config(cfg).await;
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP4 127.0.0.1 127.0.0.1 40000 1080\r\n")
+        .await
+        .unwrap();
+    handshake_noauth(&mut stream).await;
+    let relay_addr = request_udp_associate(&mut stream).await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"proxy-udp");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("same-family PROXY UDP ASSOCIATE must relay")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"proxy-udp");
 }
 
 #[tokio::test]
@@ -2454,7 +2500,19 @@ mod plugin_intercept {
         drop(control);
     }
 
-    struct AdvertiseRecorder(Mutex<Option<SocketAddr>>);
+    #[derive(Default)]
+    struct AdvertiseRecorder {
+        ctx_addr: Mutex<Option<SocketAddr>>,
+        physical_addr: Mutex<Option<SocketAddr>>,
+    }
+    struct RecordPhysicalInterceptor(Arc<AdvertiseRecorder>);
+    #[async_trait]
+    impl DatagramInterceptor for RecordPhysicalInterceptor {
+        async fn run(self: Box<Self>, args: AssociationArgs) -> std::io::Result<FlowStats> {
+            *self.0.physical_addr.lock().unwrap() = Some(args.client.local_addr()?);
+            plugin::splice_association(args).await
+        }
+    }
     struct AdvertisePlugin(Arc<AdvertiseRecorder>);
     #[async_trait]
     impl Plugin for AdvertisePlugin {
@@ -2465,14 +2523,14 @@ mod plugin_intercept {
             &self,
             ctx: &AssociateCtx<'_>,
         ) -> Option<Box<dyn DatagramInterceptor>> {
-            *self.0 .0.lock().unwrap() = Some(ctx.relay_addr);
-            None
+            *self.0.ctx_addr.lock().unwrap() = Some(ctx.relay_addr);
+            Some(Box::new(RecordPhysicalInterceptor(self.0.clone())))
         }
     }
 
     #[tokio::test]
     async fn associate_ctx_relay_addr_matches_advertised_socks_reply() {
-        let recorder = Arc::new(AdvertiseRecorder(Mutex::new(None)));
+        let recorder = Arc::new(AdvertiseRecorder::default());
         let host = PluginHost::new(vec![Arc::new(AdvertisePlugin(recorder.clone()))]);
         let cfg = Config::parse(
             r#"
@@ -2497,14 +2555,35 @@ socks pass {
             advertised.ip(),
             "203.0.113.7".parse::<std::net::IpAddr>().unwrap()
         );
+
+        for _ in 0..100 {
+            if recorder.physical_addr.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
         let ctx_addr = recorder
-            .0
+            .ctx_addr
             .lock()
             .unwrap()
             .expect("intercept_association must observe the association");
+        let physical = recorder
+            .physical_addr
+            .lock()
+            .unwrap()
+            .expect("ClientDatagrams::local_addr must be observed on takeover");
         assert_eq!(
             ctx_addr, advertised,
             "AssociateCtx::relay_addr must match the SOCKS BND address already sent"
+        );
+        assert_ne!(
+            physical, advertised,
+            "ClientDatagrams::local_addr is the physical bind, not udp.advertise"
+        );
+        assert!(
+            physical.ip().is_loopback(),
+            "physical relay bind should remain loopback, got {physical}"
         );
         drop(control);
     }

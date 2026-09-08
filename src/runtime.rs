@@ -1797,6 +1797,11 @@ impl RotatingFile {
 fn open_rotating_log_file(path: &Path, _pin_path: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1813,7 +1818,15 @@ fn open_rotating_log_file(path: &Path, _pin_path: bool) -> io::Result<File> {
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+    }
+    Ok(file)
 }
 
 fn rotated_path(path: &Path, index: usize) -> PathBuf {
@@ -2881,6 +2894,32 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
         assert!(!rotated_path(&path, 1).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_file_creates_and_enforces_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.log");
+        std::fs::write(&path, b"seed").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut file = RotatingFile::open(path.clone(), 8, 1).unwrap();
+        file.write_all(b"current\n").unwrap();
+        file.write_all(b"rotated\n").unwrap();
+        file.flush().unwrap();
+
+        for candidate in [path.clone(), rotated_path(&path, 1)] {
+            let mode = std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} must not be group/other-readable, got {mode:o}",
+                candidate.display()
+            );
+        }
     }
 
     #[cfg(windows)]

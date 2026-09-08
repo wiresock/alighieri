@@ -1260,7 +1260,12 @@ impl ClientDatagrams {
         Ok(())
     }
 
-    /// The relay socket address advertised to the client (BND.ADDR/PORT).
+    /// The physical address of the bound client-facing UDP socket.
+    ///
+    /// This is `UdpSocket::local_addr()` on the relay socket, not the address
+    /// advertised to the SOCKS client. When `udp.advertise` is set,
+    /// [`crate::plugin::AssociateCtx::relay_addr`] is the BND.ADDR/PORT already
+    /// sent to the client and can differ from this physical bind address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }

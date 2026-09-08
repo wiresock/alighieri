@@ -1079,14 +1079,19 @@ net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
 
 macOS is a first-class **console** platform: the same SOCKS5, TLS, wizard, and
 SIGHUP reload path as Linux. There is no systemd installer and no RDP egress
-on Darwin. Bind a non-privileged `internal:` port (1080 is fine) unless the
-process is started as root.
+on Darwin. Darwin archives target **macOS 10.14 or later**. A loopback
+`internal:` such as `127.0.0.1:1080` needs no extra privilege. The public TLS
+profile binds `0.0.0.0:443`; on 10.14+ XNU exempts `INADDR_ANY` from the
+low-port restriction, so `_alighieri` can listen on 443 without root. Binding
+443 on a specific interface, or running on 10.12/10.13, still requires root
+or launchd socket activation (Alighieri does not consume launchd sockets).
 
 The default background install is a **per-user LaunchAgent**. It runs as your
 login user after you log in, listens on port 1080, and never executes a
 Homebrew-replaceable binary as root. A system LaunchDaemon that binds port 443
-is a separate hardened profile (dedicated `_alighieri` account, root-owned
-`/usr/local/libexec` binary); the public-TLS wizard emits those steps.
+is a separate hardened profile (dedicated `_alighieri` account, complete
+tree under root-owned `/opt/alighieri`); the public-TLS wizard emits
+`scripts/macos-daemon.sh`.
 
 ```sh
 # from a source checkout
@@ -1098,17 +1103,18 @@ BIN="./target/release/alighieri"
 
 # Gatekeeper: unsigned release archives may carry com.apple.quarantine.
 # Clear it on the source binary *before* copying or launching. Removing the
-# attribute bypasses provenance checks; verify the published SHA-256 sidecar
-# first. Apple documents that non-Developer-ID, non-notarized software cannot
-# be verified the same way as trusted software:
-# https://support.apple.com/en-us/102445
-xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true
+# attribute bypasses provenance checks. For a GitHub release, first verify
+# the downloaded archive against the published SHA256SUMS in the same
+# directory: `shasum -a 256 -c SHA256SUMS`. Apple documents that
+# non-Developer-ID, non-notarized software cannot be verified the same way
+# as trusted software: https://support.apple.com/en-us/102445
+{ xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true; }
 "$BIN" --check --config doc/alighieri.conf
 
-# Root-owned binary: do not install into Homebrew prefixes (/opt/homebrew or a
-# user-writable /usr/local/bin). /usr/local/libexec is created root:wheel.
-sudo install -d -o root -g wheel -m 0755 /usr/local/libexec /usr/local/etc/alighieri
-sudo install -o root -g wheel -m 0755 "$BIN" /usr/local/libexec/alighieri
+# Root-owned binary: do not install into Homebrew prefixes (/opt/homebrew or
+# /usr/local). The daemon/agent binary lives in /opt/alighieri/bin.
+sudo install -d -o root -g wheel -m 0755 /opt/alighieri/bin
+sudo install -o root -g wheel -m 0755 "$BIN" /opt/alighieri/bin/alighieri
 
 CONF="$HOME/Library/Application Support/Alighieri/alighieri.conf"
 LOG="$HOME/Library/Logs/Alighieri/alighieri.log"
@@ -1119,15 +1125,15 @@ install -d "$HOME/Library/Application Support/Alighieri" \
 install -m 644 doc/alighieri.conf "$CONF"
 # LaunchAgent stdout is not rotated; use Alighieri's file sink.
 printf '\nlogoutput: file\nlogfile: %s\nlogrotate.size: 10MiB\nlogrotate.keep: 5\n' "$LOG" >> "$CONF"
-# The listener in doc/alighieri.conf is 0.0.0.0:1080. For a per-user agent,
-# bind loopback unless you intentionally expose the port.
-# Edit internal: if needed, then:
-/usr/local/libexec/alighieri --check --config "$CONF"
+# The listener in doc/alighieri.conf is 127.0.0.1:1080, which is the right
+# default for a per-user agent. Edit internal: only if you intentionally
+# expose the port, then:
+/opt/alighieri/bin/alighieri --check --config "$CONF"
 
-sed -e "s|/usr/local/etc/alighieri/alighieri.conf|$CONF|" \
+sed -e "s|/opt/alighieri/alighieri.conf|$CONF|" \
     doc/macos-launchagent.plist > "$PLIST"
 plutil -lint "$PLIST"
-launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true
+{ launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true; }
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 ```
 

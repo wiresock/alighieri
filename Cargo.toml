@@ -23,6 +23,7 @@ include = [
     "/examples/**",
     "/scripts/alighieri.sh",
     "/scripts/install-linux.sh",
+    "/scripts/macos-daemon.sh",
     "/doc/alighieri.conf",
     "/doc/acme-tls-test.md",
     "/doc/benchmarks.md",

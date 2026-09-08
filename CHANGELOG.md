@@ -12,7 +12,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   matrix on Apple Silicon, Intel Darwin is cross-built, and release archives
   will ship `aarch64-apple-darwin` and `x86_64-apple-darwin` unsigned console
   binaries with per-user LaunchAgent and dedicated-user LaunchDaemon examples.
+  Darwin binaries target macOS 10.14+. The public LaunchDaemon tree is
+  `/opt/alighieri` (outside Homebrew), provisioned by `scripts/macos-daemon.sh`.
   The Linux systemd installer and Windows RDP helpers stay off those archives.
+- GitHub releases now attach a `SHA256SUMS` manifest covering every archive.
+  Verify with `shasum -a 256 -c SHA256SUMS` before clearing Gatekeeper
+  quarantine.
 
 ### Fixed
 
@@ -27,7 +32,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - UDP ASSOCIATE fails closed when PROXY protocol advertises a client address
   family that does not match the physical listening socket.
 - Plugin `AssociateCtx::relay_addr` is the BND address already sent to the
-  client, including `udp.advertise`.
+  client, including `udp.advertise`. `ClientDatagrams::local_addr()` remains
+  the physical bound address.
 
 ## [0.6.0] - 2026-09-08
 

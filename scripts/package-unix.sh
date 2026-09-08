@@ -78,14 +78,18 @@ if [[ "$os" == "linux" ]]; then
     "$dir/scripts/alighieri.sh"
   )
   test ! -e "$dir/doc/macos-launchagent.plist"
+  test ! -e "$dir/scripts/macos-daemon.sh"
   test ! -e "$dir/alighieri-rdp-transport"
   test ! -e "$dir/alighieri-rdp-agent"
 else
+  mkdir -p "$dir/scripts"
   install -m 644 doc/macos-launchagent.plist "$dir/doc/macos-launchagent.plist"
   install -m 644 doc/macos-launchdaemon.plist "$dir/doc/macos-launchdaemon.plist"
+  install -m 755 scripts/macos-daemon.sh "$dir/scripts/macos-daemon.sh"
   required+=(
     "$dir/doc/macos-launchagent.plist"
     "$dir/doc/macos-launchdaemon.plist"
+    "$dir/scripts/macos-daemon.sh"
   )
   test ! -e "$dir/alighieri-installer-fs"
   test ! -e "$dir/alighieri-rdp-transport"
@@ -108,7 +112,7 @@ if [[ "$make_archive" -eq 1 ]]; then
     rel="${path#"$dir"/}"
     grep -Fqx "$dir/$rel" <<<"$archive_contents"
   done < <(find "$dir" -type f)
-  echo "ASSET=$dir.tar.gz"
+  printf '%s\n' "$dir.tar.gz"
 else
-  echo "ASSET=$dir"
+  printf '%s\n' "$dir"
 fi

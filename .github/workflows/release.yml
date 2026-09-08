@@ -142,35 +142,41 @@ jobs:
             echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
           } >> "$GITHUB_ENV"
       - name: Build release binaries
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           chmod +x scripts/package-unix.sh
-          eval "$(
+          ASSET="$(
             scripts/package-unix.sh \
               --os linux \
               --target "${{ matrix.target }}" \
               --version "${GITHUB_REF_NAME#v}" \
               --bindir "target/${{ matrix.target }}/release" \
               --archive
-          )"
+          )" || exit 1
+          test -f "$ASSET"
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
         run: |
-          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh
+          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh scripts/macos-daemon.sh
           scripts/macos-install-smoke.sh
-          eval "$(
+          ASSET="$(
             scripts/package-unix.sh \
               --os macos \
               --target "${{ matrix.target }}" \
               --version "${GITHUB_REF_NAME#v}" \
               --bindir "target/${{ matrix.target }}/release" \
               --archive
-          )"
+          )" || exit 1
+          test -f "$ASSET"
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -237,6 +243,22 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Generate and verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          mapfile -t archives < <(find . -maxdepth 1 -type f ! -name SHA256SUMS | sed 's|^\./||' | sort)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "no release archives" >&2; exit 1; }
+          if printf '%s\n' "${archives[@]}" | sort | uniq -d | grep -q .; then
+            echo "duplicate archive names in the release payload" >&2
+            exit 1
+          fi
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq "${#archives[@]}"
+          while read -r _ name; do
+            grep -Fqx "$name" <<<"$(printf '%s\n' "${archives[@]}")"
+          done < SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
       - name: Create draft release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:

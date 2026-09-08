@@ -8,10 +8,12 @@
 	<string>_alighieri</string>
 	<key>GroupName</key>
 	<string>_alighieri</string>
+	<key>Umask</key>
+	<string>077</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/libexec/alighieri</string>
-		<string>/usr/local/etc/alighieri/alighieri.conf</string>
+		<string>/opt/alighieri/bin/alighieri</string>
+		<string>/opt/alighieri/alighieri.conf</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
