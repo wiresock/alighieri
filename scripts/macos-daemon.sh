@@ -124,6 +124,8 @@ provision() {
   (
     created_group=0
     created_user=0
+    # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
+    # shellcheck disable=SC2317
     rollback() {
       if (( created_user )); then
         dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
