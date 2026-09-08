@@ -42,8 +42,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   prefix="$(mktemp -d "${TMPDIR:-/tmp}/alighieri-macos-prefix.XXXXXX")"
   trap 'rm -rf "$prefix"' EXIT
   mkdir -p "$prefix/libexec" "$prefix/etc/alighieri" "$prefix/LaunchAgents"
-  # Stage the documented layout without requiring root.
-  install -m 755 "$(command -v true)" "$prefix/libexec/alighieri"
+  # Stage the documented layout without requiring root. `true` is a shell
+  # builtin on Darwin, so `command -v true` is not a file `install` can copy.
+  if [[ -x /usr/bin/true ]]; then
+    install -m 755 /usr/bin/true "$prefix/libexec/alighieri"
+  else
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$prefix/libexec/alighieri"
+    chmod 755 "$prefix/libexec/alighieri"
+  fi
   install -m 644 doc/alighieri.conf "$prefix/etc/alighieri/alighieri.conf"
   install -m 644 doc/macos-launchagent.plist "$prefix/LaunchAgents/com.wiresock.alighieri.plist"
   [[ -x "$prefix/libexec/alighieri" ]] || fail "staged binary is not executable"
