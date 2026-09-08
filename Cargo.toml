@@ -29,6 +29,7 @@ include = [
     "/doc/management-cli.md",
     "/doc/plugin-sdk.md",
     "/doc/rdp-transport.md",
+    "/doc/macos-launchd.plist",
     "/doc/roadmap.md",
     "/doc/windows-service.md",
     "/doc/windows-service-smoke-test.ps1",

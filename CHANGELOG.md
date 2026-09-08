@@ -10,6 +10,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- macOS is a first-class console platform: CI runs the full test and Clippy
+  matrix on Apple Silicon, Intel Darwin is cross-built, release archives ship
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` binaries with an example
+  `launchd` plist, and the Linux systemd installer / Windows RDP helpers stay
+  off those archives.
+
 - An optional Windows `rdp` feature adds TCP CONNECT egress through an existing
   Microsoft Remote Desktop Dynamic Virtual Channel. Windows distributions now
   include a per-user COM LocalServer transport helper and an interactive remote

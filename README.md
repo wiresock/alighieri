@@ -31,6 +31,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
   - [Hot reload](#hot-reload)
 - [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
+- [macOS (console and launchd)](#macos-console-and-launchd)
 - [RDP egress over an existing Windows session](#rdp-egress-over-an-existing-windows-session)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -62,7 +63,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Optional plugin SDK** — statically link custom control-plane, TCP, and UDP
   behavior into a private host binary
 - **Async** — built on [Tokio](https://tokio.rs) for high-performance I/O
-- **Portable** — first-class on Windows and Linux; macOS and *BSD are not yet
+- **Portable** — first-class on Windows, Linux, and macOS; *BSD is not yet
   officially supported (no CI coverage)
 - **Secure defaults** — no auth required? Think again. The default config still lets you build restrictive rules.
 
@@ -76,8 +77,9 @@ cargo install alighieri --locked
 alighieri --version
 ```
 
-Prebuilt Linux and Windows binaries are also attached to each
-[release](https://github.com/wiresock/alighieri/releases). To build from a
+Prebuilt Linux, Windows, and macOS binaries are also attached to each
+[release](https://github.com/wiresock/alighieri/releases). macOS archives are
+unsigned console binaries (Apple Silicon and Intel). To build from a
 source checkout:
 
 ```sh
@@ -1072,6 +1074,49 @@ echo 'net.core.rmem_max=8388608
 net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
 ```
 
+## macOS (console and launchd)
+
+macOS is a first-class **console** platform: the same SOCKS5, TLS, wizard, and
+SIGHUP reload path as Linux. There is no systemd installer and no RDP egress
+on Darwin. Bind a non-privileged `internal:` port (1080 is fine) unless the
+process is started as root.
+
+```sh
+# from a source checkout
+cargo build --release --locked
+./target/release/alighieri doc/alighieri.conf
+
+# from an extracted release archive (aarch64-apple-darwin or x86_64-apple-darwin)
+./alighieri doc/alighieri.conf
+```
+
+Hot reload is SIGHUP (`kill -HUP <pid>`), the same as other Unix builds.
+
+To keep the process running after login, install the example LaunchDaemon in
+[`doc/macos-launchd.plist`](doc/macos-launchd.plist). Edit the program and
+config paths first: Apple Silicon Homebrew prefixes are under `/opt/homebrew`
+rather than `/usr/local`.
+
+```sh
+sudo mkdir -p /usr/local/etc/alighieri /usr/local/var/log
+sudo cp alighieri /usr/local/bin/alighieri
+sudo cp doc/alighieri.conf /usr/local/etc/alighieri/alighieri.conf
+sudo cp doc/macos-launchd.plist /Library/LaunchDaemons/com.wiresock.alighieri.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.wiresock.alighieri.plist
+```
+
+Reload after editing the config:
+
+```sh
+sudo launchctl kill -HUP system/com.wiresock.alighieri
+```
+
+Release tarballs are not notarized. A browser-downloaded archive may be
+quarantined; either build from source, or remove the quarantine attribute from
+the extracted `alighieri` binary (`xattr -d com.apple.quarantine alighieri`)
+before the first run. macOS may also prompt to allow inbound connections the
+first time the listener binds.
+
 ## RDP egress over an existing Windows session
 
 The optional `rdp` feature sends SOCKS5 TCP CONNECT traffic through the network
@@ -1340,8 +1385,8 @@ long-standing C reference SOCKS server: full SOCKS4/5 including the BIND command
 and GSSAPI, a client-side "socksify" preload library, and broad Unix
 portability, hardened since the late 1990s. Alighieri borrows Dante's
 configuration model but trades breadth (SOCKS4, BIND, GSSAPI, the client
-library, exotic Unixes) for memory safety, first-class **Windows** support,
-SOCKS-over-TLS, and built-in observability.
+library, exotic Unixes) for memory safety, first-class **Windows** and **macOS**
+support, SOCKS-over-TLS, and built-in observability.
 
 Dante capabilities below are drawn from its documented feature set and vary by
 version; verify against the version you would deploy.
@@ -1352,7 +1397,8 @@ version; verify against the version you would deploy.
 | --- | --- | --- |
 | Linux | first-class (CI + systemd manager) | yes |
 | Windows | native Service + Event Log | not supported |
-| macOS / *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
+| macOS | first-class (CI + console + example launchd plist) | yes |
+| *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
 | Language | Rust (memory-safe) | C |
 | Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |
 
