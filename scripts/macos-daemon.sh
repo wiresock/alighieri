@@ -39,6 +39,48 @@ id_cmd() { "$ID_BIN" "$@"; }
 
 is_root() { [[ "$(id_cmd -u)" == "0" ]]; }
 
+# Intel Homebrew's default prefix is /usr/local (often 0755, owned by the
+# installing user). Apple Silicon Homebrew uses /opt/homebrew. Refuse those
+# trees even when their mode bits look safe.
+refuse_homebrew_root() {
+  local path="$1"
+  case "$path" in
+    /usr/local|/usr/local/*|/opt/homebrew|/opt/homebrew/*)
+      fail "refusing Homebrew-controlled daemon root: $path"
+      ;;
+  esac
+}
+
+read_mode() {
+  local path="$1" mode=""
+  mode="$("$STAT_BIN" -f '%Lp' "$path" 2>/dev/null || true)"
+  if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  mode="$("$STAT_BIN" -c '%a' "$path" 2>/dev/null || true)"
+  if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  fail "cannot read permissions of $path"
+}
+
+read_owner() {
+  local path="$1" owner=""
+  owner="$("$STAT_BIN" -f '%u' "$path" 2>/dev/null || true)"
+  if [[ "$owner" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$owner"
+    return 0
+  fi
+  owner="$("$STAT_BIN" -c '%u' "$path" 2>/dev/null || true)"
+  if [[ "$owner" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$owner"
+    return 0
+  fi
+  fail "cannot read owner of $path"
+}
+
 # lstat-walk ancestors of $1. Refuse symlinks and group/other-writable
 # components. When running as root, also require root ownership. Shared
 # prefixes such as /opt are inspected but never taken over.
@@ -54,7 +96,7 @@ assert_safe_ancestors() {
         fail "refusing non-directory in daemon path ancestry: $current"
       fi
       local mode
-      mode="$("$STAT_BIN" -f '%Lp' "$current" 2>/dev/null || "$STAT_BIN" -c '%a' "$current")"
+      mode="$(read_mode "$current")"
       local other="$((8#${mode} % 8))"
       local group="$(((8#${mode} / 8) % 8))"
       if (( other & 2 )); then
@@ -65,7 +107,7 @@ assert_safe_ancestors() {
       fi
       if is_root; then
         local owner
-        owner="$("$STAT_BIN" -f '%u' "$current" 2>/dev/null || "$STAT_BIN" -c '%u' "$current")"
+        owner="$(read_owner "$current")"
         if [[ "$owner" != "0" ]]; then
           fail "refusing non-root-owned ancestor: $current"
         fi
@@ -80,7 +122,18 @@ record_exists() {
 }
 
 read_prop() {
-  dscl_cmd . -read "$1" "$2" 2>/dev/null | tr -d '\r' | awk 'NR==1 { $1=""; sub(/^ /, ""); print }'
+  # dscl may print "Key: value" on one line or "Key:" then an indented value.
+  dscl_cmd . -read "$1" "$2" 2>/dev/null | tr -d '\r' | awk '
+    {
+      if (NR == 1) {
+        sub(/^[^:]+:[[:space:]]*/, "")
+        if ($0 != "") { print; exit }
+        next
+      }
+      sub(/^[[:space:]]+/, "")
+      if ($0 != "") { print; exit }
+    }
+  '
 }
 
 ids_in_use() {
@@ -158,14 +211,22 @@ provision() {
     dscl_cmd . -create "/Users/${ACCOUNT}" PrimaryGroupID "$id"
     dscl_cmd . -create "/Users/${ACCOUNT}" UserShell /usr/bin/false
     dscl_cmd . -create "/Users/${ACCOUNT}" NFSHomeDirectory /var/empty
+    dscl_cmd . -create "/Users/${ACCOUNT}" Password '*'
     user_matches "$id" "$id" || fail "provisioned ${ACCOUNT} user failed verification"
     group_matches "$id" || fail "provisioned ${ACCOUNT} group failed verification"
     trap - EXIT
   )
 }
 
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
 write_plist() {
   local root="$1" plist="$2"
+  local binary_xml config_xml
+  binary_xml="$(xml_escape "${root}/bin/alighieri")"
+  config_xml="$(xml_escape "${root}/alighieri.conf")"
   cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -181,8 +242,8 @@ write_plist() {
 	<string>077</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>${root}/bin/alighieri</string>
-		<string>${root}/alighieri.conf</string>
+		<string>${binary_xml}</string>
+		<string>${config_xml}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -197,6 +258,7 @@ install_tree() {
   local root="$1" binary="$2" config="$3" start="$4"
   [[ -f "$binary" ]] || fail "binary is not a file: $binary"
   [[ -f "$config" ]] || fail "config is not a file: $config"
+  refuse_homebrew_root "$root"
   assert_safe_ancestors "$root"
 
   "$INSTALL_BIN" -d -m 0755 "$root" "$root/bin"
@@ -464,15 +526,56 @@ EOF
   # Homebrew-style writable ancestor must be refused.
   local brew="$tmp/usr/local"
   mkdir -p "$brew"
-  chmod 775 "$brew" || true
   printf '%s\n' '#!/bin/sh' 'exit 0' >"$tmp/dummy-bin"
   chmod +x "$tmp/dummy-bin"
   printf '%s\n' 'internal: 127.0.0.1 port = 1080' >"$tmp/dummy.conf"
+  cat >"$tmp/stat-775.sh" <<'EOF'
+#!/bin/sh
+set -eu
+fmt=""
+path=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|-c)
+      fmt="$2"
+      shift 2
+      ;;
+    *)
+      path="$1"
+      shift
+      ;;
+  esac
+done
+case "$fmt" in
+  %Lp|%a)
+    echo 775
+    ;;
+  %u)
+    echo 0
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  chmod +x "$tmp/stat-775.sh"
+  STAT_BIN="$tmp/stat-775.sh"
   if ( install_tree "$brew/alighieri" "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
     fail "group-writable Homebrew-style prefix must be refused"
   fi
+  STAT_BIN="${ALIGHIERI_STAT:-stat}"
   if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
     fail "Homebrew-prefix refusal must not bootstrap"
+  fi
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( install_tree /usr/local/alighieri "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
+    fail "must refuse /usr/local daemon root"
+  fi
+  if ( install_tree /opt/homebrew/alighieri "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
+    fail "must refuse /opt/homebrew daemon root"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "Homebrew-root refusal must not bootstrap"
   fi
 
   # Successful install with mocked ancestor modes; --no-start must not bootstrap.

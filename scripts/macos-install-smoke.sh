@@ -75,16 +75,15 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 
   if command -v vtool >/dev/null 2>&1; then
     minos="$(vtool -show-build "$binary" | awk '/minos/ { print $2; exit }')"
-    if [[ -n "$minos" ]]; then
-      awk -v minos="$minos" 'BEGIN {
-        n = split(minos, p, ".")
-        major = p[1] + 0
-        minor = (n >= 2 ? p[2] : 0) + 0
-        if (major < 10 || (major == 10 && minor < 14)) {
-          exit 1
-        }
-      }' || fail "Darwin binary minos $minos is older than 10.14"
-    fi
+    [[ -n "$minos" ]] || fail "vtool did not report a minos for $binary"
+    awk -v minos="$minos" 'BEGIN {
+      n = split(minos, p, ".")
+      major = p[1] + 0
+      minor = (n >= 2 ? p[2] : 0) + 0
+      if (major < 10 || (major == 10 && minor < 14)) {
+        exit 1
+      }
+    }' || fail "Darwin binary minos $minos is older than 10.14"
   fi
 
   conf="$root/generated.conf"
