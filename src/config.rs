@@ -847,7 +847,14 @@ impl Builder {
         Ok(Config {
             internal,
             egress: self.egress.unwrap_or(Egress::Direct),
-            external: self.external.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            // Collapse IPv4-mapped `::ffff:a.b.c.d` (including mapped unspecified)
+            // so outbound TCP/UDP bind helpers see a native family. A mapped
+            // `external` would otherwise skip the TCP source bind and bind UDP as
+            // AF_INET6 while destinations are canonical IPv4.
+            external: self
+                .external
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                .to_canonical(),
             proxy_protocol: self.proxy_protocol.unwrap_or_default(),
             socks_methods,
             connect_timeout: self
@@ -2147,6 +2154,22 @@ socks pass {
             })
         );
         assert_eq!(cfg.rules.rules.len(), 3);
+    }
+
+    #[test]
+    fn external_canonicalizes_ipv4_mapped_addresses() {
+        let mapped =
+            Config::parse("internal: 127.0.0.1 port = 1080\nexternal: ::ffff:192.0.2.10").unwrap();
+        assert_eq!(mapped.external, "192.0.2.10".parse::<IpAddr>().unwrap());
+
+        let mapped_unspecified =
+            Config::parse("internal: 127.0.0.1 port = 1080\nexternal: ::ffff:0.0.0.0").unwrap();
+        assert_eq!(
+            mapped_unspecified.external,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(mapped_unspecified.external.is_unspecified());
+        assert!(mapped_unspecified.external.is_ipv4());
     }
 
     #[test]

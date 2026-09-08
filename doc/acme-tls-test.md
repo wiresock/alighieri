@@ -1,5 +1,10 @@
 # Testing the Let's Encrypt (ACME) TLS listener on a fresh server
 
+This walkthrough is **Linux-oriented**: systemd, `scripts/alighieri.sh`, and
+`/etc/alighieri` apply to a Linux VPS. On macOS, use the wizard's Darwin
+public-TLS completion page (dedicated `_alighieri` account, `/usr/local/libexec`,
+LaunchDaemon) instead of these systemd steps.
+
 This is an end-to-end walkthrough: stand Alighieri up on a public VPS, let it get
 a real Let's Encrypt certificate automatically, and proxy a request through the
 TLS listener to prove it works.

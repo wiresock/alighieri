@@ -147,64 +147,31 @@ jobs:
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$dir/scripts" "$dir/doc/templates"
-          install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
-          install -m 755 \
-            "target/${{ matrix.target }}/release/alighieri-installer-fs" \
-            "$dir/alighieri-installer-fs"
-          install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
-          install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
-          install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
-          install -m 644 doc/management-cli.md "$dir/doc/management-cli.md"
-          install -m 644 \
-            doc/templates/public-tls-proxifyre.conf \
-            "$dir/doc/templates/public-tls-proxifyre.conf"
-          install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
-          test -x "$dir/alighieri-installer-fs"
-          test -x "$dir/scripts/alighieri.sh"
-          test -f "$dir/doc/alighieri.conf"
-          tar czf "$dir.tar.gz" "$dir"
-          archive_contents="$(tar tzf "$dir.tar.gz")"
-          grep -Fqx "$dir/alighieri-installer-fs" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/management-cli.md" <<< "$archive_contents"
-          grep -Fqx \
-            "$dir/doc/templates/public-tls-proxifyre.conf" \
-            <<< "$archive_contents"
-          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+          chmod +x scripts/package-unix.sh
+          eval "$(
+            scripts/package-unix.sh \
+              --os linux \
+              --target "${{ matrix.target }}" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
-          dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$dir/doc/templates"
-          install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
-          install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
-          install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
-          install -m 644 doc/management-cli.md "$dir/doc/management-cli.md"
-          install -m 644 doc/macos-launchd.plist "$dir/doc/macos-launchd.plist"
-          install -m 644 \
-            doc/templates/public-tls-proxifyre.conf \
-            "$dir/doc/templates/public-tls-proxifyre.conf"
-          install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
-          test -x "$dir/alighieri"
-          test -f "$dir/doc/alighieri.conf"
-          test -f "$dir/doc/macos-launchd.plist"
-          test ! -e "$dir/alighieri-installer-fs"
-          test ! -e "$dir/alighieri-rdp-transport"
-          test ! -e "$dir/alighieri-rdp-agent"
-          tar czf "$dir.tar.gz" "$dir"
-          archive_contents="$(tar tzf "$dir.tar.gz")"
-          grep -Fqx "$dir/alighieri" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/macos-launchd.plist" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/management-cli.md" <<< "$archive_contents"
-          if printf '%s\n' "$archive_contents" | grep -Fqx "$dir/alighieri-installer-fs"; then
-            echo "Linux installer companion must not appear in a macOS archive"
-            exit 1
-          fi
-          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh
+          scripts/macos-install-smoke.sh
+          eval "$(
+            scripts/package-unix.sh \
+              --os macos \
+              --target "${{ matrix.target }}" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -220,7 +187,7 @@ jobs:
           Copy-Item doc/management-cli.md "$dir/doc/management-cli.md"
           Copy-Item doc/rdp-transport.md "$dir/doc/rdp-transport.md"
           Copy-Item doc/templates/public-tls-proxifyre.conf "$dir/doc/templates/public-tls-proxifyre.conf"
-          Copy-Item README.md, LICENSE, CHANGELOG.md $dir/
+          Copy-Item README.md, LICENSE, LICENSING.md, CHANGELOG.md $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $archiveCheckDir = Join-Path $env:RUNNER_TEMP "$dir-archive-check"
           Expand-Archive -LiteralPath "$dir.zip" -DestinationPath $archiveCheckDir
@@ -232,7 +199,8 @@ jobs:
             (Join-Path $archiveCheckDir "$dir/doc/acme-tls-test.md"),
             (Join-Path $archiveCheckDir "$dir/doc/management-cli.md"),
             (Join-Path $archiveCheckDir "$dir/doc/rdp-transport.md"),
-            (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf")
+            (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf"),
+            (Join-Path $archiveCheckDir "$dir/LICENSING.md")
           )
           foreach ($path in $expectedArchiveFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {

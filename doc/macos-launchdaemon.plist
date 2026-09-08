@@ -4,18 +4,18 @@
 <dict>
 	<key>Label</key>
 	<string>com.wiresock.alighieri</string>
+	<key>UserName</key>
+	<string>_alighieri</string>
+	<key>GroupName</key>
+	<string>_alighieri</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/alighieri</string>
+		<string>/usr/local/libexec/alighieri</string>
 		<string>/usr/local/etc/alighieri/alighieri.conf</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
-	<key>StandardOutPath</key>
-	<string>/usr/local/var/log/alighieri.out.log</string>
-	<key>StandardErrorPath</key>
-	<string>/usr/local/var/log/alighieri.err.log</string>
 </dict>
 </plist>

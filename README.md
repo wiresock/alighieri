@@ -77,9 +77,10 @@ cargo install alighieri --locked
 alighieri --version
 ```
 
-Prebuilt Linux, Windows, and macOS binaries are also attached to each
-[release](https://github.com/wiresock/alighieri/releases). macOS archives are
-unsigned console binaries (Apple Silicon and Intel). To build from a
+Prebuilt Linux and Windows binaries are attached to each
+[release](https://github.com/wiresock/alighieri/releases). Unsigned macOS
+console archives (Apple Silicon and Intel) ship in the first release after
+0.6.0. To build from a
 source checkout:
 
 ```sh
@@ -1081,41 +1082,71 @@ SIGHUP reload path as Linux. There is no systemd installer and no RDP egress
 on Darwin. Bind a non-privileged `internal:` port (1080 is fine) unless the
 process is started as root.
 
+The default background install is a **per-user LaunchAgent**. It runs as your
+login user after you log in, listens on port 1080, and never executes a
+Homebrew-replaceable binary as root. A system LaunchDaemon that binds port 443
+is a separate hardened profile (dedicated `_alighieri` account, root-owned
+`/usr/local/libexec` binary); the public-TLS wizard emits those steps.
+
 ```sh
 # from a source checkout
 cargo build --release --locked
-./target/release/alighieri doc/alighieri.conf
+BIN="./target/release/alighieri"
 
 # from an extracted release archive (aarch64-apple-darwin or x86_64-apple-darwin)
-./alighieri doc/alighieri.conf
+# BIN="./alighieri"
+
+# Gatekeeper: unsigned release archives may carry com.apple.quarantine.
+# Clear it on the source binary *before* copying or launching. Removing the
+# attribute bypasses provenance checks; verify the published SHA-256 sidecar
+# first. Apple documents that non-Developer-ID, non-notarized software cannot
+# be verified the same way as trusted software:
+# https://support.apple.com/en-us/102445
+xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true
+"$BIN" --check --config doc/alighieri.conf
+
+# Root-owned binary: do not install into Homebrew prefixes (/opt/homebrew or a
+# user-writable /usr/local/bin). /usr/local/libexec is created root:wheel.
+sudo install -d -o root -g wheel -m 0755 /usr/local/libexec /usr/local/etc/alighieri
+sudo install -o root -g wheel -m 0755 "$BIN" /usr/local/libexec/alighieri
+
+CONF="$HOME/Library/Application Support/Alighieri/alighieri.conf"
+LOG="$HOME/Library/Logs/Alighieri/alighieri.log"
+PLIST="$HOME/Library/LaunchAgents/com.wiresock.alighieri.plist"
+install -d "$HOME/Library/Application Support/Alighieri" \
+           "$HOME/Library/Logs/Alighieri" \
+           "$HOME/Library/LaunchAgents"
+install -m 644 doc/alighieri.conf "$CONF"
+# LaunchAgent stdout is not rotated; use Alighieri's file sink.
+printf '\nlogoutput: file\nlogfile: %s\nlogrotate.size: 10MiB\nlogrotate.keep: 5\n' "$LOG" >> "$CONF"
+# The listener in doc/alighieri.conf is 0.0.0.0:1080. For a per-user agent,
+# bind loopback unless you intentionally expose the port.
+# Edit internal: if needed, then:
+/usr/local/libexec/alighieri --check --config "$CONF"
+
+sed -e "s|/usr/local/etc/alighieri/alighieri.conf|$CONF|" \
+    doc/macos-launchagent.plist > "$PLIST"
+plutil -lint "$PLIST"
+launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
 ```
 
-Hot reload is SIGHUP (`kill -HUP <pid>`), the same as other Unix builds.
-
-To keep the process running after login, install the example LaunchDaemon in
-[`doc/macos-launchd.plist`](doc/macos-launchd.plist). Edit the program and
-config paths first: Apple Silicon Homebrew prefixes are under `/opt/homebrew`
-rather than `/usr/local`.
+Hot reload is SIGHUP, the same as other Unix builds. For the LaunchAgent:
 
 ```sh
-sudo mkdir -p /usr/local/etc/alighieri /usr/local/var/log
-sudo cp alighieri /usr/local/bin/alighieri
-sudo cp doc/alighieri.conf /usr/local/etc/alighieri/alighieri.conf
-sudo cp doc/macos-launchd.plist /Library/LaunchDaemons/com.wiresock.alighieri.plist
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.wiresock.alighieri.plist
+launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"
 ```
 
-Reload after editing the config:
+`KeepAlive` relaunches the job after SIGTERM while it remains loaded.
+Stop it with `launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"`.
 
-```sh
-sudo launchctl kill -HUP system/com.wiresock.alighieri
-```
+The example LaunchAgent is [`doc/macos-launchagent.plist`](doc/macos-launchagent.plist).
+The dedicated-user LaunchDaemon used by the public TLS wizard is
+[`doc/macos-launchdaemon.plist`](doc/macos-launchdaemon.plist).
 
 Release tarballs are not notarized. A browser-downloaded archive may be
-quarantined; either build from source, or remove the quarantine attribute from
-the extracted `alighieri` binary (`xattr -d com.apple.quarantine alighieri`)
-before the first run. macOS may also prompt to allow inbound connections the
-first time the listener binds.
+quarantined; handle that **before** the first execution as shown above. macOS
+may also prompt to allow inbound connections the first time the listener binds.
 
 ## RDP egress over an existing Windows session
 
@@ -1397,7 +1428,7 @@ version; verify against the version you would deploy.
 | --- | --- | --- |
 | Linux | first-class (CI + systemd manager) | yes |
 | Windows | native Service + Event Log | not supported |
-| macOS | first-class (CI + console + example launchd plist) | yes |
+| macOS | first-class (CI + console + example LaunchAgent) | yes |
 | *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
 | Language | Rust (memory-safe) | C |
 | Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |

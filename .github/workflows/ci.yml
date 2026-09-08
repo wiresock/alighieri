@@ -87,6 +87,40 @@ jobs:
           ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN: target/debug/alighieri-installer-fs
       - name: Cargo run selects the service binary
         run: cargo run --locked -- --version
+      - name: macOS launchd example smoke
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x scripts/macos-install-smoke.sh scripts/package-unix.sh
+          scripts/macos-install-smoke.sh
+      - name: Package Unix archive layout
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x scripts/package-unix.sh
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            eval "$(
+              scripts/package-unix.sh \
+                --os linux \
+                --target x86_64-unknown-linux-gnu \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/LICENSING.md"
+          else
+            eval "$(
+              scripts/package-unix.sh \
+                --os macos \
+                --target aarch64-apple-darwin \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/LICENSING.md"
+            extract="$RUNNER_TEMP/alighieri-macos-archive"
+            mkdir -p "$extract"
+            tar -xzf "$ASSET" -C "$extract"
+            "$extract/alighieri-vtest-aarch64-apple-darwin/alighieri" --version
+          fi
       - name: Doctests
         run: cargo test --doc --locked
 
@@ -136,7 +170,19 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Assert cross-compiled macOS console binary
         if: matrix.target == 'x86_64-apple-darwin'
-        run: test -x "target/${{ matrix.target }}/release/alighieri"
+        run: |
+          test -x "target/${{ matrix.target }}/release/alighieri"
+          chmod +x scripts/package-unix.sh
+          eval "$(
+            scripts/package-unix.sh \
+              --os macos \
+              --target x86_64-apple-darwin \
+              --version test \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )"
+          file "target/${{ matrix.target }}/release/alighieri"
+          lipo -archs "target/${{ matrix.target }}/release/alighieri" | grep -Fq x86_64
       - name: Assert cross-compiled Windows RDP helpers
         if: runner.os == 'Windows'
         shell: pwsh
@@ -171,7 +217,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify Linux helpers are executable
-        run: test -x scripts/alighieri.sh && test -x scripts/install-linux.sh
+        run: |
+          test -x scripts/alighieri.sh
+          test -x scripts/install-linux.sh
+          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
       - name: Run installer self-tests
@@ -240,7 +291,8 @@ jobs:
             doc/rdp-transport.md
             scripts/alighieri.sh
             scripts/install-linux.sh
-            doc/macos-launchd.plist
+            doc/macos-launchagent.plist
+            doc/macos-launchdaemon.plist
           )
           for path in "${required[@]}"; do
             if ! grep -Fqx "$path" "$package_list"; then
