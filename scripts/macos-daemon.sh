@@ -51,6 +51,29 @@ refuse_homebrew_root() {
   esac
 }
 
+refuse_symlink() {
+  local path="$1"
+  if [[ -L "$path" ]]; then
+    fail "refusing symlink: $path"
+  fi
+}
+
+validate_daemon_root() {
+  local path="$1"
+  [[ -n "$path" ]] || fail "daemon root is required"
+  [[ "$path" == /* ]] || fail "daemon root must be an absolute path: $path"
+  [[ "$path" != "/" ]] || fail "refusing filesystem root as the daemon tree"
+  case "$path" in
+    *'/./'*|*/.|*'/..'*|*/..)
+      fail "daemon root must not contain . or .. components: $path"
+      ;;
+  esac
+  if [[ "$(dirname "$path")" == "/" ]]; then
+    fail "daemon root must not be a top-level directory: $path"
+  fi
+  refuse_homebrew_root "$path"
+}
+
 read_mode() {
   local path="$1" mode=""
   mode="$("$STAT_BIN" -f '%Lp' "$path" 2>/dev/null || true)"
@@ -164,6 +187,9 @@ user_matches() {
   [[ "$(read_prop "/Users/${ACCOUNT}" PrimaryGroupID)" == "$gid" ]] || return 1
   [[ "$(read_prop "/Users/${ACCOUNT}" UserShell)" == "/usr/bin/false" ]] || return 1
   [[ "$(read_prop "/Users/${ACCOUNT}" NFSHomeDirectory)" == "/var/empty" ]] || return 1
+  local auth
+  auth="$(read_prop "/Users/${ACCOUNT}" AuthenticationAuthority || true)"
+  [[ -z "$auth" ]] || return 1
 }
 
 group_matches() {
@@ -181,10 +207,14 @@ provision() {
     # shellcheck disable=SC2317
     rollback() {
       if (( created_user )); then
-        dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
+        if [[ -n "${id:-}" && "$(read_prop "/Users/${ACCOUNT}" UniqueID || true)" == "$id" ]]; then
+          dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
+        fi
       fi
       if (( created_group )); then
-        dscl_cmd . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
+        if [[ -n "${id:-}" && "$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID || true)" == "$id" ]]; then
+          dscl_cmd . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
+        fi
       fi
     }
     trap rollback EXIT
@@ -258,15 +288,29 @@ install_tree() {
   local root="$1" binary="$2" config="$3" start="$4"
   [[ -f "$binary" ]] || fail "binary is not a file: $binary"
   [[ -f "$config" ]] || fail "config is not a file: $config"
-  refuse_homebrew_root "$root"
+  validate_daemon_root "$root"
+  refuse_symlink "$root"
+  refuse_symlink "$root/bin"
+  refuse_symlink "$root/acme"
+  refuse_symlink "$root/logs"
+  refuse_symlink "$root/bin/alighieri"
+  refuse_symlink "$root/alighieri.conf"
   assert_safe_ancestors "$root"
 
   "$INSTALL_BIN" -d -m 0755 "$root" "$root/bin"
+  refuse_symlink "$root"
+  refuse_symlink "$root/bin"
   "$INSTALL_BIN" -m 0755 "$binary" "$root/bin/alighieri"
-  "$INSTALL_BIN" -d "$root/acme" "$root/logs"
-  if ! chmod 0700 "$root/acme" "$root/logs"; then
-    is_root && fail "failed to set mode 0700 on $root/acme and $root/logs"
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$root/bin/alighieri" 2>/dev/null || true
+    if xattr -p com.apple.quarantine "$root/bin/alighieri" >/dev/null 2>&1; then
+      fail "installed binary still has com.apple.quarantine"
+    fi
   fi
+  "$INSTALL_BIN" -d "$root/acme" "$root/logs"
+  refuse_symlink "$root/acme"
+  refuse_symlink "$root/logs"
+  chmod 0700 "$root/acme" "$root/logs" || fail "failed to set mode 0700 on $root/acme and $root/logs"
   if is_root; then
     chown root:wheel "$root" "$root/bin" "$root/bin/alighieri"
     chown "${ACCOUNT}:${ACCOUNT}" "$root/acme" "$root/logs"
@@ -290,7 +334,10 @@ install_tree() {
   if ! is_root; then
     plist_dest="$root/${PLIST_LABEL}.plist"
   fi
-  write_plist "$root" "$plist_dest"
+  local staged_plist
+  staged_plist="$(mktemp "${root}/plist.XXXXXX")"
+  write_plist "$root" "$staged_plist"
+  mv -f -- "$staged_plist" "$plist_dest"
   if is_root; then
     chown root:wheel "$plist_dest"
     chmod 0644 "$plist_dest"
@@ -573,6 +620,15 @@ EOF
   fi
   if ( install_tree /opt/homebrew/alighieri "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
     fail "must refuse /opt/homebrew daemon root"
+  fi
+  if ( install_tree /opt/./homebrew/alighieri "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
+    fail "must refuse non-canonical Homebrew daemon root"
+  fi
+  if ( install_tree / "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
+    fail "must refuse filesystem root"
+  fi
+  if ( install_tree /alighieri "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ); then
+    fail "must refuse a top-level daemon root"
   fi
   if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
     fail "Homebrew-root refusal must not bootstrap"

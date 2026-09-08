@@ -17,8 +17,19 @@ expect_plist_string() {
     actual="$(awk -v key="$key" '
       $0 ~ "<key>" key "</key>" { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }
     ' "$plist")"
-  elif grep -Fq "<string>${expected}</string>" "$plist"; then
-    actual="$expected"
+  else
+    local prefix="${key%%.*}"
+    local index="${key##*.}"
+    [[ "$index" =~ ^[0-9]+$ ]] || fail "unsupported plist key $key"
+    actual="$(awk -v prefix="$prefix" -v idx="$index" '
+      $0 ~ "<key>" prefix "</key>" { in_arr=1; n=0; next }
+      in_arr && /<string>/ {
+        gsub(/.*<string>|<\/string>.*/, "")
+        if (n == idx) { print; exit }
+        n++
+      }
+      in_arr && /<\/array>/ { in_arr=0 }
+    ' "$plist")"
   fi
   [[ "$actual" == "$expected" ]] || fail "$plist $key: expected $expected, got ${actual:-<missing>}"
 }
@@ -153,6 +164,21 @@ EOF
   expect_plist_integer "$staged_plist" Umask 63
   expect_plist_string "$staged_plist" ProgramArguments.0 "$staged_root/bin/alighieri"
   expect_plist_string "$staged_plist" ProgramArguments.1 "$staged_root/alighieri.conf"
+  mode_of() {
+    local mode=""
+    mode="$(stat -f '%Lp' "$1" 2>/dev/null || true)"
+    if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+      printf '%s\n' "$mode"
+      return
+    fi
+    stat -c '%a' "$1"
+  }
+  [[ "$(mode_of "$staged_root/alighieri.conf")" == "640" ]] \
+    || fail "staged config mode is $(mode_of "$staged_root/alighieri.conf"), expected 640"
+  [[ "$(mode_of "$staged_root/acme")" == "700" ]] \
+    || fail "staged acme mode is $(mode_of "$staged_root/acme"), expected 700"
+  [[ "$(mode_of "$staged_root/logs")" == "700" ]] \
+    || fail "staged logs mode is $(mode_of "$staged_root/logs"), expected 700"
 
   # Independent assertion failures: each required key/path is checked above.
   grep -Fq "/usr/local" "$staged_plist" && fail "staged plist still mentions /usr/local"
