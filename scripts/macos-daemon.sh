@@ -1004,7 +1004,7 @@ EOF
   unset ALIGHIERI_STAT_MAP
   ID_BIN=/usr/bin/id
   mkdir -p "$root"
-  rm -rf "$root/bin" "$root/acme" "$root/logs" "$root/alighieri.conf"
+  rm -rf "${root:?}/bin" "${root:?}/acme" "${root:?}/logs" "${root:?}/alighieri.conf"
   if ln -s "$tmp/elsewhere" "$root/bin" 2>/dev/null; then
     expect_install_failure "symlinked bin must be rejected"
     [[ ! -e "$tmp/elsewhere/alighieri" ]] || fail "symlinked bin must not write through the link"
