@@ -14,21 +14,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "10.14"
   # Hosted runners include Node. Make the wizard's executable browser-state
   # test fail rather than silently skip if that runtime ever disappears.
   ALIGHIERI_REQUIRE_NODE_TESTS: "1"
 
 jobs:
   # Build, lint, and run the full test suite (unit/component + integration)
-  # on both first-class platforms. Windows is included so the Windows Service
-  # and Event Log code is compiled, linted, and tested too.
+  # on every first-class platform. Windows is included so the Windows Service
+  # and Event Log code is compiled, linted, and tested too. macOS covers the
+  # Unix console path that Linux CI does not execute (Apple Silicon hosted).
   test:
     name: test & clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -86,12 +88,65 @@ jobs:
           ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN: target/debug/alighieri-installer-fs
       - name: Cargo run selects the service binary
         run: cargo run --locked -- --version
+      - name: macOS launchd example smoke
+        if: runner.os == 'macOS'
+        run: |
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-daemon.sh
+          scripts/macos-install-smoke.sh
+      - name: Package Unix archive layout
+        if: runner.os != 'Windows'
+        run: |
+          test -x scripts/package-unix.sh
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            ASSET="$(
+              scripts/package-unix.sh \
+                --os linux \
+                --target x86_64-unknown-linux-gnu \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )" || exit 1
+            test -f "$ASSET"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/scripts/alighieri.sh"
+            if tar tzf "$ASSET" | grep -Fq "macos-daemon.sh"; then
+              echo "Linux archive must not contain macos-daemon.sh" >&2
+              exit 1
+            fi
+            if tar tzf "$ASSET" | grep -Fq "macos-launch"; then
+              echo "Linux archive must not contain macOS launchd plists" >&2
+              exit 1
+            fi
+          else
+            ASSET="$(
+              scripts/package-unix.sh \
+                --os macos \
+                --target aarch64-apple-darwin \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )" || exit 1
+            test -f "$ASSET"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+            if tar tzf "$ASSET" | grep -Fq "scripts/alighieri.sh"; then
+              echo "macOS archive must not contain the Linux installer" >&2
+              exit 1
+            fi
+            extract="$RUNNER_TEMP/alighieri-macos-archive"
+            mkdir -p "$extract"
+            tar -xzf "$ASSET" -C "$extract"
+            "$extract/alighieri-vtest-aarch64-apple-darwin/alighieri" --version
+            test -x "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+          fi
       - name: Doctests
         run: cargo test --doc --locked
 
-  # Cross-compile the extra ARM64 release targets so the release matrix is
-  # validated on every change, not only when a tag is pushed. Build-only: the
-  # x86_64 GitHub runners cannot execute these binaries.
+  # Cross-compile extra release targets so the release matrix is validated on
+  # every change, not only when a tag is pushed. Build-only: hosted runners
+  # cannot execute foreign-architecture binaries.
   cross-build:
     name: cross-build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -106,6 +161,12 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             features: --features rdp
+          # Hosted macos-latest is Apple Silicon; this job only proves the
+          # Intel Darwin target still links. Runtime tests stay on aarch64
+          # via the macos-latest test matrix entry.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            features: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -127,6 +188,32 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Cross-compile (release, build-only)
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+      - name: Assert cross-compiled macOS console binary
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          test -x "target/${{ matrix.target }}/release/alighieri"
+          test -x scripts/package-unix.sh
+          ASSET="$(
+            scripts/package-unix.sh \
+              --os macos \
+              --target x86_64-apple-darwin \
+              --version test \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )" || exit 1
+          test -f "$ASSET"
+          file "target/${{ matrix.target }}/release/alighieri"
+          lipo -archs "target/${{ matrix.target }}/release/alighieri" | grep -Fq x86_64
+          minos="$(vtool -show-build "target/${{ matrix.target }}/release/alighieri" | awk '/minos/ { print $2; exit }')"
+          [[ -n "$minos" ]] || { echo "vtool did not report a minos" >&2; exit 1; }
+          awk -v minos="$minos" 'BEGIN {
+            n = split(minos, p, ".")
+            major = p[1] + 0
+            minor = (n >= 2 ? p[2] : 0) + 0
+            if (major > 10 || (major == 10 && minor > 14)) {
+              exit 1
+            }
+          }' || { echo "x86_64 Darwin minos $minos is newer than the documented 10.14 floor" >&2; exit 1; }
       - name: Assert cross-compiled Windows RDP helpers
         if: runner.os == 'Windows'
         shell: pwsh
@@ -161,11 +248,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify Linux helpers are executable
-        run: test -x scripts/alighieri.sh && test -x scripts/install-linux.sh
+        run: |
+          test -x scripts/alighieri.sh
+          test -x scripts/install-linux.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/macos-daemon.sh
+          test "$(git ls-files -s scripts/macos-daemon.sh | awk '{print $1}')" = 100755
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
       - name: Run installer self-tests
-        run: bash scripts/alighieri.sh __selftest
+        run: |
+          bash scripts/alighieri.sh __selftest
+          bash scripts/macos-daemon.sh __selftest
+          bash scripts/macos-install-smoke.sh
+          if ASSET="$(scripts/package-unix.sh --os macos --target t --version v --bindir /no-such-bindir --archive 2>/dev/null)"; then
+            echo "package-unix.sh must fail when the bindir is missing" >&2
+            exit 1
+          fi
+          test -z "${ASSET:-}"
 
   # Verify the crate still builds on its declared minimum supported Rust
   # version (Cargo.toml `rust-version`). Clippy and rustfmt stay on the stable
@@ -230,6 +331,9 @@ jobs:
             doc/rdp-transport.md
             scripts/alighieri.sh
             scripts/install-linux.sh
+            scripts/macos-daemon.sh
+            doc/macos-launchagent.plist
+            doc/macos-launchdaemon.plist
           )
           for path in "${required[@]}"; do
             if ! grep -Fqx "$path" "$package_list"; then

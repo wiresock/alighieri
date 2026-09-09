@@ -899,8 +899,9 @@ where
         // Accept only datagrams from the legitimate client. `src` is kept in the
         // socket's own family (it is stored as the reply target below and must
         // stay sendable on this socket); `client_source_accepted` canonicalises
-        // both addresses internally. The predeclared lock is stored in the
-        // client's family by `requested_udp_endpoint`.
+        // both addresses internally. The predeclared lock is stored as the
+        // canonical client address by `requested_udp_endpoint`, matching the
+        // AF_INET relay bind used for IPv4-mapped locals.
         if !client_source_accepted(src, client_ip, client_endpoint.get().copied()) {
             continue; // spoofed / unrelated / off-lock source
         }
@@ -1106,8 +1107,9 @@ where
 /// boundary, which is why the facade is mandatory rather than a raw socket.
 #[cfg(feature = "plugins")]
 pub struct ClientDatagrams {
-    /// The bound relay socket the client sends its datagrams to (already
-    /// advertised to the client as BND.ADDR/PORT — never rebound).
+    /// The bound client-facing UDP relay socket. This is the physical bind;
+    /// [`crate::plugin::AssociateCtx::relay_addr`] is the SOCKS BND address
+    /// already sent to the client and can differ when `udp.advertise` is set.
     socket: Arc<UdpSocket>,
     /// The association's client IP; a datagram from any other source is dropped.
     client_ip: IpAddr,
@@ -1259,7 +1261,12 @@ impl ClientDatagrams {
         Ok(())
     }
 
-    /// The relay socket address advertised to the client (BND.ADDR/PORT).
+    /// The physical address of the bound client-facing UDP socket.
+    ///
+    /// This is `UdpSocket::local_addr()` on the relay socket, not the address
+    /// advertised to the SOCKS client. When `udp.advertise` is set,
+    /// [`crate::plugin::AssociateCtx::relay_addr`] is the BND.ADDR/PORT already
+    /// sent to the client and can differ from this physical bind address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }

@@ -31,6 +31,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
   - [Hot reload](#hot-reload)
 - [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
+- [macOS (console and launchd)](#macos-console-and-launchd)
 - [RDP egress over an existing Windows session](#rdp-egress-over-an-existing-windows-session)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -62,7 +63,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - **Optional plugin SDK** — statically link custom control-plane, TCP, and UDP
   behavior into a private host binary
 - **Async** — built on [Tokio](https://tokio.rs) for high-performance I/O
-- **Portable** — first-class on Windows and Linux; macOS and *BSD are not yet
+- **Portable** — first-class on Windows, Linux, and macOS; *BSD is not yet
   officially supported (no CI coverage)
 - **Secure defaults** — no auth required? Think again. The default config still lets you build restrictive rules.
 
@@ -76,8 +77,10 @@ cargo install alighieri --locked
 alighieri --version
 ```
 
-Prebuilt Linux and Windows binaries are also attached to each
-[release](https://github.com/wiresock/alighieri/releases). To build from a
+Prebuilt Linux and Windows binaries are attached to each
+[release](https://github.com/wiresock/alighieri/releases). Unsigned macOS
+console archives (Apple Silicon and Intel) ship in the first release after
+0.6.0. To build from a
 source checkout:
 
 ```sh
@@ -1072,6 +1075,93 @@ echo 'net.core.rmem_max=8388608
 net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
 ```
 
+## macOS (console and launchd)
+
+macOS is a first-class **console** platform: the same SOCKS5, TLS, wizard, and
+SIGHUP reload path as Linux. There is no systemd installer and no RDP egress
+on Darwin. Intel (`x86_64-apple-darwin`) archives target **macOS 10.14 or later**.
+Apple Silicon (`aarch64-apple-darwin`) archives require **macOS 11.0 or
+later** — there is no Apple Silicon 10.14. A loopback `internal:` such as
+`127.0.0.1:1080` needs no extra privilege. The public TLS profile binds
+`0.0.0.0:443`; on 10.14+ XNU exempts `INADDR_ANY` from the low-port
+restriction, so `_alighieri` can listen on 443 without root. Binding 443 on a
+specific interface, or running on 10.12/10.13, still requires root or launchd
+socket activation (Alighieri does not consume launchd sockets).
+
+The default background install is a **per-user LaunchAgent**. It runs as your
+login user after you log in, listens on port 1080, and never executes a
+Homebrew-replaceable binary as root. A system LaunchDaemon that binds port 443
+is a separate hardened profile (dedicated `_alighieri` account, complete
+tree under root-owned `/opt/alighieri`); the public-TLS wizard emits
+`scripts/macos-daemon.sh`.
+
+```sh
+# from a source checkout
+cargo build --release --locked
+BIN="./target/release/alighieri"
+
+# from an extracted release archive (aarch64-apple-darwin or x86_64-apple-darwin)
+# BIN="./alighieri"
+
+# Gatekeeper: unsigned release archives may carry com.apple.quarantine.
+# Clear it on the source binary *before* copying or launching. Removing the
+# attribute bypasses provenance checks. For a GitHub release, first verify
+# the downloaded archive against its entry in the published SHA256SUMS
+# (the manifest lists every platform; checking the whole file reports
+# missing archives you did not download):
+#   grep -F "$(basename "$ARCHIVE")" SHA256SUMS | shasum -a 256 -c -
+# Apple documents that
+# non-Developer-ID, non-notarized software cannot be verified the same way
+# as trusted software: https://support.apple.com/en-us/102445
+{ xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true; }
+"$BIN" --check --config doc/alighieri.conf
+
+# Root-owned binary: do not install into Homebrew prefixes (/opt/homebrew or
+# /usr/local). The daemon/agent binary lives in /opt/alighieri/bin.
+sudo install -d -o root -g wheel -m 0755 /opt/alighieri/bin
+sudo install -o root -g wheel -m 0755 "$BIN" /opt/alighieri/bin/alighieri
+
+CONF="$HOME/Library/Application Support/Alighieri/alighieri.conf"
+LOG="$HOME/Library/Logs/Alighieri/alighieri.log"
+PLIST="$HOME/Library/LaunchAgents/com.wiresock.alighieri.plist"
+install -d "$HOME/Library/Application Support/Alighieri" \
+           "$HOME/Library/Logs/Alighieri" \
+           "$HOME/Library/LaunchAgents"
+install -m 644 doc/alighieri.conf "$CONF"
+# LaunchAgent stdout is not rotated; use Alighieri's file sink.
+printf '\nlogoutput: file\nlogfile: %s\nlogrotate.size: 10MiB\nlogrotate.keep: 5\n' "$LOG" >> "$CONF"
+# The listener in doc/alighieri.conf is 127.0.0.1:1080, which is the right
+# default for a per-user agent. Edit internal: only if you intentionally
+# expose the port, then:
+/opt/alighieri/bin/alighieri --check --config "$CONF"
+
+cp doc/macos-launchagent.plist "$PLIST"
+plutil -replace ProgramArguments.1 -string "$CONF" "$PLIST"
+plutil -lint "$PLIST"
+{ launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true; }
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+```
+
+Hot reload is SIGHUP, the same as other Unix builds. For the LaunchAgent:
+
+```sh
+launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"
+```
+
+`KeepAlive` relaunches the job after SIGTERM while it remains loaded.
+Stop it with `launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"`.
+
+The LaunchAgent template is [`doc/macos-launchagent.plist`](doc/macos-launchagent.plist);
+substitute `__ALIGHIERI_CONFIG__` with a config file the login user can read.
+Do not point it at `/opt/alighieri/alighieri.conf` after a LaunchDaemon
+install — that file is `root:_alighieri` mode 0640.
+The dedicated-user LaunchDaemon used by the public TLS wizard is
+[`doc/macos-launchdaemon.plist`](doc/macos-launchdaemon.plist).
+
+Release tarballs are not notarized. A browser-downloaded archive may be
+quarantined; handle that **before** the first execution as shown above. macOS
+may also prompt to allow inbound connections the first time the listener binds.
+
 ## RDP egress over an existing Windows session
 
 The optional `rdp` feature sends SOCKS5 TCP CONNECT traffic through the network
@@ -1340,8 +1430,8 @@ long-standing C reference SOCKS server: full SOCKS4/5 including the BIND command
 and GSSAPI, a client-side "socksify" preload library, and broad Unix
 portability, hardened since the late 1990s. Alighieri borrows Dante's
 configuration model but trades breadth (SOCKS4, BIND, GSSAPI, the client
-library, exotic Unixes) for memory safety, first-class **Windows** support,
-SOCKS-over-TLS, and built-in observability.
+library, exotic Unixes) for memory safety, first-class **Windows** and **macOS**
+support, SOCKS-over-TLS, and built-in observability.
 
 Dante capabilities below are drawn from its documented feature set and vary by
 version; verify against the version you would deploy.
@@ -1352,7 +1442,8 @@ version; verify against the version you would deploy.
 | --- | --- | --- |
 | Linux | first-class (CI + systemd manager) | yes |
 | Windows | native Service + Event Log | not supported |
-| macOS / *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
+| macOS | first-class (CI + console + LaunchAgent / LaunchDaemon) | yes |
+| *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
 | Language | Rust (memory-safe) | C |
 | Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |
 

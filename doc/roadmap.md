@@ -52,7 +52,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
 | ~~**ARM64 builds**~~ | — | — | **Shipped** — `aarch64` Linux and Windows ARM64 are in the release matrix, validated on every change by a CI cross-build job. |
-| **macOS / *BSD as first-class** | Med | M | CI coverage, a `launchd` plist, and docs — closes the portability gap that keeps Dante ahead on Unix. |
+| ~~**macOS as first-class**~~ | — | — | **Shipped** (console) — macOS CI, Darwin release archives, a per-user LaunchAgent, and a dedicated `_alighieri` LaunchDaemon provisioned by `scripts/macos-daemon.sh`. Homebrew packaging and Apple notarization remain follow-ups. *BSD is still not CI-covered. |
 | ~~**Container image**~~ (+ Helm/compose) | — | — | **Shipped** (image) — official multi-arch distroless image on GHCR, built from source. Helm chart / compose examples remain a follow-up. |
 | **Native packages** | Med | M | `deb`/`rpm`, Homebrew, and `winget` for first-class install. |
 
@@ -63,8 +63,8 @@ Ordered for value-to-effort while leaning into Alighieri's identity
 ~~external auth hook~~, ~~token-bucket bandwidth throttle~~, and
 ~~ARM64 builds + container image~~ have shipped):
 
-The first wave is complete. Next up: BIND, geo/ASN rules, macOS/BSD
-first-class, audit/OTel, native packages (deb/rpm/Homebrew/winget), and a Helm
+The first wave is complete. Next up: BIND, geo/ASN rules, *BSD CI, audit/OTel,
+native packages (deb/rpm/Homebrew/winget), Apple notarization, and a Helm
 chart / compose examples. Deprioritized unless requested: SOCKS4, GSSAPI.
 
 ---

@@ -608,7 +608,14 @@ fn wizard_form_from_fields(
     } else {
         path_field_with_changed_output(fields, "userlist", &initial_userlist, &default_userlist)
     };
-    let log_file = log_field_with_changed_output(fields, &initial_log, &default_log);
+    let log_file = {
+        let parsed = log_field_with_changed_output(fields, &initial_log, &default_log);
+        if template == WizardTemplate::PublicTls && cfg!(target_os = "macos") {
+            parsed.or_else(|| Some(default_public_service_log_path()))
+        } else {
+            parsed
+        }
+    };
 
     let listen_ip = listen_host
         .parse::<IpAddr>()
@@ -725,6 +732,7 @@ fn wizard_form_from_fields(
             );
         }
         validate_public_acme_cache_path(&cache_path)?;
+        validate_public_macos_managed_state_paths(&cache_path, log_file.as_deref())?;
         validate_public_service_path_roles(
             &cache_path,
             &output_path,
@@ -890,7 +898,12 @@ fn validate_public_userlist_deployment_path(path: &Path) -> Result<(), String> {
         "Linux public profile userlist path must be a direct file in /etc/alighieri (for example /etc/alighieri/users) so the hardened service can reach it"
             .into(),
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    return Err(
+        "macOS public profile userlist path must be a direct file in /opt/alighieri (for example /opt/alighieri/users) so the dedicated-user LaunchDaemon can reach it"
+            .into(),
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err("public profile userlist path must be absolute so the service can reach it".into());
 }
 
@@ -909,9 +922,82 @@ fn public_userlist_path_supported_by_deployment(path: &Path) -> bool {
         let expected = Path::new("/etc/alighieri").join(file_name);
         path.as_os_str() == expected.as_os_str()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        path_is_direct_child(path, macos_daemon_root())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         path.is_absolute()
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn path_is_direct_child(path: &Path, parent: &Path) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    path.as_os_str() == parent.join(file_name).as_os_str()
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn path_is_or_under(path: &Path, parent: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let mut remaining = path.components();
+    for expected in parent.components() {
+        match remaining.next() {
+            Some(component) if component == expected => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_daemon_root() -> &'static Path {
+    Path::new("/opt/alighieri")
+}
+
+fn macos_service_binary() -> &'static str {
+    "/opt/alighieri/bin/alighieri"
+}
+
+fn macos_daemon_helper() -> &'static str {
+    "./scripts/macos-daemon.sh"
+}
+
+fn validate_public_macos_managed_state_paths(
+    cache_path: &Path,
+    log_file: Option<&Path>,
+) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (cache_path, log_file);
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let acme_root = macos_daemon_root().join("acme");
+        if !path_is_or_under(cache_path, &acme_root) {
+            return Err(
+                "macOS public profile ACME cache must be /opt/alighieri/acme or a directory under it"
+                    .into(),
+            );
+        }
+        if let Some(log_file) = log_file {
+            if !path_is_direct_child(log_file, &macos_daemon_root().join("logs")) {
+                return Err(
+                    "macOS public profile log file must be a direct file in /opt/alighieri/logs"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1678,7 +1764,12 @@ fn default_public_userlist_path() -> PathBuf {
     alighieri::platform::windows::service_manager::default_base_dir().join("users")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn default_public_userlist_path() -> PathBuf {
+    macos_daemon_root().join("users")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_public_userlist_path() -> PathBuf {
     PathBuf::from("/etc/alighieri/users")
 }
@@ -1688,7 +1779,12 @@ fn default_public_acme_cache_path() -> PathBuf {
     alighieri::platform::windows::service_manager::default_base_dir().join("acme")
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn default_public_acme_cache_path() -> PathBuf {
+    macos_daemon_root().join("acme")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_public_acme_cache_path() -> PathBuf {
     PathBuf::from("/var/lib/alighieri/acme")
 }
@@ -1698,7 +1794,12 @@ fn default_public_service_config_path() -> PathBuf {
     alighieri::platform::windows::service_manager::default_config_path()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn default_public_service_config_path() -> PathBuf {
+    macos_daemon_root().join("alighieri.conf")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_public_service_config_path() -> PathBuf {
     PathBuf::from("/etc/alighieri/alighieri.conf")
 }
@@ -1708,9 +1809,22 @@ fn default_public_service_log_path() -> PathBuf {
     alighieri::platform::windows::service_manager::default_service_log_path()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn default_public_service_log_path() -> PathBuf {
+    macos_daemon_root().join("logs").join("alighieri.log")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn default_public_service_log_path() -> PathBuf {
     PathBuf::from("/var/log/alighieri/alighieri.log")
+}
+
+fn unix_service_group() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "_alighieri"
+    } else {
+        "alighieri"
+    }
 }
 
 fn default_userlist_path(output_path: &Path) -> String {
@@ -2800,7 +2914,13 @@ fn render_wizard_form(
     let logfile_value = prefill
         .and_then(|p| p.form.log_file.as_ref())
         .map(|path| path.display().to_string())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            if template == WizardTemplate::PublicTls && cfg!(target_os = "macos") {
+                default_public_service_log_path().display().to_string()
+            } else {
+                String::new()
+            }
+        });
 
     let output = html_escape(&output_path.display().to_string());
     let userlist = html_escape(&userlist_value);
@@ -2852,6 +2972,12 @@ fn render_wizard_form(
                 html_escape(&service_log)
             ),
         )
+    } else if cfg!(target_os = "macos") {
+        (
+            "/opt/alighieri/logs/alighieri.log".to_string(),
+            "The public LaunchDaemon profile writes a rotating file under <code>/opt/alighieri/logs</code> (mode 0600). launchd stdout files are not used."
+                .to_string(),
+        )
     } else {
         (
             "absolute path recommended; empty = stdout / journald".to_string(),
@@ -2861,6 +2987,8 @@ fn render_wizard_form(
     };
     let userlist_help = if cfg!(target_os = "linux") {
         "For the Linux public service profile, use a direct file in <code>/etc/alighieri</code>; that managed directory stays reachable inside the hardened systemd sandbox."
+    } else if cfg!(target_os = "macos") {
+        "For the macOS public LaunchDaemon profile, use a direct file in <code>/opt/alighieri</code> so the dedicated <code>_alighieri</code> account can read it."
     } else {
         "The public service profile requires an absolute path so user creation and the service use the same file."
     };
@@ -3208,7 +3336,7 @@ cleanup() {
     [ -z "${backup_staged:-}" ] || rm -f -- "$backup_staged"
 }
 trap cleanup EXIT HUP INT TERM
-install -m 640 -o root -g alighieri -- "$source_path" "$staged"
+install -m 640 -o root -g {group} -- "$source_path" "$staged"
 "$validator" --check --config "$staged"
 if [ -e "$destination_path" ] || [ -L "$destination_path" ]; then
     if [ ! -f "$destination_path" ] || [ -L "$destination_path" ]; then
@@ -3229,7 +3357,10 @@ if ! replace_regular_file "$staged" "$destination_path"; then
 fi
 staged=
 ' sh"#;
-    format!("{script} {source_arg} {destination_arg} {validator_arg}")
+    format!(
+        "{script} {source_arg} {destination_arg} {validator_arg}",
+        script = script.replace("{group}", unix_service_group())
+    )
 }
 
 fn render_public_success(
@@ -3315,6 +3446,13 @@ fn render_public_success(
             powershell_single_quoted(username_text),
             powershell_single_quoted(&userlist_text)
         )
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "sudo {} user add {} --userlist {}",
+            macos_service_binary(),
+            shell_quote_command_argument(username_text),
+            shell_quote_command_argument(&userlist_text)
+        )
     } else {
         format!(
             "sudo alighieri user add {} --userlist {}",
@@ -3328,12 +3466,17 @@ fn render_public_success(
         String::new()
     } else {
         let path = shell_quote_command_argument(&userlist_text);
+        let group = unix_service_group();
         html_escape(&format!(
-            "sudo chown root:alighieri -- {path}\nsudo chmod 640 -- {path}"
+            "sudo chown root:{group} -- {path}\nsudo chmod 640 -- {path}"
         ))
     };
     let ownership_guidance = if ownership_commands.is_empty() {
         String::new()
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "<p>Make the new file readable by the dedicated <code>_alighieri</code> LaunchDaemon account:</p><pre>{ownership_commands}</pre>"
+        )
     } else {
         format!(
             "<p>Make the new file readable by the hardened systemd service:</p><pre>{ownership_commands}</pre>"
@@ -3398,6 +3541,24 @@ fn render_public_success(
              <pre>{uninstall_command}</pre>\
              {copy_config}</section>"
         )
+    } else if cfg!(target_os = "macos") {
+        let helper = macos_daemon_helper();
+        let source_prepare = html_escape(&format!(
+            "cargo build --release --locked &&\n\
+{{ xattr -d com.apple.quarantine ./target/release/alighieri 2>/dev/null || true; }} &&\n\
+sudo {helper} provision &&\n\
+sudo {helper} install --binary ./target/release/alighieri --config {output_arg} --no-start"
+        ));
+        let release_prepare = html_escape(&format!(
+            "{{ xattr -d com.apple.quarantine ./alighieri 2>/dev/null || true; }} &&\n\
+sudo {helper} provision &&\n\
+sudo {helper} install --binary ./alighieri --config {output_arg} --no-start"
+        ));
+        format!(
+            "<section class=\"notice\"><strong>macOS public TLS:</strong> this profile binds <code>0.0.0.0:443</code> as the dedicated <code>_alighieri</code> account. The complete daemon tree is root-owned <code>/opt/alighieri</code>, outside Homebrew prefixes. macOS 10.14 and later allow this wildcard bind without root. Do not install under <code>/opt/homebrew</code> or <code>/usr/local</code>.\
+             <p><strong>Source checkout:</strong></p><pre>{source_prepare}</pre>\
+             <p><strong>Extracted macOS release archive (run from its root):</strong></p><pre>{release_prepare}</pre></section>"
+        )
     } else {
         "<section class=\"notice\"><strong>Fresh Linux VPS:</strong> run one matching preparation command before the steps below. It creates the <code>alighieri</code> account, service directories, binary, and unit without enabling or starting the service. This is safe even when the wizard wrote directly to <code>/etc/alighieri/alighieri.conf</code>. Create the userlist next, then run the matching final installer command shown below to enable and start Alighieri.<p><strong>Source checkout:</strong></p><pre>sudo ./scripts/alighieri.sh install --no-start</pre><p><strong>Extracted Linux release archive:</strong> run from the archive root. The archive bundles the version-matched helper and default config.</p><pre>sudo ./scripts/alighieri.sh install --binary ./alighieri --no-start</pre></section>".to_string()
     };
@@ -3422,12 +3583,20 @@ fn render_public_success(
         ]
         .join("\n");
         format!("<pre>{}</pre>", html_escape(&commands))
+    } else if cfg!(target_os = "macos") {
+        let helper = macos_daemon_helper();
+        let start_commands = html_escape(&format!("sudo {helper} start"));
+        let status_commands = html_escape(
+            "sudo launchctl print system/com.wiresock.alighieri\nsudo launchctl kill SIGHUP system/com.wiresock.alighieri",
+        );
+        format!(
+            "<p>After the userlist exists, start the LaunchDaemon. The helper fail-fasts: a failed provision, binary install, config install, or plist write never bootstraps.</p><pre>{start_commands}</pre>\
+             <p>After start succeeds:</p><pre>{status_commands}</pre>"
+        )
     } else {
+        let service_config_path = default_public_service_config_path();
         let prepare_config = |validator: &str| {
-            if paths_are_same_physical_install_target(
-                &report.output_path,
-                Path::new("/etc/alighieri/alighieri.conf"),
-            ) {
+            if paths_are_same_physical_install_target(&report.output_path, &service_config_path) {
                 format!("sudo {validator} --check --config {output_arg}")
             } else {
                 unix_atomic_config_install(&output_arg, &service_config_arg, validator)
@@ -3456,6 +3625,11 @@ fn render_public_success(
         format!(
             "The final install records the exact executable shown above and the canonical ProgramData configuration path. Keep that executable at a durable, administrator-controlled path; if it moves, reinstall the service. Installation recursively hardens files under the Alighieri service-data directory before the service can start. The Windows Service defaults to <code>{}</code> and honors a configured logfile. If you selected a userlist, ACME cache, or logfile outside the service-data directory, explicitly grant LocalService the required access and protect the files from untrusted local users.",
             html_escape(&default_public_service_log_path().display().to_string())
+        )
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "The supported LaunchDaemon reads <code>/opt/alighieri/alighieri.conf</code> as <code>_alighieri</code> and executes <code>{}</code>. <code>scripts/macos-daemon.sh install</code> always stages that config as <code>root:_alighieri</code> mode 0640, even when the wizard already wrote the canonical path. Logs go to <code>/opt/alighieri/logs/alighieri.log</code> with directory mode 0700 and file mode 0600. <code>KeepAlive</code> relaunches after SIGTERM while the job remains loaded; stop it with <code>sudo launchctl bootout system/com.wiresock.alighieri</code>.",
+            macos_service_binary()
         )
     } else {
         "The supported service reads <code>/etc/alighieri/alighieri.conf</code>; when the wizard wrote another path, the selected command above installs that exact generated file there before restarting. Public-profile userlists stay directly under the installer-managed <code>/etc/alighieri</code> directory. Rerunning the installer picks up the port-443 capability and ACME state directory. The hardened unit can write the default state and log directories; custom cache or log paths outside them require a corresponding unit permission change."
@@ -3488,6 +3662,13 @@ fn render_public_success(
     } else {
         ""
     };
+    let user_add_timing = if cfg!(windows) {
+        "Run this before installing or restarting the service:"
+    } else if cfg!(target_os = "macos") {
+        "Run this after <code>scripts/macos-daemon.sh install --no-start</code>, which installs <code>/opt/alighieri/bin/alighieri</code>:"
+    } else {
+        "Run this after the matching <code>install --no-start</code> command, before the final installer that starts the service:"
+    };
 
     html_page(
         "Public TLS Configuration Saved",
@@ -3502,7 +3683,7 @@ fn render_public_success(
 {service_preparation}
 <section>
 <h2>Create the authenticated user</h2>
-<p>This endpoint requires username/password authentication from <code>{userlist}</code>. Run this before installing or restarting the service:</p>
+<p>This endpoint requires username/password authentication from <code>{userlist}</code>. {user_add_timing}</p>
 <pre>{add_command}</pre>
 <p>The command prompts for the password securely and stores its Argon2id hash. No password was requested or generated by this wizard.</p>
 {ownership_guidance}
@@ -3835,11 +4016,18 @@ mod tests {
         assert_eq!(form.trusted_client, "0.0.0.0/0");
         assert_eq!(form.userlist_path, Some(default_public_userlist_path()));
         assert_eq!(form.acme_cache_path, Some(default_public_acme_cache_path()));
+        #[cfg(target_os = "macos")]
+        assert_eq!(form.log_file, Some(default_public_service_log_path()));
         assert!(form.udp_enabled);
         assert_eq!(form.udp_port_range.as_deref(), Some(PUBLIC_UDP_RANGE));
         assert_eq!(form.udp_advertise.as_deref(), Some(PUBLIC_DOMAIN_EXAMPLE));
 
         let text = render_config(&form);
+        #[cfg(target_os = "macos")]
+        {
+            assert!(text.contains("logoutput: file"));
+            assert!(text.contains("logfile: /opt/alighieri/logs/alighieri.log"));
+        }
         let config = Config::parse(&text).unwrap();
         assert_eq!(config.internal, "0.0.0.0:443".parse().unwrap());
         assert_eq!(config.socks_methods.as_slice(), [AuthKind::Username]);
@@ -4000,6 +4188,8 @@ mod tests {
                 r"C:\ProgramData\Alighieri Data\users",
                 r"C:\ProgramData\Alighieri Data\acme",
             )
+        } else if cfg!(target_os = "macos") {
+            ("/opt/alighieri/user db", "/opt/alighieri/acme/my cache")
         } else {
             ("/etc/alighieri/user db", "/var/lib/alighieri data/acme")
         };
@@ -4015,6 +4205,68 @@ mod tests {
             panic!("expected ACME configuration");
         };
         assert_eq!(acme.cache_dir, PathBuf::from(cache));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_tls_macos_userlist_must_be_a_direct_managed_file() {
+        for accepted in ["/opt/alighieri/users", "/opt/alighieri/public-users"] {
+            let mut fields = public_tls_fields();
+            fields.insert("userlist".into(), accepted.into());
+            let form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
+            assert_eq!(form.userlist_path.as_deref(), Some(Path::new(accepted)));
+        }
+
+        for rejected in [
+            "/etc/alighieri/users",
+            "/opt/homebrew/etc/alighieri/users",
+            "/usr/local/etc/alighieri/users",
+            "/opt/alighieri/private/users",
+        ] {
+            let mut fields = public_tls_fields();
+            fields.insert("userlist".into(), rejected.into());
+            let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+            assert!(
+                err.contains("direct file in /opt/alighieri"),
+                "{rejected}: {err}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_tls_macos_state_paths_must_stay_under_opt_alighieri() {
+        let mut fields = public_tls_fields();
+        fields.insert(
+            "acme_cache".into(),
+            "/usr/local/var/lib/alighieri/acme".into(),
+        );
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("/opt/alighieri/acme"), "{err}");
+
+        let mut fields = public_tls_fields();
+        fields.insert("logfile".into(), "/tmp/alighieri.log".into());
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("/opt/alighieri/logs"), "{err}");
+
+        let mut fields = public_tls_fields();
+        fields.insert("logfile".into(), "/opt/alighieri/logs/custom.log".into());
+        let form = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap();
+        assert_eq!(
+            form.log_file.as_deref(),
+            Some(Path::new("/opt/alighieri/logs/custom.log"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_tls_macos_rejects_colliding_managed_file_roles() {
+        let mut fields = public_tls_fields();
+        fields.insert("output".into(), "/opt/alighieri/users".into());
+        fields.insert("userlist".into(), "/opt/alighieri/users".into());
+        let err = wizard_form_from_fields(&fields, Path::new("public.conf")).unwrap_err();
+        assert!(err.contains("configuration output path"), "{err}");
+        assert!(err.contains("userlist path"), "{err}");
     }
 
     #[cfg(target_os = "linux")]
@@ -4056,6 +4308,7 @@ mod tests {
         assert!(public_userlist_path_supported_by_deployment(&custom));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_acme_cache_file_path_collisions() {
         let dir = tempfile::tempdir().unwrap();
@@ -4080,6 +4333,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_collisions_between_file_roles() {
         let dir = tempfile::tempdir().unwrap();
@@ -4107,6 +4361,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_file_ancestor_conflicts() {
         let dir = tempfile::tempdir().unwrap();
@@ -4402,6 +4657,7 @@ mod tests {
         assert!(err.contains("not a regular file"), "{err}");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_rejects_hard_linked_file_roles() {
         let dir = tempfile::tempdir().unwrap();
@@ -4420,6 +4676,7 @@ mod tests {
         assert!(err.contains("log file"), "{err}");
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn public_tls_reserves_rotated_log_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -5681,6 +5938,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         // profile even when this test runs on Windows CI.
         wizard_form.userlist_path = Some(PathBuf::from("/etc/alighieri/users"));
         wizard_form.acme_cache_path = Some(PathBuf::from("/var/lib/alighieri/acme"));
+        wizard_form.log_file = None;
         let wizard_config = Config::parse(&render_config(&wizard_form)).unwrap();
 
         let static_to_wizard = config_loss_warnings(&static_config, &wizard_config);
@@ -6070,8 +6328,11 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(html.contains("Alighieri supports IPv6 in other configurations"));
         assert!(html.contains("incorrect or unreachable AAAA record"));
         assert!(html.contains("inbound UDP <code>40000-40099</code>"));
+        #[cfg(not(target_os = "macos"))]
         assert!(html.contains("--check --config"));
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        assert!(html.contains("macos-daemon.sh install --binary"));
+        #[cfg(target_os = "linux")]
         {
             assert!(html.contains("scripts/alighieri.sh install --no-start"));
             assert!(html.contains("scripts/alighieri.sh install --binary ./alighieri --no-start"));
@@ -6103,6 +6364,46 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
                     .expect("source final command must have its own block");
             assert!(source_final < source_block_end && source_block_end < release_final);
             assert!(!html.contains("raw.githubusercontent.com"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(html.contains("macOS public TLS"));
+            assert!(html.contains("/opt/alighieri/bin/alighieri"));
+            assert!(html.contains("scripts/macos-daemon.sh"));
+            assert!(html.contains("macos-daemon.sh provision"));
+            assert!(html.contains("macos-daemon.sh install --binary ./target/release/alighieri"));
+            assert!(html.contains("macos-daemon.sh install --binary ./alighieri"));
+            assert!(html.contains("--no-start"));
+            assert!(html.contains("macos-daemon.sh start"));
+            assert!(html.contains("{ xattr -d com.apple.quarantine ./target/release/alighieri 2&gt;/dev/null || true; }"));
+            assert!(html
+                .contains("{ xattr -d com.apple.quarantine ./alighieri 2&gt;/dev/null || true; }"));
+            assert!(!html.contains("|| true &amp;&amp;"));
+            assert!(html.contains("/opt/alighieri/bin/alighieri user add"));
+            assert!(!html.contains("sudo alighieri user add"));
+            assert!(html.contains("launchctl print system/com.wiresock.alighieri"));
+            assert!(html.contains("launchctl kill SIGHUP"));
+            assert!(html.contains("/opt/alighieri/alighieri.conf"));
+            assert!(html.contains("/opt/alighieri/logs/alighieri.log"));
+            assert!(html.contains("cargo build --release --locked"));
+            assert!(html.contains("./target/release/alighieri"));
+            assert!(html.contains("./alighieri"));
+            assert!(!html.contains("/usr/local/libexec"));
+            assert!(!html.contains("/usr/local/etc/alighieri"));
+            assert!(!html.contains("dscl . -create"));
+            assert!(!html.contains("systemctl"));
+            assert!(!html.contains("journalctl"));
+            assert!(!html.contains("scripts/alighieri.sh"));
+            assert!(!html.contains("root:alighieri"));
+            assert!(!html.contains("Fresh Linux VPS"));
+            assert!(!html.contains("raw.githubusercontent.com"));
+            let install = html.find("macos-daemon.sh install").unwrap();
+            let user = html.find("/opt/alighieri/bin/alighieri user add").unwrap();
+            let start = html.find("macos-daemon.sh start").unwrap();
+            assert!(
+                install < user && user < start,
+                "user add must run after install --no-start and before start"
+            );
         }
         assert!(html.contains("Configure ProxiFyre 2.5+"));
         assert!(html.contains("ProxiFyre 2.5.0 or later"));
@@ -6197,6 +6498,8 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         fields.insert("initial_username".into(), "proxyuser;echo-owned".into());
         let injected_userlist = if cfg!(windows) {
             r"C:\ProgramData\Alighieri\users;echo-owned"
+        } else if cfg!(target_os = "macos") {
+            "/opt/alighieri/users;echo-owned"
         } else {
             "/etc/alighieri/users;echo-owned"
         };
@@ -6210,6 +6513,13 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
                 completion_context().powershell_command(),
                 powershell_single_quoted("proxyuser;echo-owned"),
                 powershell_single_quoted(injected_userlist)
+            ))
+        } else if cfg!(target_os = "macos") {
+            html_escape(&format!(
+                "sudo {} user add {} --userlist {}",
+                macos_service_binary(),
+                shell_quote_command_argument("proxyuser;echo-owned"),
+                shell_quote_command_argument(injected_userlist)
             ))
         } else {
             html_escape(&format!(
@@ -6255,13 +6565,22 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         let html = render_success(&report, &form, &completion_context());
         let absolute_output = std::path::absolute(&report.output_path).unwrap();
 
+        #[cfg(not(target_os = "macos"))]
         assert!(html.contains("--check --config"));
+        #[cfg(target_os = "macos")]
+        assert!(html.contains("--config"));
         assert!(html.contains(&html_escape(&absolute_output.display().to_string())));
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
             assert!(html.contains("chown root:alighieri -- --user-list"));
             assert!(html.contains("chmod 640 -- --user-list"));
             assert!(html.contains("install -m 640 -o root -g alighieri -- "));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(html.contains("chown root:_alighieri -- --user-list"));
+            assert!(html.contains("chmod 640 -- --user-list"));
+            assert!(html.contains("macos-daemon.sh install --binary"));
         }
     }
 
@@ -6291,7 +6610,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             assert!(html.contains("GetRandomFileName"));
             assert!(html.contains("finally"));
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
             assert!(html.contains("&quot;$validator&quot; --check --config &quot;$staged&quot;"));
             assert!(html.contains("./target/release/alighieri"));
@@ -6306,6 +6625,19 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             assert!(html.contains("trap cleanup"));
             assert!(html
                 .contains("scripts/alighieri.sh install --config /etc/alighieri/alighieri.conf"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(html.contains("./target/release/alighieri"));
+            assert!(html.contains("./alighieri"));
+            assert!(html
+                .contains("macos-daemon.sh install --binary ./target/release/alighieri --config"));
+            assert!(html.contains("macos-daemon.sh install --binary ./alighieri --config"));
+            assert!(html.contains("/opt/alighieri/bin/alighieri"));
+            assert!(!html.contains("doc/macos-launchdaemon.plist"));
+            assert!(!html.contains("&quot;$validator&quot; --check --config &quot;$staged&quot;"));
+            assert!(!html.contains("scripts/alighieri.sh"));
+            assert!(!html.contains("sudo alighieri"));
         }
     }
 
@@ -6329,6 +6661,14 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             "main/scripts/alighieri.sh",
         ]
         .concat();
+        assert!(
+            include_str!("../doc/alighieri.conf").contains("internal: 127.0.0.1 port = 1080"),
+            "doc/alighieri.conf listener drifted"
+        );
+        assert!(
+            include_str!("../README.md").contains("doc/alighieri.conf is 127.0.0.1:1080"),
+            "README must describe the example listener as 127.0.0.1:1080"
+        );
         for (name, contents) in [
             ("README", include_str!("../README.md")),
             ("ACME guide", include_str!("../doc/acme-tls-test.md")),

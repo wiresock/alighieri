@@ -117,6 +117,12 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             features: --features rdp
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            features: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -136,37 +142,45 @@ jobs:
             echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
           } >> "$GITHUB_ENV"
       - name: Build release binaries
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
 
       - name: Package (Linux)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: |
-          dir="alighieri-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$dir/scripts" "$dir/doc/templates"
-          install -m 755 "target/${{ matrix.target }}/release/alighieri" "$dir/alighieri"
-          install -m 755 \
-            "target/${{ matrix.target }}/release/alighieri-installer-fs" \
-            "$dir/alighieri-installer-fs"
-          install -m 755 scripts/alighieri.sh "$dir/scripts/alighieri.sh"
-          install -m 644 doc/alighieri.conf "$dir/doc/alighieri.conf"
-          install -m 644 doc/acme-tls-test.md "$dir/doc/acme-tls-test.md"
-          install -m 644 doc/management-cli.md "$dir/doc/management-cli.md"
-          install -m 644 \
-            doc/templates/public-tls-proxifyre.conf \
-            "$dir/doc/templates/public-tls-proxifyre.conf"
-          install -m 644 README.md LICENSE CHANGELOG.md "$dir/"
-          test -x "$dir/alighieri-installer-fs"
-          test -x "$dir/scripts/alighieri.sh"
-          test -f "$dir/doc/alighieri.conf"
-          tar czf "$dir.tar.gz" "$dir"
-          archive_contents="$(tar tzf "$dir.tar.gz")"
-          grep -Fqx "$dir/alighieri-installer-fs" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/acme-tls-test.md" <<< "$archive_contents"
-          grep -Fqx "$dir/doc/management-cli.md" <<< "$archive_contents"
-          grep -Fqx \
-            "$dir/doc/templates/public-tls-proxifyre.conf" \
-            <<< "$archive_contents"
-          echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+          test -x scripts/package-unix.sh
+          ASSET="$(
+            scripts/package-unix.sh \
+              --os linux \
+              --target "${{ matrix.target }}" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )" || exit 1
+          test -f "$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.14"
+        run: |
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/macos-daemon.sh
+          ALIGHIERI_SMOKE_BIN="target/${{ matrix.target }}/release/alighieri" \
+            scripts/macos-install-smoke.sh
+          ASSET="$(
+            scripts/package-unix.sh \
+              --os macos \
+              --target "${{ matrix.target }}" \
+              --version "${GITHUB_REF_NAME#v}" \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )" || exit 1
+          test -f "$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -182,7 +196,7 @@ jobs:
           Copy-Item doc/management-cli.md "$dir/doc/management-cli.md"
           Copy-Item doc/rdp-transport.md "$dir/doc/rdp-transport.md"
           Copy-Item doc/templates/public-tls-proxifyre.conf "$dir/doc/templates/public-tls-proxifyre.conf"
-          Copy-Item README.md, LICENSE, CHANGELOG.md $dir/
+          Copy-Item README.md, LICENSE, LICENSING.md, CHANGELOG.md $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $archiveCheckDir = Join-Path $env:RUNNER_TEMP "$dir-archive-check"
           Expand-Archive -LiteralPath "$dir.zip" -DestinationPath $archiveCheckDir
@@ -194,7 +208,8 @@ jobs:
             (Join-Path $archiveCheckDir "$dir/doc/acme-tls-test.md"),
             (Join-Path $archiveCheckDir "$dir/doc/management-cli.md"),
             (Join-Path $archiveCheckDir "$dir/doc/rdp-transport.md"),
-            (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf")
+            (Join-Path $archiveCheckDir "$dir/doc/templates/public-tls-proxifyre.conf"),
+            (Join-Path $archiveCheckDir "$dir/LICENSING.md")
           )
           foreach ($path in $expectedArchiveFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -231,6 +246,22 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Generate and verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd artifacts
+          mapfile -t archives < <(find . -maxdepth 1 -type f ! -name SHA256SUMS | sed 's|^\./||' | sort)
+          [[ ${#archives[@]} -gt 0 ]] || { echo "no release archives" >&2; exit 1; }
+          if printf '%s\n' "${archives[@]}" | sort | uniq -d | grep -q .; then
+            echo "duplicate archive names in the release payload" >&2
+            exit 1
+          fi
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq "${#archives[@]}"
+          while read -r _ name; do
+            grep -Fqx "$name" <<<"$(printf '%s\n' "${archives[@]}")"
+          done < SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
       - name: Create draft release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
