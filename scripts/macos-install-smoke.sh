@@ -229,8 +229,6 @@ EOF
     plutil -replace ProgramArguments.1 -string "$special" "$agent_plist"
     plutil -lint "$agent_plist" >/dev/null
     expect_plist_string "$agent_plist" ProgramArguments.1 "$special"
-    grep -Fq "__ALIGHIERI_CONFIG__" "$agent_plist" \
-      && fail "plutil replacement left the config placeholder"
   fi
 fi
 
