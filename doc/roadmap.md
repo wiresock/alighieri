@@ -52,7 +52,7 @@ wizard. See the [CHANGELOG](../CHANGELOG.md) for the full list.
 | Item | Value | Effort | Notes |
 | --- | --- | --- | --- |
 | ~~**ARM64 builds**~~ | — | — | **Shipped** — `aarch64` Linux and Windows ARM64 are in the release matrix, validated on every change by a CI cross-build job. |
-| ~~**macOS as first-class**~~ | — | — | **Shipped** (console) — macOS CI, Darwin release archives, a per-user LaunchAgent, and a dedicated-user LaunchDaemon example. Homebrew packaging and Apple notarization remain follow-ups. *BSD is still not CI-covered. |
+| ~~**macOS as first-class**~~ | — | — | **Shipped** (console) — macOS CI, Darwin release archives, a per-user LaunchAgent, and a dedicated `_alighieri` LaunchDaemon provisioned by `scripts/macos-daemon.sh`. Homebrew packaging and Apple notarization remain follow-ups. *BSD is still not CI-covered. |
 | ~~**Container image**~~ (+ Helm/compose) | — | — | **Shipped** (image) — official multi-arch distroless image on GHCR, built from source. Helm chart / compose examples remain a follow-up. |
 | **Native packages** | Med | M | `deb`/`rpm`, Homebrew, and `winget` for first-class install. |
 

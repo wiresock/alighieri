@@ -11,13 +11,21 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - macOS is a first-class console platform: CI runs the full test and Clippy
   matrix on Apple Silicon, Intel Darwin is cross-built, and release archives
   will ship `aarch64-apple-darwin` and `x86_64-apple-darwin` unsigned console
-  binaries with per-user LaunchAgent and dedicated-user LaunchDaemon examples.
-  Darwin binaries target macOS 10.14+. The public LaunchDaemon tree is
-  `/opt/alighieri` (outside Homebrew), provisioned by `scripts/macos-daemon.sh`.
-  The Linux systemd installer and Windows RDP helpers stay off those archives.
+  binaries with a per-user LaunchAgent template and a dedicated-user
+  LaunchDaemon provisioned by `scripts/macos-daemon.sh`. Intel Darwin
+  binaries target macOS 10.14+; Apple Silicon binaries require macOS 11.0+.
+  The public LaunchDaemon tree is `/opt/alighieri` (outside Homebrew). The
+  Linux systemd installer and Windows RDP helpers stay off those archives.
 - GitHub releases now attach a `SHA256SUMS` manifest covering every archive.
   Verify with `shasum -a 256 -c SHA256SUMS` before clearing Gatekeeper
   quarantine.
+
+### Changed
+
+- Unix rotating logfiles are created mode 0600, opened with `O_NOFOLLOW`,
+  and refused when the path is a symlink or a non-regular file (for example
+  a FIFO). Operators who previously pointed `logfile` at a symlink must
+  log to a regular file instead.
 
 ### Fixed
 

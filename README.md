@@ -1079,12 +1079,14 @@ net.core.wmem_max=8388608' | sudo tee /etc/sysctl.d/90-alighieri.conf
 
 macOS is a first-class **console** platform: the same SOCKS5, TLS, wizard, and
 SIGHUP reload path as Linux. There is no systemd installer and no RDP egress
-on Darwin. Darwin archives target **macOS 10.14 or later**. A loopback
-`internal:` such as `127.0.0.1:1080` needs no extra privilege. The public TLS
-profile binds `0.0.0.0:443`; on 10.14+ XNU exempts `INADDR_ANY` from the
-low-port restriction, so `_alighieri` can listen on 443 without root. Binding
-443 on a specific interface, or running on 10.12/10.13, still requires root
-or launchd socket activation (Alighieri does not consume launchd sockets).
+on Darwin. Intel (`x86_64-apple-darwin`) archives target **macOS 10.14 or later**.
+Apple Silicon (`aarch64-apple-darwin`) archives require **macOS 11.0 or
+later** — there is no Apple Silicon 10.14. A loopback `internal:` such as
+`127.0.0.1:1080` needs no extra privilege. The public TLS profile binds
+`0.0.0.0:443`; on 10.14+ XNU exempts `INADDR_ANY` from the low-port
+restriction, so `_alighieri` can listen on 443 without root. Binding 443 on a
+specific interface, or running on 10.12/10.13, still requires root or launchd
+socket activation (Alighieri does not consume launchd sockets).
 
 The default background install is a **per-user LaunchAgent**. It runs as your
 login user after you log in, listens on port 1080, and never executes a
@@ -1130,7 +1132,7 @@ printf '\nlogoutput: file\nlogfile: %s\nlogrotate.size: 10MiB\nlogrotate.keep: 5
 # expose the port, then:
 /opt/alighieri/bin/alighieri --check --config "$CONF"
 
-sed -e "s|/opt/alighieri/alighieri.conf|$CONF|" \
+sed -e "s|__ALIGHIERI_CONFIG__|$CONF|" \
     doc/macos-launchagent.plist > "$PLIST"
 plutil -lint "$PLIST"
 { launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true; }
@@ -1146,7 +1148,10 @@ launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"
 `KeepAlive` relaunches the job after SIGTERM while it remains loaded.
 Stop it with `launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"`.
 
-The example LaunchAgent is [`doc/macos-launchagent.plist`](doc/macos-launchagent.plist).
+The LaunchAgent template is [`doc/macos-launchagent.plist`](doc/macos-launchagent.plist);
+substitute `__ALIGHIERI_CONFIG__` with a config file the login user can read.
+Do not point it at `/opt/alighieri/alighieri.conf` after a LaunchDaemon
+install — that file is `root:_alighieri` mode 0640.
 The dedicated-user LaunchDaemon used by the public TLS wizard is
 [`doc/macos-launchdaemon.plist`](doc/macos-launchdaemon.plist).
 
@@ -1434,7 +1439,7 @@ version; verify against the version you would deploy.
 | --- | --- | --- |
 | Linux | first-class (CI + systemd manager) | yes |
 | Windows | native Service + Event Log | not supported |
-| macOS | first-class (CI + console + example LaunchAgent) | yes |
+| macOS | first-class (CI + console + LaunchAgent / LaunchDaemon) | yes |
 | *BSD / Solaris / AIX | not officially supported (no CI coverage) | broadly supported |
 | Language | Rust (memory-safe) | C |
 | Process model | async, single process (Tokio tasks) | multi-process (preforked) / threaded |

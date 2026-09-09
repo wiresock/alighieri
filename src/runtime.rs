@@ -1801,7 +1801,8 @@ fn open_rotating_log_file(path: &Path, _pin_path: bool) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK so an existing FIFO cannot hang the log worker on open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -1819,11 +1820,32 @@ fn open_rotating_log_file(path: &Path, _pin_path: bool) -> io::Result<File> {
             options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         }
     }
+    #[cfg(unix)]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.file_type().is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("logfile must be a regular file: {}", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     let file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = file.metadata()?.permissions();
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("logfile must be a regular file: {}", path.display()),
+            ));
+        }
+        let mut perms = metadata.permissions();
         perms.set_mode(0o600);
         file.set_permissions(perms)?;
     }
@@ -2938,6 +2960,24 @@ mod tests {
                 io::ErrorKind::NotFound,
                 "O_NOFOLLOW must refuse the symlink rather than creating a new file: {error}"
             ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotating_file_refuses_a_fifo_logfile() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alighieri.log");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        match RotatingFile::open(path, 10, 1) {
+            Ok(_) => panic!("logfile open must refuse a FIFO"),
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+                assert!(error.to_string().contains("regular file"), "{error}");
+            }
         }
     }
 

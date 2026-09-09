@@ -67,9 +67,12 @@ done
 
 expect_plist_string doc/macos-launchagent.plist Label com.wiresock.alighieri
 expect_plist_string doc/macos-launchagent.plist ProgramArguments.0 /opt/alighieri/bin/alighieri
+expect_plist_string doc/macos-launchagent.plist ProgramArguments.1 __ALIGHIERI_CONFIG__
 expect_plist_string doc/macos-launchagent.plist LimitLoadToSessionType Aqua
 expect_plist_missing doc/macos-launchagent.plist UserName
 expect_plist_missing doc/macos-launchagent.plist StandardOutPath
+grep -Fq "/opt/alighieri/alighieri.conf" doc/macos-launchagent.plist \
+  && fail "LaunchAgent template must not point at the daemon config"
 
 expect_plist_string doc/macos-launchdaemon.plist Label com.wiresock.alighieri
 expect_plist_string doc/macos-launchdaemon.plist UserName _alighieri

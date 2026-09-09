@@ -201,6 +201,16 @@ jobs:
           test -f "$ASSET"
           file "target/${{ matrix.target }}/release/alighieri"
           lipo -archs "target/${{ matrix.target }}/release/alighieri" | grep -Fq x86_64
+          minos="$(vtool -show-build "target/${{ matrix.target }}/release/alighieri" | awk '/minos/ { print $2; exit }')"
+          [[ -n "$minos" ]] || { echo "vtool did not report a minos" >&2; exit 1; }
+          awk -v minos="$minos" 'BEGIN {
+            n = split(minos, p, ".")
+            major = p[1] + 0
+            minor = (n >= 2 ? p[2] : 0) + 0
+            if (major > 10 || (major == 10 && minor > 14)) {
+              exit 1
+            }
+          }' || { echo "x86_64 Darwin minos $minos is newer than the documented 10.14 floor" >&2; exit 1; }
       - name: Assert cross-compiled Windows RDP helpers
         if: runner.os == 'Windows'
         shell: pwsh
@@ -318,6 +328,7 @@ jobs:
             doc/rdp-transport.md
             scripts/alighieri.sh
             scripts/install-linux.sh
+            scripts/macos-daemon.sh
             doc/macos-launchagent.plist
             doc/macos-launchdaemon.plist
           )

@@ -1107,8 +1107,9 @@ where
 /// boundary, which is why the facade is mandatory rather than a raw socket.
 #[cfg(feature = "plugins")]
 pub struct ClientDatagrams {
-    /// The bound relay socket the client sends its datagrams to (already
-    /// advertised to the client as BND.ADDR/PORT — never rebound).
+    /// The bound client-facing UDP relay socket. This is the physical bind;
+    /// [`crate::plugin::AssociateCtx::relay_addr`] is the SOCKS BND address
+    /// already sent to the client and can differ when `udp.advertise` is set.
     socket: Arc<UdpSocket>,
     /// The association's client IP; a datagram from any other source is dropped.
     client_ip: IpAddr,
