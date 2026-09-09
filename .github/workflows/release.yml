@@ -149,7 +149,7 @@ jobs:
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          chmod +x scripts/package-unix.sh
+          test -x scripts/package-unix.sh
           ASSET="$(
             scripts/package-unix.sh \
               --os linux \
@@ -166,7 +166,9 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "10.14"
         run: |
-          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh scripts/macos-daemon.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/macos-daemon.sh
           ALIGHIERI_SMOKE_BIN="target/${{ matrix.target }}/release/alighieri" \
             scripts/macos-install-smoke.sh
           ASSET="$(

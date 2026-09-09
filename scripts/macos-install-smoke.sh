@@ -82,7 +82,42 @@ expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.0 /opt/alighie
 expect_plist_string doc/macos-launchdaemon.plist ProgramArguments.1 /opt/alighieri/alighieri.conf
 expect_plist_missing doc/macos-launchdaemon.plist StandardOutPath
 
-[[ -x scripts/macos-daemon.sh ]] || chmod +x scripts/macos-daemon.sh
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  [[ "$(git ls-files -s scripts/macos-daemon.sh | awk '{print $1}')" == "100755" ]] \
+    || fail "scripts/macos-daemon.sh must be committed as mode 100755"
+fi
+[[ -x scripts/macos-daemon.sh ]] \
+  || fail "scripts/macos-daemon.sh is not executable; do not chmod in tests, fix the git file mode"
+
+# SHA256SUMS lists every platform. Operators download one archive; check that
+# entry only. A full `sha256sum -c SHA256SUMS` fails when the other archives
+# are absent.
+checksum_tool() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  else
+    shasum -a 256 "$@"
+  fi
+}
+sums_dir="$(mktemp -d "${PWD}/target/alighieri-checksum.XXXXXX")"
+printf 'keep\n' >"$sums_dir/keep-me.tar.gz"
+printf 'other\n' >"$sums_dir/other.tar.gz"
+(
+  cd "$sums_dir"
+  checksum_tool keep-me.tar.gz other.tar.gz >SHA256SUMS
+)
+rm -f "$sums_dir/other.tar.gz"
+(
+  cd "$sums_dir"
+  grep -F keep-me.tar.gz SHA256SUMS | checksum_tool -c -
+) >/dev/null || fail "single-archive SHA256SUMS check failed"
+if (
+  cd "$sums_dir"
+  checksum_tool -c SHA256SUMS
+) >/dev/null 2>&1; then
+  fail "full SHA256SUMS check must fail when other archives are missing"
+fi
+rm -rf "$sums_dir"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   root="${PWD}/target/alighieri-macos-smoke"
@@ -186,6 +221,17 @@ EOF
   # Independent assertion failures: each required key/path is checked above.
   grep -Fq "/usr/local" "$staged_plist" && fail "staged plist still mentions /usr/local"
   grep -Fq "/opt/homebrew" "$staged_plist" && fail "staged plist mentions Homebrew"
+
+  if command -v plutil >/dev/null 2>&1; then
+    agent_plist="$root/agent.plist"
+    cp doc/macos-launchagent.plist "$agent_plist"
+    special="/Volumes/Work & Personal/alighieri.conf"
+    plutil -replace ProgramArguments.1 -string "$special" "$agent_plist"
+    plutil -lint "$agent_plist" >/dev/null
+    expect_plist_string "$agent_plist" ProgramArguments.1 "$special"
+    grep -Fq "__ALIGHIERI_CONFIG__" "$agent_plist" \
+      && fail "plutil replacement left the config placeholder"
+  fi
 fi
 
 echo "macos-install-smoke: ok"

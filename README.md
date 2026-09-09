@@ -1106,8 +1106,11 @@ BIN="./target/release/alighieri"
 # Gatekeeper: unsigned release archives may carry com.apple.quarantine.
 # Clear it on the source binary *before* copying or launching. Removing the
 # attribute bypasses provenance checks. For a GitHub release, first verify
-# the downloaded archive against the published SHA256SUMS in the same
-# directory: `shasum -a 256 -c SHA256SUMS`. Apple documents that
+# the downloaded archive against its entry in the published SHA256SUMS
+# (the manifest lists every platform; checking the whole file reports
+# missing archives you did not download):
+#   grep -F "$(basename "$ARCHIVE")" SHA256SUMS | shasum -a 256 -c -
+# Apple documents that
 # non-Developer-ID, non-notarized software cannot be verified the same way
 # as trusted software: https://support.apple.com/en-us/102445
 { xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true; }
@@ -1132,8 +1135,8 @@ printf '\nlogoutput: file\nlogfile: %s\nlogrotate.size: 10MiB\nlogrotate.keep: 5
 # expose the port, then:
 /opt/alighieri/bin/alighieri --check --config "$CONF"
 
-sed -e "s|__ALIGHIERI_CONFIG__|$CONF|" \
-    doc/macos-launchagent.plist > "$PLIST"
+cp doc/macos-launchagent.plist "$PLIST"
+plutil -replace ProgramArguments.1 -string "$CONF" "$PLIST"
 plutil -lint "$PLIST"
 { launchctl bootout "gui/$(id -u)/com.wiresock.alighieri" 2>/dev/null || true; }
 launchctl bootstrap "gui/$(id -u)" "$PLIST"

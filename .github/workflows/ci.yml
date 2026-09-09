@@ -91,12 +91,14 @@ jobs:
       - name: macOS launchd example smoke
         if: runner.os == 'macOS'
         run: |
-          chmod +x scripts/macos-install-smoke.sh scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-daemon.sh
           scripts/macos-install-smoke.sh
       - name: Package Unix archive layout
         if: runner.os != 'Windows'
         run: |
-          chmod +x scripts/package-unix.sh
+          test -x scripts/package-unix.sh
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             ASSET="$(
               scripts/package-unix.sh \
@@ -137,6 +139,7 @@ jobs:
             mkdir -p "$extract"
             tar -xzf "$ASSET" -C "$extract"
             "$extract/alighieri-vtest-aarch64-apple-darwin/alighieri" --version
+            test -x "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
           fi
       - name: Doctests
         run: cargo test --doc --locked
@@ -189,7 +192,7 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
           test -x "target/${{ matrix.target }}/release/alighieri"
-          chmod +x scripts/package-unix.sh
+          test -x scripts/package-unix.sh
           ASSET="$(
             scripts/package-unix.sh \
               --os macos \
@@ -248,10 +251,10 @@ jobs:
         run: |
           test -x scripts/alighieri.sh
           test -x scripts/install-linux.sh
-          chmod +x scripts/package-unix.sh scripts/macos-install-smoke.sh scripts/macos-daemon.sh
           test -x scripts/package-unix.sh
           test -x scripts/macos-install-smoke.sh
           test -x scripts/macos-daemon.sh
+          test "$(git ls-files -s scripts/macos-daemon.sh | awk '{print $1}')" = 100755
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
       - name: Run installer self-tests

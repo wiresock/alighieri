@@ -28,6 +28,7 @@ use_system_tools() {
   LAUNCHCTL_BIN=/usr/bin/launchctl
   STAT_BIN=/usr/bin/stat
   XATTR_BIN=/usr/bin/xattr
+  MV_BIN=/bin/mv
 }
 
 use_system_tools
@@ -44,6 +45,7 @@ fail() {
 
 dscl_cmd() { "$DSCL_BIN" "$@"; }
 id_cmd() { "$ID_BIN" "$@"; }
+mv_cmd() { "$MV_BIN" "$@"; }
 
 is_root() { [[ "$(id_cmd -u)" == "0" ]]; }
 
@@ -273,20 +275,28 @@ read_prop() {
   '
 }
 
-ids_in_use() {
-  {
-    dscl_cmd . -list /Users UniqueID 2>/dev/null | awk '{print $2}'
-    dscl_cmd . -list /Groups PrimaryGroupID 2>/dev/null | awk '{print $2}'
-  } | tr -d '\r' | awk 'NF && $1 ~ /^[0-9]+$/'
+# Directory Service inventory. A failed user-list or group-list is an error,
+# not an empty snapshot: swallowing either side would let allocate_id reuse a
+# live UniqueID. Two concurrent root provisioners can still race after this
+# snapshot; serialize that at the operator level.
+list_numeric_ids() {
+  local kind="$1" key="$2" out=""
+  out="$(dscl_cmd . -list "$kind" "$key")" || return 1
+  printf '%s\n' "$out" | tr -d '\r' | awk 'NF >= 2 && $NF ~ /^[0-9]+$/ { print $NF }'
 }
 
-# Snapshot of used UniqueID/PrimaryGroupID values. Two concurrent root
-# provisioners can still pick the same candidate; serialize at the operator
-# level rather than introducing a lock for that narrow privileged race.
+count_id_holders() {
+  local kind="$1" key="$2" id="$3" out=""
+  out="$(dscl_cmd . -list "$kind" "$key")" || return 1
+  printf '%s\n' "$out" | tr -d '\r' | awk -v id="$id" 'NF >= 2 && $NF == id { c++ } END { print c+0 }'
+}
+
 allocate_id() {
-  local used
-  used="$(ids_in_use | sort -n | uniq)"
-  local candidate="$UID_MIN"
+  local users groups used candidate
+  users="$(list_numeric_ids /Users UniqueID)" || return 1
+  groups="$(list_numeric_ids /Groups PrimaryGroupID)" || return 1
+  used="$(printf '%s\n' "$users" "$groups" | awk 'NF' | sort -n | uniq)"
+  candidate="$UID_MIN"
   while [[ "$candidate" -le "$UID_MAX" ]]; do
     if ! printf '%s\n' "$used" | grep -Fxq "$candidate"; then
       echo "$candidate"
@@ -295,6 +305,28 @@ allocate_id() {
     candidate=$((candidate + 1))
   done
   return 1
+}
+
+assert_numeric_identity_unique() {
+  local uid="$1" gid="$2" nusers ngroups
+  nusers="$(count_id_holders /Users UniqueID "$uid")" \
+    || fail "failed to enumerate user UniqueIDs"
+  ngroups="$(count_id_holders /Groups PrimaryGroupID "$gid")" \
+    || fail "failed to enumerate group PrimaryGroupIDs"
+  [[ "$nusers" == "1" ]] || fail "UniqueID ${uid} is shared by ${nusers} users; refuse to reuse ${ACCOUNT}"
+  [[ "$ngroups" == "1" ]] || fail "PrimaryGroupID ${gid} is shared by ${ngroups} groups; refuse to reuse ${ACCOUNT}"
+}
+
+# Dedicated daemon group: empty GroupMembership, or only this account.
+assert_group_membership_locked() {
+  local members tok
+  members="$(read_prop "/Groups/${ACCOUNT}" GroupMembership || true)"
+  while IFS= read -r tok; do
+    [[ -n "$tok" ]] || continue
+    if [[ "$tok" != "$ACCOUNT" && "$tok" != "${ACCOUNT#_}" ]]; then
+      fail "unexpected GroupMembership '${tok}' on ${ACCOUNT}"
+    fi
+  done <<<"$members"
 }
 
 id_in_service_range() {
@@ -342,6 +374,8 @@ require_daemon_identity() {
   gid="$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID)"
   user_matches "$uid" "$gid" || fail "existing ${ACCOUNT} user does not match the expected daemon identity"
   group_matches "$gid" || fail "existing ${ACCOUNT} group does not match the expected daemon identity"
+  assert_numeric_identity_unique "$uid" "$gid"
+  assert_group_membership_locked
 }
 
 lock_service_account() {
@@ -359,15 +393,13 @@ provision() {
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     rollback() {
+      # Delete records this invocation created, even if UniqueID/GID assignment
+      # never succeeded. created_* is set only after -create of that record.
       if (( created_user )); then
-        if [[ -n "${id:-}" && "$(read_prop "/Users/${ACCOUNT}" UniqueID || true)" == "$id" ]]; then
-          dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
-        fi
+        dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
       fi
       if (( created_group )); then
-        if [[ -n "${id:-}" && "$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID || true)" == "$id" ]]; then
-          dscl_cmd . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
-        fi
+        dscl_cmd . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
       fi
     }
     trap rollback EXIT
@@ -377,6 +409,8 @@ provision() {
       gid="$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID)"
       user_matches "$uid" "$gid" || fail "existing ${ACCOUNT} user does not match the expected daemon identity"
       group_matches "$gid" || fail "existing ${ACCOUNT} group does not match the expected daemon identity"
+      assert_numeric_identity_unique "$uid" "$gid"
+      assert_group_membership_locked
       trap - EXIT
       exit 0
     fi
@@ -384,7 +418,11 @@ provision() {
       fail "partial ${ACCOUNT} identity exists; resolve it before provisioning"
     fi
 
-    id="$(allocate_id)" || fail "no unused system UID/GID in ${UID_MIN}-${UID_MAX}"
+    id=""
+    if ! id="$(allocate_id)"; then
+      fail "no unused system UID/GID in ${UID_MIN}-${UID_MAX}, or Directory Service enumeration failed"
+    fi
+    [[ -n "$id" ]] || fail "allocator returned an empty id"
     dscl_cmd . -create "/Groups/${ACCOUNT}"
     created_group=1
     dscl_cmd . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$id"
@@ -397,6 +435,8 @@ provision() {
     lock_service_account
     user_matches "$id" "$id" || fail "provisioned ${ACCOUNT} user failed verification"
     group_matches "$id" || fail "provisioned ${ACCOUNT} group failed verification"
+    assert_numeric_identity_unique "$id" "$id"
+    assert_group_membership_locked
     trap - EXIT
   )
 }
@@ -476,14 +516,30 @@ install_tree() {
   assert_existing_exec_dir "$root/bin"
   apply_install_ownership root:wheel "$root" "$root/bin"
 
+  # Run the commit in a subshell that is *not* the left-hand side of `||`.
+  # `cmd || return` disables `set -e` inside cmd, so an unguarded `mv`
+  # could fail and still reach start_daemon.
+  local commit_status=0
+  set +e
   (
+    set -euo pipefail
     staged_bin=""
     staged_conf=""
     staged_plist=""
+    backup_bin=""
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     cleanup_staged() {
       rm -f -- ${staged_bin:+"$staged_bin"} ${staged_conf:+"$staged_conf"} ${staged_plist:+"$staged_plist"}
+      if [[ -n "${backup_bin:-}" && -f "$backup_bin" ]]; then
+        if [[ ! -e "$root/bin/alighieri" ]]; then
+          # Use /bin/mv, not mv_cmd: a test double that injects live-path
+          # failures must not block restoring the backup.
+          /bin/mv -f -- "$backup_bin" "$root/bin/alighieri" || true
+        else
+          rm -f -- "$backup_bin"
+        fi
+      fi
     }
     trap cleanup_staged EXIT
 
@@ -515,10 +571,25 @@ install_tree() {
       fail "configuration check failed for $staged_bin"
     fi
 
-    mv -f -- "$staged_bin" "$root/bin/alighieri"
+    if [[ -f "$root/bin/alighieri" ]]; then
+      backup_bin="$(mktemp "${root}/bin/alighieri.bak.XXXXXX")"
+      mv_cmd -f -- "$root/bin/alighieri" "$backup_bin" \
+        || fail "failed to backup the live binary"
+    fi
+    if ! mv_cmd -f -- "$staged_bin" "$root/bin/alighieri"; then
+      fail "failed to replace the live binary"
+    fi
     staged_bin=""
-    mv -f -- "$staged_conf" "$root/alighieri.conf"
+    if ! mv_cmd -f -- "$staged_conf" "$root/alighieri.conf"; then
+      if [[ -n "$backup_bin" ]]; then
+        /bin/mv -f -- "$backup_bin" "$root/bin/alighieri" || true
+        backup_bin=""
+      fi
+      fail "failed to replace the live configuration"
+    fi
     staged_conf=""
+    rm -f -- ${backup_bin:+"$backup_bin"}
+    backup_bin=""
     chmod_nofollow 0640 "$root/alighieri.conf"
     apply_install_ownership "root:${ACCOUNT}" "$root/alighieri.conf"
 
@@ -528,12 +599,17 @@ install_tree() {
     fi
     staged_plist="$(mktemp "${root}/plist.XXXXXX")"
     write_plist "$root" "$staged_plist"
-    mv -f -- "$staged_plist" "$plist_dest"
+    if ! mv_cmd -f -- "$staged_plist" "$plist_dest"; then
+      fail "failed to replace the launchd plist"
+    fi
     staged_plist=""
     apply_install_ownership root:wheel "$plist_dest"
     chmod_nofollow 0644 "$plist_dest"
     trap - EXIT
-  ) || return 1
+  )
+  commit_status=$?
+  set -e
+  [[ "$commit_status" -eq 0 ]] || return 1
 
   if [[ "$start" == "1" ]]; then
     start_daemon
@@ -578,6 +654,14 @@ list_records() {
 case "$op" in
   -create)
     rec="$1"; shift
+    if [ -n "${ALIGHIERI_DSCL_FAIL_CREATE:-}" ]; then
+      if [ $# -eq 0 ] && [ "$ALIGHIERI_DSCL_FAIL_CREATE" = "$rec" ]; then
+        exit 1
+      fi
+      if [ $# -ge 1 ] && [ "$ALIGHIERI_DSCL_FAIL_CREATE" = "$rec $1" ]; then
+        exit 1
+      fi
+    fi
     mkdir -p "$db$rec"
     if [ $# -ge 2 ]; then
       printf '%s\n' "$2" >"$db$rec/$1"
@@ -592,6 +676,9 @@ case "$op" in
     fi
     ;;
   -list)
+    if [ -n "${ALIGHIERI_DSCL_FAIL_LIST:-}" ] && [ "$ALIGHIERI_DSCL_FAIL_LIST" = "$1" ]; then
+      exit 1
+    fi
     list_records "$1" "$2"
     ;;
   -delete)
@@ -917,6 +1004,70 @@ EOF
   fi
   reset_valid_identity
 
+  # Directory Service inventory failure must not allocate a default UID.
+  ALIGHIERI_DSCL_FAIL_LIST=/Users
+  export ALIGHIERI_DSCL_FAIL_LIST
+  expect_provision_failure "user UniqueID inventory failure must fail closed"
+  unset ALIGHIERI_DSCL_FAIL_LIST
+  ALIGHIERI_DSCL_FAIL_LIST=/Groups
+  export ALIGHIERI_DSCL_FAIL_LIST
+  expect_provision_failure "group PrimaryGroupID inventory failure must fail closed"
+  unset ALIGHIERI_DSCL_FAIL_LIST
+
+  rm -rf "$db/Users/_alighieri" "$db/Groups/_alighieri"
+  ALIGHIERI_DSCL_FAIL_LIST=/Users
+  export ALIGHIERI_DSCL_FAIL_LIST
+  expect_provision_failure "allocator must not create an account after a failed user list"
+  [[ ! -d "$db/Users/_alighieri" ]] || fail "failed user inventory must not create a user"
+  [[ ! -d "$db/Groups/_alighieri" ]] || fail "failed user inventory must not create a group"
+  unset ALIGHIERI_DSCL_FAIL_LIST
+  reset_valid_identity
+
+  # Existing identity with a colliding UniqueID/GID must be refused.
+  mkdir -p "$db/Users/_collider"
+  printf '%s\n' 261 >"$db/Users/_collider/UniqueID"
+  expect_provision_failure "duplicate UniqueID on an existing identity must be rejected"
+  expect_install_failure "duplicate UniqueID must not install"
+  [[ ! -e "$root/bin/alighieri" ]] || fail "duplicate UniqueID must not write the binary"
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( start_daemon ); then
+    fail "duplicate UniqueID must not start"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "duplicate UniqueID must not bootstrap"
+  fi
+  rm -rf "$db/Users/_collider"
+
+  mkdir -p "$db/Groups/_collider"
+  printf '%s\n' 261 >"$db/Groups/_collider/PrimaryGroupID"
+  expect_provision_failure "duplicate PrimaryGroupID on an existing identity must be rejected"
+  expect_install_failure "duplicate PrimaryGroupID must not install"
+  rm -rf "$db/Groups/_collider"
+
+  printf '%s\n' "_www" >"$db/Groups/_alighieri/GroupMembership"
+  expect_provision_failure "unexpected GroupMembership must be rejected"
+  expect_install_failure "unexpected GroupMembership must not install"
+  rm -f "$db/Groups/_alighieri/GroupMembership"
+  reset_valid_identity
+
+  # Rollback must delete records created by this invocation even when the
+  # numeric ID was never assigned.
+  rm -rf "$db/Users/_alighieri" "$db/Groups/_alighieri"
+  ALIGHIERI_DSCL_FAIL_CREATE="/Groups/_alighieri PrimaryGroupID"
+  export ALIGHIERI_DSCL_FAIL_CREATE
+  expect_provision_failure "GID assignment failure must fail"
+  [[ ! -d "$db/Groups/_alighieri" ]] || fail "GID assignment failure must roll back the group"
+  [[ ! -d "$db/Users/_alighieri" ]] || fail "GID assignment failure must not leave a user"
+  unset ALIGHIERI_DSCL_FAIL_CREATE
+
+  ALIGHIERI_DSCL_FAIL_CREATE="/Users/_alighieri UniqueID"
+  export ALIGHIERI_DSCL_FAIL_CREATE
+  expect_provision_failure "UniqueID assignment failure must fail"
+  [[ ! -d "$db/Users/_alighieri" ]] || fail "UniqueID assignment failure must roll back the user"
+  [[ ! -d "$db/Groups/_alighieri" ]] || fail "UniqueID assignment failure must roll back the group"
+  unset ALIGHIERI_DSCL_FAIL_CREATE
+  reset_valid_identity
+
   # Homebrew-style writable ancestor must be refused.
   local brew="$tmp/usr/local"
   mkdir -p "$brew"
@@ -1084,6 +1235,73 @@ EOF
   [[ "$(cksum <"$root/${PLIST_LABEL}.plist")" == "$live_plist_hash" ]] \
     || fail "quarantine failure must leave the live plist unchanged"
   XATTR_BIN=/usr/bin/xattr
+
+  cat >"$tmp/mv.sh" <<'EOF'
+#!/bin/sh
+set -eu
+fail_dest="${ALIGHIERI_MV_FAIL:-}"
+last=""
+for last do
+  :
+done
+if [ -n "$fail_dest" ] && [ "$last" = "$fail_dest" ]; then
+  echo "INJECTED mv failure: $last" >&2
+  exit 1
+fi
+exec /bin/mv "$@"
+EOF
+  chmod +x "$tmp/mv.sh"
+
+  expect_retained_live_tree() {
+    local msg="$1"
+    [[ "$(cksum <"$root/bin/alighieri")" == "$live_bin_hash" ]] \
+      || fail "$msg: live binary changed"
+    [[ "$(cksum <"$root/alighieri.conf")" == "$live_conf_hash" ]] \
+      || fail "$msg: live config changed"
+    [[ "$(cksum <"$root/${PLIST_LABEL}.plist")" == "$live_plist_hash" ]] \
+      || fail "$msg: live plist changed"
+    grep -Fq 'exit 0' "$root/bin/alighieri" \
+      || fail "$msg: live binary is not the previously installed script"
+  }
+
+  MV_BIN="$tmp/mv.sh"
+  ALIGHIERI_MV_FAIL="$root/bin/alighieri"
+  export ALIGHIERI_MV_FAIL
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
+    fail "failed live-binary rename must fail the install"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed live-binary rename must not bootstrap"
+  fi
+  expect_retained_live_tree "failed live-binary rename"
+
+  ALIGHIERI_MV_FAIL="$root/alighieri.conf"
+  export ALIGHIERI_MV_FAIL
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
+    fail "failed live-config rename must fail the install"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed live-config rename must not bootstrap"
+  fi
+  expect_retained_live_tree "failed live-config rename"
+
+  ALIGHIERI_MV_FAIL="$root/${PLIST_LABEL}.plist"
+  export ALIGHIERI_MV_FAIL
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
+    fail "failed plist rename must fail the install"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed plist rename must not bootstrap"
+  fi
+  # Binary+config already passed --check and were committed; plist remains the
+  # previous live file and launchd must not start.
+  [[ "$(cksum <"$root/${PLIST_LABEL}.plist")" == "$live_plist_hash" ]] \
+    || fail "failed plist rename must leave the live plist unchanged"
+  unset ALIGHIERI_MV_FAIL
+  MV_BIN=/bin/mv
 
   # start_daemon ignores a failed bootout and then bootstraps.
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
