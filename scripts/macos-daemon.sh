@@ -18,11 +18,19 @@ PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
 UID_MIN=261
 UID_MAX=400
 SCRIPT_PATH="${BASH_SOURCE[0]}"
+INSTALL_LOCK_DIR="/var/run/alighieri-macos-install.lock"
+# Older name kept as a fallback for in-process selftest assignments.
 PROVISION_LOCK_DIR="/var/run/alighieri-macos-provision.lock"
+INSTALL_LOCK_RETRIES=100
 PROVISION_LOCK_RETRIES=100
+INSTALL_LOCK_SLEEP=0.05
 PROVISION_LOCK_SLEEP=0.05
-# In-process selftest hook; production verbs clear this.
+INSTALL_LOCK_DEPTH=0
+# In-process selftest hooks; production verbs clear these.
 INSTALL_FAIL_AFTER=""
+INSTALL_PAUSE_DIR=""
+INSTALL_PAUSE_POINT=""
+INCOMPLETE_RECOVERY_MARKER=""
 
 # Privileged verbs always start from these paths. __selftest may reassign the
 # variables in-process; production commands call use_system_tools first.
@@ -36,6 +44,8 @@ use_system_tools() {
   MV_BIN=/bin/mv
   RESTORE_BIN=/bin/mv
   INSTALL_FAIL_AFTER=""
+  INSTALL_PAUSE_DIR=""
+  INSTALL_PAUSE_POINT=""
 }
 
 use_system_tools
@@ -550,21 +560,63 @@ lock_service_account() {
   dscl_cmd . -delete "/Users/${ACCOUNT}" PasswordPolicyOptions >/dev/null 2>&1 || true
 }
 
-acquire_provision_lock() {
-  local dir="$PROVISION_LOCK_DIR"
-  local n=0 max="${PROVISION_LOCK_RETRIES:-100}"
-  [[ -n "$dir" ]] || fail "provision lock directory is unset"
+install_lock_dir() {
+  printf '%s\n' "${INSTALL_LOCK_DIR:-$PROVISION_LOCK_DIR}"
+}
+
+# Shared lock for provision, install, and start. Nested callers in the same
+# process (install -> provision) increment depth instead of mkdir again.
+acquire_install_lock() {
+  local dir n=0 max
+  dir="$(install_lock_dir)"
+  max="${INSTALL_LOCK_RETRIES:-${PROVISION_LOCK_RETRIES:-100}}"
+  [[ -n "$dir" ]] || fail "install lock directory is unset"
+  if (( INSTALL_LOCK_DEPTH > 0 )); then
+    INSTALL_LOCK_DEPTH=$((INSTALL_LOCK_DEPTH + 1))
+    return 0
+  fi
   while ! mkdir "$dir" 2>/dev/null; do
     n=$((n + 1))
     if (( n >= max )); then
-      fail "another Alighieri provision is in progress (${dir})"
+      fail "another Alighieri install is in progress (${dir})"
     fi
-    sleep "${PROVISION_LOCK_SLEEP:-0.05}"
+    sleep "${INSTALL_LOCK_SLEEP:-${PROVISION_LOCK_SLEEP:-0.05}}"
   done
+  INSTALL_LOCK_DEPTH=1
 }
 
-release_provision_lock() {
-  rmdir "${PROVISION_LOCK_DIR}" 2>/dev/null || true
+release_install_lock() {
+  (( INSTALL_LOCK_DEPTH > 0 )) || return 0
+  INSTALL_LOCK_DEPTH=$((INSTALL_LOCK_DEPTH - 1))
+  if (( INSTALL_LOCK_DEPTH == 0 )); then
+    rmdir "$(install_lock_dir)" 2>/dev/null || true
+  fi
+}
+
+acquire_provision_lock() { acquire_install_lock; }
+release_provision_lock() { release_install_lock; }
+
+maybe_pause_install() {
+  local point="$1"
+  if [[ -n "${INSTALL_PAUSE_DIR:-}" && "${INSTALL_PAUSE_POINT:-}" == "$point" ]]; then
+    printf 'paused\n' >"${INSTALL_PAUSE_DIR}/ready"
+    while [[ ! -f "${INSTALL_PAUSE_DIR}/go" ]]; do
+      sleep 0.05
+    done
+  fi
+}
+
+assert_no_incomplete_recovery() {
+  local m
+  for m in \
+    ${INCOMPLETE_RECOVERY_MARKER:+"$INCOMPLETE_RECOVERY_MARKER"} \
+    "${root:-$DEFAULT_ROOT}/.alighieri-incomplete-recovery"
+  do
+    [[ -n "$m" ]] || continue
+    if [[ -f "$m" ]]; then
+      fail "incomplete install recovery at ${m}; refusing to start"
+    fi
+  done
 }
 
 # dscl -create is not exclusive. Only claim deletion ownership when the
@@ -723,15 +775,22 @@ install_tree() {
   [[ -f "$binary" && ! -L "$binary" ]] || fail "binary is not a regular file: $binary"
   [[ -f "$config" && ! -L "$config" ]] || fail "config is not a regular file: $config"
   validate_daemon_root "$root"
-  # Root installs always provision/validate. A non-root staging install (CI
-  # smoke) cannot talk to Directory Service; if an identity already exists it
-  # is still validated so a leftover mismatched account cannot be used.
-  if is_root; then
-    provision
-    require_daemon_identity
-  elif record_exists "/Users/${ACCOUNT}" || record_exists "/Groups/${ACCOUNT}"; then
-    require_daemon_identity
-  fi
+  INCOMPLETE_RECOVERY_MARKER="${root}/.alighieri-incomplete-recovery"
+  local tx_status=0
+  set +e
+  (
+    set -euo pipefail
+    acquire_install_lock
+    trap release_install_lock EXIT
+    # Root installs always provision/validate. A non-root staging install (CI
+    # smoke) cannot talk to Directory Service; if an identity already exists it
+    # is still validated so a leftover mismatched account cannot be used.
+    if is_root; then
+      provision
+      require_daemon_identity
+    elif record_exists "/Users/${ACCOUNT}" || record_exists "/Groups/${ACCOUNT}"; then
+      require_daemon_identity
+    fi
   refuse_symlink "$root"
   refuse_symlink "$root/bin"
   refuse_symlink "$root/acme"
@@ -754,7 +813,7 @@ install_tree() {
   # Run the commit in a subshell that is *not* the left-hand side of `||`.
   # `cmd || return` disables `set -e` inside cmd, so an unguarded `mv`
   # could fail and still reach start_daemon.
-  local commit_status=0
+  commit_status=0
   set +e
   (
     set -euo pipefail
@@ -773,12 +832,13 @@ install_tree() {
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     restore_previous_generation() {
-      local failed=0
+      local failed=0 bin_ok=1 conf_ok=1
       if [[ -n "${backup_bin:-}" && -f "$backup_bin" ]]; then
         if restore_cmd -f -- "$backup_bin" "$root/bin/alighieri"; then
           backup_bin=""
         else
           failed=1
+          bin_ok=0
         fi
       fi
       if [[ -n "${backup_conf:-}" && -f "$backup_conf" ]]; then
@@ -786,12 +846,29 @@ install_tree() {
           backup_conf=""
         else
           failed=1
+          conf_ok=0
         fi
       fi
+      # Restore an auto-start plist only when the executable/config pair is
+      # coherent. Otherwise keep the previous plist outside launchd's
+      # discovery path and remove any published dest plist.
       if [[ -n "${backup_plist:-}" && -f "$backup_plist" ]]; then
-        if restore_cmd -f -- "$backup_plist" "$plist_dest"; then
-          backup_plist=""
+        if (( bin_ok && conf_ok )); then
+          if restore_cmd -f -- "$backup_plist" "$plist_dest"; then
+            backup_plist=""
+          else
+            failed=1
+          fi
         else
+          if [[ -f "$plist_dest" && "$plist_dest" != "$backup_plist" ]]; then
+            rm -f -- "$plist_dest"
+          fi
+          {
+            echo "incomplete"
+            echo "binary_backup=${backup_bin:-}"
+            echo "config_backup=${backup_conf:-}"
+            echo "plist_backup=${backup_plist}"
+          } >"${INCOMPLETE_RECOVERY_MARKER}"
           failed=1
         fi
       fi
@@ -805,6 +882,7 @@ install_tree() {
       echo "macos-daemon: live binary=$root/bin/alighieri backup=${backup_bin:-<none>}" >&2
       echo "macos-daemon: live config=$root/alighieri.conf backup=${backup_conf:-<none>}" >&2
       echo "macos-daemon: live plist=$plist_dest backup=${backup_plist:-<none>}" >&2
+      echo "macos-daemon: auto-start plist withheld; marker=${INCOMPLETE_RECOVERY_MARKER:-<none>}" >&2
     }
 
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
@@ -890,6 +968,7 @@ install_tree() {
     fi
     staged_bin=""
     inject_install_fault after-binary
+    maybe_pause_install after-binary
 
     if ! mv_cmd -f -- "$staged_conf" "$root/alighieri.conf"; then
       fail "failed to replace the live configuration"
@@ -920,18 +999,38 @@ install_tree() {
     fi
 
     committed=1
+    rm -f -- ${INCOMPLETE_RECOVERY_MARKER:+"$INCOMPLETE_RECOVERY_MARKER"}
     trap - EXIT
     rm -f -- ${backup_bin:+"$backup_bin"} ${backup_conf:+"$backup_conf"} ${backup_plist:+"$backup_plist"}
   )
   commit_status=$?
   set -e
-  [[ "$commit_status" -eq 0 ]] || return 1
+  [[ "$commit_status" -eq 0 ]] || exit 1
+    trap - EXIT
+    release_install_lock
+  )
+  tx_status=$?
+  set -e
+  [[ "$tx_status" -eq 0 ]] || return 1
 }
 
 start_daemon() {
-  require_daemon_identity
-  { "$LAUNCHCTL_BIN" bootout "system/${PLIST_LABEL}" || true; }
-  "$LAUNCHCTL_BIN" bootstrap system "$PLIST_PATH"
+  local start_status=0
+  set +e
+  (
+    set -euo pipefail
+    acquire_install_lock
+    trap release_install_lock EXIT
+    assert_no_incomplete_recovery
+    require_daemon_identity
+    { "$LAUNCHCTL_BIN" bootout "system/${PLIST_LABEL}" || true; }
+    "$LAUNCHCTL_BIN" bootstrap system "$PLIST_PATH"
+    trap - EXIT
+    release_install_lock
+  )
+  start_status=$?
+  set -e
+  [[ "$start_status" -eq 0 ]] || return 1
 }
 
 selftest() {
@@ -942,9 +1041,12 @@ selftest() {
   mkdir -p target
   tmp="$(mktemp -d "${PWD}/target/alighieri-macos-daemon.XXXXXX")"
   ALIGHIERI_SELFTEST_TMP="$tmp"
+  INSTALL_LOCK_DIR="$tmp/provision.lock"
   PROVISION_LOCK_DIR="$tmp/provision.lock"
   RESTORE_BIN=/bin/mv
   INSTALL_FAIL_AFTER=""
+  INSTALL_PAUSE_DIR=""
+  INSTALL_PAUSE_POINT=""
   trap 'rm -rf "${ALIGHIERI_SELFTEST_TMP:-}"' EXIT
   local db="$tmp/dscl"
   mkdir -p "$db/Users" "$db/Groups"
@@ -1540,12 +1642,14 @@ EOF
     || fail "failed user UniqueID read: must not leave a group after rollback"
   reset_valid_identity
 
-  mkdir "$PROVISION_LOCK_DIR"
+  mkdir "$INSTALL_LOCK_DIR"
+  INSTALL_LOCK_RETRIES=3
   PROVISION_LOCK_RETRIES=3
   expect_provision_failure "held provision lock must fail"
+  INSTALL_LOCK_RETRIES=100
   PROVISION_LOCK_RETRIES=100
   [[ -d "$db/Users/_alighieri" ]] || fail "lock failure must not delete identity"
-  rmdir "$PROVISION_LOCK_DIR"
+  rmdir "$INSTALL_LOCK_DIR"
 
   # Two provisioners at the create boundary: one fails UniqueID assignment,
   # the other must still leave a complete identity.
@@ -1976,12 +2080,85 @@ EOF
     || fail "failed restore must report the mixed live state"
   grep -Fq '# gen-old' "$bak" \
     || fail "retained backup is not the old generation"
+  [[ ! -f "$root/${PLIST_LABEL}.plist" ]] \
+    || fail "failed binary restore must not restore an auto-start plist"
+  [[ -f "$root/.alighieri-incomplete-recovery" ]] \
+    || fail "failed binary restore must record incomplete recovery"
+  local plist_bak=""
+  plist_bak="$(printf '%s\n' "$root/plist.bak."*)"
+  [[ -n "$plist_bak" && -f "$plist_bak" ]] \
+    || fail "failed binary restore must retain the previous plist outside launchd"
+  grep -Fq "<key>RunAtLoad</key>" "$plist_bak" \
+    || fail "retained plist is not a launchd job"
+  grep -Fq "<key>KeepAlive</key>" "$plist_bak" \
+    || fail "retained plist is missing KeepAlive"
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( start_daemon ); then
+    fail "start must reject incomplete recovery"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "start must not bootstrap a mixed generation"
+  fi
   unset ALIGHIERI_MV_FAIL
   MV_BIN=/bin/mv
   RESTORE_BIN=/bin/mv
   restore_cmd -f -- "$bak" "$root/bin/alighieri" \
     || fail "could not put the old generation back after the restore-failure fixture"
+  restore_cmd -f -- "$plist_bak" "$root/${PLIST_LABEL}.plist" \
+    || fail "could not restore the withheld plist after the restore-failure fixture"
+  rm -f -- "$root/.alighieri-incomplete-recovery"
   expect_retained_live_tree "after recovering from the restore-failure fixture"
+
+  # Two installers at a publication boundary: A pauses after publishing the
+  # binary, B must wait, A then fails and rolls back, B installs a complete
+  # generation. start must not run while A holds the transaction lock.
+  printf '%s\n' '#!/bin/sh' '# gen-b' 'exit 0' >"$tmp/b-bin"
+  chmod +x "$tmp/b-bin"
+  printf '%s\n' '# gen-b-conf' 'internal: 127.0.0.1 port = 1080' >"$tmp/b.conf"
+  rm -rf "$tmp/pause" "$tmp/a.status" "$tmp/b.status"
+  mkdir -p "$tmp/pause"
+  INSTALL_PAUSE_DIR="$tmp/pause"
+  INSTALL_PAUSE_POINT=after-binary
+  INSTALL_FAIL_AFTER=after-config
+  mark_job_loaded
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  ( set -euo pipefail; install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 0; echo 0 >"$tmp/a.status" ) &
+  local a_pid=$!
+  local waited=0
+  while [[ ! -f "${INSTALL_PAUSE_DIR}/ready" ]]; do
+    waited=$((waited + 1))
+    if (( waited > 100 )); then
+      fail "installer A did not pause after binary publication"
+    fi
+    sleep 0.05
+  done
+  INSTALL_LOCK_RETRIES=3
+  PROVISION_LOCK_RETRIES=3
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( start_daemon ); then
+    fail "start must not run during another install transaction"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "start during an install transaction must not bootstrap"
+  fi
+  INSTALL_LOCK_RETRIES=100
+  PROVISION_LOCK_RETRIES=100
+  INSTALL_PAUSE_POINT=""
+  INSTALL_FAIL_AFTER=""
+  ( set -euo pipefail; install_tree "$root" "$tmp/b-bin" "$tmp/b.conf" 0; echo 0 >"$tmp/b.status" ) &
+  local b_pid=$!
+  printf 'go\n' >"${INSTALL_PAUSE_DIR}/go"
+  wait "$a_pid" || true
+  wait "$b_pid" || true
+  INSTALL_PAUSE_DIR=""
+  [[ ! -f "$tmp/a.status" ]] || fail "installer A must fail and roll back"
+  [[ -f "$tmp/b.status" ]] || fail "installer B must complete"
+  grep -Fq '# gen-b' "$root/bin/alighieri" \
+    || fail "overlapping installs must leave B's complete binary"
+  grep -Fq '# gen-b-conf' "$root/alighieri.conf" \
+    || fail "overlapping installs must leave B's complete config"
+  grep -Fq "${root}/bin/alighieri" "$root/${PLIST_LABEL}.plist" \
+    || fail "overlapping installs must leave a coherent plist"
 
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 1
