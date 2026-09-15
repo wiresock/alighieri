@@ -18,9 +18,10 @@ PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
 UID_MIN=261
 UID_MAX=400
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-INSTALL_LOCK_DIR="/var/run/alighieri-macos-install.lock"
+# Empty: root uses /var/run, unprivileged staging uses $root/.alighieri-install.lock.
+INSTALL_LOCK_DIR=""
 # Older name kept as a fallback for in-process selftest assignments.
-PROVISION_LOCK_DIR="/var/run/alighieri-macos-provision.lock"
+PROVISION_LOCK_DIR=""
 INSTALL_LOCK_RETRIES=100
 PROVISION_LOCK_RETRIES=100
 INSTALL_LOCK_SLEEP=0.05
@@ -561,7 +562,19 @@ lock_service_account() {
 }
 
 install_lock_dir() {
-  printf '%s\n' "${INSTALL_LOCK_DIR:-$PROVISION_LOCK_DIR}"
+  if [[ -n "${INSTALL_LOCK_DIR:-}" ]]; then
+    printf '%s\n' "$INSTALL_LOCK_DIR"
+    return 0
+  fi
+  if [[ -n "${PROVISION_LOCK_DIR:-}" ]]; then
+    printf '%s\n' "$PROVISION_LOCK_DIR"
+    return 0
+  fi
+  if is_root; then
+    printf '%s\n' "/var/run/alighieri-macos-install.lock"
+    return 0
+  fi
+  printf '%s\n' "${root:-$DEFAULT_ROOT}/.alighieri-install.lock"
 }
 
 # Shared lock for provision, install, and start. Nested callers in the same
@@ -775,6 +788,10 @@ install_tree() {
   [[ -f "$binary" && ! -L "$binary" ]] || fail "binary is not a regular file: $binary"
   [[ -f "$config" && ! -L "$config" ]] || fail "config is not a regular file: $config"
   validate_daemon_root "$root"
+  # Unprivileged installs lock under $root; that directory must exist first.
+  if [[ -z "${INSTALL_LOCK_DIR:-}" ]] && ! is_root; then
+    mkdir -p "$root"
+  fi
   INCOMPLETE_RECOVERY_MARKER="${root}/.alighieri-incomplete-recovery"
   local tx_status=0
   set +e
