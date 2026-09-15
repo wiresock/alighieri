@@ -107,7 +107,14 @@ done
 if [[ "$os" == "macos" ]]; then
   test -x "$dir/scripts/macos-daemon.sh" \
     || { echo "packaged macos-daemon.sh is not executable" >&2; exit 1; }
-  "$dir/scripts/macos-daemon.sh" __selftest
+  # Invoke the packaged helper. Do not print to stdout: this script's
+  # stdout is the ASSET path contract used by CI and release.
+  set +e
+  "$dir/scripts/macos-daemon.sh" >/dev/null
+  helper_status=$?
+  set -e
+  [[ "$helper_status" -eq 2 ]] \
+    || { echo "packaged macos-daemon.sh did not report usage" >&2; exit 1; }
 fi
 
 if [[ "$make_archive" -eq 1 ]]; then

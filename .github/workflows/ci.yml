@@ -140,6 +140,7 @@ jobs:
             tar -xzf "$ASSET" -C "$extract"
             "$extract/alighieri-vtest-aarch64-apple-darwin/alighieri" --version
             test -x "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+            "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh" __selftest
           fi
       - name: Doctests
         run: cargo test --doc --locked
