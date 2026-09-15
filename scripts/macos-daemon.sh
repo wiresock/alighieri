@@ -864,8 +864,12 @@ install_tree() {
     chmod_nofollow 0644 "$staged_plist"
     apply_install_ownership root:wheel "$staged_plist"
 
-    # Unload before replacing files so KeepAlive cannot respawn into a mixed tree.
-    unload_job_before_replace
+    # Unload a system KeepAlive job before replacing files. Non-root staging
+    # installs cannot query the system domain (CI smoke); a launchctl test
+    # double still exercises the unload path.
+    if is_root || [[ "$LAUNCHCTL_BIN" != /usr/bin/launchctl ]]; then
+      unload_job_before_replace
+    fi
     inject_install_fault after-unload
 
     if [[ -f "$root/bin/alighieri" ]]; then
