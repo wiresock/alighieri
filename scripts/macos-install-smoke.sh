@@ -91,13 +91,27 @@ fi
 
 # SHA256SUMS lists every platform. Operators download one archive; check that
 # entry only. A full `sha256sum -c SHA256SUMS` fails when the other archives
-# are absent.
+# are absent. The commands below match the README macOS archive snippet.
 checksum_tool() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$@"
   else
     shasum -a 256 "$@"
   fi
+}
+verify_selected_archive() {
+  # Documented operator snippet (README): require a nonempty ARCHIVE and
+  # exactly one matching SHA256SUMS line.
+  [ -n "${ARCHIVE:-}" ] || { echo "set ARCHIVE to the downloaded file" >&2; return 1; }
+  name=$(basename -- "$ARCHIVE")
+  if [ -z "$name" ] || [ "$name" = "." ]; then
+    echo "ARCHIVE has no filename" >&2
+    return 1
+  fi
+  entry=$(grep -F "$name" SHA256SUMS || true)
+  n=$(printf '%s\n' "$entry" | awk 'NF { c++ } END { print c+0 }')
+  [ "$n" -eq 1 ] || { echo "expected exactly one SHA256SUMS entry for $name" >&2; return 1; }
+  printf '%s\n' "$entry" | checksum_tool -c -
 }
 sums_dir="$(mktemp -d "${PWD}/target/alighieri-checksum.XXXXXX")"
 printf 'keep\n' >"$sums_dir/keep-me.tar.gz"
@@ -109,8 +123,23 @@ printf 'other\n' >"$sums_dir/other.tar.gz"
 rm -f "$sums_dir/other.tar.gz"
 (
   cd "$sums_dir"
-  grep -F keep-me.tar.gz SHA256SUMS | checksum_tool -c -
+  ARCHIVE=keep-me.tar.gz
+  verify_selected_archive
 ) >/dev/null || fail "single-archive SHA256SUMS check failed"
+if (
+  cd "$sums_dir"
+  ARCHIVE=
+  verify_selected_archive
+) >/dev/null 2>&1; then
+  fail "empty ARCHIVE must not verify a SHA256SUMS entry"
+fi
+if (
+  cd "$sums_dir"
+  unset ARCHIVE
+  verify_selected_archive
+) >/dev/null 2>&1; then
+  fail "unset ARCHIVE must not verify a SHA256SUMS entry"
+fi
 if (
   cd "$sums_dir"
   checksum_tool -c SHA256SUMS

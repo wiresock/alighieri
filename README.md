@@ -1106,10 +1106,21 @@ BIN="./target/release/alighieri"
 # Gatekeeper: unsigned release archives may carry com.apple.quarantine.
 # Clear it on the source binary *before* copying or launching. Removing the
 # attribute bypasses provenance checks. For a GitHub release, first verify
-# the downloaded archive against its entry in the published SHA256SUMS
+# the downloaded archive against its single matching entry in SHA256SUMS
 # (the manifest lists every platform; checking the whole file reports
-# missing archives you did not download):
-#   grep -F "$(basename "$ARCHIVE")" SHA256SUMS | shasum -a 256 -c -
+# missing archives you did not download). Set ARCHIVE to that file:
+#   ARCHIVE=alighieri-aarch64-apple-darwin.tar.gz
+#   # ARCHIVE=alighieri-x86_64-apple-darwin.tar.gz
+#   [ -n "${ARCHIVE:-}" ] || { echo "set ARCHIVE to the downloaded file" >&2; exit 1; }
+#   name=$(basename -- "$ARCHIVE")
+#   if [ -z "$name" ] || [ "$name" = "." ]; then
+#     echo "ARCHIVE has no filename" >&2
+#     exit 1
+#   fi
+#   entry=$(grep -F "$name" SHA256SUMS || true)
+#   n=$(printf '%s\n' "$entry" | awk 'NF { c++ } END { print c+0 }')
+#   [ "$n" -eq 1 ] || { echo "expected exactly one SHA256SUMS entry for $name" >&2; exit 1; }
+#   printf '%s\n' "$entry" | shasum -a 256 -c -
 # Apple documents that
 # non-Developer-ID, non-notarized software cannot be verified the same way
 # as trusted software: https://support.apple.com/en-us/102445

@@ -18,6 +18,11 @@ PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
 UID_MIN=261
 UID_MAX=400
 SCRIPT_PATH="${BASH_SOURCE[0]}"
+PROVISION_LOCK_DIR="/var/run/alighieri-macos-provision.lock"
+PROVISION_LOCK_RETRIES=100
+PROVISION_LOCK_SLEEP=0.05
+# In-process selftest hook; production verbs clear this.
+INSTALL_FAIL_AFTER=""
 
 # Privileged verbs always start from these paths. __selftest may reassign the
 # variables in-process; production commands call use_system_tools first.
@@ -29,6 +34,8 @@ use_system_tools() {
   STAT_BIN=/usr/bin/stat
   XATTR_BIN=/usr/bin/xattr
   MV_BIN=/bin/mv
+  RESTORE_BIN=/bin/mv
+  INSTALL_FAIL_AFTER=""
 }
 
 use_system_tools
@@ -46,6 +53,7 @@ fail() {
 dscl_cmd() { "$DSCL_BIN" "$@"; }
 id_cmd() { "$ID_BIN" "$@"; }
 mv_cmd() { "$MV_BIN" "$@"; }
+restore_cmd() { "$RESTORE_BIN" "$@"; }
 
 is_root() { [[ "$(id_cmd -u)" == "0" ]]; }
 
@@ -260,25 +268,56 @@ record_exists() {
   dscl_cmd . -read "$1" >/dev/null 2>&1
 }
 
-read_prop() {
-  # dscl may print "Key: value" on one line or "Key:" then an indented value.
-  dscl_cmd . -read "$1" "$2" 2>/dev/null | tr -d '\r' | awk '
-    {
-      if (NR == 1) {
-        sub(/^[^:]+:[[:space:]]*/, "")
-        if ($0 != "") { print; exit }
-        next
+# Print every value of Open Directory attribute $2 on record $1.
+# Returns 0 when the attribute is present, 2 when it is absent, 1 when the
+# lookup failed. "No such key" / eDSAttributeNotFound is absence, not success
+# with an empty membership and not a hard failure.
+read_attr_values() {
+  local rec="$1" key="$2" out="" rc=0
+  out="$(dscl_cmd . -read "$rec" "$key" 2>&1)" || rc=$?
+  if printf '%s\n' "$out" | grep -Eq 'No such key:|eDSAttributeNotFound'; then
+    return 2
+  fi
+  if (( rc != 0 )); then
+    return 1
+  fi
+  if [[ -z "$out" ]]; then
+    return 2
+  fi
+  printf '%s\n' "$out" | tr -d '\r' | awk -v key="$key" '
+    NR == 1 {
+      prefix = key ":"
+      if (index($0, prefix) == 1) {
+        rest = substr($0, length(prefix) + 1)
+      } else {
+        rest = $0
+        sub(/^[^:]+:/, "", rest)
       }
+      n = split(rest, a, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
+      next
+    }
+    {
       sub(/^[[:space:]]+/, "")
-      if ($0 != "") { print; exit }
+      n = split($0, a, /[[:space:]]+/)
+      for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
     }
   '
+  return 0
+}
+
+read_prop() {
+  # First nonempty value of an attribute. Missing attributes fail (callers
+  # that treat absence as empty use `|| true`).
+  local values rc=0
+  values="$(read_attr_values "$1" "$2")" || rc=$?
+  (( rc == 0 )) || return 1
+  printf '%s\n' "$values" | awk 'NF { print; exit }'
 }
 
 # Directory Service inventory. A failed user-list or group-list is an error,
 # not an empty snapshot: swallowing either side would let allocate_id reuse a
-# live UniqueID. Two concurrent root provisioners can still race after this
-# snapshot; serialize that at the operator level.
+# live UniqueID. Concurrent provisioners are serialized by PROVISION_LOCK_DIR.
 list_numeric_ids() {
   local kind="$1" key="$2" out=""
   out="$(dscl_cmd . -list "$kind" "$key")" || return 1
@@ -317,16 +356,94 @@ assert_numeric_identity_unique() {
   [[ "$ngroups" == "1" ]] || fail "PrimaryGroupID ${gid} is shared by ${ngroups} groups; refuse to reuse ${ACCOUNT}"
 }
 
-# Dedicated daemon group: empty GroupMembership, or only this account.
+# RecordName values that identify ACCOUNT. An unverified short name such as
+# "alighieri" is not accepted unless it is actually an alias of this record.
+account_record_names() {
+  local rc=0 names=""
+  names="$(read_attr_values "/Users/${ACCOUNT}" RecordName)" || rc=$?
+  if (( rc == 1 )); then
+    return 1
+  fi
+  if (( rc == 2 )) || [[ -z "$names" ]]; then
+    printf '%s\n' "$ACCOUNT"
+    return 0
+  fi
+  printf '%s\n' "$names"
+}
+
+name_is_account_alias() {
+  local tok="$1" names="$2"
+  printf '%s\n' "$names" | grep -Fxq "$tok"
+}
+
+# Dedicated daemon group: no unexpected name, GUID, nested, or primary-group
+# members. Absence of a membership attribute is allowed; a failed read is not.
+# Callers must not wrap this in `$(...)`: fail() inside a substitution only
+# exits that substitution.
 assert_group_membership_locked() {
-  local members tok
-  members="$(read_prop "/Groups/${ACCOUNT}" GroupMembership || true)"
-  while IFS= read -r tok; do
-    [[ -n "$tok" ]] || continue
-    if [[ "$tok" != "$ACCOUNT" && "$tok" != "${ACCOUNT#_}" ]]; then
-      fail "unexpected GroupMembership '${tok}' on ${ACCOUNT}"
+  local gid names rc=0 values="" tok user_guid guid_rc=0 list uname ugid
+  gid="$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID)" \
+    || fail "failed to read ${ACCOUNT} PrimaryGroupID"
+  names="$(account_record_names)" \
+    || fail "failed to read ${ACCOUNT} RecordName"
+
+  rc=0
+  values="$(read_attr_values "/Groups/${ACCOUNT}" GroupMembership)" || rc=$?
+  if (( rc == 1 )); then
+    fail "failed to read GroupMembership for ${ACCOUNT}"
+  fi
+  if (( rc == 0 )); then
+    while IFS= read -r tok; do
+      [[ -n "$tok" ]] || continue
+      if ! name_is_account_alias "$tok" "$names"; then
+        fail "unexpected GroupMembership '${tok}' on ${ACCOUNT}"
+      fi
+    done <<<"$values"
+  fi
+
+  user_guid=""
+  guid_rc=0
+  user_guid="$(read_attr_values "/Users/${ACCOUNT}" GeneratedUID)" || guid_rc=$?
+  if (( guid_rc == 1 )); then
+    fail "failed to read GeneratedUID for ${ACCOUNT}"
+  fi
+  rc=0
+  values="$(read_attr_values "/Groups/${ACCOUNT}" GroupMembers)" || rc=$?
+  if (( rc == 1 )); then
+    fail "failed to read GroupMembers for ${ACCOUNT}"
+  fi
+  if (( rc == 0 )); then
+    while IFS= read -r tok; do
+      [[ -n "$tok" ]] || continue
+      if (( guid_rc == 2 )) || [[ -z "$user_guid" || "$tok" != "$user_guid" ]]; then
+        fail "unexpected GroupMembers '${tok}' on ${ACCOUNT}"
+      fi
+    done <<<"$values"
+  fi
+
+  rc=0
+  values="$(read_attr_values "/Groups/${ACCOUNT}" NestedGroups)" || rc=$?
+  if (( rc == 1 )); then
+    fail "failed to read NestedGroups for ${ACCOUNT}"
+  fi
+  if (( rc == 0 )); then
+    while IFS= read -r tok; do
+      [[ -n "$tok" ]] || continue
+      fail "unexpected NestedGroups '${tok}' on ${ACCOUNT}"
+    done <<<"$values"
+  fi
+
+  list="$(dscl_cmd . -list /Users PrimaryGroupID)" \
+    || fail "failed to enumerate user PrimaryGroupIDs"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    uname="${line%% *}"
+    ugid="${line##* }"
+    [[ "$ugid" == "$gid" ]] || continue
+    if ! name_is_account_alias "$uname" "$names"; then
+      fail "user ${uname} has PrimaryGroupID ${gid}; refuse to reuse ${ACCOUNT}"
     fi
-  done <<<"$members"
+  done <<<"$list"
 }
 
 id_in_service_range() {
@@ -384,25 +501,62 @@ lock_service_account() {
   dscl_cmd . -delete "/Users/${ACCOUNT}" PasswordPolicyOptions >/dev/null 2>&1 || true
 }
 
+acquire_provision_lock() {
+  local dir="$PROVISION_LOCK_DIR"
+  local n=0 max="${PROVISION_LOCK_RETRIES:-100}"
+  [[ -n "$dir" ]] || fail "provision lock directory is unset"
+  while ! mkdir "$dir" 2>/dev/null; do
+    n=$((n + 1))
+    if (( n >= max )); then
+      fail "another Alighieri provision is in progress (${dir})"
+    fi
+    sleep "${PROVISION_LOCK_SLEEP:-0.05}"
+  done
+}
+
+release_provision_lock() {
+  rmdir "${PROVISION_LOCK_DIR}" 2>/dev/null || true
+}
+
+# dscl -create is not exclusive. Only claim deletion ownership when the
+# record has no identifying numeric id yet (we just created an empty record).
+claim_created_record() {
+  local rec="$1" key="$2"
+  local existing=""
+  existing="$(read_prop "$rec" "$key" 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 provision() {
   # Run the mutating work in a subshell so the rollback EXIT trap cannot
   # replace a caller's trap (the selftest uses EXIT to remove its temp dir).
   (
     created_group=0
     created_user=0
+    lock_held=0
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     rollback() {
-      # Delete records this invocation created, even if UniqueID/GID assignment
-      # never succeeded. created_* is set only after -create of that record.
+      # Delete records this invocation uniquely created, even if UniqueID/GID
+      # assignment never succeeded. created_* is not set merely because
+      # dscl -create returned success against an existing record.
       if (( created_user )); then
         dscl_cmd . -delete "/Users/${ACCOUNT}" >/dev/null 2>&1 || true
       fi
       if (( created_group )); then
         dscl_cmd . -delete "/Groups/${ACCOUNT}" >/dev/null 2>&1 || true
       fi
+      if (( lock_held )); then
+        release_provision_lock
+      fi
     }
     trap rollback EXIT
+
+    acquire_provision_lock
+    lock_held=1
 
     if record_exists "/Users/${ACCOUNT}" && record_exists "/Groups/${ACCOUNT}"; then
       uid="$(read_prop "/Users/${ACCOUNT}" UniqueID)"
@@ -411,6 +565,8 @@ provision() {
       group_matches "$gid" || fail "existing ${ACCOUNT} group does not match the expected daemon identity"
       assert_numeric_identity_unique "$uid" "$gid"
       assert_group_membership_locked
+      lock_held=0
+      release_provision_lock
       trap - EXIT
       exit 0
     fi
@@ -423,10 +579,35 @@ provision() {
       fail "no unused system UID/GID in ${UID_MIN}-${UID_MAX}, or Directory Service enumeration failed"
     fi
     [[ -n "$id" ]] || fail "allocator returned an empty id"
+
+    # Re-check under the lock before create. If a populated record is already
+    # present, dscl -create succeeding must not take deletion ownership.
+    if record_exists "/Users/${ACCOUNT}" && record_exists "/Groups/${ACCOUNT}"; then
+      uid="$(read_prop "/Users/${ACCOUNT}" UniqueID)"
+      gid="$(read_prop "/Groups/${ACCOUNT}" PrimaryGroupID)"
+      user_matches "$uid" "$gid" || fail "existing ${ACCOUNT} user does not match the expected daemon identity"
+      group_matches "$gid" || fail "existing ${ACCOUNT} group does not match the expected daemon identity"
+      assert_numeric_identity_unique "$uid" "$gid"
+      assert_group_membership_locked
+      lock_held=0
+      release_provision_lock
+      trap - EXIT
+      exit 0
+    fi
+    if record_exists "/Users/${ACCOUNT}" || record_exists "/Groups/${ACCOUNT}"; then
+      fail "partial ${ACCOUNT} identity exists; resolve it before provisioning"
+    fi
+
     dscl_cmd . -create "/Groups/${ACCOUNT}"
+    if ! claim_created_record "/Groups/${ACCOUNT}" PrimaryGroupID; then
+      fail "${ACCOUNT} group already exists; another installer owns it"
+    fi
     created_group=1
     dscl_cmd . -create "/Groups/${ACCOUNT}" PrimaryGroupID "$id"
     dscl_cmd . -create "/Users/${ACCOUNT}"
+    if ! claim_created_record "/Users/${ACCOUNT}" UniqueID; then
+      fail "${ACCOUNT} user already exists; another installer owns it"
+    fi
     created_user=1
     dscl_cmd . -create "/Users/${ACCOUNT}" UniqueID "$id"
     dscl_cmd . -create "/Users/${ACCOUNT}" PrimaryGroupID "$id"
@@ -437,6 +618,8 @@ provision() {
     group_matches "$id" || fail "provisioned ${ACCOUNT} group failed verification"
     assert_numeric_identity_unique "$id" "$id"
     assert_group_membership_locked
+    lock_held=0
+    release_provision_lock
     trap - EXIT
   )
 }
@@ -477,12 +660,11 @@ write_plist() {
 EOF
 }
 
-# Stage the new binary and config under private names, --check the staged
-# pair, then replace the live binary and then the live config. A failed
-# --check or quarantine check deletes the temps and leaves the previous
-# live files untouched. If the config mv fails after the binary mv, the
-# new binary remains with the previous config; both staged files already
-# passed --check together.
+# Stage binary, config, and plist under private names, apply ownership/modes
+# to the staged files, --check the staged pair, unload a loaded KeepAlive
+# job, then publish. Previous live files stay backed up until publish (and
+# bootstrap, when requested) succeeds. Restoration uses RESTORE_BIN, not
+# MV_BIN, so a live-path test double cannot block recovery.
 install_tree() {
   local root="$1" binary="$2" config="$3" start="$4"
   [[ -f "$binary" && ! -L "$binary" ]] || fail "binary is not a regular file: $binary"
@@ -527,21 +709,72 @@ install_tree() {
     staged_conf=""
     staged_plist=""
     backup_bin=""
+    backup_conf=""
+    backup_plist=""
+    committed=0
+    plist_dest="$root/${PLIST_LABEL}.plist"
+    if is_root && on_darwin; then
+      plist_dest="$PLIST_PATH"
+    fi
+
+    # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
+    # shellcheck disable=SC2317
+    restore_previous_generation() {
+      local failed=0
+      if [[ -n "${backup_bin:-}" && -f "$backup_bin" ]]; then
+        if restore_cmd -f -- "$backup_bin" "$root/bin/alighieri"; then
+          backup_bin=""
+        else
+          failed=1
+        fi
+      fi
+      if [[ -n "${backup_conf:-}" && -f "$backup_conf" ]]; then
+        if restore_cmd -f -- "$backup_conf" "$root/alighieri.conf"; then
+          backup_conf=""
+        else
+          failed=1
+        fi
+      fi
+      if [[ -n "${backup_plist:-}" && -f "$backup_plist" ]]; then
+        if restore_cmd -f -- "$backup_plist" "$plist_dest"; then
+          backup_plist=""
+        else
+          failed=1
+        fi
+      fi
+      return "$failed"
+    }
+
+    # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
+    # shellcheck disable=SC2317
+    report_mixed_tree() {
+      echo "macos-daemon: restore failed; live files may mix generations and must not be started" >&2
+      echo "macos-daemon: live binary=$root/bin/alighieri backup=${backup_bin:-<none>}" >&2
+      echo "macos-daemon: live config=$root/alighieri.conf backup=${backup_conf:-<none>}" >&2
+      echo "macos-daemon: live plist=$plist_dest backup=${backup_plist:-<none>}" >&2
+    }
+
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     cleanup_staged() {
+      set +e
       rm -f -- ${staged_bin:+"$staged_bin"} ${staged_conf:+"$staged_conf"} ${staged_plist:+"$staged_plist"}
-      if [[ -n "${backup_bin:-}" && -f "$backup_bin" ]]; then
-        if [[ ! -e "$root/bin/alighieri" ]]; then
-          # Use /bin/mv, not mv_cmd: a test double that injects live-path
-          # failures must not block restoring the backup.
-          /bin/mv -f -- "$backup_bin" "$root/bin/alighieri" || true
-        else
-          rm -f -- "$backup_bin"
-        fi
+      if [[ "${committed:-0}" -eq 1 ]]; then
+        rm -f -- ${backup_bin:+"$backup_bin"} ${backup_conf:+"$backup_conf"} ${backup_plist:+"$backup_plist"}
+        return 0
+      fi
+      if ! restore_previous_generation; then
+        report_mixed_tree
       fi
     }
     trap cleanup_staged EXIT
+
+    inject_install_fault() {
+      local point="$1"
+      if [[ "${INSTALL_FAIL_AFTER:-}" == "$point" ]]; then
+        fail "injected install failure at ${point}"
+      fi
+    }
 
     staged_bin="$(mktemp "${root}/bin/alighieri.tmp.XXXXXX")"
     rm -f -- "$staged_bin"
@@ -567,53 +800,78 @@ install_tree() {
     if ! "$INSTALL_BIN" -m 0640 "$config" "$staged_conf"; then
       fail "failed to stage configuration"
     fi
+    chmod_nofollow 0640 "$staged_conf"
+    apply_install_ownership "root:${ACCOUNT}" "$staged_conf"
     if ! "$staged_bin" --check --config "$staged_conf"; then
       fail "configuration check failed for $staged_bin"
     fi
+
+    staged_plist="$(mktemp "${root}/plist.XXXXXX")"
+    write_plist "$root" "$staged_plist"
+    chmod_nofollow 0644 "$staged_plist"
+    apply_install_ownership root:wheel "$staged_plist"
+
+    # Unload before replacing files so KeepAlive cannot respawn into a mixed tree.
+    "$LAUNCHCTL_BIN" bootout "system/${PLIST_LABEL}" >/dev/null 2>&1 || true
+    inject_install_fault after-unload
 
     if [[ -f "$root/bin/alighieri" ]]; then
       backup_bin="$(mktemp "${root}/bin/alighieri.bak.XXXXXX")"
       mv_cmd -f -- "$root/bin/alighieri" "$backup_bin" \
         || fail "failed to backup the live binary"
     fi
+    if [[ -f "$root/alighieri.conf" ]]; then
+      backup_conf="$(mktemp "${root}/alighieri.conf.bak.XXXXXX")"
+      mv_cmd -f -- "$root/alighieri.conf" "$backup_conf" \
+        || fail "failed to backup the live configuration"
+    fi
+    if [[ -f "$plist_dest" ]]; then
+      backup_plist="$(mktemp "${root}/plist.bak.XXXXXX")"
+      mv_cmd -f -- "$plist_dest" "$backup_plist" \
+        || fail "failed to backup the live plist"
+    fi
+
     if ! mv_cmd -f -- "$staged_bin" "$root/bin/alighieri"; then
       fail "failed to replace the live binary"
     fi
     staged_bin=""
+    inject_install_fault after-binary
+
     if ! mv_cmd -f -- "$staged_conf" "$root/alighieri.conf"; then
-      if [[ -n "$backup_bin" ]]; then
-        /bin/mv -f -- "$backup_bin" "$root/bin/alighieri" || true
-        backup_bin=""
-      fi
       fail "failed to replace the live configuration"
     fi
     staged_conf=""
-    rm -f -- ${backup_bin:+"$backup_bin"}
-    backup_bin=""
-    chmod_nofollow 0640 "$root/alighieri.conf"
-    apply_install_ownership "root:${ACCOUNT}" "$root/alighieri.conf"
+    inject_install_fault after-config
 
-    plist_dest="$root/${PLIST_LABEL}.plist"
-    if is_root && on_darwin; then
-      plist_dest="$PLIST_PATH"
-    fi
-    staged_plist="$(mktemp "${root}/plist.XXXXXX")"
-    write_plist "$root" "$staged_plist"
+    chmod_nofollow 0640 "$root/alighieri.conf"
+    inject_install_fault chmod-conf
+    apply_install_ownership "root:${ACCOUNT}" "$root/alighieri.conf"
+    inject_install_fault chown-conf
+
     if ! mv_cmd -f -- "$staged_plist" "$plist_dest"; then
       fail "failed to replace the launchd plist"
     fi
     staged_plist=""
+    inject_install_fault after-plist
+
     apply_install_ownership root:wheel "$plist_dest"
+    inject_install_fault chown-plist
     chmod_nofollow 0644 "$plist_dest"
+    inject_install_fault chmod-plist
+
+    if [[ "$start" == "1" ]]; then
+      inject_install_fault bootstrap
+      "$LAUNCHCTL_BIN" bootstrap system "$PLIST_PATH" \
+        || fail "failed to bootstrap ${PLIST_LABEL}"
+    fi
+
+    committed=1
     trap - EXIT
+    rm -f -- ${backup_bin:+"$backup_bin"} ${backup_conf:+"$backup_conf"} ${backup_plist:+"$backup_plist"}
   )
   commit_status=$?
   set -e
   [[ "$commit_status" -eq 0 ]] || return 1
-
-  if [[ "$start" == "1" ]]; then
-    start_daemon
-  fi
 }
 
 start_daemon() {
@@ -630,6 +888,9 @@ selftest() {
   mkdir -p target
   tmp="$(mktemp -d "${PWD}/target/alighieri-macos-daemon.XXXXXX")"
   ALIGHIERI_SELFTEST_TMP="$tmp"
+  PROVISION_LOCK_DIR="$tmp/provision.lock"
+  RESTORE_BIN=/bin/mv
+  INSTALL_FAIL_AFTER=""
   trap 'rm -rf "${ALIGHIERI_SELFTEST_TMP:-}"' EXIT
   local db="$tmp/dscl"
   mkdir -p "$db/Users" "$db/Groups"
@@ -662,6 +923,15 @@ case "$op" in
         exit 1
       fi
     fi
+    if [ -n "${ALIGHIERI_DSCL_FAIL_CREATE_ONCE:-}" ] && [ -f "${ALIGHIERI_DSCL_FAIL_CREATE_ONCE}" ]; then
+      if [ $# -ge 1 ] && [ "$rec $1" = "/Users/_alighieri UniqueID" ]; then
+        rm -f "${ALIGHIERI_DSCL_FAIL_CREATE_ONCE}"
+        exit 1
+      fi
+    fi
+    if [ -n "${ALIGHIERI_DSCL_SLOW_CREATE:-}" ]; then
+      sleep 0.05
+    fi
     mkdir -p "$db$rec"
     if [ $# -ge 2 ]; then
       printf '%s\n' "$2" >"$db$rec/$1"
@@ -669,10 +939,24 @@ case "$op" in
     ;;
   -read)
     rec="$1"; key="${2:-}"
+    if [ -z "$key" ] && [ -n "${ALIGHIERI_DSCL_HIDE_EXISTENCE:-}" ]; then
+      case "$rec" in
+        /Users/_alighieri|/Groups/_alighieri)
+          exit 1
+          ;;
+      esac
+    fi
+    if [ -n "${ALIGHIERI_DSCL_FAIL_READ:-}" ] && [ "$ALIGHIERI_DSCL_FAIL_READ" = "$rec ${key:-}" ]; then
+      echo "DS Error: injected read failure" >&2
+      exit 1
+    fi
     [ -d "$db$rec" ] || exit 1
     if [ -n "$key" ]; then
-      [ -f "$db$rec/$key" ] || exit 1
-      printf '%s: %s\n' "$key" "$(tr -d '\r' < "$db$rec/$key")"
+      if [ ! -f "$db$rec/$key" ]; then
+        echo "No such key: $key"
+        exit 0
+      fi
+      printf '%s: %s\n' "$key" "$(tr -d '\r' < "$db$rec/$key" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
     fi
     ;;
   -list)
@@ -1048,6 +1332,40 @@ EOF
   expect_provision_failure "unexpected GroupMembership must be rejected"
   expect_install_failure "unexpected GroupMembership must not install"
   rm -f "$db/Groups/_alighieri/GroupMembership"
+
+  printf '%s\n' "alighieri" >"$db/Groups/_alighieri/GroupMembership"
+  expect_provision_failure "unverified alighieri alias must be rejected"
+  expect_install_failure "unverified alighieri alias must not install"
+  [[ -d "$db/Users/_alighieri" && -d "$db/Groups/_alighieri" ]] \
+    || fail "rejected alias must not modify the existing identity"
+  rm -f "$db/Groups/_alighieri/GroupMembership"
+
+  printf '%s\n' "_alighieri" "_www" >"$db/Groups/_alighieri/GroupMembership"
+  expect_provision_failure "wrapped extra GroupMembership must be rejected"
+  expect_install_failure "wrapped extra GroupMembership must not install"
+  rm -f "$db/Groups/_alighieri/GroupMembership"
+
+  printf '%s\n' "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" >"$db/Groups/_alighieri/GroupMembers"
+  expect_provision_failure "unrelated GroupMembers GUID must be rejected"
+  expect_install_failure "unrelated GroupMembers GUID must not install"
+  rm -f "$db/Groups/_alighieri/GroupMembers"
+
+  printf '%s\n' "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" >"$db/Groups/_alighieri/NestedGroups"
+  expect_provision_failure "NestedGroups membership must be rejected"
+  expect_install_failure "NestedGroups membership must not install"
+  rm -f "$db/Groups/_alighieri/NestedGroups"
+
+  mkdir -p "$db/Users/_www"
+  printf '%s\n' 261 >"$db/Users/_www/PrimaryGroupID"
+  expect_provision_failure "foreign primary-group member must be rejected"
+  expect_install_failure "foreign primary-group member must not install"
+  rm -rf "$db/Users/_www"
+
+  ALIGHIERI_DSCL_FAIL_READ="/Groups/_alighieri GroupMembership"
+  export ALIGHIERI_DSCL_FAIL_READ
+  expect_provision_failure "failed GroupMembership lookup must fail closed"
+  expect_install_failure "failed GroupMembership lookup must not install"
+  unset ALIGHIERI_DSCL_FAIL_READ
   reset_valid_identity
 
   # Rollback must delete records created by this invocation even when the
@@ -1066,6 +1384,50 @@ EOF
   [[ ! -d "$db/Users/_alighieri" ]] || fail "UniqueID assignment failure must roll back the user"
   [[ ! -d "$db/Groups/_alighieri" ]] || fail "UniqueID assignment failure must roll back the group"
   unset ALIGHIERI_DSCL_FAIL_CREATE
+  reset_valid_identity
+
+  # Command success of dscl -create must not take deletion ownership of an
+  # identity that already exists (existence checks can be stale or hidden).
+  ALIGHIERI_DSCL_HIDE_EXISTENCE=1
+  export ALIGHIERI_DSCL_HIDE_EXISTENCE
+  expect_provision_failure "create against an existing identity must not take deletion ownership"
+  unset ALIGHIERI_DSCL_HIDE_EXISTENCE
+  [[ -d "$db/Users/_alighieri" ]] || fail "must not delete a competing user identity"
+  [[ -d "$db/Groups/_alighieri" ]] || fail "must not delete a competing group identity"
+  [[ "$(read_prop "/Users/_alighieri" UniqueID)" == "261" ]] \
+    || fail "competing user UniqueID must remain"
+
+  mkdir "$PROVISION_LOCK_DIR"
+  PROVISION_LOCK_RETRIES=3
+  expect_provision_failure "held provision lock must fail"
+  PROVISION_LOCK_RETRIES=100
+  [[ -d "$db/Users/_alighieri" ]] || fail "lock failure must not delete identity"
+  rmdir "$PROVISION_LOCK_DIR"
+
+  # Two provisioners at the create boundary: one fails UniqueID assignment,
+  # the other must still leave a complete identity.
+  rm -rf "$db/Users/_alighieri" "$db/Groups/_alighieri"
+  rmdir "$PROVISION_LOCK_DIR" 2>/dev/null || true
+  : >"$tmp/fail-uid-once"
+  ALIGHIERI_DSCL_FAIL_CREATE_ONCE="$tmp/fail-uid-once"
+  export ALIGHIERI_DSCL_FAIL_CREATE_ONCE
+  ALIGHIERI_DSCL_SLOW_CREATE=1
+  export ALIGHIERI_DSCL_SLOW_CREATE
+  rm -f "$tmp/p1.ok" "$tmp/p2.ok"
+  local p1_pid="" p2_pid=""
+  ( set -euo pipefail; provision; echo ok >"$tmp/p1.ok" ) &
+  p1_pid=$!
+  ( set -euo pipefail; provision; echo ok >"$tmp/p2.ok" ) &
+  p2_pid=$!
+  wait "$p1_pid" || true
+  wait "$p2_pid" || true
+  unset ALIGHIERI_DSCL_FAIL_CREATE_ONCE ALIGHIERI_DSCL_SLOW_CREATE
+  [[ -d "$db/Users/_alighieri" && -d "$db/Groups/_alighieri" ]] \
+    || fail "concurrent provision must leave a complete identity"
+  [[ -f "$tmp/p1.ok" || -f "$tmp/p2.ok" ]] \
+    || fail "concurrent provision: both attempts failed"
+  user_matches "$(read_prop "/Users/_alighieri" UniqueID)" "$(read_prop "/Groups/_alighieri" PrimaryGroupID)" \
+    || fail "concurrent provision left a mismatched identity"
   reset_valid_identity
 
   # Homebrew-style writable ancestor must be refused.
@@ -1171,9 +1533,12 @@ EOF
 
   # Successful install with mocked ancestor modes; --no-start must not bootstrap.
   STAT_BIN="$tmp/stat.sh"
-  printf '%s\n' '#!/bin/sh' 'exit 0' >"$tmp/fake-bin"
+  printf '%s\n' '#!/bin/sh' '# gen-old' 'exit 0' >"$tmp/fake-bin"
   chmod +x "$tmp/fake-bin"
-  printf '%s\n' 'internal: 127.0.0.1 port = 1080' >"$tmp/fake.conf"
+  printf '%s\n' '# gen-old-conf' 'internal: 127.0.0.1 port = 1080' >"$tmp/fake.conf"
+  printf '%s\n' '#!/bin/sh' '# gen-new' 'exit 0' >"$tmp/dummy-bin"
+  chmod +x "$tmp/dummy-bin"
+  printf '%s\n' '# gen-new-conf' 'internal: 127.0.0.1 port = 1080' >"$tmp/dummy.conf"
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   install_tree "$root" "$tmp/fake-bin" "$tmp/fake.conf" 0
   [[ -x "$root/bin/alighieri" ]] || fail "installed binary missing"
@@ -1182,6 +1547,8 @@ EOF
     || fail "generated plist missing Umask 63 (077 octal)"
   grep -Fq "${root}/bin/alighieri" "$root/${PLIST_LABEL}.plist" \
     || fail "generated plist missing staged binary path"
+  grep -Fq '# gen-old' "$root/bin/alighieri" \
+    || fail "installed binary is not the old generation"
   if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
     fail "install --no-start must not bootstrap"
   fi
@@ -1260,48 +1627,125 @@ EOF
       || fail "$msg: live config changed"
     [[ "$(cksum <"$root/${PLIST_LABEL}.plist")" == "$live_plist_hash" ]] \
       || fail "$msg: live plist changed"
-    grep -Fq 'exit 0' "$root/bin/alighieri" \
-      || fail "$msg: live binary is not the previously installed script"
+    grep -Fq '# gen-old' "$root/bin/alighieri" \
+      || fail "$msg: live binary is not the old generation"
+    grep -Fq '# gen-old-conf' "$root/alighieri.conf" \
+      || fail "$msg: live config is not the old generation"
+    if grep -Fq '# gen-new' "$root/bin/alighieri"; then
+      fail "$msg: live binary is the new generation"
+    fi
+  }
+
+  expect_unloaded_retained() {
+    local msg="$1"
+    expect_retained_live_tree "$msg"
+    grep -Fq bootout "$ALIGHIERI_LAUNCHCTL_LOG" \
+      || fail "$msg: must bootout before replacing files"
+    if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+      fail "$msg: must not bootstrap"
+    fi
+  }
+
+  fail_install_capturing() {
+    local status=0
+    set +e
+    ( set -euo pipefail; install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 1 )
+    status=$?
+    set -e
+    [[ "$status" -ne 0 ]] || fail "$1"
   }
 
   MV_BIN="$tmp/mv.sh"
   ALIGHIERI_MV_FAIL="$root/bin/alighieri"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
-  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
-    fail "failed live-binary rename must fail the install"
-  fi
-  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
-    fail "failed live-binary rename must not bootstrap"
-  fi
-  expect_retained_live_tree "failed live-binary rename"
+  fail_install_capturing "failed live-binary rename must fail the install"
+  expect_unloaded_retained "failed live-binary rename"
 
   ALIGHIERI_MV_FAIL="$root/alighieri.conf"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
-  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
-    fail "failed live-config rename must fail the install"
-  fi
-  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
-    fail "failed live-config rename must not bootstrap"
-  fi
-  expect_retained_live_tree "failed live-config rename"
+  fail_install_capturing "failed live-config rename must fail the install"
+  expect_unloaded_retained "failed live-config rename"
 
   ALIGHIERI_MV_FAIL="$root/${PLIST_LABEL}.plist"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
-  if ( install_tree "$root" "$tmp/dummy-bin" "$tmp/fake.conf" 1 ); then
-    fail "failed plist rename must fail the install"
-  fi
-  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
-    fail "failed plist rename must not bootstrap"
-  fi
-  # Binary+config already passed --check and were committed; plist remains the
-  # previous live file and launchd must not start.
-  [[ "$(cksum <"$root/${PLIST_LABEL}.plist")" == "$live_plist_hash" ]] \
-    || fail "failed plist rename must leave the live plist unchanged"
+  fail_install_capturing "failed plist rename must fail the install"
+  expect_unloaded_retained "failed plist rename"
   unset ALIGHIERI_MV_FAIL
   MV_BIN=/bin/mv
+
+  # Every operation after binary replacement, including ownership and
+  # bootstrap, must leave a coherent recoverable generation.
+  local point
+  for point in after-binary after-config chmod-conf chown-conf after-plist chown-plist chmod-plist bootstrap; do
+    INSTALL_FAIL_AFTER="$point"
+    : >"$ALIGHIERI_LAUNCHCTL_LOG"
+    fail_install_capturing "injected failure at ${point} must fail the install"
+    expect_unloaded_retained "injected failure at ${point}"
+  done
+  INSTALL_FAIL_AFTER=""
+
+  # Config replacement fails and restoring the previous binary also fails:
+  # keep the backup, report it, and do not bootstrap the mixed pair.
+  cat >"$tmp/restore-fail.sh" <<EOF
+#!/bin/sh
+set -eu
+last=""
+for last do
+  :
+done
+if [ "\$last" = "$root/bin/alighieri" ]; then
+  echo "INJECTED restore failure: \$last" >&2
+  exit 1
+fi
+exec /bin/mv "\$@"
+EOF
+  chmod +x "$tmp/restore-fail.sh"
+  RESTORE_BIN="$tmp/restore-fail.sh"
+  MV_BIN="$tmp/mv.sh"
+  ALIGHIERI_MV_FAIL="$root/alighieri.conf"
+  export ALIGHIERI_MV_FAIL
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  local restore_err="" restore_status=0
+  set +e
+  restore_err="$( ( set -euo pipefail; install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 1 ) 2>&1 )"
+  restore_status=$?
+  set -e
+  [[ "$restore_status" -ne 0 ]] || fail "failed restore must fail the install"
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed restore must not bootstrap the mixed pair"
+  fi
+  grep -Fq bootout "$ALIGHIERI_LAUNCHCTL_LOG" \
+    || fail "failed restore must bootout so KeepAlive cannot activate the mixed pair"
+  grep -Fq '# gen-new' "$root/bin/alighieri" \
+    || fail "failed restore must leave the new binary in place"
+  grep -Fq '# gen-old-conf' "$root/alighieri.conf" \
+    || fail "failed restore must leave the previous config in place"
+  local bak=""
+  bak="$(printf '%s\n' "$root/bin/alighieri.bak."*)"
+  [[ -n "$bak" && -f "$bak" ]] \
+    || fail "failed restore must retain the binary backup"
+  grep -Fq "$bak" <<<"$restore_err" \
+    || fail "failed restore must report the backup path"
+  grep -Fq "restore failed" <<<"$restore_err" \
+    || fail "failed restore must report the mixed live state"
+  grep -Fq '# gen-old' "$bak" \
+    || fail "retained backup is not the old generation"
+  unset ALIGHIERI_MV_FAIL
+  MV_BIN=/bin/mv
+  RESTORE_BIN=/bin/mv
+  restore_cmd -f -- "$bak" "$root/bin/alighieri" \
+    || fail "could not put the old generation back after the restore-failure fixture"
+  expect_retained_live_tree "after recovering from the restore-failure fixture"
+
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 1
+  grep -Fq "bootstrap system ${PLIST_PATH}" "$ALIGHIERI_LAUNCHCTL_LOG" \
+    || fail "successful install with start must bootstrap"
+  grep -Fq '# gen-new' "$root/bin/alighieri" \
+    || fail "successful upgrade must install the new generation"
 
   # start_daemon ignores a failed bootout and then bootstraps.
   : >"$ALIGHIERI_LAUNCHCTL_LOG"

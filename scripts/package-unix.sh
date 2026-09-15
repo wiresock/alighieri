@@ -104,6 +104,11 @@ for path in "${required[@]}"; do
     exit 1
   fi
 done
+if [[ "$os" == "macos" ]]; then
+  test -x "$dir/scripts/macos-daemon.sh" \
+    || { echo "packaged macos-daemon.sh is not executable" >&2; exit 1; }
+  "$dir/scripts/macos-daemon.sh" __selftest
+fi
 
 if [[ "$make_archive" -eq 1 ]]; then
   tar czf "$dir.tar.gz" "$dir"

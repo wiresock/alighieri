@@ -17,7 +17,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   The public LaunchDaemon tree is `/opt/alighieri` (outside Homebrew). The
   Linux systemd installer and Windows RDP helpers stay off those archives.
 - GitHub releases now attach a `SHA256SUMS` manifest covering every archive.
-  Verify with `shasum -a 256 -c SHA256SUMS` before clearing Gatekeeper
+  Verify the downloaded archive's single matching entry (not the whole
+  manifest, which lists every platform) before clearing Gatekeeper
   quarantine.
 
 ### Changed
