@@ -845,11 +845,30 @@ install_tree() {
     if is_root && on_darwin; then
       plist_dest="$PLIST_PATH"
     fi
+    plist_present_before=0
+    if [[ -f "$plist_dest" ]]; then
+      plist_present_before=1
+    fi
+    recovery_marker_present_before=0
+    if [[ -n "${INCOMPLETE_RECOVERY_MARKER:-}" && -f "$INCOMPLETE_RECOVERY_MARKER" ]]; then
+      recovery_marker_present_before=1
+    fi
+
+    # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
+    # shellcheck disable=SC2317
+    write_recovery_marker() {
+      {
+        echo "incomplete"
+        echo "binary_backup=${backup_bin:-}"
+        echo "config_backup=${backup_conf:-}"
+        echo "plist_backup=${backup_plist:-}"
+      } >"${INCOMPLETE_RECOVERY_MARKER}"
+    }
 
     # Invoked by the EXIT trap; shellcheck cannot see trap dispatch.
     # shellcheck disable=SC2317
     restore_previous_generation() {
-      local failed=0 bin_ok=1 conf_ok=1
+      local failed=0 bin_ok=1 conf_ok=1 withhold_plist=0
       if [[ -n "${backup_bin:-}" && -f "$backup_bin" ]]; then
         if restore_cmd -f -- "$backup_bin" "$root/bin/alighieri"; then
           backup_bin=""
@@ -866,28 +885,30 @@ install_tree() {
           conf_ok=0
         fi
       fi
-      # Restore an auto-start plist only when the executable/config pair is
-      # coherent. Otherwise keep the previous plist outside launchd's
-      # discovery path and remove any published dest plist.
-      if [[ -n "${backup_plist:-}" && -f "$backup_plist" ]]; then
-        if (( bin_ok && conf_ok )); then
-          if restore_cmd -f -- "$backup_plist" "$plist_dest"; then
-            backup_plist=""
-          else
-            failed=1
-          fi
+      # Restore an auto-start plist only when the previous dest existed and
+      # the executable/config pair is coherent. If the dest was already
+      # withheld, restore that absence even when there is no backup — including
+      # a retry that published a new plist.
+      if (( !bin_ok || !conf_ok )); then
+        withhold_plist=1
+      elif (( !plist_present_before )) && [[ -f "$plist_dest" ]]; then
+        withhold_plist=1
+      fi
+      if (( withhold_plist )); then
+        if [[ -f "$plist_dest" && "$plist_dest" != "${backup_plist:-}" ]]; then
+          rm -f -- "$plist_dest"
+        fi
+        write_recovery_marker
+        failed=1
+      elif [[ -n "${backup_plist:-}" && -f "$backup_plist" ]]; then
+        if restore_cmd -f -- "$backup_plist" "$plist_dest"; then
+          backup_plist=""
         else
-          if [[ -f "$plist_dest" && "$plist_dest" != "$backup_plist" ]]; then
-            rm -f -- "$plist_dest"
-          fi
-          {
-            echo "incomplete"
-            echo "binary_backup=${backup_bin:-}"
-            echo "config_backup=${backup_conf:-}"
-            echo "plist_backup=${backup_plist}"
-          } >"${INCOMPLETE_RECOVERY_MARKER}"
           failed=1
         fi
+      fi
+      if (( recovery_marker_present_before )); then
+        write_recovery_marker
       fi
       return "$failed"
     }
@@ -2119,12 +2140,42 @@ EOF
   unset ALIGHIERI_MV_FAIL
   MV_BIN=/bin/mv
   RESTORE_BIN=/bin/mv
-  restore_cmd -f -- "$bak" "$root/bin/alighieri" \
-    || fail "could not put the old generation back after the restore-failure fixture"
-  restore_cmd -f -- "$plist_bak" "$root/${PLIST_LABEL}.plist" \
-    || fail "could not restore the withheld plist after the restore-failure fixture"
-  rm -f -- "$root/.alighieri-incomplete-recovery"
-  expect_retained_live_tree "after recovering from the restore-failure fixture"
+
+  # Retry from the incomplete-recovery state without repairing files or the
+  # marker. If this attempt publishes a plist and then fails, rollback must
+  # restore dest absence so launchd cannot auto-start the mixed pair.
+  INSTALL_FAIL_AFTER=after-plist
+  mark_job_loaded
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  fail_install_capturing "retry after incomplete recovery must fail"
+  INSTALL_FAIL_AFTER=""
+  grep -Fq '# gen-new' "$root/bin/alighieri" \
+    || fail "failed retry must keep the mixed binary"
+  grep -Fq '# gen-old-conf' "$root/alighieri.conf" \
+    || fail "failed retry must keep the mixed config"
+  [[ ! -f "$root/${PLIST_LABEL}.plist" ]] \
+    || fail "failed retry must not reintroduce an auto-start plist"
+  [[ -f "$root/.alighieri-incomplete-recovery" ]] \
+    || fail "failed retry must preserve the recovery marker"
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  if ( start_daemon ); then
+    fail "start must still reject incomplete recovery after a failed retry"
+  fi
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed retry must not make the mixed pair startable"
+  fi
+
+  mark_job_loaded
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  install_tree "$root" "$tmp/dummy-bin" "$tmp/dummy.conf" 0
+  grep -Fq '# gen-new' "$root/bin/alighieri" \
+    || fail "successful retry must install the new binary"
+  grep -Fq '# gen-new-conf' "$root/alighieri.conf" \
+    || fail "successful retry must install the new config"
+  [[ -f "$root/${PLIST_LABEL}.plist" ]] \
+    || fail "successful retry must publish a plist"
+  [[ ! -f "$root/.alighieri-incomplete-recovery" ]] \
+    || fail "successful retry must clear the recovery marker"
 
   # Two installers at a publication boundary: A pauses after publishing the
   # binary, B must wait, A then fails and rolls back, B installs a complete
