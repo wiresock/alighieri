@@ -55,6 +55,45 @@ id_cmd() { "$ID_BIN" "$@"; }
 mv_cmd() { "$MV_BIN" "$@"; }
 restore_cmd() { "$RESTORE_BIN" "$@"; }
 
+# Move a live file aside. Prints the backup path only after the original has
+# been transferred. A failed move removes the mktemp placeholder so cleanup
+# cannot restore an empty file over the untouched original.
+backup_live_file() {
+  local live="$1" prefix="$2" tmp
+  [[ -f "$live" ]] || return 0
+  tmp="$(mktemp "$prefix")"
+  if mv_cmd -f -- "$live" "$tmp"; then
+    printf '%s\n' "$tmp"
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+# Confirm the LaunchDaemon is not loaded before replacing files. A loaded job
+# whose bootout fails, or an unreadable job state, aborts without publication.
+unload_job_before_replace() {
+  local out="" rc=0
+  out="$("$LAUNCHCTL_BIN" print "system/${PLIST_LABEL}" 2>&1)" || rc=$?
+  if (( rc == 0 )); then
+    "$LAUNCHCTL_BIN" bootout "system/${PLIST_LABEL}" \
+      || fail "failed to unload ${PLIST_LABEL}; refusing to replace files"
+    rc=0
+    out="$("$LAUNCHCTL_BIN" print "system/${PLIST_LABEL}" 2>&1)" || rc=$?
+    if (( rc == 0 )); then
+      fail "${PLIST_LABEL} is still loaded after bootout; refusing to replace files"
+    fi
+    if ! printf '%s\n' "$out" | grep -Eq 'Could not find service|No such process'; then
+      fail "failed to confirm ${PLIST_LABEL} is unloaded"
+    fi
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -Eq 'Could not find service|No such process'; then
+    return 0
+  fi
+  fail "failed to query ${PLIST_LABEL} state; refusing to replace files"
+}
+
 is_root() { [[ "$(id_cmd -u)" == "0" ]]; }
 
 on_darwin() { [[ "$(uname -s)" == "Darwin" ]]; }
@@ -264,8 +303,18 @@ strip_quarantine() {
   return 0
 }
 
+# Returns 0 if the record exists, 1 if it is positively absent. Lookup
+# errors (as opposed to eDSRecordNotFound) abort rather than looking absent.
 record_exists() {
-  dscl_cmd . -read "$1" >/dev/null 2>&1
+  local rec="$1" out="" rc=0
+  out="$(dscl_cmd . -read "$rec" 2>&1)" || rc=$?
+  if (( rc == 0 )); then
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -Eq 'eDSRecordNotFound|No such record'; then
+    return 1
+  fi
+  fail "failed to look up ${rec}"
 }
 
 # Print every value of Open Directory attribute $2 on record $1.
@@ -520,11 +569,15 @@ release_provision_lock() {
 
 # dscl -create is not exclusive. Only claim deletion ownership when the
 # record has no identifying numeric id yet (we just created an empty record).
+# A failed ownership read is not "absent": abort without claiming, changing
+# IDs, or deleting records.
 claim_created_record() {
-  local rec="$1" key="$2"
-  local existing=""
-  existing="$(read_prop "$rec" "$key" 2>/dev/null || true)"
-  if [[ -n "$existing" ]]; then
+  local rec="$1" key="$2" rc=0 existing=""
+  existing="$(read_attr_values "$rec" "$key")" || rc=$?
+  if (( rc == 1 )); then
+    fail "failed to read ${key} for ${rec}; will not take deletion ownership"
+  fi
+  if (( rc == 0 )) && [[ -n "$existing" ]]; then
     return 1
   fi
   return 0
@@ -812,22 +865,19 @@ install_tree() {
     apply_install_ownership root:wheel "$staged_plist"
 
     # Unload before replacing files so KeepAlive cannot respawn into a mixed tree.
-    "$LAUNCHCTL_BIN" bootout "system/${PLIST_LABEL}" >/dev/null 2>&1 || true
+    unload_job_before_replace
     inject_install_fault after-unload
 
     if [[ -f "$root/bin/alighieri" ]]; then
-      backup_bin="$(mktemp "${root}/bin/alighieri.bak.XXXXXX")"
-      mv_cmd -f -- "$root/bin/alighieri" "$backup_bin" \
+      backup_bin="$(backup_live_file "$root/bin/alighieri" "${root}/bin/alighieri.bak.XXXXXX")" \
         || fail "failed to backup the live binary"
     fi
     if [[ -f "$root/alighieri.conf" ]]; then
-      backup_conf="$(mktemp "${root}/alighieri.conf.bak.XXXXXX")"
-      mv_cmd -f -- "$root/alighieri.conf" "$backup_conf" \
+      backup_conf="$(backup_live_file "$root/alighieri.conf" "${root}/alighieri.conf.bak.XXXXXX")" \
         || fail "failed to backup the live configuration"
     fi
     if [[ -f "$plist_dest" ]]; then
-      backup_plist="$(mktemp "${root}/plist.bak.XXXXXX")"
-      mv_cmd -f -- "$plist_dest" "$backup_plist" \
+      backup_plist="$(backup_live_file "$plist_dest" "${root}/plist.bak.XXXXXX")" \
         || fail "failed to backup the live plist"
     fi
 
@@ -942,6 +992,15 @@ case "$op" in
     if [ -z "$key" ] && [ -n "${ALIGHIERI_DSCL_HIDE_EXISTENCE:-}" ]; then
       case "$rec" in
         /Users/_alighieri|/Groups/_alighieri)
+          echo "DS Error: injected existence lookup failure" >&2
+          exit 1
+          ;;
+      esac
+    fi
+    if [ -z "$key" ] && [ -n "${ALIGHIERI_DSCL_LIE_ABSENT:-}" ]; then
+      case "$rec" in
+        /Users/_alighieri|/Groups/_alighieri)
+          echo "eDSRecordNotFound" >&2
           exit 1
           ;;
       esac
@@ -950,7 +1009,10 @@ case "$op" in
       echo "DS Error: injected read failure" >&2
       exit 1
     fi
-    [ -d "$db$rec" ] || exit 1
+    if [ ! -d "$db$rec" ]; then
+      echo "eDSRecordNotFound" >&2
+      exit 1
+    fi
     if [ -n "$key" ]; then
       if [ ! -f "$db$rec/$key" ]; then
         echo "No such key: $key"
@@ -1032,13 +1094,46 @@ EOF
 #!/bin/sh
 set -eu
 echo "$@" >> "${ALIGHIERI_LAUNCHCTL_LOG:?}"
-if [ "$1" = bootout ]; then
-  exit 1
+state_file="${ALIGHIERI_LAUNCHCTL_STATE_FILE:?}"
+if [ ! -f "$state_file" ]; then
+  echo absent >"$state_file"
 fi
-if [ "$1" = bootstrap ]; then
-  exit 0
-fi
-exit 0
+state="$(tr -d '\r' < "$state_file")"
+cmd="$1"
+case "$cmd" in
+  print)
+    if [ "$state" = loaded ]; then
+      echo "state = running"
+      exit 0
+    fi
+    echo "Could not find service" >&2
+    exit 113
+    ;;
+  bootout)
+    if [ -n "${ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT:-}" ]; then
+      echo "INJECTED bootout failure" >&2
+      exit 1
+    fi
+    if [ "$state" = loaded ]; then
+      echo absent >"$state_file"
+      exit 0
+    fi
+    echo "Could not find service" >&2
+    exit 113
+    ;;
+  bootstrap)
+    if [ -n "${ALIGHIERI_LAUNCHCTL_FAIL_BOOTSTRAP:-}" ]; then
+      echo "INJECTED bootstrap failure" >&2
+      exit 1
+    fi
+    echo loaded >"$state_file"
+    exit 0
+    ;;
+  *)
+    echo "unexpected launchctl command: $*" >&2
+    exit 2
+    ;;
+esac
 EOF
   chmod +x "$tmp/launchctl.sh"
 
@@ -1062,10 +1157,12 @@ EOF
 
   export ALIGHIERI_DSCL_DB="$db"
   export ALIGHIERI_LAUNCHCTL_LOG="$tmp/launchctl.log"
+  export ALIGHIERI_LAUNCHCTL_STATE_FILE="$tmp/launchctl.state"
   DSCL_BIN="$tmp/dscl.sh"
   LAUNCHCTL_BIN="$tmp/launchctl.sh"
   STAT_BIN="$tmp/stat.sh"
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  echo absent >"$ALIGHIERI_LAUNCHCTL_STATE_FILE"
 
   # Clean provision then exact rerun.
   provision
@@ -1155,9 +1252,15 @@ case "$op" in
     ;;
   -read)
     rec="$1"; key="${2:-}"
-    [ -d "$db$rec" ] || exit 1
+    if [ ! -d "$db$rec" ]; then
+      echo "eDSRecordNotFound" >&2
+      exit 1
+    fi
     if [ -n "$key" ]; then
-      [ -f "$db$rec/$key" ] || exit 1
+      if [ ! -f "$db$rec/$key" ]; then
+        echo "No such key: $key"
+        exit 0
+      fi
       printf '%s: %s\n' "$key" "$(tr -d '\r' < "$db$rec/$key")"
     fi
     ;;
@@ -1386,16 +1489,52 @@ EOF
   unset ALIGHIERI_DSCL_FAIL_CREATE
   reset_valid_identity
 
-  # Command success of dscl -create must not take deletion ownership of an
-  # identity that already exists (existence checks can be stale or hidden).
+  assert_identity_unchanged() {
+    local msg="$1"
+    [[ -d "$db/Users/_alighieri" ]] || fail "$msg: user record deleted"
+    [[ -d "$db/Groups/_alighieri" ]] || fail "$msg: group record deleted"
+    [[ "$(read_prop "/Users/_alighieri" UniqueID)" == "261" ]] \
+      || fail "$msg: user UniqueID changed"
+    [[ "$(read_prop "/Groups/_alighieri" PrimaryGroupID)" == "261" ]] \
+      || fail "$msg: group PrimaryGroupID changed"
+    [[ "$(read_prop "/Users/_alighieri" PrimaryGroupID)" == "261" ]] \
+      || fail "$msg: user PrimaryGroupID changed"
+  }
+
+  # Lookup errors on existence must fail closed, not look like absence.
   ALIGHIERI_DSCL_HIDE_EXISTENCE=1
   export ALIGHIERI_DSCL_HIDE_EXISTENCE
-  expect_provision_failure "create against an existing identity must not take deletion ownership"
+  expect_provision_failure "existence lookup failure must fail closed"
   unset ALIGHIERI_DSCL_HIDE_EXISTENCE
-  [[ -d "$db/Users/_alighieri" ]] || fail "must not delete a competing user identity"
-  [[ -d "$db/Groups/_alighieri" ]] || fail "must not delete a competing group identity"
+  assert_identity_unchanged "existence lookup failure"
+
+  # Existence lied as absent and the group's GID read failed: do not claim
+  # ownership, overwrite the GID, or delete the pre-existing group.
+  ALIGHIERI_DSCL_LIE_ABSENT=1
+  export ALIGHIERI_DSCL_LIE_ABSENT
+  ALIGHIERI_DSCL_FAIL_READ="/Groups/_alighieri PrimaryGroupID"
+  export ALIGHIERI_DSCL_FAIL_READ
+  expect_provision_failure "failed group GID read must not take deletion ownership"
+  unset ALIGHIERI_DSCL_FAIL_READ
+  assert_identity_unchanged "failed group GID read"
+
+  unset ALIGHIERI_DSCL_LIE_ABSENT
+  rm -rf "$db/Groups/_alighieri"
+  ALIGHIERI_DSCL_LIE_ABSENT=1
+  export ALIGHIERI_DSCL_LIE_ABSENT
+  ALIGHIERI_DSCL_FAIL_READ="/Users/_alighieri UniqueID"
+  export ALIGHIERI_DSCL_FAIL_READ
+  expect_provision_failure "failed user UniqueID read must not take deletion ownership"
+  unset ALIGHIERI_DSCL_FAIL_READ
+  unset ALIGHIERI_DSCL_LIE_ABSENT
+  [[ -d "$db/Users/_alighieri" ]] || fail "failed user UniqueID read: user record deleted"
   [[ "$(read_prop "/Users/_alighieri" UniqueID)" == "261" ]] \
-    || fail "competing user UniqueID must remain"
+    || fail "failed user UniqueID read: UniqueID changed"
+  [[ "$(read_prop "/Users/_alighieri" PrimaryGroupID)" == "261" ]] \
+    || fail "failed user UniqueID read: user PrimaryGroupID changed"
+  [[ ! -d "$db/Groups/_alighieri" ]] \
+    || fail "failed user UniqueID read: must not leave a group after rollback"
+  reset_valid_identity
 
   mkdir "$PROVISION_LOCK_DIR"
   PROVISION_LOCK_RETRIES=3
@@ -1607,12 +1746,27 @@ EOF
 #!/bin/sh
 set -eu
 fail_dest="${ALIGHIERI_MV_FAIL:-}"
+fail_src="${ALIGHIERI_MV_FAIL_SRC:-}"
 last=""
-for last do
-  :
+src=""
+for arg do
+  case "$arg" in
+    -*)
+      ;;
+    *)
+      if [ -z "$src" ]; then
+        src="$arg"
+      fi
+      last="$arg"
+      ;;
+  esac
 done
 if [ -n "$fail_dest" ] && [ "$last" = "$fail_dest" ]; then
   echo "INJECTED mv failure: $last" >&2
+  exit 1
+fi
+if [ -n "$fail_src" ] && [ "$src" = "$fail_src" ]; then
+  echo "INJECTED mv source failure: $src" >&2
   exit 1
 fi
 exec /bin/mv "$@"
@@ -1636,6 +1790,10 @@ EOF
     fi
   }
 
+  mark_job_loaded() {
+    echo loaded >"$ALIGHIERI_LAUNCHCTL_STATE_FILE"
+  }
+
   expect_unloaded_retained() {
     local msg="$1"
     expect_retained_live_tree "$msg"
@@ -1644,6 +1802,8 @@ EOF
     if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
       fail "$msg: must not bootstrap"
     fi
+    [[ "$(tr -d '\r' <"$ALIGHIERI_LAUNCHCTL_STATE_FILE")" == "absent" ]] \
+      || fail "$msg: job must remain unloaded"
   }
 
   fail_install_capturing() {
@@ -1655,19 +1815,96 @@ EOF
     [[ "$status" -ne 0 ]] || fail "$1"
   }
 
+  assert_no_empty_backups() {
+    local f
+    for f in "$root/bin/alighieri.bak."* "$root/alighieri.conf.bak."* "$root/plist.bak."*; do
+      [[ -e "$f" ]] || continue
+      [[ -s "$f" ]] || fail "empty backup placeholder remains: $f"
+    done
+  }
+
+  # Loaded job whose unload fails: do not replace any live file.
+  mark_job_loaded
+  ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT=1
+  export ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  fail_install_capturing "failed bootout of a loaded job must fail the install"
+  expect_retained_live_tree "failed bootout of a loaded job"
+  [[ "$(tr -d '\r' <"$ALIGHIERI_LAUNCHCTL_STATE_FILE")" == "loaded" ]] \
+    || fail "failed bootout must leave the job loaded"
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "failed bootout must not bootstrap"
+  fi
+  unset ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT
+
+  # Unexpected launchctl verbs must be rejected by the double.
+  if ( "$LAUNCHCTL_BIN" blame "system/${PLIST_LABEL}" ); then
+    fail "unexpected launchctl command must fail"
+  fi
+
+  # Absent job remains a valid fresh-install / --no-start case (already
+  # installed above). Confirm print-not-found does not require bootout.
+  echo absent >"$ALIGHIERI_LAUNCHCTL_STATE_FILE"
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  install_tree "$root" "$tmp/fake-bin" "$tmp/fake.conf" 0
+  if grep -Fq bootstrap "$ALIGHIERI_LAUNCHCTL_LOG"; then
+    fail "absent-job --no-start must not bootstrap"
+  fi
+  grep -Fq '# gen-old' "$root/bin/alighieri" \
+    || fail "absent-job reinstall must keep a coherent generation"
+  live_bin_hash="$(cksum <"$root/bin/alighieri")"
+  live_conf_hash="$(cksum <"$root/alighieri.conf")"
+  live_plist_hash="$(cksum <"$root/${PLIST_LABEL}.plist")"
+
   MV_BIN="$tmp/mv.sh"
+
+  # Fail each live-to-backup move independently. The original must survive
+  # and an empty mktemp placeholder must not be restored over it.
+  mark_job_loaded
+  ALIGHIERI_MV_FAIL_SRC="$root/bin/alighieri"
+  export ALIGHIERI_MV_FAIL_SRC
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  fail_install_capturing "failed binary backup must fail the install"
+  expect_unloaded_retained "failed binary backup"
+  [[ -s "$root/bin/alighieri" ]] || fail "failed binary backup left a zero-byte original"
+  assert_no_empty_backups
+  unset ALIGHIERI_MV_FAIL_SRC
+
+  mark_job_loaded
+  ALIGHIERI_MV_FAIL_SRC="$root/alighieri.conf"
+  export ALIGHIERI_MV_FAIL_SRC
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  fail_install_capturing "failed config backup must fail the install"
+  expect_unloaded_retained "failed config backup"
+  [[ -s "$root/alighieri.conf" ]] || fail "failed config backup left a zero-byte original"
+  assert_no_empty_backups
+  unset ALIGHIERI_MV_FAIL_SRC
+
+  mark_job_loaded
+  ALIGHIERI_MV_FAIL_SRC="$root/${PLIST_LABEL}.plist"
+  export ALIGHIERI_MV_FAIL_SRC
+  : >"$ALIGHIERI_LAUNCHCTL_LOG"
+  fail_install_capturing "failed plist backup must fail the install"
+  expect_unloaded_retained "failed plist backup"
+  [[ -s "$root/${PLIST_LABEL}.plist" ]] || fail "failed plist backup left a zero-byte original"
+  assert_no_empty_backups
+  unset ALIGHIERI_MV_FAIL_SRC
+
+  mark_job_loaded
   ALIGHIERI_MV_FAIL="$root/bin/alighieri"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   fail_install_capturing "failed live-binary rename must fail the install"
   expect_unloaded_retained "failed live-binary rename"
 
+  mark_job_loaded
   ALIGHIERI_MV_FAIL="$root/alighieri.conf"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   fail_install_capturing "failed live-config rename must fail the install"
   expect_unloaded_retained "failed live-config rename"
 
+  mark_job_loaded
   ALIGHIERI_MV_FAIL="$root/${PLIST_LABEL}.plist"
   export ALIGHIERI_MV_FAIL
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
@@ -1681,6 +1918,7 @@ EOF
   local point
   for point in after-binary after-config chmod-conf chown-conf after-plist chown-plist chmod-plist bootstrap; do
     INSTALL_FAIL_AFTER="$point"
+    mark_job_loaded
     : >"$ALIGHIERI_LAUNCHCTL_LOG"
     fail_install_capturing "injected failure at ${point} must fail the install"
     expect_unloaded_retained "injected failure at ${point}"
@@ -1707,6 +1945,7 @@ EOF
   MV_BIN="$tmp/mv.sh"
   ALIGHIERI_MV_FAIL="$root/alighieri.conf"
   export ALIGHIERI_MV_FAIL
+  mark_job_loaded
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   local restore_err="" restore_status=0
   set +e
@@ -1748,8 +1987,12 @@ EOF
     || fail "successful upgrade must install the new generation"
 
   # start_daemon ignores a failed bootout and then bootstraps.
+  mark_job_loaded
+  ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT=1
+  export ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT
   : >"$ALIGHIERI_LAUNCHCTL_LOG"
   start_daemon
+  unset ALIGHIERI_LAUNCHCTL_FAIL_BOOTOUT
   grep -Fq "bootout system/${PLIST_LABEL}" "$ALIGHIERI_LAUNCHCTL_LOG" \
     || fail "start must attempt bootout"
   grep -Fq "bootstrap system ${PLIST_PATH}" "$ALIGHIERI_LAUNCHCTL_LOG" \
