@@ -250,7 +250,9 @@ jobs:
       - name: Style and audit
         run: |
           brew style Formula/alighieri.rb
-          brew audit --strict --formula Formula/alighieri.rb
+          brew tap-new --no-git local/alighieri
+          cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
+          brew audit --strict local/alighieri/alighieri
       - name: Install via formula
         env:
           HOMEBREW_ALIGHIERI_SOURCE: ${{ github.workspace }}
