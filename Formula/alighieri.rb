@@ -29,11 +29,6 @@ class Alighieri < Formula
   def install
     system "cargo", "install", "--bin", "alighieri", *std_cargo_args
     etc.install "doc/alighieri.conf"
-    (var/"log").mkpath
-  end
-
-  def post_install
-    (var/"log").mkpath
   end
 
   def caveats
