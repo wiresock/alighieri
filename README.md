@@ -1159,12 +1159,15 @@ A formula is in this repository for local and `--HEAD` installs. It is **not**
 in Homebrew/core and there is no WireSock tap.
 
 ```sh
-# From a checkout of this PR / branch (builds the files you have):
+# From a checkout of this PR / branch (builds the files you have).
+# Current Homebrew requires the formula to live in a tap:
 gh pr checkout 164
-HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install --formula ./Formula/alighieri.rb
+brew tap-new --no-git local/alighieri
+cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
+HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install local/alighieri/alighieri
 
-# After this lands on GitHub main:
-brew install --HEAD --formula ./Formula/alighieri.rb
+# After this lands on GitHub main (same tap):
+brew install --HEAD local/alighieri/alighieri
 ```
 
 ```sh

@@ -257,7 +257,7 @@ jobs:
         env:
           HOMEBREW_ALIGHIERI_SOURCE: ${{ github.workspace }}
           HOMEBREW_NO_INSTALL_FROM_API: 1
-        run: brew install --formula --verbose ./Formula/alighieri.rb
+        run: brew install --verbose local/alighieri/alighieri
       - name: Test formula
         run: |
           brew test alighieri
