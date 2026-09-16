@@ -4,7 +4,8 @@ class Alighieri < Formula
   # HOMEBREW_ALIGHIERI_SOURCE=/path/to/checkout builds that tree (PR testing).
   # Otherwise the tagged GitHub archive is used; --HEAD tracks GitHub main.
   if (src = ENV.fetch("HOMEBREW_ALIGHIERI_SOURCE", nil)) && File.directory?(src)
-    url "file://#{src}", using: :git
+    rev = IO.popen(["git", "-C", src, "rev-parse", "HEAD"], err: File::NULL, &:read).to_s.strip
+    url "file://#{src}", using: :git, revision: rev
     version "0.6.0"
   else
     url "https://github.com/wiresock/alighieri/archive/refs/tags/v0.6.0.tar.gz"
