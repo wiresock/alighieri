@@ -1153,6 +1153,36 @@ plutil -lint "$PLIST"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 ```
 
+### Homebrew (repository formula)
+
+A formula is in this repository for local and `--HEAD` installs. It is **not**
+in Homebrew/core and there is no WireSock tap.
+
+```sh
+# From a checkout of this PR / branch (builds the files you have):
+gh pr checkout 164
+HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install --formula ./Formula/alighieri.rb
+
+# After this lands on GitHub main:
+brew install --HEAD --formula ./Formula/alighieri.rb
+```
+
+```sh
+alighieri --version
+brew test alighieri
+```
+
+`brew services` starts a **per-user LaunchAgent** using
+`$(brew --prefix)/etc/alighieri.conf` (loopback `:1080` in the example
+config). That is the same command-line model as `doc/macos-launchagent.plist`
+(`alighieri --config PATH`). It is not the hardened `_alighieri` LaunchDaemon
+under `/opt/alighieri`.
+
+```sh
+brew services start alighieri
+brew services stop alighieri
+```
+
 Hot reload is SIGHUP, the same as other Unix builds. For the LaunchAgent:
 
 ```sh

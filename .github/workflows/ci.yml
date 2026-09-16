@@ -240,6 +240,28 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # In-repo Homebrew formula: style/audit plus an install from this checkout.
+  # Does not duplicate the macOS cargo test matrix.
+  homebrew:
+    name: homebrew formula
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Style and audit
+        run: |
+          brew style Formula/alighieri.rb
+          brew audit --strict --formula Formula/alighieri.rb
+      - name: Install via formula
+        env:
+          HOMEBREW_ALIGHIERI_SOURCE: ${{ github.workspace }}
+          HOMEBREW_NO_INSTALL_FROM_API: 1
+        run: brew install --formula --verbose ./Formula/alighieri.rb
+      - name: Test formula
+        run: |
+          brew test alighieri
+          alighieri --version
+          alighieri --check --config "$(brew --prefix)/etc/alighieri.conf"
+
   # Lint the Linux management scripts and run their bundled self-tests (the
   # installer's path-normalisation and hardened-path warning logic). shellcheck
   # is preinstalled on the GitHub-hosted Ubuntu runners.

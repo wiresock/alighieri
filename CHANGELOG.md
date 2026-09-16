@@ -20,6 +20,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   Verify the downloaded archive's single matching entry (not the whole
   manifest, which lists every platform) before clearing Gatekeeper
   quarantine.
+- An in-repository Homebrew formula (`Formula/alighieri.rb`) installs the
+  console binary for local/`--HEAD` testing. `brew services` runs a per-user
+  LaunchAgent. This is not a Homebrew/core submission or a WireSock tap.
 
 ### Changed
 
