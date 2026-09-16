@@ -870,20 +870,43 @@ impl Connection {
 
         // The relay socket is bound on the same interface the client reached us
         // on, so the address we advertise is reachable by the client.
-        let relay_socket =
-            match bind_udp_in_range(self.local.ip(), self.config.udp_port_range).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(peer = %self.peer, error = %e, "failed to bind UDP relay socket");
-                    socks5::write_reply(
-                        &mut self.stream,
-                        Reply::GeneralFailure,
-                        socks5::unspecified_v4(),
-                    )
-                    .await?;
-                    return Err(Error::Io(e));
-                }
-            };
+        // `bind_udp_in_range` canonicalises an IPv4-mapped local (`::ffff:`) to
+        // AF_INET: Darwin will not deliver IPv4 UDP to an AF_INET6 socket bound
+        // to a specific mapped address, even when the TCP accept succeeded.
+        // PROXY can advertise a logical client family that does not match the
+        // physical TCP socket; refuse that combination rather than succeeding
+        // the ASSOCIATE and then dropping every datagram.
+        let Some(relay_bind_ip) = udp_client_facing_bind_ip(self.local.ip(), self.peer.ip()) else {
+            warn!(
+                peer = %self.peer,
+                local = %self.local,
+                "udp associate rejected: PROXY client family does not match the listening socket"
+            );
+            socks5::write_reply(
+                &mut self.stream,
+                Reply::GeneralFailure,
+                socks5::unspecified_v4(),
+            )
+            .await?;
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP ASSOCIATE client family does not match the listening socket",
+            )));
+        };
+        let relay_socket = match bind_udp_in_range(relay_bind_ip, self.config.udp_port_range).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(peer = %self.peer, error = %e, "failed to bind UDP relay socket");
+                socks5::write_reply(
+                    &mut self.stream,
+                    Reply::GeneralFailure,
+                    socks5::unspecified_v4(),
+                )
+                .await?;
+                return Err(Error::Io(e));
+            }
+        };
         // The outbound socket carries traffic to/from remote peers, sourced from
         // the configured external address. `outbound_dual` is true when it is a
         // dual-stack IPv6 socket (so IPv4 destinations are sent in `::ffff:`
@@ -910,10 +933,10 @@ impl Connection {
         let relay_addr = relay_socket
             .local_addr()
             .unwrap_or_else(|_| socks5::unspecified_v4());
-        // On a dual-stack listener the relay socket is bound on an IPv4-mapped
-        // (`::ffff:`) local address, so report the canonical form to the client: a
-        // v4 client must get a v4 (ATYP=0x01) BND.ADDR it can parse, not the IPv6
-        // (mapped) encoding. A genuine IPv6 address is unchanged.
+        // Always advertise the canonical address so a v4 client gets ATYP=0x01
+        // rather than an IPv6-mapped encoding. After the bind above this is a
+        // no-op for the mapped case (the socket is already AF_INET); a genuine
+        // IPv6 address is unchanged.
         let relay_addr = SocketAddr::new(relay_addr.ip().to_canonical(), relay_addr.port());
         // Advertise the configured public host (with the real relay port) so a
         // client reaching us via NAT is told an address it can send to; a hostname
@@ -1016,7 +1039,7 @@ impl Connection {
                 self.local,
                 Command::UdpAssociate,
                 Protocol::Udp,
-                relay_addr,
+                advertised,
                 requested_host,
                 client_endpoint,
                 crate::plugin::TagSet::new(),
@@ -1185,19 +1208,31 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
     if addr.port() == 0 {
         return None;
     }
-    // Match canonically so a dual-stack client (an IPv4-mapped `::ffff:a.b.c.d`)
-    // still matches a plain-IPv4 DST.ADDR instead of silently dropping the
-    // predeclared source lock and weakening the per-association source binding.
-    // Bind the lock to the client's own address — the same family as the relay
-    // socket, so it stays a valid reply target — keeping the requested port. An
-    // unspecified DST.ADDR means "lock to my source", which is likewise the
-    // client address.
-    if addr.ip().is_unspecified() || addr.ip().to_canonical() == client_ip.to_canonical() {
+    // Canonicalise *before* unspecified/equality tests so a dual-stack client
+    // that sends `[::ffff:0.0.0.0]:P` still locks to the authenticated peer IP
+    // and declared port instead of falling through to first-datagram-wins.
+    // Match mapped `::ffff:a.b.c.d` against a plain-IPv4 DST.ADDR the same way.
+    let dest_ip = addr.ip().to_canonical();
+    let client_ip = client_ip.to_canonical();
+    if dest_ip.is_unspecified() || dest_ip == client_ip {
         let mut endpoint = *addr;
         endpoint.set_ip(client_ip);
         return Some(endpoint);
     }
     None
+}
+
+/// Client-facing UDP relay bind IP. PROXY protocol can replace the logical
+/// client with a different address family than the physical TCP socket; a
+/// mismatch cannot share one UDP socket, so the caller must fail closed.
+fn udp_client_facing_bind_ip(local: IpAddr, peer: IpAddr) -> Option<IpAddr> {
+    let local = local.to_canonical();
+    let peer = peer.to_canonical();
+    if local.is_ipv4() == peer.is_ipv4() {
+        Some(local)
+    } else {
+        None
+    }
 }
 
 /// Binds a UDP relay socket on `ip`. With a configured `range`, scans the
@@ -1206,7 +1241,13 @@ fn requested_udp_endpoint(dest: &TargetAddr, client_ip: IpAddr) -> Option<Socket
 /// and the advertised `BND.PORT` is not trivially predictable — and returns
 /// `AddrInUse` if no port in the range can be bound. Without a range it binds an
 /// OS-assigned ephemeral port (the historical default).
+///
+/// IPv4-mapped addresses (`::ffff:a.b.c.d`) are bound as plain IPv4. Darwin does
+/// not deliver IPv4 UDP to an AF_INET6 socket bound to a specific mapped
+/// address, so keeping the mapped form would accept UDP ASSOCIATE and then
+/// silently drop every client datagram.
 async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<UdpSocket> {
+    let ip = ip.to_canonical();
     let Some(range) = range else {
         return UdpSocket::bind((ip, 0)).await;
     };
@@ -1262,6 +1303,7 @@ async fn bind_udp_in_range(ip: IpAddr, range: Option<PortRange>) -> io::Result<U
 async fn bind_outbound_udp(external: IpAddr) -> io::Result<(UdpSocket, bool)> {
     use std::net::Ipv4Addr;
 
+    let external = external.to_canonical();
     if external.is_unspecified() {
         match bind_dual_stack_udp() {
             Ok(socket) => return Ok((socket, true)),
@@ -1311,6 +1353,7 @@ async fn connect_remote(
     external: IpAddr,
     timeout: std::time::Duration,
 ) -> Result<TcpStream> {
+    let external = external.to_canonical();
     let socket = match target {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -1538,18 +1581,47 @@ mod tests {
     }
 
     #[test]
-    fn requested_udp_endpoint_locks_mapped_client_in_its_own_family() {
+    fn requested_udp_endpoint_maps_mapped_unspecified_to_client_ip() {
+        let client_ip = "127.0.0.1".parse().unwrap();
+        let mapped_unspecified: SocketAddr = "[::ffff:0.0.0.0]:53000".parse().unwrap();
+        let endpoint = requested_udp_endpoint(&TargetAddr::Ip(mapped_unspecified), client_ip);
+        assert_eq!(endpoint, Some("127.0.0.1:53000".parse().unwrap()));
+
+        let mapped_client: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(
+            requested_udp_endpoint(&TargetAddr::Ip(mapped_unspecified), mapped_client),
+            Some("127.0.0.1:53000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn udp_client_facing_bind_ip_rejects_cross_family_proxy() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(udp_client_facing_bind_ip(v4, v4), Some(v4));
+        assert_eq!(udp_client_facing_bind_ip(v6, v6), Some(v6));
+        assert_eq!(
+            udp_client_facing_bind_ip("::ffff:127.0.0.1".parse().unwrap(), v4),
+            Some(v4)
+        );
+        assert_eq!(udp_client_facing_bind_ip(v6, v4), None);
+        assert_eq!(udp_client_facing_bind_ip(v4, v6), None);
+    }
+
+    #[test]
+    fn requested_udp_endpoint_locks_mapped_client_to_canonical_ip() {
         // On a dual-stack listener a v4 client appears as `::ffff:a.b.c.d`, while
         // its ASSOCIATE request carries the plain-IPv4 DST.ADDR. The lock must be
-        // set (not dropped to first-datagram-wins) and kept in the client's own
-        // family, so it stays a valid reply target on the dual-stack relay socket.
+        // set (not dropped to first-datagram-wins) and stored as canonical IPv4,
+        // matching the AF_INET relay socket `bind_udp_in_range` creates from a
+        // mapped local — a mapped IPv6 endpoint is not sendable on that socket.
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        let want = Some(SocketAddr::new(mapped, 53000));
+        let want = Some("127.0.0.1:53000".parse().unwrap());
         assert_eq!(
             requested_udp_endpoint(&TargetAddr::Ip("127.0.0.1:53000".parse().unwrap()), mapped),
             want
         );
-        // Unspecified DST.ADDR likewise locks to the (mapped) client address.
+        // Unspecified DST.ADDR likewise locks to the canonical client address.
         assert_eq!(
             requested_udp_endpoint(&TargetAddr::Ip("0.0.0.0:53000".parse().unwrap()), mapped),
             want
@@ -1658,6 +1730,64 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_udp_in_range_canonicalises_ipv4_mapped_so_v4_clients_can_reach_it() {
+        // Binding the mapped form (`::ffff:127.0.0.1`) as AF_INET6 is what Darwin
+        // cannot receive IPv4 UDP on. The helper must land on AF_INET instead.
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let relay = bind_udp_in_range(mapped, None).await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        assert!(
+            relay_addr.is_ipv4(),
+            "IPv4-mapped bind must land on AF_INET, got {relay_addr}"
+        );
+        assert_eq!(relay_addr.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", relay_addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(1), relay.recv_from(&mut buf))
+            .await
+            .expect("IPv4 datagram must reach a relay bound from an IPv4-mapped local")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
+        assert_eq!(
+            src.ip().to_canonical(),
+            client.local_addr().unwrap().ip().to_canonical()
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_outbound_udp_canonicalises_mapped_external() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let (socket, dual) = bind_outbound_udp(mapped).await.unwrap();
+        assert!(!dual, "a concrete mapped IPv4 external is not dual-stack");
+        let addr = socket.local_addr().unwrap();
+        assert!(
+            addr.is_ipv4(),
+            "mapped external must bind AF_INET, got {addr}"
+        );
+        assert_eq!(addr.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn connect_remote_canonicalises_mapped_external_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let client = connect_remote(dest, mapped, Duration::from_secs(2))
+            .await
+            .expect("mapped external must bind as IPv4 and connect");
+        let (_stream, peer) = accept.await.unwrap();
+        assert!(
+            peer.is_ipv4(),
+            "remote must observe a native IPv4 source, got {peer}"
+        );
+        assert_eq!(peer.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        drop(client);
     }
 
     #[test]
