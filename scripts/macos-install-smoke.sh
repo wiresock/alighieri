@@ -117,9 +117,12 @@ manual_docs="$(readme_section "### Manual per-user LaunchAgent")"
 [[ -n "$manual_docs" ]] || fail "README is missing the manual LaunchAgent section"
 require_in_section "$manual_docs" "com.wiresock.alighieri" \
   "manual LaunchAgent docs lost the com.wiresock.alighieri label"
+# Match documentation text: command substitution must remain literal.
+# shellcheck disable=SC2016
 require_in_section "$manual_docs" \
   'launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"' \
   "manual LaunchAgent docs lost the SIGHUP launchctl command"
+# shellcheck disable=SC2016
 require_in_section "$manual_docs" \
   'launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"' \
   "manual LaunchAgent docs lost the bootout launchctl command"
