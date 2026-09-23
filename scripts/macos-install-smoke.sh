@@ -150,10 +150,12 @@ require_in_section "$homebrew_docs" "brew services restart alighieri" \
   "Homebrew docs missing brew services restart"
 require_in_section "$homebrew_docs" "brew services stop alighieri" \
   "Homebrew docs missing brew services stop"
-require_in_section "$homebrew_docs" "HOMEBREW_ALIGHIERI_SOURCE" \
-  "Homebrew docs missing the local-checkout override"
 require_in_section "$homebrew_docs" "brew install --HEAD" \
   "Homebrew docs missing brew install --HEAD"
+require_in_section "$homebrew_docs" "no stable Homebrew source" \
+  "Homebrew docs must say there is no stable source"
+forbid_in_section "$homebrew_docs" "HOMEBREW_ALIGHIERI_SOURCE" \
+  "Homebrew docs must not read a local checkout from the environment"
 forbid_in_section "$homebrew_docs" "com.wiresock.alighieri" \
   "Homebrew docs must not target the manual LaunchAgent label"
 forbid_in_section "$homebrew_docs" "launchctl" \

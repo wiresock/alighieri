@@ -20,12 +20,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   Verify the downloaded archive's single matching entry (not the whole
   manifest, which lists every platform) before clearing Gatekeeper
   quarantine.
-- An in-repository Homebrew formula (`Formula/alighieri.rb`) installs the
-  console binary from a local checkout (`HOMEBREW_ALIGHIERI_SOURCE`) or from
-  GitHub `--HEAD`. There is no stable formula source until a patched release
-  exists; a plain `brew install` does not fall back to an older tag.
-  `brew services` runs a per-user service. This is not a Homebrew/core
-  submission or a WireSock tap.
+- An in-repository Homebrew formula (`Formula/alighieri.rb`) is head-only.
+  `brew install --HEAD` builds GitHub main. There is no stable formula
+  source until a patched release exists; a plain `brew install` does not
+  fall back to an older tag. `brew services` runs a per-user service. This
+  is not a Homebrew/core submission or a WireSock tap.
 
 ### Changed
 

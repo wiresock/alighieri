@@ -240,10 +240,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # In-repo Homebrew formula: style/audit, head-only refusal, then an install
-  # from this checkout. Does not duplicate the macOS cargo test matrix.
-  # Do not `brew install --HEAD` here: that clones GitHub main, which does
-  # not yet contain this branch. The head URL is asserted instead.
+  # In-repo Homebrew formula: style/audit and head-only refusal use the
+  # committed formula. The install step then substitutes a temporary formula
+  # whose stable url is an immutable archive of this commit. Do not
+  # `brew install --HEAD` here: that clones GitHub main.
   homebrew:
     name: homebrew formula
     runs-on: macos-latest
@@ -322,43 +322,46 @@ jobs:
           echo "plain install refused before building a stable archive"
       - name: Install via formula from this checkout
         env:
-          HOMEBREW_ALIGHIERI_SOURCE: ${{ github.workspace }}
           HOMEBREW_NO_INSTALL_FROM_API: 1
           HOMEBREW_NO_ASK: 1
         run: |
           set -euo pipefail
+          # The committed formula must not see a local-checkout override.
+          unset HOMEBREW_ALIGHIERI_SOURCE || true
           json="${RUNNER_TEMP}/alighieri-local-source.json"
           log="${RUNNER_TEMP}/alighieri-local-install.log"
-          expected_rev="$(git rev-parse HEAD)"
+          bash scripts/homebrew-pr-formula.sh \
+            "$(brew --repository local/alighieri)/Formula/alighieri.rb"
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP}/alighieri-pr-source.env"
           brew info --json=v2 --formula local/alighieri/alighieri >"$json"
-          python3 - "$json" "$expected_rev" "${HOMEBREW_ALIGHIERI_SOURCE}" <<'PY'
+          python3 - "$json" <<PY
           import json
-          import os
           import sys
 
-          json_path, expected_rev, source = sys.argv[1:]
-          with open(json_path, encoding="utf-8") as handle:
-              info = json.load(handle)
-          formula = info["formulae"][0]
+          expected_sha = "${ALIGHIERI_PR_SHA256}"
+          expected_archive = "${ALIGHIERI_PR_ARCHIVE}"
+          expected_version = "${ALIGHIERI_PR_VERSION}"
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              formula = json.load(handle)["formulae"][0]
           stable = (formula.get("urls") or {}).get("stable") or {}
           url = stable.get("url") or ""
-          revision = stable.get("revision") or ""
-          using = stable.get("using") or ""
+          checksum = stable.get("checksum") or ""
+          if checksum.startswith("sha256:"):
+              checksum = checksum[len("sha256:"):]
           if "v0.6.0.tar.gz" in url or "/tags/v0.6.0" in url:
-              sys.exit(f"local install still selects the v0.6.0 archive: {url}")
-          if not url.startswith("file://"):
-              sys.exit(f"local install did not select a file checkout: {url}")
-          path = url[len("file://"):]
-          if os.path.realpath(path) != os.path.realpath(source):
-              sys.exit(f"stable url {url} is not {source}")
-          if revision != expected_rev:
-              sys.exit(f"formula revision {revision} != checkout {expected_rev}")
-          if using and using != "git":
-              sys.exit(f"expected git strategy, got {using}")
+              sys.exit(f"install formula still selects the v0.6.0 archive: {url}")
+          if url != "file://" + expected_archive:
+              sys.exit(f"stable url {url} is not file://{expected_archive}")
+          if checksum != expected_sha:
+              sys.exit(f"formula sha256 {checksum} != archive {expected_sha}")
+          version = ((formula.get("versions") or {}).get("stable")) or ""
+          if version != expected_version:
+              sys.exit(f"formula version {version} != archive crate {expected_version}")
           head = (formula.get("urls") or {}).get("head") or {}
           if head.get("url") != "https://github.com/wiresock/alighieri.git" or head.get("branch") != "main":
               sys.exit(f"head spec changed: {head!r}")
-          print(f"formula selected {revision} from {url}")
+          print(f"formula selected archive {expected_archive}")
           PY
           dump_homebrew_failure() {
             echo "===== brew install output ====="
@@ -386,15 +389,15 @@ jobs:
             done < <(find "${HOME}/Library/Logs/Homebrew" "$(brew --prefix)/var/log" \
               -type f \( -iname '*alighieri*' -o -iname '*sandbox*' \) 2>/dev/null || true)
           }
-          # --debug keeps the sandbox failure's child output. Logs below are
-          # local to the runner; nothing is uploaded.
-          if ! brew install --verbose --debug --keep-tmp --formula local/alighieri/alighieri >"$log" 2>&1; then
+          # Logs stay on the runner. Nothing is uploaded.
+          if ! brew install --verbose --formula local/alighieri/alighieri >"$log" 2>&1; then
             dump_homebrew_failure
             exit 1
           fi
-          if ! grep -F "Checking out revision ${expected_rev}" "$log" >/dev/null \
-            && ! grep -F "checkout -f ${expected_rev}" "$log" >/dev/null; then
-            echo "install did not check out the formula-selected revision ${expected_rev}" >&2
+          archive_name="$(basename "${ALIGHIERI_PR_ARCHIVE}")"
+          if ! grep -F "${archive_name}" "$log" >/dev/null \
+            && ! grep -F "${ALIGHIERI_PR_SHA256}" "$log" >/dev/null; then
+            echo "install did not use PR archive ${archive_name}" >&2
             cat "$log" >&2
             exit 1
           fi
@@ -403,42 +406,7 @@ jobs:
             cat "$log" >&2
             exit 1
           fi
-          # Dependency set of the commit Homebrew selected, not merely the
-          # worktree file that happens to be checked out.
-          git show "${expected_rev}:Cargo.lock" >"${RUNNER_TEMP}/selected-Cargo.lock"
-          python3 - "${RUNNER_TEMP}/selected-Cargo.lock" <<'PY'
-          import re
-          import sys
-
-          text = open(sys.argv[1], encoding="utf-8").read()
-          versions = []
-          for block in text.split("[[package]]"):
-              if re.search(r'^name = "rustls"$', block, re.M):
-                  match = re.search(r'^version = "([^"]+)"', block, re.M)
-                  versions.append(match.group(1) if match else "")
-          if not versions:
-              sys.exit("formula-selected Cargo.lock has no rustls package")
-
-          def parse(version):
-              core = version.split("-", 1)[0].split("+", 1)[0]
-              parts = []
-              for part in core.split("."):
-                  if not part.isdigit():
-                      sys.exit(f"unparseable rustls version {version}")
-                  parts.append(int(part))
-              while len(parts) < 3:
-                  parts.append(0)
-              return tuple(parts[:3])
-
-          floor = (0, 23, 45)  # RUSTSEC-2026-0285 fixed rustls 0.23.40
-          for version in versions:
-              if parse(version) < floor:
-                  sys.exit(
-                      f"formula-selected rustls {version} is older than "
-                      "0.23.45 (RUSTSEC-2026-0285)"
-                  )
-          print("formula-selected rustls " + ", ".join(versions))
-          PY
+          echo "installed PR archive ${ALIGHIERI_PR_REVISION} rustls ${ALIGHIERI_PR_RUSTLS}"
       - name: Test formula
         run: |
           brew test alighieri

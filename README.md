@@ -1194,27 +1194,17 @@ sudo ./scripts/macos-daemon.sh
 
 ### Homebrew (repository formula)
 
-A formula in this repository supports two sources. It is **not** in
+A formula in this repository is **head-only**. It is **not** in
 Homebrew/core and there is no WireSock tap.
 
-* A local checkout, for development and PR testing:
-  `HOMEBREW_ALIGHIERI_SOURCE=/path/to/checkout`.
-* GitHub `main`, after this lands: `brew install --HEAD`.
-
 There is no stable Homebrew source until a patched release exists. A plain
-`brew install` with neither the local override nor `--HEAD` stops and tells
-you to pass `--HEAD`. It does not download a tagged archive.
+`brew install` stops and tells you to pass `--HEAD`. It does not download a
+tagged archive. `--HEAD` builds GitHub `main`.
 
 ```sh
-# From a checkout of this PR / branch (builds that checkout, not a tag).
-# Current Homebrew requires the formula to live in a tap:
-gh pr checkout 164
+# Current Homebrew requires the formula to live in a tap.
 brew tap-new --no-git local/alighieri
 cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
-HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install local/alighieri/alighieri
-
-# From GitHub main after this lands (same tap). This does not use
-# HOMEBREW_ALIGHIERI_SOURCE:
 brew install --HEAD local/alighieri/alighieri
 ```
 
