@@ -360,8 +360,36 @@ jobs:
               sys.exit(f"head spec changed: {head!r}")
           print(f"formula selected {revision} from {url}")
           PY
-          if ! brew install --verbose --formula local/alighieri/alighieri >"$log" 2>&1; then
-            cat "$log" >&2
+          dump_homebrew_failure() {
+            echo "===== brew install output ====="
+            cat "$log" >&2 || true
+            echo "===== brew config ====="
+            brew config >&2 || true
+            echo "===== brew trust ====="
+            brew trust --json=v1 >&2 || true
+            echo "===== Homebrew log files ====="
+            local roots=()
+            roots+=("${HOME}/Library/Logs/Homebrew")
+            roots+=("$(brew --prefix)/var/log")
+            roots+=("$(brew --cache)")
+            local root file
+            for root in "${roots[@]}"; do
+              [[ -d "$root" ]] || continue
+              echo "----- tree ${root} -----" >&2
+              find "$root" \( -iname '*alighieri*' -o -iname '*sandbox*' -o -iname '*.log' \) >&2 || true
+            done
+            while IFS= read -r file; do
+              [[ -f "$file" ]] || continue
+              echo "===== log ${file} =====" >&2
+              # Keep the Actions log readable if a bottle pour log is huge.
+              tail -n 400 "$file" >&2 || true
+            done < <(find "${HOME}/Library/Logs/Homebrew" "$(brew --prefix)/var/log" \
+              -type f \( -iname '*alighieri*' -o -iname '*sandbox*' \) 2>/dev/null || true)
+          }
+          # --debug keeps the sandbox failure's child output. Logs below are
+          # local to the runner; nothing is uploaded.
+          if ! brew install --verbose --debug --keep-tmp --formula local/alighieri/alighieri >"$log" 2>&1; then
+            dump_homebrew_failure
             exit 1
           fi
           if ! grep -F "Checking out revision ${expected_rev}" "$log" >/dev/null \
