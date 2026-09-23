@@ -89,6 +89,73 @@ fi
 [[ -x scripts/macos-daemon.sh ]] \
   || fail "scripts/macos-daemon.sh is not executable; do not chmod in tests, fix the git file mode"
 
+# README sections for the three macOS deployments. Moving the manual
+# launchctl target under the Homebrew heading must fail this check.
+readme_section() {
+  local heading="$1"
+  awk -v heading="$heading" '
+    $0 == heading { capture = 1; next }
+    # Shell comments are a single "#". Stop only on markdown headings.
+    capture && /^#{2,3} / { exit }
+    capture { print }
+  ' README.md
+}
+
+require_in_section() {
+  local section="$1" needle="$2" label="$3"
+  grep -Fq "$needle" <<<"$section" || fail "$label"
+}
+
+forbid_in_section() {
+  local section="$1" needle="$2" label="$3"
+  if grep -Fq "$needle" <<<"$section"; then
+    fail "$label"
+  fi
+}
+
+manual_docs="$(readme_section "### Manual per-user LaunchAgent")"
+[[ -n "$manual_docs" ]] || fail "README is missing the manual LaunchAgent section"
+require_in_section "$manual_docs" "com.wiresock.alighieri" \
+  "manual LaunchAgent docs lost the com.wiresock.alighieri label"
+require_in_section "$manual_docs" \
+  'launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"' \
+  "manual LaunchAgent docs lost the SIGHUP launchctl command"
+require_in_section "$manual_docs" \
+  'launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"' \
+  "manual LaunchAgent docs lost the bootout launchctl command"
+require_in_section "$manual_docs" "doc/macos-launchagent.plist" \
+  "manual LaunchAgent docs lost the plist reference"
+
+daemon_docs="$(readme_section "### Privileged public-TLS LaunchDaemon")"
+[[ -n "$daemon_docs" ]] || fail "README is missing the privileged LaunchDaemon section"
+require_in_section "$daemon_docs" "_alighieri" \
+  "LaunchDaemon docs lost the _alighieri account"
+require_in_section "$daemon_docs" "/opt/alighieri" \
+  "LaunchDaemon docs lost /opt/alighieri"
+require_in_section "$daemon_docs" "scripts/macos-daemon.sh" \
+  "LaunchDaemon docs lost scripts/macos-daemon.sh"
+forbid_in_section "$daemon_docs" "brew services start" \
+  "LaunchDaemon docs must not start the service with brew services"
+
+homebrew_docs="$(readme_section "### Homebrew (repository formula)")"
+[[ -n "$homebrew_docs" ]] || fail "README is missing the Homebrew section"
+require_in_section "$homebrew_docs" "brew services start alighieri" \
+  "Homebrew docs missing brew services start"
+require_in_section "$homebrew_docs" "brew services list" \
+  "Homebrew docs missing brew services list"
+require_in_section "$homebrew_docs" "brew services restart alighieri" \
+  "Homebrew docs missing brew services restart"
+require_in_section "$homebrew_docs" "brew services stop alighieri" \
+  "Homebrew docs missing brew services stop"
+require_in_section "$homebrew_docs" "HOMEBREW_ALIGHIERI_SOURCE" \
+  "Homebrew docs missing the local-checkout override"
+require_in_section "$homebrew_docs" "brew install --HEAD" \
+  "Homebrew docs missing brew install --HEAD"
+forbid_in_section "$homebrew_docs" "com.wiresock.alighieri" \
+  "Homebrew docs must not target the manual LaunchAgent label"
+forbid_in_section "$homebrew_docs" "launchctl" \
+  "Homebrew docs must not document manual launchctl lifecycle commands"
+
 # SHA256SUMS lists every platform. Operators download one archive; check that
 # entry only. A full `sha256sum -c SHA256SUMS` fails when the other archives
 # are absent. The commands below match the README macOS archive snippet.

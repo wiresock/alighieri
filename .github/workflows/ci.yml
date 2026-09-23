@@ -240,8 +240,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # In-repo Homebrew formula: style/audit plus an install from this checkout.
-  # Does not duplicate the macOS cargo test matrix.
+  # In-repo Homebrew formula: style/audit, head-only refusal, then an install
+  # from this checkout. Does not duplicate the macOS cargo test matrix.
+  # Do not `brew install --HEAD` here: that clones GitHub main, which does
+  # not yet contain this branch. The head URL is asserted instead.
   homebrew:
     name: homebrew formula
     runs-on: macos-latest
@@ -252,12 +254,163 @@ jobs:
           brew style Formula/alighieri.rb
           brew tap-new --no-git local/alighieri
           cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
-          brew audit --strict local/alighieri/alighieri
-      - name: Install via formula
+          # Audit the formula as a user would load it: no local override.
+          env -u HOMEBREW_ALIGHIERI_SOURCE brew audit --strict local/alighieri/alighieri
+      - name: Refuse a stable archive without a local checkout
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: 1
+          HOMEBREW_NO_ASK: 1
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/alighieri-head-only.json"
+          log="${RUNNER_TEMP}/alighieri-plain-install.log"
+          env -u HOMEBREW_ALIGHIERI_SOURCE \
+            brew info --json=v2 --formula local/alighieri/alighieri >"$json"
+          python3 - "$json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              info = json.load(handle)
+          formulae = info.get("formulae") or []
+          if len(formulae) != 1:
+              sys.exit(f"expected one formula from brew info, got {len(formulae)}")
+          formula = formulae[0]
+          stable = (formula.get("urls") or {}).get("stable") or {}
+          stable_url = stable.get("url") or ""
+          stable_version = ((formula.get("versions") or {}).get("stable")) or ""
+          # Head-only formulae have no stable url. Some Homebrew versions
+          # report the stable version as "HEAD"; a real archive version must
+          # not appear.
+          if stable_url or (stable_version and stable_version != "HEAD"):
+              sys.exit(
+                  "plain formula selected a stable source "
+                  f"url={stable_url!r} version={stable_version!r}"
+              )
+          head = (formula.get("urls") or {}).get("head") or {}
+          if head.get("url") != "https://github.com/wiresock/alighieri.git":
+              sys.exit(f"unexpected head url: {head!r}")
+          if head.get("branch") != "main":
+              sys.exit(f"unexpected head branch: {head!r}")
+          print("head-only formula source: GitHub main, no stable archive")
+          PY
+          set +e
+          env -u HOMEBREW_ALIGHIERI_SOURCE \
+            brew install --formula local/alighieri/alighieri >"$log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "plain install succeeded without --HEAD or a local checkout" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if ! grep -F "head-only formula" "$log" >/dev/null; then
+            echo "plain install failed, but not with the head-only refusal" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if ! grep -F "brew install --HEAD" "$log" >/dev/null; then
+            echo "head-only refusal did not tell the user to pass --HEAD" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F "v0.6.0.tar.gz" "$log" >/dev/null; then
+            echo "plain install referenced the v0.6.0 archive" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          echo "plain install refused before building a stable archive"
+      - name: Install via formula from this checkout
         env:
           HOMEBREW_ALIGHIERI_SOURCE: ${{ github.workspace }}
           HOMEBREW_NO_INSTALL_FROM_API: 1
-        run: brew install --verbose local/alighieri/alighieri
+          HOMEBREW_NO_ASK: 1
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/alighieri-local-source.json"
+          log="${RUNNER_TEMP}/alighieri-local-install.log"
+          expected_rev="$(git rev-parse HEAD)"
+          brew info --json=v2 --formula local/alighieri/alighieri >"$json"
+          python3 - "$json" "$expected_rev" "${HOMEBREW_ALIGHIERI_SOURCE}" <<'PY'
+          import json
+          import os
+          import sys
+
+          json_path, expected_rev, source = sys.argv[1:]
+          with open(json_path, encoding="utf-8") as handle:
+              info = json.load(handle)
+          formula = info["formulae"][0]
+          stable = (formula.get("urls") or {}).get("stable") or {}
+          url = stable.get("url") or ""
+          revision = stable.get("revision") or ""
+          using = stable.get("using") or ""
+          if "v0.6.0.tar.gz" in url or "/tags/v0.6.0" in url:
+              sys.exit(f"local install still selects the v0.6.0 archive: {url}")
+          if not url.startswith("file://"):
+              sys.exit(f"local install did not select a file checkout: {url}")
+          path = url[len("file://"):]
+          if os.path.realpath(path) != os.path.realpath(source):
+              sys.exit(f"stable url {url} is not {source}")
+          if revision != expected_rev:
+              sys.exit(f"formula revision {revision} != checkout {expected_rev}")
+          if using and using != "git":
+              sys.exit(f"expected git strategy, got {using}")
+          head = (formula.get("urls") or {}).get("head") or {}
+          if head.get("url") != "https://github.com/wiresock/alighieri.git" or head.get("branch") != "main":
+              sys.exit(f"head spec changed: {head!r}")
+          print(f"formula selected {revision} from {url}")
+          PY
+          if ! brew install --verbose --formula local/alighieri/alighieri >"$log" 2>&1; then
+            cat "$log" >&2
+            exit 1
+          fi
+          if ! grep -F "Checking out revision ${expected_rev}" "$log" >/dev/null \
+            && ! grep -F "checkout -f ${expected_rev}" "$log" >/dev/null; then
+            echo "install did not check out the formula-selected revision ${expected_rev}" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F "v0.6.0.tar.gz" "$log" >/dev/null; then
+            echo "local install fetched the v0.6.0 archive" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          # Dependency set of the commit Homebrew selected, not merely the
+          # worktree file that happens to be checked out.
+          git show "${expected_rev}:Cargo.lock" >"${RUNNER_TEMP}/selected-Cargo.lock"
+          python3 - "${RUNNER_TEMP}/selected-Cargo.lock" <<'PY'
+          import re
+          import sys
+
+          text = open(sys.argv[1], encoding="utf-8").read()
+          versions = []
+          for block in text.split("[[package]]"):
+              if re.search(r'^name = "rustls"$', block, re.M):
+                  match = re.search(r'^version = "([^"]+)"', block, re.M)
+                  versions.append(match.group(1) if match else "")
+          if not versions:
+              sys.exit("formula-selected Cargo.lock has no rustls package")
+
+          def parse(version):
+              core = version.split("-", 1)[0].split("+", 1)[0]
+              parts = []
+              for part in core.split("."):
+                  if not part.isdigit():
+                      sys.exit(f"unparseable rustls version {version}")
+                  parts.append(int(part))
+              while len(parts) < 3:
+                  parts.append(0)
+              return tuple(parts[:3])
+
+          floor = (0, 23, 45)  # RUSTSEC-2026-0285 fixed rustls 0.23.40
+          for version in versions:
+              if parse(version) < floor:
+                  sys.exit(
+                      f"formula-selected rustls {version} is older than "
+                      "0.23.45 (RUSTSEC-2026-0285)"
+                  )
+          print("formula-selected rustls " + ", ".join(versions))
+          PY
       - name: Test formula
         run: |
           brew test alighieri

@@ -32,6 +32,9 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - [Machine-readable management CLI](#machine-readable-management-cli)
 - [Linux service (systemd)](#linux-service-systemd)
 - [macOS (console and launchd)](#macos-console-and-launchd)
+  - [Manual per-user LaunchAgent](#manual-per-user-launchagent)
+  - [Privileged public-TLS LaunchDaemon](#privileged-public-tls-launchdaemon)
+  - [Homebrew (repository formula)](#homebrew-repository-formula)
 - [RDP egress over an existing Windows session](#rdp-egress-over-an-existing-windows-session)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -1088,12 +1091,16 @@ restriction, so `_alighieri` can listen on 443 without root. Binding 443 on a
 specific interface, or running on 10.12/10.13, still requires root or launchd
 socket activation (Alighieri does not consume launchd sockets).
 
+Three background deployments are separate. Do not mix their lifecycle commands.
+
+### Manual per-user LaunchAgent
+
 The default background install is a **per-user LaunchAgent**. It runs as your
 login user after you log in, listens on port 1080, and never executes a
-Homebrew-replaceable binary as root. A system LaunchDaemon that binds port 443
-is a separate hardened profile (dedicated `_alighieri` account, complete
-tree under root-owned `/opt/alighieri`); the public-TLS wizard emits
-`scripts/macos-daemon.sh`.
+Homebrew-replaceable binary as root. The template is
+[`doc/macos-launchagent.plist`](doc/macos-launchagent.plist). Its launchd label
+is `com.wiresock.alighieri`. That label belongs to this manual agent, not to
+a Homebrew service and not to the privileged LaunchDaemon below.
 
 ```sh
 # from a source checkout
@@ -1153,40 +1160,13 @@ plutil -lint "$PLIST"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 ```
 
-### Homebrew (repository formula)
+Substitute `__ALIGHIERI_CONFIG__` in
+[`doc/macos-launchagent.plist`](doc/macos-launchagent.plist) with a config file
+the login user can read. Do not point it at `/opt/alighieri/alighieri.conf`
+after a LaunchDaemon install — that file is `root:_alighieri` mode 0640.
 
-A formula is in this repository for local and `--HEAD` installs. It is **not**
-in Homebrew/core and there is no WireSock tap.
-
-```sh
-# From a checkout of this PR / branch (builds the files you have).
-# Current Homebrew requires the formula to live in a tap:
-gh pr checkout 164
-brew tap-new --no-git local/alighieri
-cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
-HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install local/alighieri/alighieri
-
-# After this lands on GitHub main (same tap):
-brew install --HEAD local/alighieri/alighieri
-```
-
-```sh
-alighieri --version
-brew test alighieri
-```
-
-`brew services` starts a **per-user LaunchAgent** using
-`$(brew --prefix)/etc/alighieri.conf` (loopback `:1080` in the example
-config). That is the same command-line model as `doc/macos-launchagent.plist`
-(`alighieri --config PATH`). It is not the hardened `_alighieri` LaunchDaemon
-under `/opt/alighieri`.
-
-```sh
-brew services start alighieri
-brew services stop alighieri
-```
-
-Hot reload is SIGHUP, the same as other Unix builds. For the LaunchAgent:
+Hot reload is SIGHUP, the same as other Unix builds. For this manual
+LaunchAgent:
 
 ```sh
 launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"
@@ -1195,16 +1175,71 @@ launchctl kill SIGHUP "gui/$(id -u)/com.wiresock.alighieri"
 `KeepAlive` relaunches the job after SIGTERM while it remains loaded.
 Stop it with `launchctl bootout "gui/$(id -u)/com.wiresock.alighieri"`.
 
-The LaunchAgent template is [`doc/macos-launchagent.plist`](doc/macos-launchagent.plist);
-substitute `__ALIGHIERI_CONFIG__` with a config file the login user can read.
-Do not point it at `/opt/alighieri/alighieri.conf` after a LaunchDaemon
-install — that file is `root:_alighieri` mode 0640.
-The dedicated-user LaunchDaemon used by the public TLS wizard is
-[`doc/macos-launchdaemon.plist`](doc/macos-launchdaemon.plist).
-
 Release tarballs are not notarized. A browser-downloaded archive may be
 quarantined; handle that **before** the first execution as shown above. macOS
 may also prompt to allow inbound connections the first time the listener binds.
+
+### Privileged public-TLS LaunchDaemon
+
+A system LaunchDaemon that binds port 443 is a separate hardened profile:
+dedicated `_alighieri` account and a complete tree under root-owned
+`/opt/alighieri`. The public-TLS wizard emits
+[`scripts/macos-daemon.sh`](scripts/macos-daemon.sh). The plist is
+[`doc/macos-launchdaemon.plist`](doc/macos-launchdaemon.plist). Homebrew does
+not install or manage this service.
+
+```sh
+sudo ./scripts/macos-daemon.sh
+```
+
+### Homebrew (repository formula)
+
+A formula in this repository supports two sources. It is **not** in
+Homebrew/core and there is no WireSock tap.
+
+* A local checkout, for development and PR testing:
+  `HOMEBREW_ALIGHIERI_SOURCE=/path/to/checkout`.
+* GitHub `main`, after this lands: `brew install --HEAD`.
+
+There is no stable Homebrew source until a patched release exists. A plain
+`brew install` with neither the local override nor `--HEAD` stops and tells
+you to pass `--HEAD`. It does not download a tagged archive.
+
+```sh
+# From a checkout of this PR / branch (builds that checkout, not a tag).
+# Current Homebrew requires the formula to live in a tap:
+gh pr checkout 164
+brew tap-new --no-git local/alighieri
+cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
+HOMEBREW_ALIGHIERI_SOURCE="$PWD" brew install local/alighieri/alighieri
+
+# From GitHub main after this lands (same tap). This does not use
+# HOMEBREW_ALIGHIERI_SOURCE:
+brew install --HEAD local/alighieri/alighieri
+```
+
+```sh
+alighieri --version
+brew test alighieri
+```
+
+`brew services` manages a per-user service using
+`$(brew --prefix)/etc/alighieri.conf` (loopback `:1080` in the example
+config). The command is `alighieri --config PATH`, the same shape as the
+manual agent, but Homebrew generates the job itself. This is not the manual
+LaunchAgent and it is not the hardened `_alighieri` LaunchDaemon under
+`/opt/alighieri`.
+
+```sh
+brew services start alighieri
+brew services list
+brew services restart alighieri
+brew services stop alighieri
+```
+
+Editing the Homebrew config does not affect a running service until you
+restart it. `brew services restart alighieri` applies those configuration
+changes. That is the supported Homebrew workflow.
 
 ## RDP egress over an existing Windows session
 
