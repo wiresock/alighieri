@@ -50,7 +50,7 @@ RUN set -eux; \
 # Distroless runtime (glibc, matches the bookworm builder ABI): no shell or
 # package manager, runs as a non-root user. Use the :debug-nonroot tag if you
 # need a busybox shell to poke around. Pinned by digest (Dependabot-maintained).
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
 COPY --from=builder /alighieri /usr/local/bin/alighieri
 EXPOSE 1080
 ENTRYPOINT ["/usr/local/bin/alighieri"]
