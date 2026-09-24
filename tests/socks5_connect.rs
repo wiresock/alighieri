@@ -138,19 +138,36 @@ async fn request_connect(stream: &mut TcpStream, dest: SocketAddr) -> SocketAddr
 }
 
 async fn request_udp_associate(stream: &mut TcpStream) -> SocketAddr {
-    let mut req = vec![0x05, 0x03, 0x00, 0x01];
-    req.extend_from_slice(&[0, 0, 0, 0]);
-    req.extend_from_slice(&0u16.to_be_bytes());
+    request_udp_associate_dest(stream, "0.0.0.0:0".parse().unwrap())
+        .await
+        .unwrap_or_else(|reply| panic!("UDP ASSOCIATE failed with reply 0x{reply:02x}"))
+}
+
+async fn request_udp_associate_dest(
+    stream: &mut TcpStream,
+    dest: SocketAddr,
+) -> Result<SocketAddr, u8> {
+    let mut req = vec![0x05, 0x03, 0x00];
+    match dest {
+        SocketAddr::V4(v4) => {
+            req.push(0x01);
+            req.extend_from_slice(&v4.ip().octets());
+            req.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        SocketAddr::V6(v6) => {
+            req.push(0x04);
+            req.extend_from_slice(&v6.ip().octets());
+            req.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
     stream.write_all(&req).await.unwrap();
 
     let mut reply = [0u8; 4];
     stream.read_exact(&mut reply).await.unwrap();
     assert_eq!(reply[0], 0x05);
-    assert_eq!(
-        reply[1], 0x00,
-        "UDP ASSOCIATE failed with reply 0x{:02x}",
-        reply[1]
-    );
+    if reply[1] != 0x00 {
+        return Err(reply[1]);
+    }
     assert_eq!(reply[2], 0x00);
 
     match reply[3] {
@@ -158,13 +175,13 @@ async fn request_udp_associate(stream: &mut TcpStream) -> SocketAddr {
             let mut octets = [0u8; 4];
             stream.read_exact(&mut octets).await.unwrap();
             let port = stream.read_u16().await.unwrap();
-            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+            Ok(SocketAddr::new(std::net::IpAddr::V4(octets.into()), port))
         }
         0x04 => {
             let mut octets = [0u8; 16];
             stream.read_exact(&mut octets).await.unwrap();
             let port = stream.read_u16().await.unwrap();
-            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+            Ok(SocketAddr::new(std::net::IpAddr::V6(octets.into()), port))
         }
         other => panic!("unexpected ATYP {other}"),
     }
@@ -533,13 +550,12 @@ async fn udp_associate_relays_datagrams() {
 }
 
 /// On a dual-stack `[::]` listener an IPv4 client is accepted as an IPv4-mapped
-/// peer, so the UDP relay socket is bound on a `::ffff:` (AF_INET6) address. This
-/// exercises that path end to end: the client must get a v4 (ATYP=0x01) BND.ADDR
-/// (not an IPv6-form reply it would misparse), and the locked client endpoint
-/// must stay sendable on the v6 relay socket (a plain-IPv4 endpoint cannot be
-/// `send_to` on AF_INET6), so the reply round-trips. Skipped when `[::]:0` cannot
-/// be bound or has no IPv4 path (e.g. Windows' default `IPV6_V6ONLY`, or a host
-/// without IPv6).
+/// peer. The relay socket is bound on the canonical IPv4 address — Darwin does
+/// not deliver IPv4 UDP to an AF_INET6 socket bound to `::ffff:a.b.c.d` — and
+/// this exercises that path end to end: the client must get a v4 (ATYP=0x01)
+/// BND.ADDR (not an IPv6-form reply it would misparse), and datagrams must
+/// round-trip. Skipped when `[::]:0` cannot be bound or has no IPv4 path
+/// (e.g. Windows' default `IPV6_V6ONLY`, or a host without IPv6).
 #[tokio::test]
 async fn udp_associate_relays_for_mapped_client_on_dual_stack_listener() {
     let cfg = Config::parse(
@@ -564,6 +580,9 @@ socks pass {
     let probe = match TcpListener::bind("[::]:0").await {
         Ok(l) => l,
         Err(e) => {
+            if dual_stack_v4_mapped_required() {
+                panic!("cannot bind [::]:0 on a platform that must support dual-stack UDP ASSOCIATE: {e}");
+            }
             eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: cannot bind [::]:0: {e}");
             return;
         }
@@ -573,6 +592,9 @@ socks pass {
         probe.local_addr().unwrap().port(),
     );
     if TcpStream::connect(probe_addr).await.is_err() {
+        if dual_stack_v4_mapped_required() {
+            panic!("no IPv4 path to a [::] listener on a platform that must support dual-stack UDP ASSOCIATE");
+        }
         eprintln!("skipping udp_associate_relays_for_mapped_client_on_dual_stack_listener: no IPv4 path to a [::] listener (IPV6_V6ONLY?)");
         return;
     }
@@ -594,9 +616,9 @@ socks pass {
         .expect("IPv4 client must reach the dual-stack listener once the support probe passed");
     handshake_noauth(&mut control).await;
     let relay_addr = request_udp_associate(&mut control).await;
-    // The v4 client must be handed a v4 (ATYP=0x01) BND.ADDR even though the relay
-    // socket is bound on a dual-stack `::ffff:` address — assert it directly
-    // rather than canonicalising, so a mapped (IPv6-form) reply would fail here.
+    // The v4 client must be handed a v4 (ATYP=0x01) BND.ADDR. After this PR the
+    // relay socket itself is AF_INET; assert the reply family directly so a
+    // mapped (IPv6-form) BND.ADDR would fail here.
     assert!(
         relay_addr.is_ipv4(),
         "dual-stack relay must reply with a v4 BND.ADDR for a v4 client, got {relay_addr}"
@@ -616,6 +638,154 @@ socks pass {
     let header = socks5::parse_udp_header(&buf[..n]).unwrap();
     assert_eq!(header.dest, TargetAddr::Ip(echo));
     assert_eq!(&buf[header.payload_offset..n], b"mapped ping");
+}
+
+fn dual_stack_v4_mapped_required() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+#[tokio::test]
+async fn udp_associate_ipv6_client_round_trips() {
+    let listener = match TcpListener::bind("[::1]:0").await {
+        Ok(l) => l,
+        Err(e) => {
+            if dual_stack_v4_mapped_required() {
+                panic!("cannot bind [::1]:0 on a first-class Unix CI host: {e}");
+            }
+            eprintln!("skipping udp_associate_ipv6_client_round_trips: {e}");
+            return;
+        }
+    };
+    drop(listener);
+
+    let cfg = Config::parse(
+        r#"
+internal: [::1]:0
+external: ::1
+socksmethod: none
+client pass { }
+socks pass {
+    from: ::/0 to: ::/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let server = Server::bind(cfg).await.expect("::1 listener must bind");
+    let listen = server.local_addr().unwrap();
+    let _handle = tokio::spawn(async move { server.run().await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut control = TcpStream::connect(listen).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+    assert!(
+        relay_addr.is_ipv6(),
+        "IPv6 client must receive an IPv6 BND.ADDR, got {relay_addr}"
+    );
+
+    let echo = UdpSocket::bind("[::1]:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1024];
+        loop {
+            let Ok((n, src)) = echo.recv_from(&mut buf).await else {
+                break;
+            };
+            let _ = echo.send_to(&buf[..n], src).await;
+        }
+    });
+
+    let udp = UdpSocket::bind("[::1]:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo_addr));
+    datagram.extend_from_slice(b"v6 ping");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("IPv6 UDP ASSOCIATE must round-trip")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"v6 ping");
+}
+
+#[tokio::test]
+async fn udp_associate_mapped_unspecified_locks_declared_port() {
+    let (_handle, proxy_addr) = start_proxy().await;
+    let echo = start_udp_echo_server().await;
+
+    let declared = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let declared_addr = declared.local_addr().unwrap();
+    let mapped_unspecified =
+        SocketAddr::new("::ffff:0.0.0.0".parse().unwrap(), declared_addr.port());
+
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate_dest(&mut control, mapped_unspecified)
+        .await
+        .expect("mapped unspecified ASSOCIATE must succeed and lock the port");
+
+    let interloper = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut rogue = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    rogue.extend_from_slice(b"rogue");
+    interloper.send_to(&rogue, relay_addr).await.unwrap();
+    let mut buf = [0u8; 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), interloper.recv_from(&mut buf))
+            .await
+            .is_err(),
+        "a same-IP different-port sender must not claim a predeclared association"
+    );
+
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"locked");
+    declared.send_to(&datagram, relay_addr).await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), declared.recv_from(&mut buf))
+        .await
+        .expect("the declared endpoint must still round-trip")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"locked");
+}
+
+#[tokio::test]
+async fn udp_associate_mapped_external_reaches_ipv4() {
+    if UdpSocket::bind("127.0.0.2:0").await.is_err() {
+        eprintln!("skipping udp_associate_mapped_external_reaches_ipv4: 127.0.0.2 unavailable");
+        return;
+    }
+    let echo = start_udp_echo_server().await;
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: ::ffff:127.0.0.2
+socksmethod: none
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    assert!(cfg.external.is_ipv4());
+    let (_handle, proxy_addr) = start_proxy_with_config(cfg).await;
+    let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+    handshake_noauth(&mut control).await;
+    let relay_addr = request_udp_associate(&mut control).await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"mapped-ext");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("mapped external must relay IPv4 UDP")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"mapped-ext");
 }
 
 /// The default `external` (`0.0.0.0`) yields a dual-stack outbound, so the
@@ -1627,6 +1797,83 @@ async fn proxy_protocol_v1_uses_real_client_for_rules() {
 }
 
 #[tokio::test]
+async fn proxy_protocol_udp_associate_fails_closed_on_family_mismatch() {
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+proxyprotocol: 127.0.0.0/8
+client pass { }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+socks pass {
+    from: ::/0 to: ::/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_proxy, proxy_addr) = start_proxy_with_config(cfg).await;
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP6 2001:db8::1 ::1 40000 1080\r\n")
+        .await
+        .unwrap();
+    handshake_noauth(&mut stream).await;
+    let reply = request_udp_associate_dest(&mut stream, "0.0.0.0:0".parse().unwrap())
+        .await
+        .expect_err("cross-family PROXY UDP ASSOCIATE must fail closed");
+    assert_eq!(
+        reply, 0x01,
+        "cross-family PROXY UDP must fail closed with GeneralFailure"
+    );
+}
+
+#[tokio::test]
+async fn proxy_protocol_udp_associate_round_trips_same_family() {
+    let echo = start_udp_echo_server().await;
+    let cfg = Config::parse(
+        r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+proxyprotocol: 127.0.0.0/8
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+    )
+    .unwrap();
+    let (_proxy, proxy_addr) = start_proxy_with_config(cfg).await;
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP4 127.0.0.1 127.0.0.1 40000 1080\r\n")
+        .await
+        .unwrap();
+    handshake_noauth(&mut stream).await;
+    let relay_addr = request_udp_associate(&mut stream).await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = socks5::build_udp_header(&TargetAddr::Ip(echo));
+    datagram.extend_from_slice(b"proxy-udp");
+    udp.send_to(&datagram, relay_addr).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut buf))
+        .await
+        .expect("same-family PROXY UDP ASSOCIATE must relay")
+        .unwrap();
+    let header = socks5::parse_udp_header(&buf[..n]).unwrap();
+    assert_eq!(&buf[header.payload_offset..n], b"proxy-udp");
+}
+
+#[tokio::test]
 async fn proxy_protocol_rejects_untrusted_source() {
     // PROXY protocol is enabled but only 10.0.0.0/8 is trusted; the loopback
     // test client is not, so the connection is dropped before any handshake.
@@ -2067,10 +2314,14 @@ mod plugin_intercept {
     async fn start_proxy_with_plugins(
         host: PluginHost,
     ) -> (tokio::task::JoinHandle<Option<()>>, SocketAddr) {
-        let server = Server::bind(permissive_config())
-            .await
-            .unwrap()
-            .with_plugins(host);
+        start_proxy_with_plugins_and_config(host, permissive_config()).await
+    }
+
+    async fn start_proxy_with_plugins_and_config(
+        host: PluginHost,
+        cfg: Config,
+    ) -> (tokio::task::JoinHandle<Option<()>>, SocketAddr) {
+        let server = Server::bind(cfg).await.unwrap().with_plugins(host);
         let addr = server.local_addr().unwrap();
         let handle = tokio::spawn(async move { server.run().await.ok() });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2246,6 +2497,94 @@ mod plugin_intercept {
             "a taken-over association must not run the on_datagram verdict path"
         );
 
+        drop(control);
+    }
+
+    #[derive(Default)]
+    struct AdvertiseRecorder {
+        ctx_addr: Mutex<Option<SocketAddr>>,
+        physical_addr: Mutex<Option<SocketAddr>>,
+    }
+    struct RecordPhysicalInterceptor(Arc<AdvertiseRecorder>);
+    #[async_trait]
+    impl DatagramInterceptor for RecordPhysicalInterceptor {
+        async fn run(self: Box<Self>, args: AssociationArgs) -> std::io::Result<FlowStats> {
+            *self.0.physical_addr.lock().unwrap() = Some(args.client.local_addr()?);
+            plugin::splice_association(args).await
+        }
+    }
+    struct AdvertisePlugin(Arc<AdvertiseRecorder>);
+    #[async_trait]
+    impl Plugin for AdvertisePlugin {
+        fn name(&self) -> &str {
+            "advertise"
+        }
+        fn intercept_association(
+            &self,
+            ctx: &AssociateCtx<'_>,
+        ) -> Option<Box<dyn DatagramInterceptor>> {
+            *self.0.ctx_addr.lock().unwrap() = Some(ctx.relay_addr);
+            Some(Box::new(RecordPhysicalInterceptor(self.0.clone())))
+        }
+    }
+
+    #[tokio::test]
+    async fn associate_ctx_relay_addr_matches_advertised_socks_reply() {
+        let recorder = Arc::new(AdvertiseRecorder::default());
+        let host = PluginHost::new(vec![Arc::new(AdvertisePlugin(recorder.clone()))]);
+        let cfg = Config::parse(
+            r#"
+internal: 127.0.0.1:0
+external: 127.0.0.1
+socksmethod: none
+udp.advertise: 203.0.113.7
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate
+}
+"#,
+        )
+        .unwrap();
+        let (_proxy, proxy_addr) = start_proxy_with_plugins_and_config(host, cfg).await;
+        let mut control = TcpStream::connect(proxy_addr).await.unwrap();
+        handshake_noauth(&mut control).await;
+        let advertised = request_udp_associate(&mut control).await;
+        assert_eq!(
+            advertised.ip(),
+            "203.0.113.7".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        for _ in 0..100 {
+            if recorder.physical_addr.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let ctx_addr = recorder
+            .ctx_addr
+            .lock()
+            .unwrap()
+            .expect("intercept_association must observe the association");
+        let physical = recorder
+            .physical_addr
+            .lock()
+            .unwrap()
+            .expect("ClientDatagrams::local_addr must be observed on takeover");
+        assert_eq!(
+            ctx_addr, advertised,
+            "AssociateCtx::relay_addr must match the SOCKS BND address already sent"
+        );
+        assert_ne!(
+            physical, advertised,
+            "ClientDatagrams::local_addr is the physical bind, not udp.advertise"
+        );
+        assert!(
+            physical.ip().is_loopback(),
+            "physical relay bind should remain loopback, got {physical}"
+        );
         drop(control);
     }
 

@@ -14,21 +14,23 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "10.14"
   # Hosted runners include Node. Make the wizard's executable browser-state
   # test fail rather than silently skip if that runtime ever disappears.
   ALIGHIERI_REQUIRE_NODE_TESTS: "1"
 
 jobs:
   # Build, lint, and run the full test suite (unit/component + integration)
-  # on both first-class platforms. Windows is included so the Windows Service
-  # and Event Log code is compiled, linted, and tested too.
+  # on every first-class platform. Windows is included so the Windows Service
+  # and Event Log code is compiled, linted, and tested too. macOS covers the
+  # Unix console path that Linux CI does not execute (Apple Silicon hosted).
   test:
     name: test & clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -86,12 +88,66 @@ jobs:
           ALIGHIERI_INSTALLER_FS_HELPER_TEST_BIN: target/debug/alighieri-installer-fs
       - name: Cargo run selects the service binary
         run: cargo run --locked -- --version
+      - name: macOS launchd example smoke
+        if: runner.os == 'macOS'
+        run: |
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-daemon.sh
+          scripts/macos-install-smoke.sh
+      - name: Package Unix archive layout
+        if: runner.os != 'Windows'
+        run: |
+          test -x scripts/package-unix.sh
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            ASSET="$(
+              scripts/package-unix.sh \
+                --os linux \
+                --target x86_64-unknown-linux-gnu \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )" || exit 1
+            test -f "$ASSET"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-x86_64-unknown-linux-gnu/scripts/alighieri.sh"
+            if tar tzf "$ASSET" | grep -Fq "macos-daemon.sh"; then
+              echo "Linux archive must not contain macos-daemon.sh" >&2
+              exit 1
+            fi
+            if tar tzf "$ASSET" | grep -Fq "macos-launch"; then
+              echo "Linux archive must not contain macOS launchd plists" >&2
+              exit 1
+            fi
+          else
+            ASSET="$(
+              scripts/package-unix.sh \
+                --os macos \
+                --target aarch64-apple-darwin \
+                --version test \
+                --bindir target/debug \
+                --archive
+            )" || exit 1
+            test -f "$ASSET"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/LICENSING.md"
+            tar tzf "$ASSET" | grep -Fqx "alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+            if tar tzf "$ASSET" | grep -Fq "scripts/alighieri.sh"; then
+              echo "macOS archive must not contain the Linux installer" >&2
+              exit 1
+            fi
+            extract="$RUNNER_TEMP/alighieri-macos-archive"
+            mkdir -p "$extract"
+            tar -xzf "$ASSET" -C "$extract"
+            "$extract/alighieri-vtest-aarch64-apple-darwin/alighieri" --version
+            test -x "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh"
+            "$extract/alighieri-vtest-aarch64-apple-darwin/scripts/macos-daemon.sh" __selftest
+          fi
       - name: Doctests
         run: cargo test --doc --locked
 
-  # Cross-compile the extra ARM64 release targets so the release matrix is
-  # validated on every change, not only when a tag is pushed. Build-only: the
-  # x86_64 GitHub runners cannot execute these binaries.
+  # Cross-compile extra release targets so the release matrix is validated on
+  # every change, not only when a tag is pushed. Build-only: hosted runners
+  # cannot execute foreign-architecture binaries.
   cross-build:
     name: cross-build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -106,6 +162,12 @@ jobs:
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             features: --features rdp
+          # Hosted macos-latest is Apple Silicon; this job only proves the
+          # Intel Darwin target still links. Runtime tests stay on aarch64
+          # via the macos-latest test matrix entry.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            features: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -127,6 +189,32 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Cross-compile (release, build-only)
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+      - name: Assert cross-compiled macOS console binary
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          test -x "target/${{ matrix.target }}/release/alighieri"
+          test -x scripts/package-unix.sh
+          ASSET="$(
+            scripts/package-unix.sh \
+              --os macos \
+              --target x86_64-apple-darwin \
+              --version test \
+              --bindir "target/${{ matrix.target }}/release" \
+              --archive
+          )" || exit 1
+          test -f "$ASSET"
+          file "target/${{ matrix.target }}/release/alighieri"
+          lipo -archs "target/${{ matrix.target }}/release/alighieri" | grep -Fq x86_64
+          minos="$(vtool -show-build "target/${{ matrix.target }}/release/alighieri" | awk '/minos/ { print $2; exit }')"
+          [[ -n "$minos" ]] || { echo "vtool did not report a minos" >&2; exit 1; }
+          awk -v minos="$minos" 'BEGIN {
+            n = split(minos, p, ".")
+            major = p[1] + 0
+            minor = (n >= 2 ? p[2] : 0) + 0
+            if (major > 10 || (major == 10 && minor > 14)) {
+              exit 1
+            }
+          }' || { echo "x86_64 Darwin minos $minos is newer than the documented 10.14 floor" >&2; exit 1; }
       - name: Assert cross-compiled Windows RDP helpers
         if: runner.os == 'Windows'
         shell: pwsh
@@ -152,6 +240,179 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # In-repo Homebrew formula: style/audit and head-only refusal use the
+  # committed formula. The install step then substitutes a temporary formula
+  # whose stable url is an immutable archive of this commit. Do not
+  # `brew install --HEAD` here: that clones GitHub main.
+  homebrew:
+    name: homebrew formula
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Style and audit
+        run: |
+          brew style Formula/alighieri.rb
+          brew tap-new --no-git local/alighieri
+          cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
+          # Audit the formula as a user would load it: no local override.
+          env -u HOMEBREW_ALIGHIERI_SOURCE brew audit --strict local/alighieri/alighieri
+      - name: Refuse a stable archive without a local checkout
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: 1
+          HOMEBREW_NO_ASK: 1
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/alighieri-head-only.json"
+          log="${RUNNER_TEMP}/alighieri-plain-install.log"
+          env -u HOMEBREW_ALIGHIERI_SOURCE \
+            brew info --json=v2 --formula local/alighieri/alighieri >"$json"
+          python3 - "$json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              info = json.load(handle)
+          formulae = info.get("formulae") or []
+          if len(formulae) != 1:
+              sys.exit(f"expected one formula from brew info, got {len(formulae)}")
+          formula = formulae[0]
+          stable = (formula.get("urls") or {}).get("stable") or {}
+          stable_url = stable.get("url") or ""
+          stable_version = ((formula.get("versions") or {}).get("stable")) or ""
+          # Head-only formulae have no stable url. Some Homebrew versions
+          # report the stable version as "HEAD"; a real archive version must
+          # not appear.
+          if stable_url or (stable_version and stable_version != "HEAD"):
+              sys.exit(
+                  "plain formula selected a stable source "
+                  f"url={stable_url!r} version={stable_version!r}"
+              )
+          head = (formula.get("urls") or {}).get("head") or {}
+          if head.get("url") != "https://github.com/wiresock/alighieri.git":
+              sys.exit(f"unexpected head url: {head!r}")
+          if head.get("branch") != "main":
+              sys.exit(f"unexpected head branch: {head!r}")
+          print("head-only formula source: GitHub main, no stable archive")
+          PY
+          set +e
+          env -u HOMEBREW_ALIGHIERI_SOURCE \
+            brew install --formula local/alighieri/alighieri >"$log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "plain install succeeded without --HEAD or a local checkout" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if ! grep -Fi "head-only formula" "$log" >/dev/null; then
+            echo "plain install failed, but not with the head-only refusal" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if ! grep -F "brew install --HEAD" "$log" >/dev/null; then
+            echo "head-only refusal did not tell the user to pass --HEAD" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F "v0.6.0.tar.gz" "$log" >/dev/null; then
+            echo "plain install referenced the v0.6.0 archive" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          echo "plain install refused before building a stable archive"
+      - name: Install via formula from this checkout
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: 1
+          HOMEBREW_NO_ASK: 1
+        run: |
+          set -euo pipefail
+          # The committed formula must not see a local-checkout override.
+          unset HOMEBREW_ALIGHIERI_SOURCE || true
+          json="${RUNNER_TEMP}/alighieri-local-source.json"
+          log="${RUNNER_TEMP}/alighieri-local-install.log"
+          bash scripts/homebrew-pr-formula.sh \
+            "$(brew --repository local/alighieri)/Formula/alighieri.rb"
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP}/alighieri-pr-source.env"
+          brew info --json=v2 --formula local/alighieri/alighieri >"$json"
+          python3 - "$json" <<PY
+          import json
+          import sys
+
+          expected_sha = "${ALIGHIERI_PR_SHA256}"
+          expected_archive = "${ALIGHIERI_PR_ARCHIVE}"
+          expected_version = "${ALIGHIERI_PR_VERSION}"
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              formula = json.load(handle)["formulae"][0]
+          stable = (formula.get("urls") or {}).get("stable") or {}
+          url = stable.get("url") or ""
+          checksum = stable.get("checksum") or ""
+          if checksum.startswith("sha256:"):
+              checksum = checksum[len("sha256:"):]
+          if "v0.6.0.tar.gz" in url or "/tags/v0.6.0" in url:
+              sys.exit(f"install formula still selects the v0.6.0 archive: {url}")
+          if url != "file://" + expected_archive:
+              sys.exit(f"stable url {url} is not file://{expected_archive}")
+          if checksum != expected_sha:
+              sys.exit(f"formula sha256 {checksum} != archive {expected_sha}")
+          version = ((formula.get("versions") or {}).get("stable")) or ""
+          if version != expected_version:
+              sys.exit(f"formula version {version} != archive crate {expected_version}")
+          head = (formula.get("urls") or {}).get("head") or {}
+          if head.get("url") != "https://github.com/wiresock/alighieri.git" or head.get("branch") != "main":
+              sys.exit(f"head spec changed: {head!r}")
+          print(f"formula selected archive {expected_archive}")
+          PY
+          dump_homebrew_failure() {
+            echo "===== brew install output ====="
+            cat "$log" >&2 || true
+            echo "===== brew config ====="
+            brew config >&2 || true
+            echo "===== brew trust ====="
+            brew trust --json=v1 >&2 || true
+            echo "===== Homebrew log files ====="
+            local roots=()
+            roots+=("${HOME}/Library/Logs/Homebrew")
+            roots+=("$(brew --prefix)/var/log")
+            roots+=("$(brew --cache)")
+            local root file
+            for root in "${roots[@]}"; do
+              [[ -d "$root" ]] || continue
+              echo "----- tree ${root} -----" >&2
+              find "$root" \( -iname '*alighieri*' -o -iname '*sandbox*' -o -iname '*.log' \) >&2 || true
+            done
+            while IFS= read -r file; do
+              [[ -f "$file" ]] || continue
+              echo "===== log ${file} =====" >&2
+              # Keep the Actions log readable if a bottle pour log is huge.
+              tail -n 400 "$file" >&2 || true
+            done < <(find "${HOME}/Library/Logs/Homebrew" "$(brew --prefix)/var/log" \
+              -type f \( -iname '*alighieri*' -o -iname '*sandbox*' \) 2>/dev/null || true)
+          }
+          # Logs stay on the runner. Nothing is uploaded.
+          if ! brew install --verbose --formula local/alighieri/alighieri >"$log" 2>&1; then
+            dump_homebrew_failure
+            exit 1
+          fi
+          archive_name="$(basename "${ALIGHIERI_PR_ARCHIVE}")"
+          if ! grep -F "${archive_name}" "$log" >/dev/null \
+            && ! grep -F "${ALIGHIERI_PR_SHA256}" "$log" >/dev/null; then
+            echo "install did not use PR archive ${archive_name}" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          if grep -F "v0.6.0.tar.gz" "$log" >/dev/null; then
+            echo "local install fetched the v0.6.0 archive" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+          echo "installed PR archive ${ALIGHIERI_PR_REVISION} rustls ${ALIGHIERI_PR_RUSTLS}"
+      - name: Test formula
+        run: |
+          brew test alighieri
+          alighieri --version
+          alighieri --check --config "$(brew --prefix)/etc/alighieri.conf"
+
   # Lint the Linux management scripts and run their bundled self-tests (the
   # installer's path-normalisation and hardened-path warning logic). shellcheck
   # is preinstalled on the GitHub-hosted Ubuntu runners.
@@ -161,11 +422,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify Linux helpers are executable
-        run: test -x scripts/alighieri.sh && test -x scripts/install-linux.sh
+        run: |
+          test -x scripts/alighieri.sh
+          test -x scripts/install-linux.sh
+          test -x scripts/package-unix.sh
+          test -x scripts/macos-install-smoke.sh
+          test -x scripts/macos-daemon.sh
+          test "$(git ls-files -s scripts/macos-daemon.sh | awk '{print $1}')" = 100755
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh
       - name: Run installer self-tests
-        run: bash scripts/alighieri.sh __selftest
+        run: |
+          bash scripts/alighieri.sh __selftest
+          bash scripts/macos-daemon.sh __selftest
+          bash scripts/macos-install-smoke.sh
+          if ASSET="$(scripts/package-unix.sh --os macos --target t --version v --bindir /no-such-bindir --archive 2>/dev/null)"; then
+            echo "package-unix.sh must fail when the bindir is missing" >&2
+            exit 1
+          fi
+          test -z "${ASSET:-}"
 
   # Verify the crate still builds on its declared minimum supported Rust
   # version (Cargo.toml `rust-version`). Clippy and rustfmt stay on the stable
@@ -230,6 +505,9 @@ jobs:
             doc/rdp-transport.md
             scripts/alighieri.sh
             scripts/install-linux.sh
+            scripts/macos-daemon.sh
+            doc/macos-launchagent.plist
+            doc/macos-launchdaemon.plist
           )
           for path in "${required[@]}"; do
             if ! grep -Fqx "$path" "$package_list"; then

@@ -6,6 +6,50 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- macOS is a first-class console platform: CI runs the full test and Clippy
+  matrix on Apple Silicon, Intel Darwin is cross-built, and release archives
+  will ship `aarch64-apple-darwin` and `x86_64-apple-darwin` unsigned console
+  binaries with a per-user LaunchAgent template and a dedicated-user
+  LaunchDaemon provisioned by `scripts/macos-daemon.sh`. Intel Darwin
+  binaries target macOS 10.14+; Apple Silicon binaries require macOS 11.0+.
+  The public LaunchDaemon tree is `/opt/alighieri` (outside Homebrew). The
+  Linux systemd installer and Windows RDP helpers stay off those archives.
+- GitHub releases now attach a `SHA256SUMS` manifest covering every archive.
+  Verify the downloaded archive's single matching entry (not the whole
+  manifest, which lists every platform) before clearing Gatekeeper
+  quarantine.
+- An in-repository Homebrew formula (`Formula/alighieri.rb`) is head-only.
+  `brew install --HEAD` builds GitHub main. There is no stable formula
+  source until a patched release exists; a plain `brew install` does not
+  fall back to an older tag. `brew services` runs a per-user service. This
+  is not a Homebrew/core submission or a WireSock tap.
+
+### Changed
+
+- Unix rotating logfiles are created mode 0600, opened with `O_NOFOLLOW`,
+  and refused when the path is a symlink or a non-regular file (for example
+  a FIFO). Operators who previously pointed `logfile` at a symlink must
+  log to a regular file instead.
+
+### Fixed
+
+- rustls is updated to 0.23.45 (RUSTSEC-2026-0285).
+- UDP ASSOCIATE on a dual-stack `[::]` listener now binds the client-facing
+  relay socket on the canonical IPv4 address rather than `::ffff:a.b.c.d`.
+  Darwin does not deliver IPv4 UDP to an AF_INET6 socket bound to a mapped
+  address, so IPv4 clients previously timed out after a successful associate.
+- IPv4-mapped `external` addresses are canonicalised to native IPv4 so TCP
+  source binds and UDP outbound sockets use the configured address.
+- Mapped unspecified UDP ASSOCIATE destinations (`::ffff:0.0.0.0`) now lock
+  to the authenticated client IP and requested port.
+- UDP ASSOCIATE fails closed when PROXY protocol advertises a client address
+  family that does not match the physical listening socket.
+- Plugin `AssociateCtx::relay_addr` is the BND address already sent to the
+  client, including `udp.advertise`. `ClientDatagrams::local_addr()` remains
+  the physical bound address.
+
 ## [0.6.0] - 2026-09-08
 
 ### Added
