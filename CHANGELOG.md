@@ -6,6 +6,12 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- Stable Homebrew installs from the official WireSock tap:
+  `brew install wiresock/tap/alighieri` builds the tagged release source.
+  The in-repository formula remains a head-only development formula.
+
 ## [0.7.0] - 2026-09-24
 
 ### Added
