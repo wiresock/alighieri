@@ -5,7 +5,7 @@
 # Rust build), then the binary ships in a minimal distroless runtime. Pinned to
 # the project MSRV — and by digest, kept current by Dependabot — so rebuilding a
 # release tag stays reproducible and the mutable tag cannot drift under us.
-FROM --platform=$BUILDPLATFORM rust:1.97-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+FROM --platform=$BUILDPLATFORM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
 ARG TARGETARCH
 WORKDIR /src
 
