@@ -1116,8 +1116,8 @@ BIN="./target/release/alighieri"
 # the downloaded archive against its single matching entry in SHA256SUMS
 # (the manifest lists every platform; checking the whole file reports
 # missing archives you did not download). Set ARCHIVE to that file:
-#   ARCHIVE=alighieri-aarch64-apple-darwin.tar.gz
-#   # ARCHIVE=alighieri-x86_64-apple-darwin.tar.gz
+#   ARCHIVE=alighieri-v0.7.0-aarch64-apple-darwin.tar.gz  # use your version
+#   # ARCHIVE=alighieri-v0.7.0-x86_64-apple-darwin.tar.gz
 #   [ -n "${ARCHIVE:-}" ] || { echo "set ARCHIVE to the downloaded file" >&2; exit 1; }
 #   name=$(basename -- "$ARCHIVE")
 #   if [ -z "$name" ] || [ "$name" = "." ]; then
