@@ -17,7 +17,7 @@ Enable the SDK and add Tokio for the host runtime:
 
 ```toml
 [dependencies]
-alighieri = { version = "0.5", features = ["plugins"] }
+alighieri = { version = "0.7", features = ["plugins"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 ```
 
@@ -296,9 +296,9 @@ ends it when the control connection closes or the association idles out.
 An empty host is the fast path. The `plugins` feature is off by default, so a
 stock build includes neither dispatch code nor its optional macro dependency.
 
-The documented SDK follows the `0.5.x` compatibility policy: patch releases
-preserve compatible APIs, and intentional breaking changes require `0.6.0`.
-Context and vocabulary types are non-exhaustive or opaque so fields, variants,
-and implementation details can evolve. Match non-exhaustive enums with a
-wildcard arm and construct non-exhaustive contexts through their public
-constructors in tests.
+Alighieri is pre-1.0. Within a minor release line (for example `0.7.x`),
+patch releases preserve compatibility for the documented SDK, and intentional
+breaking changes require a new minor release. Context and vocabulary types
+are non-exhaustive or opaque so fields, variants, and implementation details
+can evolve. Match non-exhaustive enums with a wildcard arm and construct
+non-exhaustive contexts through their public constructors in tests.

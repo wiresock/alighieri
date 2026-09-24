@@ -2,15 +2,15 @@ class Alighieri < Formula
   desc "Lightweight SOCKS5 proxy with Dante-inspired configuration"
   homepage "https://github.com/wiresock/alighieri"
   license "AGPL-3.0-or-later"
-  # Head-only until a release contains the patched dependency set.
-  # Do not add a stable `url`: the previous tag predates that set, and a
+  # Head-only. Stable Homebrew packaging belongs outside this repository and
+  # must pin an immutable release archive. Do not add a stable `url` here: a
   # formula must not read a local checkout while Homebrew reloads it inside
   # the build sandbox. `brew install --HEAD` tracks GitHub main.
   head "https://github.com/wiresock/alighieri.git", branch: "main"
 
-  # github_latest would report the previous tag as a stable update.
+  # github_latest would report a release tag this formula cannot install.
   livecheck do
-    skip "No stable archive until a release contains the patched dependency set"
+    skip "Head-only formula; stable releases are not packaged here"
   end
 
   depends_on "rust" => :build
@@ -31,8 +31,9 @@ class Alighieri < Formula
       This formula lives in the Alighieri repository. It is not in
       Homebrew/core and there is no WireSock tap.
 
-      There is no stable Homebrew source until a release contains the
-      patched dependency set. Install GitHub main with:
+      This formula is head-only and has no stable source. Prebuilt
+      macOS archives are on the GitHub releases page. Install GitHub
+      main with:
 
         brew install --HEAD alighieri
 

@@ -80,11 +80,11 @@ cargo install alighieri --locked
 alighieri --version
 ```
 
-Prebuilt Linux and Windows binaries are attached to each
-[release](https://github.com/wiresock/alighieri/releases). Unsigned macOS
-console archives (Apple Silicon and Intel) ship in the first release after
-0.6.0. To build from a
-source checkout:
+Prebuilt Linux, Windows, and unsigned macOS console (Apple Silicon and Intel)
+binaries are attached to each
+[release](https://github.com/wiresock/alighieri/releases), with a
+`SHA256SUMS` manifest. macOS archives are available from 0.7.0. To build from
+a source checkout:
 
 ```sh
 cargo build --release
@@ -1197,9 +1197,10 @@ sudo ./scripts/macos-daemon.sh
 A formula in this repository is **head-only**. It is **not** in
 Homebrew/core and there is no WireSock tap.
 
-There is no stable Homebrew source until a patched release exists. A plain
-`brew install` stops and tells you to pass `--HEAD`. It does not download a
-tagged archive. `--HEAD` builds GitHub `main`.
+There is no stable Homebrew source: the formula is head-only. A plain
+`brew install` stops and tells you to pass `--HEAD`; it does not download a
+tagged archive. `--HEAD` builds GitHub `main`. Prebuilt macOS archives are on
+the [releases](https://github.com/wiresock/alighieri/releases) page.
 
 ```sh
 # Current Homebrew requires the formula to live in a tap.
@@ -1400,19 +1401,20 @@ inspection, stop, and uninstall, see
 
 ## Rust API and plugin SDK
 
-Version 0.5 supports the configuration model and parser, crate-wide
+The public Rust API covers the configuration model and parser, crate-wide
 `Error`/`Result`, `Server` lifecycle, runtime shutdown/reload drivers, and the
-feature-gated plugin SDK as its public Rust API. Patch releases in the `0.5.x`
-line preserve compatibility for those documented interfaces; an intentional
-breaking API or SDK change requires `0.6.0`. Engine, wire-protocol, relay,
-platform, and CLI-support internals are not part of that compatibility
-contract. See the complete [API documentation](https://docs.rs/alighieri).
+feature-gated plugin SDK. Alighieri is pre-1.0: within a minor release line
+(for example `0.7.x`), patch releases preserve compatibility for those
+documented interfaces, and intentional breaking changes require a new minor
+release. Engine, wire-protocol, relay, platform, and CLI-support internals are
+not part of that compatibility contract. See the complete
+[API documentation](https://docs.rs/alighieri).
 
 The `plugins` feature adds an in-process SDK:
 
 ```toml
 [dependencies]
-alighieri = { version = "0.5", features = ["plugins"] }
+alighieri = { version = "0.7", features = ["plugins"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 ```
 
@@ -1568,7 +1570,7 @@ version; verify against the version you would deploy.
 | SOCKS-over-TLS listener | yes (rustls, TLS 1.2/1.3) | no (uses GSSAPI for confidentiality/integrity) |
 | Credential storage | Argon2id hashes | system / crypt / PAM |
 | License | AGPL-3.0-or-later + commercial | BSD-style (permissive) |
-| Maturity | developing (current release v0.6.0) | decades in production |
+| Maturity | developing (current release v0.7.0) | decades in production |
 
 **Which to choose**
 
