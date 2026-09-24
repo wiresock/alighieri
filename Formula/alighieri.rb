@@ -2,8 +2,8 @@ class Alighieri < Formula
   desc "Lightweight SOCKS5 proxy with Dante-inspired configuration"
   homepage "https://github.com/wiresock/alighieri"
   license "AGPL-3.0-or-later"
-  # Head-only. Stable Homebrew packaging belongs outside this repository and
-  # must pin an immutable release archive. Do not add a stable `url` here: a
+  # Development formula: head-only. Stable releases are packaged in the
+  # official tap, wiresock/homebrew-tap. Do not add a stable `url` here: a
   # formula must not read a local checkout while Homebrew reloads it inside
   # the build sandbox. `brew install --HEAD` tracks GitHub main.
   head "https://github.com/wiresock/alighieri.git", branch: "main"
@@ -28,16 +28,14 @@ class Alighieri < Formula
 
   def caveats
     <<~EOS
-      This formula lives in the Alighieri repository. It is not in
-      Homebrew/core and there is no WireSock tap.
+      This is the head-only development formula from the Alighieri
+      repository. For stable releases use the official tap:
 
-      This formula is head-only and has no stable source. Prebuilt
-      macOS archives are on the GitHub releases page. Install GitHub
-      main with:
+        brew install wiresock/tap/alighieri
+
+      This formula builds GitHub main only:
 
         brew install --HEAD alighieri
-
-      A plain install does not build a tagged archive.
 
       Default config:
         #{etc}/alighieri.conf

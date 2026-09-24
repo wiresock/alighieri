@@ -34,7 +34,7 @@ New to it? Jump to [Quick start](#quick-start), or let the
 - [macOS (console and launchd)](#macos-console-and-launchd)
   - [Manual per-user LaunchAgent](#manual-per-user-launchagent)
   - [Privileged public-TLS LaunchDaemon](#privileged-public-tls-launchdaemon)
-  - [Homebrew (repository formula)](#homebrew-repository-formula)
+  - [Homebrew](#homebrew)
 - [RDP egress over an existing Windows session](#rdp-egress-over-an-existing-windows-session)
 - [Windows Service](#windows-service)
 - [Architecture](#architecture)
@@ -83,8 +83,9 @@ alighieri --version
 Prebuilt Linux, Windows, and unsigned macOS console (Apple Silicon and Intel)
 binaries are attached to each
 [release](https://github.com/wiresock/alighieri/releases), with a
-`SHA256SUMS` manifest. macOS archives are available from 0.7.0. To build from
-a source checkout:
+`SHA256SUMS` manifest. macOS archives are available from 0.7.0. On macOS you
+can also install with [Homebrew](#homebrew):
+`brew install wiresock/tap/alighieri`. To build from a source checkout:
 
 ```sh
 cargo build --release
@@ -1192,24 +1193,19 @@ not install or manage this service.
 sudo ./scripts/macos-daemon.sh
 ```
 
-### Homebrew (repository formula)
+### Homebrew
 
-A formula in this repository is **head-only**. It is **not** in
-Homebrew/core and there is no WireSock tap.
-
-There is no stable Homebrew source: the formula is head-only. A plain
-`brew install` stops and tells you to pass `--HEAD`; it does not download a
-tagged archive. `--HEAD` builds GitHub `main`. Prebuilt macOS archives are on
-the [releases](https://github.com/wiresock/alighieri/releases) page.
-
-```sh
-# Current Homebrew requires the formula to live in a tap.
-brew tap-new --no-git local/alighieri
-cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
-brew install --HEAD local/alighieri/alighieri
-```
+Install the latest release from the official WireSock tap,
+[`wiresock/homebrew-tap`](https://github.com/wiresock/homebrew-tap). It builds
+the tagged release source; Alighieri is not in Homebrew/core. The formula
+needs Homebrew 6.0.22 or later; `brew install` normally updates Homebrew
+itself, but run `brew update` first if you have disabled auto-update. On Intel
+Macs Homebrew no longer publishes bottles, so the Rust toolchain is compiled
+from source and the install can take hours; the prebuilt `x86_64-apple-darwin`
+release archive is the faster route there.
 
 ```sh
+brew install wiresock/tap/alighieri
 alighieri --version
 brew test alighieri
 ```
@@ -1231,6 +1227,20 @@ brew services stop alighieri
 Editing the Homebrew config does not affect a running service until you
 restart it. `brew services restart alighieri` applies those configuration
 changes. That is the supported Homebrew workflow.
+
+`Formula/alighieri.rb` in this repository is a **development** formula: it
+is head-only (a plain `brew install` of it refuses and tells you to pass
+`--HEAD`) and CI uses it to test unreleased changes. To build GitHub `main`
+from it:
+
+```sh
+# Current Homebrew requires the formula to live in a tap.
+brew tap-new --no-git local/alighieri
+cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
+brew install --HEAD local/alighieri/alighieri
+```
+
+Use one of the two, not both: they install the same `alighieri` formula name.
 
 ## RDP egress over an existing Windows session
 

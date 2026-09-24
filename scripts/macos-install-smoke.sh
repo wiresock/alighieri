@@ -140,7 +140,7 @@ require_in_section "$daemon_docs" "scripts/macos-daemon.sh" \
 forbid_in_section "$daemon_docs" "brew services start" \
   "LaunchDaemon docs must not start the service with brew services"
 
-homebrew_docs="$(readme_section "### Homebrew (repository formula)")"
+homebrew_docs="$(readme_section "### Homebrew")"
 [[ -n "$homebrew_docs" ]] || fail "README is missing the Homebrew section"
 require_in_section "$homebrew_docs" "brew services start alighieri" \
   "Homebrew docs missing brew services start"
@@ -150,10 +150,10 @@ require_in_section "$homebrew_docs" "brew services restart alighieri" \
   "Homebrew docs missing brew services restart"
 require_in_section "$homebrew_docs" "brew services stop alighieri" \
   "Homebrew docs missing brew services stop"
+require_in_section "$homebrew_docs" "brew install wiresock/tap/alighieri" \
+  "Homebrew docs missing the official tap install"
 require_in_section "$homebrew_docs" "brew install --HEAD" \
-  "Homebrew docs missing brew install --HEAD"
-require_in_section "$homebrew_docs" "no stable Homebrew source" \
-  "Homebrew docs must say there is no stable source"
+  "Homebrew docs missing the development --HEAD install"
 forbid_in_section "$homebrew_docs" "HOMEBREW_ALIGHIERI_SOURCE" \
   "Homebrew docs must not read a local checkout from the environment"
 forbid_in_section "$homebrew_docs" "com.wiresock.alighieri" \
