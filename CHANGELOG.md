@@ -6,11 +6,13 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-24
+
 ### Added
 
 - macOS is a first-class console platform: CI runs the full test and Clippy
   matrix on Apple Silicon, Intel Darwin is cross-built, and release archives
-  will ship `aarch64-apple-darwin` and `x86_64-apple-darwin` unsigned console
+  ship `aarch64-apple-darwin` and `x86_64-apple-darwin` unsigned console
   binaries with a per-user LaunchAgent template and a dedicated-user
   LaunchDaemon provisioned by `scripts/macos-daemon.sh`. Intel Darwin
   binaries target macOS 10.14+; Apple Silicon binaries require macOS 11.0+.
@@ -21,10 +23,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   manifest, which lists every platform) before clearing Gatekeeper
   quarantine.
 - An in-repository Homebrew formula (`Formula/alighieri.rb`) is head-only.
-  `brew install --HEAD` builds GitHub main. There is no stable formula
-  source until a patched release exists; a plain `brew install` does not
-  fall back to an older tag. `brew services` runs a per-user service. This
-  is not a Homebrew/core submission or a WireSock tap.
+  `brew install --HEAD` builds GitHub main; a plain `brew install` refuses
+  rather than falling back to an older tag. `brew services` runs a per-user
+  service. This is not a Homebrew/core submission or a WireSock tap.
 
 ### Changed
 
@@ -836,7 +837,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/wiresock/alighieri/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/wiresock/alighieri/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/wiresock/alighieri/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wiresock/alighieri/compare/v0.5.1...v0.5.2

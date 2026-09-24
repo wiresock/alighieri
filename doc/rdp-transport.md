@@ -87,11 +87,11 @@ machine. The existing `external` source-bind setting applies only to direct
 egress; a concrete `external` value with RDP egress is a configuration error in
 the MVP.
 
-The version 0.5 plugin SDK exposes a concrete `TcpStream` to stream
-interceptors. RDP streams therefore bypass data-plane stream interception in
-this MVP rather than breaking the published SDK. Generalising that public type
-belongs in an intentional 0.6 API change. Ordinary builds and direct egress are
-unchanged.
+The current plugin SDK exposes a concrete `TcpStream` to stream
+interceptors. RDP streams therefore bypass data-plane stream interception
+rather than breaking the published SDK. Generalising that public type requires
+an intentional future minor-version API change. Ordinary builds and direct
+egress are unchanged.
 
 ## DVC and IPC lifecycle
 
@@ -539,7 +539,7 @@ Windows x86-64 and is additionally cross-built for Windows ARM64.
 - Console-mode Alighieri only; the existing `LocalService` deployment cannot
   securely select an interactive user's DVC yet.
 - No UDP, stream resumption, agent service, GUI, or multi-user RDS management.
-- The current 0.5 plugin data-plane interceptor cannot wrap an RDP upstream.
+- The current plugin data-plane interceptor cannot wrap an RDP upstream.
 - Remote DNS is not cached in the MVP; each hostname request uses the remote
   machine's current resolver result.
 - WTS and COM calls run on dedicated OS workers. Shutdown signals cancel async
