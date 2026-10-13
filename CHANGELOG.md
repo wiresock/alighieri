@@ -6,11 +6,26 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-13
+
 ### Added
 
 - Stable Homebrew installs from the official WireSock tap:
   `brew install wiresock/tap/alighieri` builds the tagged release source.
   The in-repository formula remains a head-only development formula.
+
+### Changed
+
+- Updated locked Rust dependencies, including Tokio, Serde, tokio-rustls,
+  rustls-acme, and async-trait, while retaining Rust 1.88 compatibility.
+- Refreshed CI and release actions, the Rust container builder, and the
+  distroless Debian 12 runtime image.
+
+### Fixed
+
+- Kept Clippy clean on newer Rust toolchains without changing atomic
+  operations or raising the minimum supported Rust version above 1.88.
+- Corrected the macOS release archive filenames in installation examples.
 
 ## [0.7.0] - 2026-09-24
 
@@ -843,7 +858,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/wiresock/alighieri/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/wiresock/alighieri/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/wiresock/alighieri/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/wiresock/alighieri/compare/v0.5.2...v0.5.3
