@@ -565,6 +565,7 @@ fn escape_label_value(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+#[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.88")]
 fn decrement_gauge(gauge: &AtomicU64) {
     let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_sub(1)

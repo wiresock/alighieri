@@ -287,6 +287,7 @@ impl ClientHandle {
         }
     }
 
+    #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.88")]
     fn allocate_stream_id(&self) -> Result<u32, MuxError> {
         self.inner
             .next_stream_id
