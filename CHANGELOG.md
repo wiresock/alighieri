@@ -12,6 +12,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Updated the Windows RDP transport to `windows` and `windows-core` 0.62,
   moved together so both share one copy of the COM interface traits.
+- Updated locked Rust dependencies, including serde_json, Tokio, and
+  zeroize, while retaining Rust 1.88 compatibility.
 - Refreshed CI and release actions, the Rust container builder (1.99), and
   the distroless Debian 12 runtime image.
 
