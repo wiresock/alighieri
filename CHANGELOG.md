@@ -6,10 +6,19 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-19
+
 ### Changed
 
 - Updated the Windows RDP transport to `windows` and `windows-core` 0.62,
   moved together so both share one copy of the COM interface traits.
+- Refreshed CI and release actions, the Rust container builder (1.99), and
+  the distroless Debian 12 runtime image.
+
+### Fixed
+
+- Removed an intermittent broken-pipe failure in the management CLI tests
+  when a command exits without reading stdin.
 
 ### Security
 
@@ -868,7 +877,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/wiresock/alighieri/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/wiresock/alighieri/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/wiresock/alighieri/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/wiresock/alighieri/compare/v0.5.3...v0.6.0
