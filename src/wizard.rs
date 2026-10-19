@@ -21,6 +21,9 @@ const DEFAULT_OUTPUT_PATH: &str = "alighieri.conf";
 const MAX_HTTP_BYTES: usize = 64 * 1024;
 const MAX_FORM_BYTES: usize = 32 * 1024;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
+/// How long to keep draining a client's request after an error response, so
+/// the close is a FIN rather than an RST that could destroy the response.
+const HTTP_LINGER_SECS: u64 = 2;
 #[cfg(test)]
 const PUBLIC_DOMAIN_EXAMPLE: &str = "proxy.example.com";
 const PUBLIC_UDP_RANGE: &str = "40000-40099";
@@ -262,6 +265,7 @@ pub async fn run_config_wizard(args: ConfigWizardArgs) -> Result<(), String> {
     }
     println!("alighieri: this local wizard exits after saving one configuration");
 
+    let request_timeout = Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS);
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -274,19 +278,26 @@ pub async fn run_config_wizard(args: ConfigWizardArgs) -> Result<(), String> {
         if !peer.ip().is_loopback() {
             continue;
         }
-        if handle_wizard_connection(stream, &state).await {
+        if handle_wizard_connection(stream, &state, request_timeout).await {
             return Ok(());
         }
     }
 }
 
-async fn handle_wizard_connection(mut stream: TcpStream, state: &WizardState) -> bool {
-    let request = match read_http_request(&mut stream).await {
+async fn handle_wizard_connection(
+    mut stream: TcpStream,
+    state: &WizardState,
+    request_timeout: Duration,
+) -> bool {
+    let request = match read_http_request(&mut stream, request_timeout).await {
         Ok(Some(request)) => request,
         Ok(None) => return false,
         Err(e) => {
             let response = HttpResponse::html(400, "Bad Request", render_error(&e));
             write_wizard_response(&mut stream, &response).await;
+            // The request may be only partly read (timed out, oversized, or
+            // truncated), so close gracefully instead of dropping the socket.
+            linger_close(&mut stream).await;
             return false;
         }
     };
@@ -301,6 +312,27 @@ async fn handle_wizard_connection(mut stream: TcpStream, state: &WizardState) ->
             false
         }
     }
+}
+
+/// Half-closes after an error response, then drains what the client is still
+/// sending before the socket drops. Dropping a socket with unread request bytes
+/// makes the kernel send RST, which can destroy the response before the client
+/// reads it. Draining is bounded by `HTTP_LINGER_SECS` and `MAX_HTTP_BYTES`.
+async fn linger_close(stream: &mut TcpStream) {
+    if stream.shutdown().await.is_err() {
+        return;
+    }
+    let drain = async {
+        let mut chunk = [0u8; 4096];
+        let mut drained = 0;
+        while drained <= MAX_HTTP_BYTES {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => drained += n,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(HTTP_LINGER_SECS), drain).await;
 }
 
 async fn write_wizard_response(stream: &mut TcpStream, response: &HttpResponse) {
@@ -384,15 +416,13 @@ fn token_matches(provided: Option<&String>, expected: &str) -> bool {
     provided.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
+async fn read_http_request(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<Option<HttpRequest>, String> {
     // `_untimed` carries the size bounds (MAX_HTTP_BYTES / MAX_FORM_BYTES); this
     // wrapper adds the wall-clock timeout.
-    match tokio::time::timeout(
-        Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS),
-        read_http_request_untimed(stream),
-    )
-    .await
-    {
+    match tokio::time::timeout(timeout, read_http_request_untimed(stream)).await {
         Ok(result) => result,
         Err(_) => Err("timed out reading config wizard request".into()),
     }
@@ -6940,7 +6970,12 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_wizard_connection(stream, &state).await
+            handle_wizard_connection(
+                stream,
+                &state,
+                Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -6951,6 +6986,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
+        drop(client);
 
         assert!(!server.await.unwrap());
         let response = String::from_utf8_lossy(&response);
@@ -6958,7 +6994,11 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(response.contains("config wizard form is too large"));
     }
 
-    #[tokio::test(start_paused = true)]
+    // Timeout tests use a short real timeout rather than a paused clock: virtual
+    // time can jump past the deadline before loopback delivers the request.
+    const TEST_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+
+    #[tokio::test]
     async fn incomplete_headers_time_out_without_finishing_wizard() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6971,15 +7011,13 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_wizard_connection(stream, &state).await
+            handle_wizard_connection(stream, &state, TEST_REQUEST_TIMEOUT).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS + 1)).await;
-        tokio::task::yield_now().await;
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
+        drop(client);
 
         assert!(!server.await.unwrap());
         let response = String::from_utf8_lossy(&response);
@@ -6987,7 +7025,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
         assert!(response.contains("timed out reading config wizard request"));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn incomplete_body_times_out_without_finishing_wizard() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7000,7 +7038,7 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_wizard_connection(stream, &state).await
+            handle_wizard_connection(stream, &state, TEST_REQUEST_TIMEOUT).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -7010,11 +7048,9 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             )
             .await
             .unwrap();
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS + 1)).await;
-        tokio::task::yield_now().await;
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
+        drop(client);
 
         assert!(!server.await.unwrap());
         let response = String::from_utf8_lossy(&response);
@@ -7044,7 +7080,14 @@ check(udpFieldsControl.hidden && rangeControl.disabled && advertiseControl.disab
             .unwrap();
         drop(client);
 
-        assert!(!handle_wizard_connection(stream, &state).await);
+        assert!(
+            !handle_wizard_connection(
+                stream,
+                &state,
+                Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS)
+            )
+            .await
+        );
     }
 
     #[test]
