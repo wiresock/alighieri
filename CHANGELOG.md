@@ -6,6 +6,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Security
+
+- Updated the locked rustls to 0.23.46 to address RUSTSEC-2026-0346,
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349.
+
 ## [0.7.1] - 2026-10-13
 
 ### Added
