@@ -9,10 +9,9 @@ use std::time::Duration;
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    LocalFree, BOOL, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE,
-    HLOCAL,
+    LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE, HLOCAL,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -60,7 +59,7 @@ impl Drop for SecurityDescriptor {
             // SAFETY: the conversion API allocated this descriptor with LocalAlloc
             // and this RAII object owns it exactly once.
             unsafe {
-                let _ = LocalFree(HLOCAL(self.0 .0));
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
             }
         }
     }
@@ -215,7 +214,7 @@ fn sid_string(sid: PSID) -> io::Result<String> {
     unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(windows_error)?;
     // SAFETY: successful conversion yields a NUL-terminated LocalAlloc string.
     let result = unsafe { text.to_string() }.map_err(io::Error::other);
-    unsafe { LocalFree(HLOCAL(text.0.cast())) };
+    unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
     result
 }
 
@@ -386,8 +385,8 @@ mod tests {
             AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
             AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
             AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
-            AUTHZ_AUDIT_EVENT_HANDLE, AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE,
-            AUTHZ_RM_FLAG_NO_AUDIT, AUTHZ_SKIP_TOKEN_GROUPS,
+            AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT,
+            AUTHZ_SKIP_TOKEN_GROUPS,
         };
         use windows::Win32::Security::{DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION};
         use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
@@ -462,7 +461,7 @@ mod tests {
                         AUTHZ_ACCESS_CHECK_FLAGS(0),
                         context,
                         &request,
-                        AUTHZ_AUDIT_EVENT_HANDLE::default(),
+                        None,
                         descriptor.0,
                         None,
                         &mut reply,
@@ -473,7 +472,7 @@ mod tests {
             unsafe {
                 let _ = AuthzFreeContext(context);
                 let _ = AuthzFreeResourceManager(manager);
-                let _ = LocalFree(HLOCAL(principal.0));
+                let _ = LocalFree(Some(HLOCAL(principal.0)));
             }
             result.expect("evaluate pipe DACL using AuthzAccessCheck");
             assert_eq!(

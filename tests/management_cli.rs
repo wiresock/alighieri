@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -104,7 +104,12 @@ fn invoke(args: Vec<OsString>, stdin: &[u8]) -> Output {
         .unwrap();
 
     if let Some(mut child_stdin) = child.stdin.take() {
-        child_stdin.write_all(stdin).unwrap();
+        // Some commands exit without reading stdin (e.g. rejecting an invalid
+        // username before the password), so the pipe may already be closed;
+        // the child's output is what each test asserts on.
+        if let Err(error) = child_stdin.write_all(stdin) {
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+        }
     }
     child.wait_with_output().unwrap()
 }

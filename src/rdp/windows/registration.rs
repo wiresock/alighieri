@@ -92,7 +92,7 @@ fn create_key(root: HKEY, path: &str) -> io::Result<RegistryKey> {
         RegCreateKeyExW(
             root,
             PCWSTR(path.as_ptr()),
-            0,
+            None,
             PWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             KEY_WRITE,
@@ -118,7 +118,7 @@ fn set_string(key: &RegistryKey, name: Option<&str>, value: &OsStr) -> io::Resul
             key.0,
             name.as_ref()
                 .map_or(PCWSTR::null(), |name| PCWSTR(name.as_ptr())),
-            0,
+            None,
             REG_SZ,
             Some(bytes),
         )
