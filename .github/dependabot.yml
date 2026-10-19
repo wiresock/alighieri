@@ -7,6 +7,14 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # windows and windows-core must move in lockstep: `windows` re-exports
+      # the `windows-core` traits (Interface, `implement`), so bumping one alone
+      # leaves two incompatible copies and breaks the `rdp` build. Listed first
+      # because Dependabot assigns a dependency to the first group it matches.
+      windows:
+        patterns:
+          - "windows"
+          - "windows-core"
       # Batch routine patch/minor bumps into a single PR to cut review noise.
       cargo-minor:
         update-types:
