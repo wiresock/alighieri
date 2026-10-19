@@ -17,8 +17,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Fixed
 
-- Removed an intermittent broken-pipe failure in the management CLI tests
-  when a command exits without reading stdin.
+- The configuration wizard now closes gracefully after rejecting a request
+  (timed out, oversized, or truncated), so the client receives the error
+  response instead of a connection reset.
+- Removed intermittent failures in the management CLI and wizard timeout
+  tests.
 
 ### Security
 
