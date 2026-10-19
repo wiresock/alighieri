@@ -6,6 +6,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the Windows RDP transport to `windows` and `windows-core` 0.62,
+  moved together so both share one copy of the COM interface traits.
+
 ### Security
 
 - Updated the locked rustls to 0.23.46 to address RUSTSEC-2026-0346,

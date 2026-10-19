@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
-use windows::core::{implement, Error, IUnknown, Interface, BSTR, GUID, PCSTR};
+use windows::core::{
+    implement, Error, IUnknown, IUnknownImpl, Interface, OutRef, Ref, BOOL, BSTR, GUID, PCSTR,
+};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_OUTOFMEMORY, FALSE, HANDLE, TRUE,
+    CloseHandle, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_OUTOFMEMORY, FALSE, HANDLE, TRUE,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoRegisterClassObject, CoResumeClassObjects, CoRevokeClassObject,
@@ -329,6 +331,32 @@ impl RdpPlugin {
             }
         }
     }
+
+    /// Starts the bridge for a new DVC. `Ok(None)` rejects the channel
+    /// without failing the COM call, e.g. when a session is already active.
+    fn accept_channel(
+        &self,
+        channel: Option<&IWTSVirtualChannel>,
+    ) -> windows::core::Result<Option<IWTSVirtualChannelCallback>> {
+        let channel = channel.ok_or_else(|| Error::new(E_INVALIDARG, "null DVC"))?;
+        // Acquire the only fallible per-plugin state before starting bridge
+        // threads. If this mutex were poisoned after `hub.open`, those threads
+        // would otherwise retain an ownerless live session.
+        let mut owned_session = self
+            .session
+            .lock()
+            .map_err(|_| Error::new(E_OUTOFMEMORY, "session lock poisoned"))?;
+        let session = match self.hub.open(channel) {
+            Ok(session) => session,
+            Err(error) => {
+                warn!(%error, "rejected additional RDP DVC");
+                return Ok(None);
+            }
+        };
+        *owned_session = Some(Arc::downgrade(&session));
+        drop(owned_session);
+        Ok(Some(RdpChannelCallback { session }.into()))
+    }
 }
 
 impl Drop for RdpPlugin {
@@ -340,12 +368,14 @@ impl Drop for RdpPlugin {
 impl IWTSPlugin_Impl for RdpPlugin_Impl {
     fn Initialize(
         &self,
-        channel_manager: Option<&IWTSVirtualChannelManager>,
+        channel_manager: Ref<'_, IWTSVirtualChannelManager>,
     ) -> windows::core::Result<()> {
-        let manager = channel_manager.ok_or_else(|| Error::new(E_INVALIDARG, "null manager"))?;
-        // SAFETY: the windows-rs implementation object advertises
-        // IWTSListenerCallback through the `implement` declaration above.
-        let callback: IWTSListenerCallback = unsafe { self.cast()? };
+        let manager = channel_manager
+            .as_ref()
+            .ok_or_else(|| Error::new(E_INVALIDARG, "null manager"))?;
+        // The `implement` declaration above advertises IWTSListenerCallback, so
+        // this conversion is checked at compile time and cannot fail.
+        let callback: IWTSListenerCallback = self.to_interface();
         // SAFETY: CHANNEL_NAME_NUL is static, ASCII, and NUL-terminated; callback
         // and listener COM references are retained for the plugin lifetime.
         let listener =
@@ -393,52 +423,37 @@ impl IWTSPlugin_Impl for RdpPlugin_Impl {
 impl IWTSListenerCallback_Impl for RdpPlugin_Impl {
     fn OnNewChannelConnection(
         &self,
-        channel: Option<&IWTSVirtualChannel>,
+        channel: Ref<'_, IWTSVirtualChannel>,
         _data: &BSTR,
         accept: *mut BOOL,
-        callback: *mut Option<IWTSVirtualChannelCallback>,
+        callback: OutRef<'_, IWTSVirtualChannelCallback>,
     ) -> windows::core::Result<()> {
         if accept.is_null() || callback.is_null() {
             return Err(Error::new(E_INVALIDARG, "null DVC callback output"));
         }
-        // Initialize all out parameters before any fallible work.
         // SAFETY: COM supplies writable, potentially uninitialized out storage
-        // when these pointers are non-null. `ptr::write` must be used for the
-        // interface Option so initialization never tries to release garbage.
-        unsafe {
-            ptr::write(accept, FALSE);
-            ptr::write(callback, None);
-        }
-        let channel = channel.ok_or_else(|| Error::new(E_INVALIDARG, "null DVC"))?;
-        // Acquire the only fallible per-plugin state before starting bridge
-        // threads. If this mutex were poisoned after `hub.open`, those threads
-        // would otherwise retain an ownerless live session.
-        let mut owned_session = self
-            .session
-            .lock()
-            .map_err(|_| Error::new(E_OUTOFMEMORY, "session lock poisoned"))?;
-        let session = match self.hub.open(channel) {
-            Ok(session) => session,
-            Err(error) => {
-                warn!(%error, "rejected additional RDP DVC");
-                return Ok(());
+        // when this pointer is non-null; reject until the bridge has started.
+        unsafe { ptr::write(accept, FALSE) };
+        // `OutRef::write` consumes the out parameter and never reads or drops
+        // the uninitialized previous value, so it is written exactly once on
+        // every path: the callback only after the bridge started, else `None`.
+        match self.accept_channel(channel.as_ref()) {
+            Ok(Some(channel_callback)) => {
+                // SAFETY: `accept` was validated and initialized above.
+                unsafe { ptr::write(accept, TRUE) };
+                callback.write(Some(channel_callback))?;
+                info!(
+                    channel = CHANNEL_NAME,
+                    "accepted RDP Dynamic Virtual Channel"
+                );
+                Ok(())
             }
-        };
-        *owned_session = Some(Arc::downgrade(&session));
-        drop(owned_session);
-        let channel_callback: IWTSVirtualChannelCallback = RdpChannelCallback { session }.into();
-        // SAFETY: both outputs were initialized above. `ptr::write` transfers
-        // the callback interface directly into COM-owned output storage only
-        // after the bridge successfully started; the previous value is `None`.
-        unsafe {
-            ptr::write(accept, TRUE);
-            ptr::write(callback, Some(channel_callback));
+            Ok(None) => callback.write(None),
+            Err(error) => {
+                callback.write(None)?;
+                Err(error)
+            }
         }
-        info!(
-            channel = CHANNEL_NAME,
-            "accepted RDP Dynamic Virtual Channel"
-        );
-        Ok(())
     }
 }
 
@@ -487,7 +502,7 @@ struct ClassFactory {
 impl IClassFactory_Impl for ClassFactory_Impl {
     fn CreateInstance(
         &self,
-        outer: Option<&IUnknown>,
+        outer: Ref<'_, IUnknown>,
         iid: *const GUID,
         object: *mut *mut c_void,
     ) -> windows::core::Result<()> {
@@ -495,7 +510,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
             // SAFETY: a non-null COM out pointer is writable for this call.
             unsafe { *object = ptr::null_mut() };
         }
-        if outer.is_some() {
+        if !outer.is_null() {
             return Err(Error::new(
                 CLASS_E_NOAGGREGATION,
                 "aggregation is unsupported",
