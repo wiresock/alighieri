@@ -6,6 +6,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Security
+
+- Updated the locked `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10
+  to reject distrusted emSign intermediates (CVE-2026-111943,
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)
+  and [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html)).
+  These dependencies verify TLS connections to ACME services during
+  certificate issuance and renewal.
+
 ## [0.7.2] - 2026-10-19
 
 ### Changed
