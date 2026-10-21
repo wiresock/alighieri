@@ -6,6 +6,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-21
+
 ### Security
 
 - Updated the locked `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10
@@ -891,7 +893,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/wiresock/alighieri/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/wiresock/alighieri/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/wiresock/alighieri/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/wiresock/alighieri/compare/v0.6.0...v0.7.0
