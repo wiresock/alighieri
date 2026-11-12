@@ -156,7 +156,9 @@ pub(crate) fn emit_error(operation: &'static str, error: ManagementError) -> Exi
         operation,
         error,
     };
-    emit_serializable(operation, &envelope);
+    // An error response always exits with FAILURE, whether or not writing the
+    // envelope itself succeeded, so the write's own status is not needed.
+    let _ = emit_serializable(operation, &envelope);
     ExitCode::FAILURE
 }
 
