@@ -6,6 +6,16 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-12
+
+### Security
+
+- Updated the locked `event-listener` to 5.4.2 and `rustix` to 1.1.6 to
+  resolve unsoundness advisories
+  [RUSTSEC-2026-0221](https://rustsec.org/advisories/RUSTSEC-2026-0221.html)
+  and [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+  Both crates are reached through the ACME client's async runtime.
+
 ### Changed
 
 - The Windows RDP transport now uses `windows-core` 0.100 with Win32/COM
@@ -17,6 +27,11 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `alighieri::rdp::windows::registration::PLUGIN_CLSID` (Windows, `rdp`) is
   now a `windows_core` 0.100 `GUID`; library users comparing it with a
   `windows` 0.62 `GUID` must convert or upgrade.
+- Updated locked Rust dependencies, including Tokio 1.54.1 and libc 0.2.191,
+  while retaining Rust 1.88 compatibility for the default build.
+- Refreshed CI and release actions and the Rust 1.99 container builder image.
+- The development Homebrew formula instructions now trust the local tap, as
+  current Homebrew requires.
 
 ## [0.7.3] - 2026-10-21
 
@@ -905,7 +920,8 @@ commercial license available for proprietary use (see
 - Configuration validation (`--check`, `--check --json`), machine-readable
   reload metadata (`config metadata --json`), and a `--version` / `-V` flag.
 
-[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/wiresock/alighieri/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/wiresock/alighieri/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/wiresock/alighieri/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/wiresock/alighieri/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/wiresock/alighieri/compare/v0.7.0...v0.7.1
