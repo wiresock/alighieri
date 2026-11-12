@@ -6,18 +6,18 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
-use windows::core::{Error as WindowsError, PCSTR};
-use windows::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_PIPE_NOT_CONNECTED, ERROR_TIMEOUT, HANDLE,
-    WIN32_ERROR,
-};
-use windows::Win32::System::RemoteDesktop::{
-    WTSVirtualChannelClose, WTSVirtualChannelOpenEx, WTSVirtualChannelRead, WTSVirtualChannelWrite,
-    WTS_CHANNEL_OPTION_DYNAMIC, WTS_CURRENT_SESSION,
-};
+use windows_core::{Error as WindowsError, PCSTR, PSTR};
 
 use crate::rdp::mux::{self, AgentPolicy};
 
+use super::bindings::{
+    WTSVirtualChannelClose, WTSVirtualChannelOpenEx, WTSVirtualChannelRead, WTSVirtualChannelWrite,
+    WTS_CHANNEL_OPTION_DYNAMIC, WTS_CURRENT_SESSION,
+};
+use super::bindings::{
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_PIPE_NOT_CONNECTED, ERROR_TIMEOUT, HANDLE,
+    INVALID_HANDLE_VALUE, WIN32_ERROR,
+};
 use super::pdu::DvcReassembler;
 use super::transport::CHANNEL_NAME;
 
@@ -221,7 +221,7 @@ fn wts_actor(
 // (including stop-before-close ordering) are shared with production. Channel
 // implementations release their owned resource in Drop.
 trait WtsChannel {
-    fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize>;
+    fn read(&mut self, buffer: &mut [u8]) -> windows_core::Result<usize>;
     fn write(&mut self, data: &[u8]) -> io::Result<()>;
 }
 
@@ -250,11 +250,21 @@ impl<C> Drop for ActorChannel<C> {
 }
 
 impl WtsChannel for NativeWtsChannel {
-    fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize> {
+    fn read(&mut self, buffer: &mut [u8]) -> windows_core::Result<usize> {
         let mut count = 0u32;
         // SAFETY: the channel handle is owned exclusively by this actor thread;
         // the mutable buffer and count out pointer remain live for the call.
-        unsafe { WTSVirtualChannelRead(self.0, READ_TIMEOUT_MS, buffer, &mut count) }?;
+        let capacity = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+        unsafe {
+            WTSVirtualChannelRead(
+                self.0,
+                READ_TIMEOUT_MS,
+                PSTR(buffer.as_mut_ptr()),
+                capacity,
+                &mut count,
+            )
+        }
+        .ok()?;
         Ok(count as usize)
     }
 
@@ -386,10 +396,9 @@ fn open_channel() -> io::Result<HANDLE> {
             PCSTR(CHANNEL_NAME_NUL.as_ptr()),
             WTS_CHANNEL_OPTION_DYNAMIC,
         )
-    }
-    .map_err(windows_error)?;
-    if channel.is_invalid() || channel.0.is_null() {
-        Err(io::Error::other("WTS returned an invalid DVC handle"))
+    };
+    if channel.0.is_null() || channel == INVALID_HANDLE_VALUE {
+        Err(windows_error(WindowsError::from_thread()))
     } else {
         Ok(channel)
     }
@@ -400,7 +409,9 @@ fn write_channel(channel: HANDLE, data: &[u8]) -> io::Result<()> {
         let mut written = 0u32;
         // SAFETY: the actor exclusively owns `channel`; WTS copies the live
         // chunk before returning and initializes `written`.
-        unsafe { WTSVirtualChannelWrite(channel, chunk, &mut written) }.map_err(windows_error)?;
+        unsafe { WTSVirtualChannelWrite(channel, chunk, &mut written) }
+            .ok()
+            .map_err(windows_error)?;
         if written as usize != chunk.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -413,7 +424,7 @@ fn write_channel(channel: HANDLE, data: &[u8]) -> io::Result<()> {
 
 fn close_channel(channel: HANDLE) {
     // SAFETY: called exactly once by the actor that owns the channel handle.
-    if let Err(error) = unsafe { WTSVirtualChannelClose(channel) } {
+    if let Err(error) = unsafe { WTSVirtualChannelClose(channel) }.ok() {
         if !is_win32_error(&error, ERROR_BROKEN_PIPE)
             && !is_win32_error(&error, ERROR_PIPE_NOT_CONNECTED)
         {
@@ -424,7 +435,7 @@ fn close_channel(channel: HANDLE) {
 }
 
 fn is_win32_error(error: &WindowsError, expected: WIN32_ERROR) -> bool {
-    win32_error_code(error) == Some(expected.0)
+    win32_error_code(error) == Some(expected)
 }
 
 fn is_wts_read_poll_tick(error: &WindowsError) -> bool {
@@ -450,7 +461,12 @@ mod tests {
     use std::future::Future;
     use std::sync::{Arc, Condvar, Mutex};
     use tokio::net::TcpListener;
-    use windows::core::HRESULT;
+    use windows_core::HRESULT;
+
+    /// The HRESULT Windows reports for a failed Win32 call with `code`.
+    fn win32_hresult(code: WIN32_ERROR) -> HRESULT {
+        windows_core::WIN32_ERROR(code).to_hresult()
+    }
 
     struct BlockedWriteChannel {
         entered: Option<oneshot::Sender<()>>,
@@ -458,7 +474,7 @@ mod tests {
     }
 
     impl WtsChannel for BlockedWriteChannel {
-        fn read(&mut self, _buffer: &mut [u8]) -> windows::core::Result<usize> {
+        fn read(&mut self, _buffer: &mut [u8]) -> windows_core::Result<usize> {
             panic!("the primed write must run before any read");
         }
 
@@ -615,16 +631,14 @@ mod tests {
     }
 
     impl WtsChannel for TestWtsChannel<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> windows::core::Result<usize> {
+        fn read(&mut self, buffer: &mut [u8]) -> windows_core::Result<usize> {
             match self.read.take().expect("unexpected actor read") {
                 ActorRead::Bytes(data) => {
                     buffer[..data.len()].copy_from_slice(&data);
                     Ok(data.len())
                 }
                 ActorRead::Count(count) => Ok(count),
-                ActorRead::Error(error) => {
-                    Err(WindowsError::from_hresult(HRESULT::from_win32(error.0)))
-                }
+                ActorRead::Error(error) => Err(WindowsError::from_hresult(win32_hresult(error))),
             }
         }
 
@@ -738,7 +752,7 @@ mod tests {
     }
 
     impl WtsChannel for PanickingWtsChannel<'_> {
-        fn read(&mut self, _buffer: &mut [u8]) -> windows::core::Result<usize> {
+        fn read(&mut self, _buffer: &mut [u8]) -> windows_core::Result<usize> {
             assert_eq!(self.operation, "read");
             panic!("injected actor read panic");
         }
@@ -1023,11 +1037,11 @@ mod tests {
 
     #[test]
     fn hresult_mapping_uses_captured_win32_code() {
-        let timeout = WindowsError::from_hresult(HRESULT::from_win32(ERROR_TIMEOUT.0));
+        let timeout = WindowsError::from_hresult(win32_hresult(ERROR_TIMEOUT));
         assert!(is_win32_error(&timeout, ERROR_TIMEOUT));
         assert_eq!(
             windows_error(timeout).raw_os_error(),
-            Some(ERROR_TIMEOUT.0 as i32)
+            Some(ERROR_TIMEOUT as i32)
         );
 
         let generic = WindowsError::from_hresult(HRESULT(0x8000_4005_u32 as i32));
@@ -1037,9 +1051,9 @@ mod tests {
 
     #[test]
     fn wts_read_poll_tick_accepts_only_no_data_errors() {
-        let timeout = WindowsError::from_hresult(HRESULT::from_win32(ERROR_TIMEOUT.0));
-        let incomplete = WindowsError::from_hresult(HRESULT::from_win32(ERROR_IO_INCOMPLETE.0));
-        let broken_pipe = WindowsError::from_hresult(HRESULT::from_win32(ERROR_BROKEN_PIPE.0));
+        let timeout = WindowsError::from_hresult(win32_hresult(ERROR_TIMEOUT));
+        let incomplete = WindowsError::from_hresult(win32_hresult(ERROR_IO_INCOMPLETE));
+        let broken_pipe = WindowsError::from_hresult(win32_hresult(ERROR_BROKEN_PIPE));
         let generic = WindowsError::from_hresult(HRESULT(0x8000_4005_u32 as i32));
 
         assert!(is_wts_read_poll_tick(&timeout));

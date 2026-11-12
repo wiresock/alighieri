@@ -7,13 +7,14 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      # windows and windows-core must move in lockstep: `windows` re-exports
-      # the `windows-core` traits (Interface, `implement`), so bumping one alone
-      # leaves two incompatible copies and breaks the `rdp` build. Listed first
-      # because Dependabot assigns a dependency to the first group it matches.
+      # The `rdp` bindings in src/rdp/windows/bindings.rs are generated for one
+      # windows-core release line. Keep windows-core bumps in their own PR (not
+      # the cargo-minor batch): a new 0.x line also needs the matching
+      # windows-bindgen in tools/rdp-bindings and regenerated bindings
+      # (scripts/generate-rdp-bindings.sh). Listed first because Dependabot
+      # assigns a dependency to the first group it matches.
       windows:
         patterns:
-          - "windows"
           - "windows-core"
       # Batch routine patch/minor bumps into a single PR to cut review noise.
       cargo-minor:
@@ -29,6 +30,16 @@ updates:
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-major"
+
+  # The generator for the `rdp` bindings (not part of the published crate).
+  # Bump windows-bindgen together with the main crate's windows-core and
+  # regenerate src/rdp/windows/bindings.rs; the `rdp bindings up to date` CI
+  # job fails until the committed bindings match the new generator.
+  - package-ecosystem: cargo
+    directory: "/tools/rdp-bindings"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
 
   # GitHub Actions used by the CI and release workflows.
   - package-ecosystem: github-actions

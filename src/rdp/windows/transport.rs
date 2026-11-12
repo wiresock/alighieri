@@ -9,28 +9,27 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
-use windows::core::{
+use windows_core::AgileReference;
+use windows_core::{
     implement, Error, IUnknown, IUnknownImpl, Interface, OutRef, Ref, BOOL, BSTR, GUID, PCSTR,
+    PCWSTR,
 };
-use windows::Win32::Foundation::{
-    CloseHandle, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_OUTOFMEMORY, FALSE, HANDLE, TRUE,
-};
-use windows::Win32::System::Com::{
+
+use super::bindings::{CloseHandle, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_OUTOFMEMORY, HANDLE};
+use super::bindings::{
     CoInitializeEx, CoRegisterClassObject, CoResumeClassObjects, CoRevokeClassObject,
     CoUninitialize, IClassFactory, IClassFactory_Impl, CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED,
     REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
 };
-use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_SHUTDOWN_EVENT,
-};
-use windows::Win32::System::RemoteDesktop::{
+use super::bindings::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
+use super::bindings::{
     IWTSListener, IWTSListenerCallback, IWTSListenerCallback_Impl, IWTSPlugin, IWTSPlugin_Impl,
     IWTSVirtualChannel, IWTSVirtualChannelCallback, IWTSVirtualChannelCallback_Impl,
     IWTSVirtualChannelManager,
 };
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
-use windows_core::AgileReference;
-
+use super::bindings::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_SHUTDOWN_EVENT,
+};
 use super::pipe;
 use super::registration::PLUGIN_CLSID;
 
@@ -40,6 +39,9 @@ const BRIDGE_QUEUE_CAPACITY: usize = 512;
 const MAX_CALLBACK_BYTES: u32 = 65_536;
 /// Conservative maximum accepted by every supported mstsc DVC implementation.
 const DVC_WRITE_CHUNK: usize = 1_590;
+
+const TRUE: BOOL = BOOL(1);
+const FALSE: BOOL = BOOL(0);
 
 static SHUTDOWN_EVENT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
@@ -53,7 +55,7 @@ unsafe extern "system" fn console_handler(control: u32) -> BOOL {
         CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_SHUTDOWN_EVENT
     ) {
         let event = shutdown_handle();
-        if !event.is_invalid() {
+        if !event.0.is_null() {
             // SAFETY: `run_com_server` publishes a live manual-reset event until
             // after the handler is removed.
             unsafe {
@@ -72,7 +74,7 @@ struct BridgeHub {
 }
 
 impl BridgeHub {
-    fn open(&self, channel: &IWTSVirtualChannel) -> windows::core::Result<Arc<SessionBridge>> {
+    fn open(&self, channel: &IWTSVirtualChannel) -> windows_core::Result<Arc<SessionBridge>> {
         let mut active = self
             .active
             .lock()
@@ -108,7 +110,7 @@ struct SessionBridge {
 }
 
 impl SessionBridge {
-    fn start(channel: AgileReference<IWTSVirtualChannel>) -> windows::core::Result<Arc<Self>> {
+    fn start(channel: AgileReference<IWTSVirtualChannel>) -> windows_core::Result<Arc<Self>> {
         let (inbound_tx, inbound_rx) = mpsc::channel(BRIDGE_QUEUE_CAPACITY);
         let (outbound_tx, outbound_rx) = mpsc::channel(BRIDGE_QUEUE_CAPACITY);
         let (stop, stop_rx) = watch::channel(false);
@@ -134,7 +136,7 @@ impl SessionBridge {
         Ok(session)
     }
 
-    fn on_data(&self, data: &[u8]) -> windows::core::Result<()> {
+    fn on_data(&self, data: &[u8]) -> windows_core::Result<()> {
         if self.is_closed() {
             return Ok(());
         }
@@ -177,7 +179,7 @@ fn spawn_channel_writer(
         .name("alighieri-rdp-dvc-writer".into())
         .spawn(move || {
             // SAFETY: this thread owns one balanced MTA initialization.
-            let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED as u32) }.is_ok();
             if !initialized {
                 error!("failed to initialize the DVC writer COM apartment");
                 session.close();
@@ -185,7 +187,7 @@ fn spawn_channel_writer(
             }
 
             let result = channel.resolve().and_then(|resolved| {
-                let writes = (|| -> windows::core::Result<()> {
+                let writes = (|| -> windows_core::Result<()> {
                     while let Some(data) = outbound.blocking_recv() {
                         for chunk in data.chunks(DVC_WRITE_CHUNK) {
                             if session.is_closed() {
@@ -194,7 +196,7 @@ fn spawn_channel_writer(
                             // SAFETY: the resolved proxy is used only in this initialized
                             // apartment and `Write` copies the live slice before returning.
                             unsafe {
-                                resolved.Write(chunk, None::<&IUnknown>)?;
+                                resolved.Write(chunk, None::<&IUnknown>).ok()?;
                             }
                         }
                     }
@@ -202,7 +204,7 @@ fn spawn_channel_writer(
                 })();
                 // This is outside every DVC callback. Closing here makes pipe loss
                 // visible to WTS immediately instead of waiting for keepalive expiry.
-                let close = unsafe { resolved.Close() };
+                let close = unsafe { resolved.Close() }.ok();
                 drop(resolved);
                 writes.and(close)
             });
@@ -337,7 +339,7 @@ impl RdpPlugin {
     fn accept_channel(
         &self,
         channel: Option<&IWTSVirtualChannel>,
-    ) -> windows::core::Result<Option<IWTSVirtualChannelCallback>> {
+    ) -> windows_core::Result<Option<IWTSVirtualChannelCallback>> {
         let channel = channel.ok_or_else(|| Error::new(E_INVALIDARG, "null DVC"))?;
         // Acquire the only fallible per-plugin state before starting bridge
         // threads. If this mutex were poisoned after `hub.open`, those threads
@@ -369,7 +371,7 @@ impl IWTSPlugin_Impl for RdpPlugin_Impl {
     fn Initialize(
         &self,
         channel_manager: Ref<'_, IWTSVirtualChannelManager>,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         let manager = channel_manager
             .as_ref()
             .ok_or_else(|| Error::new(E_INVALIDARG, "null manager"))?;
@@ -396,18 +398,18 @@ impl IWTSPlugin_Impl for RdpPlugin_Impl {
         Ok(())
     }
 
-    fn Connected(&self) -> windows::core::Result<()> {
+    fn Connected(&self) -> windows_core::Result<()> {
         info!("mstsc connected");
         Ok(())
     }
 
-    fn Disconnected(&self, disconnect_code: u32) -> windows::core::Result<()> {
+    fn Disconnected(&self, disconnect_code: u32) -> windows_core::Result<()> {
         info!(disconnect_code, "mstsc disconnected");
         self.close_owned_session();
         Ok(())
     }
 
-    fn Terminated(&self) -> windows::core::Result<()> {
+    fn Terminated(&self) -> windows_core::Result<()> {
         self.close_owned_session();
         if let Ok(mut listener) = self.listener.lock() {
             *listener = None;
@@ -427,7 +429,7 @@ impl IWTSListenerCallback_Impl for RdpPlugin_Impl {
         _data: &BSTR,
         accept: *mut BOOL,
         callback: OutRef<'_, IWTSVirtualChannelCallback>,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         if accept.is_null() || callback.is_null() {
             return Err(Error::new(E_INVALIDARG, "null DVC callback output"));
         }
@@ -471,7 +473,7 @@ impl Drop for RdpChannelCallback {
 }
 
 impl IWTSVirtualChannelCallback_Impl for RdpChannelCallback_Impl {
-    fn OnDataReceived(&self, size: u32, buffer: *const u8) -> windows::core::Result<()> {
+    fn OnDataReceived(&self, size: u32, buffer: *const u8) -> windows_core::Result<()> {
         if size == 0 {
             return Ok(());
         }
@@ -485,7 +487,7 @@ impl IWTSVirtualChannelCallback_Impl for RdpChannelCallback_Impl {
         self.session.on_data(data)
     }
 
-    fn OnClose(&self) -> windows::core::Result<()> {
+    fn OnClose(&self) -> windows_core::Result<()> {
         // Keep teardown out of the callback: signaling lets the dedicated COM
         // writer serialize the final Close and all proxy release operations.
         self.session.close();
@@ -505,7 +507,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         outer: Ref<'_, IUnknown>,
         iid: *const GUID,
         object: *mut *mut c_void,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         if !object.is_null() {
             // SAFETY: a non-null COM out pointer is writable for this call.
             unsafe { *object = ptr::null_mut() };
@@ -527,7 +529,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         }
     }
 
-    fn LockServer(&self, _lock: BOOL) -> windows::core::Result<()> {
+    fn LockServer(&self, _lock: BOOL) -> windows_core::Result<()> {
         Ok(())
     }
 }
@@ -538,19 +540,19 @@ pub fn run() -> io::Result<()> {
     run_com_server().map_err(io::Error::other)
 }
 
-fn run_com_server() -> windows::core::Result<()> {
+fn run_com_server() -> windows_core::Result<()> {
     // SAFETY: all COM/event registrations are balanced on this same main thread.
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-        let event = match CreateEventW(None, true, false, None) {
-            Ok(event) => event,
-            Err(error) => {
-                CoUninitialize();
-                return Err(error);
-            }
-        };
+        CoInitializeEx(None, COINIT_MULTITHREADED as u32).ok()?;
+        let event = CreateEventW(None, true, false, PCWSTR::null());
+        if event.0.is_null() {
+            // Capture the thread's last error before CoUninitialize can reset it.
+            let error = Error::from_thread();
+            CoUninitialize();
+            return Err(error);
+        }
         SHUTDOWN_EVENT.store(event.0, Ordering::Release);
-        if let Err(error) = SetConsoleCtrlHandler(Some(console_handler), true) {
+        if let Err(error) = SetConsoleCtrlHandler(Some(console_handler), true).ok() {
             SHUTDOWN_EVENT.store(ptr::null_mut(), Ordering::Release);
             let _ = CloseHandle(event);
             CoUninitialize();
@@ -563,7 +565,7 @@ fn run_com_server() -> windows::core::Result<()> {
             &PLUGIN_CLSID,
             &factory,
             CLSCTX_LOCAL_SERVER,
-            REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
+            (REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED) as u32,
         ) {
             Ok(cookie) => cookie,
             Err(error) => {
@@ -575,7 +577,7 @@ fn run_com_server() -> windows::core::Result<()> {
                 return Err(error);
             }
         };
-        if let Err(error) = CoResumeClassObjects() {
+        if let Err(error) = CoResumeClassObjects().ok() {
             let _ = CoRevokeClassObject(cookie);
             drop(factory);
             let _ = SetConsoleCtrlHandler(Some(console_handler), false);

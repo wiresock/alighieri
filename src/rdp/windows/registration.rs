@@ -5,17 +5,18 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
-use windows::Win32::System::Registry::{
+use windows_core::{PCWSTR, PWSTR};
+
+use super::bindings::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+use super::bindings::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, WIN32_ERROR};
 
 /// Stable COM identity for the Alighieri out-of-process DVC plugin.
 pub const PLUGIN_CLSID_TEXT: &str = "{508D8D20-12D7-4C2E-AB9C-79A38C5B6701}";
-pub const PLUGIN_CLSID: windows::core::GUID =
-    windows::core::GUID::from_u128(0x508d8d20_12d7_4c2e_ab9c_79a38c5b6701);
+pub const PLUGIN_CLSID: windows_core::GUID =
+    windows_core::GUID::from_u128(0x508d8d20_12d7_4c2e_ab9c_79a38c5b6701);
 pub const ADDIN_NAME: &str = "AlighieriRdpTransport";
 
 const CLSID_KEY: &str = "Software\\Classes\\CLSID\\{508D8D20-12D7-4C2E-AB9C-79A38C5B6701}";
@@ -142,10 +143,10 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 fn win32_result(status: WIN32_ERROR) -> io::Result<()> {
-    if status.is_ok() {
+    if status == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(status.0 as i32))
+        Err(io::Error::from_raw_os_error(status as i32))
     }
 }
 
