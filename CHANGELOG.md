@@ -14,6 +14,9 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   live in `tools/rdp-bindings` and `scripts/generate-rdp-bindings.sh`.
 - Building the `rdp` feature on Windows now requires Rust 1.95 or newer. The
   default build and the other features keep the Rust 1.88 minimum.
+- `alighieri::rdp::windows::registration::PLUGIN_CLSID` (Windows, `rdp`) is
+  now a `windows_core` 0.100 `GUID`; library users comparing it with a
+  `windows` 0.62 `GUID` must convert or upgrade.
 
 ## [0.7.3] - 2026-10-21
 

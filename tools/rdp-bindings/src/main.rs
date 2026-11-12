@@ -13,7 +13,9 @@ const FILTER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/filter.txt");
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let [winmd, output, version] = args.as_slice() else {
-        eprintln!("usage: alighieri-rdp-bindings <Windows.Win32.winmd> <output.rs> <metadata-version>");
+        eprintln!(
+            "usage: alighieri-rdp-bindings <Windows.Win32.winmd> <output.rs> <metadata-version>"
+        );
         std::process::exit(2);
     };
     let output = PathBuf::from(output);
