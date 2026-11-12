@@ -1234,8 +1234,9 @@ is head-only (a plain `brew install` of it refuses and tells you to pass
 from it:
 
 ```sh
-# Current Homebrew requires the formula to live in a tap.
+# Current Homebrew requires the formula to live in a tap it trusts.
 brew tap-new --no-git local/alighieri
+brew trust local/alighieri
 cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
 brew install --HEAD local/alighieri/alighieri
 ```

@@ -253,6 +253,9 @@ jobs:
         run: |
           brew style Formula/alighieri.rb
           brew tap-new --no-git local/alighieri
+          # Homebrew refuses to load formulae from a tap it has not been told
+          # to trust ("Refusing to load formula ... from untrusted tap").
+          brew trust local/alighieri
           cp Formula/alighieri.rb "$(brew --repository local/alighieri)/Formula/"
           # Audit the formula as a user would load it: no local override.
           env -u HOMEBREW_ALIGHIERI_SOURCE brew audit --strict local/alighieri/alighieri
