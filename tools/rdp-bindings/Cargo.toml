@@ -1,0 +1,17 @@
+# Generator for `src/rdp/windows/bindings.rs`. Not part of the published crate
+# and not a workspace member: run it through `scripts/generate-rdp-bindings.sh`,
+# which downloads the pinned Win32 metadata it reads.
+[package]
+name = "alighieri-rdp-bindings"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+
+# Keep this crate out of any parent workspace.
+[workspace]
+
+[dependencies]
+# Must stay on the same release line as the `windows-core` dependency of the
+# main crate: the generated code calls into windows-core.
+windows-bindgen = "=0.100.0"

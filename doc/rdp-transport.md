@@ -506,7 +506,8 @@ tests. A second Windows/RDP session is required to complete them.
 Manual end-to-end procedure:
 
 1. On machine A, build all three binaries with
-   `cargo build --release --locked --features rdp --bins`. The commands below
+   `cargo build --release --locked --features rdp --bins` (Rust 1.95 or
+   newer). The commands below
    use the resulting checkout paths; extracted release archives can use their
    archive-root binaries directly.
 2. Run `.\target\release\alighieri-rdp-transport.exe --register` before starting

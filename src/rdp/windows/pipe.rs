@@ -9,19 +9,20 @@ use std::time::Duration;
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{
-    LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE, HLOCAL,
-};
-use windows::Win32::Security::Authorization::{
+use windows_core::{BOOL, PCWSTR, PWSTR};
+
+use super::bindings::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
-use windows::Win32::Security::{
+use super::bindings::{GetCurrentProcess, OpenProcessToken};
+use super::bindings::{
     GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use super::bindings::{
+    LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE, HLOCAL,
+};
 
 /// Local-only pipe used by the single-session MVP.
 pub const PIPE_NAME: &str = r"\\.\pipe\alighieri-rdp-v1";
@@ -47,6 +48,7 @@ impl SecurityDescriptor {
                 &mut descriptor,
                 None,
             )
+            .ok()
             .map_err(windows_error)?;
         }
         Ok(Self(descriptor))
@@ -55,7 +57,7 @@ impl SecurityDescriptor {
 
 impl Drop for SecurityDescriptor {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
+        if !self.0 .0.is_null() {
             // SAFETY: the conversion API allocated this descriptor with LocalAlloc
             // and this RAII object owns it exactly once.
             unsafe {
@@ -113,14 +115,14 @@ async fn connect_client_at(pipe_name: &str) -> io::Result<NamedPipeClient> {
                 validate_server_owner(&client, &expected_owner)?;
                 return Ok(client);
             }
-            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                 if busy_retries == 10 {
                     return Err(error);
                 }
                 busy_retries += 1;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND.0 as i32) => {
+            Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "no active Alighieri RDP Dynamic Virtual Channel",
@@ -136,7 +138,7 @@ fn validate_server_owner(client: &NamedPipeClient, expected_owner: &str) -> io::
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: query the connected kernel object, not its replaceable name.
     // Windows allocates the descriptor; `owner` points inside that allocation.
-    let result = unsafe {
+    let result = windows_core::WIN32_ERROR(unsafe {
         GetSecurityInfo(
             HANDLE(client.as_raw_handle()),
             SE_KERNEL_OBJECT,
@@ -147,7 +149,7 @@ fn validate_server_owner(client: &NamedPipeClient, expected_owner: &str) -> io::
             None,
             Some(&mut descriptor),
         )
-    };
+    });
     let _descriptor = SecurityDescriptor(descriptor);
     if result.is_err() {
         return Err(io::Error::from_raw_os_error(result.0 as i32));
@@ -167,6 +169,7 @@ fn current_user_sid() -> io::Result<String> {
     let mut token = HANDLE::default();
     // SAFETY: the process pseudo-handle is valid and token is writable.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .ok()
         .map_err(windows_error)?;
     // SAFETY: OpenProcessToken returned a new owned handle on success.
     let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
@@ -181,13 +184,13 @@ fn current_user_sid() -> io::Result<String> {
             &mut length,
         )
     };
-    let error = query.err().ok_or_else(|| {
+    let error = query.ok().err().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Windows returned an empty TOKEN_USER",
         )
     })?;
-    if error.code() != windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+    if error.code() != windows_core::WIN32_ERROR(ERROR_INSUFFICIENT_BUFFER).to_hresult() {
         return Err(windows_error(error));
     }
     // usize storage supplies the alignment TOKEN_USER requires. The returned
@@ -203,6 +206,7 @@ fn current_user_sid() -> io::Result<String> {
             &mut length,
         )
     }
+    .ok()
     .map_err(windows_error)?;
     // SAFETY: GetTokenInformation initialized a correctly aligned TOKEN_USER.
     sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
@@ -211,14 +215,16 @@ fn current_user_sid() -> io::Result<String> {
 fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text = PWSTR::null();
     // SAFETY: callers provide a SID in a live Windows-owned descriptor/token.
-    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(windows_error)?;
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }
+        .ok()
+        .map_err(windows_error)?;
     // SAFETY: successful conversion yields a NUL-terminated LocalAlloc string.
     let result = unsafe { text.to_string() }.map_err(io::Error::other);
     unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
     result
 }
 
-fn windows_error(error: windows::core::Error) -> io::Error {
+fn windows_error(error: windows_core::Error) -> io::Error {
     let hresult = error.code().0 as u32;
     if hresult & 0xffff_0000 == 0x8007_0000 {
         io::Error::from_raw_os_error((hresult & 0x0000_ffff) as i32)
@@ -380,22 +386,23 @@ mod tests {
 
     #[tokio::test]
     async fn live_pipe_dacl_grants_owner_system_and_denies_an_unrelated_sid() {
-        use windows::Win32::Foundation::LUID;
-        use windows::Win32::Security::Authorization::{
+        use crate::rdp::windows::bindings::LUID;
+        use crate::rdp::windows::bindings::{
             AuthzAccessCheck, AuthzFreeContext, AuthzFreeResourceManager,
             AuthzInitializeContextFromSid, AuthzInitializeResourceManager, ConvertStringSidToSidW,
-            AUTHZ_ACCESS_CHECK_FLAGS, AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST,
-            AUTHZ_CLIENT_CONTEXT_HANDLE, AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT,
-            AUTHZ_SKIP_TOKEN_GROUPS,
+            AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST, AUTHZ_CLIENT_CONTEXT_HANDLE,
+            AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT, AUTHZ_SKIP_TOKEN_GROUPS,
         };
-        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION};
-        use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        use crate::rdp::windows::bindings::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+        };
+        use crate::rdp::windows::bindings::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
 
         let pipe_name = format!(r"\\.\pipe\alighieri-rdp-access-test-{}", std::process::id());
         let server = create_server_at(&pipe_name).unwrap();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         // SAFETY: query the live kernel object's installed security descriptor.
-        let status = unsafe {
+        let status = windows_core::WIN32_ERROR(unsafe {
             GetSecurityInfo(
                 HANDLE(server.as_raw_handle()),
                 SE_KERNEL_OBJECT,
@@ -406,10 +413,10 @@ mod tests {
                 None,
                 Some(&mut descriptor),
             )
-        };
+        });
         let descriptor = SecurityDescriptor(descriptor);
         assert!(status.is_ok(), "read live pipe security: {status:?}");
-        let desired = (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0;
+        let desired = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
 
         // Evaluate the installed descriptor with Windows' authorization engine.
         // Supplying explicit SIDs without account/group lookup avoids creating
@@ -438,16 +445,17 @@ mod tests {
             // SAFETY: all input/output storage lives through these calls;
             // handles and the converted SID are released before assertions.
             let result = unsafe {
-                (|| -> windows::core::Result<()> {
-                    ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut principal)?;
+                (|| -> windows_core::Result<()> {
+                    ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut principal).ok()?;
                     AuthzInitializeResourceManager(
-                        AUTHZ_RM_FLAG_NO_AUDIT.0,
+                        AUTHZ_RM_FLAG_NO_AUDIT,
                         None,
                         None,
                         None,
                         PCWSTR::null(),
                         &mut manager,
-                    )?;
+                    )
+                    .ok()?;
                     AuthzInitializeContextFromSid(
                         AUTHZ_SKIP_TOKEN_GROUPS,
                         principal,
@@ -456,9 +464,10 @@ mod tests {
                         LUID::default(),
                         None,
                         &mut context,
-                    )?;
+                    )
+                    .ok()?;
                     AuthzAccessCheck(
-                        AUTHZ_ACCESS_CHECK_FLAGS(0),
+                        0,
                         context,
                         &request,
                         None,
@@ -467,6 +476,7 @@ mod tests {
                         &mut reply,
                         None,
                     )
+                    .ok()
                 })()
             };
             unsafe {

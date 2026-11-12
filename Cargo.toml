@@ -4,7 +4,9 @@ version = "0.7.3"
 edition = "2021"
 default-run = "alighieri"
 # Raised from 1.85 for rustls-acme's cert-parsing chain: the RUSTSEC-2026-0009
-# patched `time` (>=0.3.47) requires rustc 1.88.
+# patched `time` (>=0.3.47) requires rustc 1.88. The Windows-only `rdp` feature
+# needs rustc 1.95 for its `windows-core` 0.100 dependency; every other build
+# keeps this minimum.
 rust-version = "1.88"
 description = "Alighieri — a lightweight, secure, asynchronous SOCKS5 proxy server with Dante-inspired configuration"
 repository = "https://github.com/wiresock/alighieri"
@@ -108,8 +110,9 @@ installer-fs = []
 plugins = ["dep:async-trait"]
 # Windows RDP Dynamic Virtual Channel transport. The protocol remains
 # platform-neutral so `--all-features` can test it on non-Windows hosts; COM,
-# WTS, and registry bindings are target-scoped below.
-rdp = ["dep:windows", "dep:windows-core"]
+# WTS, and registry bindings are target-scoped below. Building it on Windows
+# requires rustc 1.95 (windows-core 0.100).
+rdp = ["dep:windows-core"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -117,8 +120,10 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_System_IO", "Win32_System_Registry"] }
-windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
-windows-core = { version = "0.62", optional = true }
+# The `rdp` Win32/COM bindings are generated into src/rdp/windows/bindings.rs
+# (see scripts/generate-rdp-bindings.sh) and call into windows-core. Keep this on
+# the same release line as windows-bindgen in tools/rdp-bindings.
+windows-core = { version = "0.100", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -1262,6 +1262,9 @@ them from source:
 cargo build --release --locked --features rdp --bins
 ```
 
+The `rdp` feature needs Rust 1.95 or newer (for its `windows-core`
+dependency); the rest of Alighieri keeps the 1.88 minimum.
+
 A source build places the executables in `.\target\release`. Copy
 `alighieri.exe`, `alighieri-rdp-transport.exe`, and
 `alighieri-rdp-agent.exe` from there to a stable directory and enter it before
